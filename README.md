@@ -1,17 +1,12 @@
-# ai_assistant
+# ai-assistant
 
-A new Flutter project.
+Flutter frontend to the self-hosted voice/LLM stack over Tailscale.
 
-## Getting Started
+**Read [PLAN.md](PLAN.md) first** - backend surface map, architecture,
+and the phase-by-phase build order.
 
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```sh
+export PATH="$HOME/Projects/mobile/flutter/bin:$PATH"   # flutter SDK lives here
+flutter run -d <device> --dart-define=HOST_FQDN=<tailnet-host> \
+  --dart-define=TOKEN_MINT_SHARED_SECRET=<from voicebox .env>
+```
