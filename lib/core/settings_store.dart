@@ -1,0 +1,58 @@
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+import 'backend_settings.dart';
+
+/// Persistence for runtime backend settings.
+abstract interface class SettingsStore {
+  /// Returns saved settings, or null when nothing usable has been saved.
+  Future<BackendSettings?> load();
+
+  /// Persists [settings] for later retrieval.
+  Future<void> save(BackendSettings settings);
+
+  /// Removes any previously saved settings.
+  Future<void> clear();
+}
+
+/// [FlutterSecureStorage]-backed store. The storage instance is injectable
+/// so tests can substitute a fake.
+class SecureSettingsStore implements SettingsStore {
+  /// Creates a store. When [storage] is null a default [FlutterSecureStorage]
+  /// is used whose iOS keychain items are scoped to this device
+  /// (`first_unlock_this_device`) so they never sync across devices.
+  SecureSettingsStore({FlutterSecureStorage? storage})
+      : _storage = storage ??
+            const FlutterSecureStorage(
+              aOptions: AndroidOptions(),
+              iOptions: IOSOptions(
+                accessibility: KeychainAccessibility.first_unlock_this_device,
+              ),
+            );
+
+  static const _kHost = 'backend_host';
+  static const _kSecret = 'backend_secret';
+
+  final FlutterSecureStorage _storage;
+
+  @override
+  Future<BackendSettings?> load() async {
+    final host = await _storage.read(key: _kHost);
+    if (host == null || host.trim().isEmpty) {
+      return null;
+    }
+    final secret = await _storage.read(key: _kSecret) ?? '';
+    return BackendSettings(host: host, secret: secret);
+  }
+
+  @override
+  Future<void> save(BackendSettings settings) async {
+    await _storage.write(key: _kHost, value: settings.trimmedHost);
+    await _storage.write(key: _kSecret, value: settings.secret);
+  }
+
+  @override
+  Future<void> clear() async {
+    await _storage.delete(key: _kHost);
+    await _storage.delete(key: _kSecret);
+  }
+}
