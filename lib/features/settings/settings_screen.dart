@@ -19,8 +19,10 @@ class SettingsScreen extends ConsumerStatefulWidget {
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _hostController = TextEditingController();
   final _secretController = TextEditingController();
+  final _mcpSecretController = TextEditingController();
 
   bool _obscureSecret = true;
+  bool _obscureMcpSecret = true;
   bool _probing = false;
   bool _didAutoProbe = false;
   BackendStatus? _status;
@@ -34,6 +36,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     super.initState();
     _hostController.addListener(_onFormChanged);
     _secretController.addListener(_onFormChanged);
+    _mcpSecretController.addListener(_onFormChanged);
     _handleSettings(ref.read(settingsProvider));
     _formListenersActive = true;
   }
@@ -50,8 +53,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   void dispose() {
     _hostController.removeListener(_onFormChanged);
     _secretController.removeListener(_onFormChanged);
+    _mcpSecretController.removeListener(_onFormChanged);
     _hostController.dispose();
     _secretController.dispose();
+    _mcpSecretController.dispose();
     super.dispose();
   }
 
@@ -83,6 +88,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
     if (_secretController.text.isEmpty) {
       _secretController.text = settings.secret;
+    }
+    if (_mcpSecretController.text.isEmpty) {
+      _mcpSecretController.text = settings.mcpSecret ?? '';
     }
   }
 
@@ -117,17 +125,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   Future<void> _testConnection() async {
-    await _runProbe(BackendSettings(
-      host: _hostController.text,
-      secret: _secretController.text,
-    ));
+    await _runProbe(_settingsFromForm());
   }
 
+  BackendSettings _settingsFromForm() => BackendSettings(
+        host: _hostController.text,
+        secret: _secretController.text,
+        mcpSecret: _mcpSecretController.text,
+      );
+
   Future<void> _save() async {
-    final settings = BackendSettings(
-      host: _hostController.text,
-      secret: _secretController.text,
-    );
+    final settings = _settingsFromForm();
     // Saving is a user-initiated probe; make sure the settings-listener's
     // follow-up auto-probe is suppressed even if it fires before [_runProbe].
     _didAutoProbe = true;
@@ -145,6 +153,33 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       const SnackBar(content: Text('Settings saved')),
     );
     await _runProbe(settings);
+  }
+
+  /// Confirms and clears all saved settings (host, secret, MCP token).
+  Future<void> _clearSettings() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Clear settings'),
+        content: const Text('Clear saved host, secret and MCP token?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await ref.read(settingsProvider.notifier).clear();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Settings cleared')),
+    );
   }
 
   /// Reacts to the persisted-settings provider: prefills the form from saved
@@ -230,6 +265,32 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     ),
                   ),
                 ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _mcpSecretController,
+                  enabled: !isLoading,
+                  obscureText: _obscureMcpSecret,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  keyboardType: TextInputType.visiblePassword,
+                  decoration: InputDecoration(
+                    labelText: 'MCP token (optional)',
+                    hintText: 'voice-mcp bearer token (Phase 4)',
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        _obscureMcpSecret
+                            ? Icons.visibility_off
+                            : Icons.visibility,
+                      ),
+                      tooltip: _obscureMcpSecret
+                          ? 'Show MCP token'
+                          : 'Hide MCP token',
+                      onPressed: () =>
+                          setState(() => _obscureMcpSecret = !_obscureMcpSecret),
+                    ),
+                  ),
+                ),
                 const SizedBox(height: 24),
                 Row(
                   children: [
@@ -250,6 +311,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ),
                 const SizedBox(height: 24),
                 _buildResults(context),
+                const SizedBox(height: 32),
+                _buildDangerZone(context),
               ],
             ),
           ),
@@ -277,20 +340,41 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final check in BackendCheck.values)
-          if (status.resultFor(check) case final result?)
-            _CheckRow(result: result, label: check.label),
-        const SizedBox(height: 12),
-        Text(
-          status.allOk
-              ? 'All backend services reachable'
-              : 'Some backend services are unavailable',
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: status.allOk
-                ? Colors.green.shade700
-                : theme.colorScheme.error,
-            fontWeight: FontWeight.w600,
+        ExpansionTile(
+          initiallyExpanded: false,
+          title: Text(
+            status.allOk
+                ? 'All backend services reachable'
+                : 'Some backend services are unavailable',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: status.allOk
+                  ? Colors.green.shade700
+                  : theme.colorScheme.error,
+              fontWeight: FontWeight.w600,
+            ),
           ),
+          children: [
+            for (final check in BackendCheck.values)
+              if (status.resultFor(check) case final result?)
+                _CheckRow(result: result, label: check.label),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// "Danger Zone" section: clears all saved settings after confirmation.
+  Widget _buildDangerZone(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Danger Zone', style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: _clearSettings,
+          icon: Icon(Icons.delete_outline, color: scheme.error),
+          label: Text('Clear settings', style: TextStyle(color: scheme.error)),
         ),
       ],
     );

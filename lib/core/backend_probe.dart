@@ -1,5 +1,4 @@
-import 'dart:async';
-import 'dart:io';
+import 'dart:io' show WebSocketException;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
@@ -7,6 +6,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'backend_settings.dart';
 import 'config.dart';
+import 'network_errors.dart';
 
 /// Individual backend endpoint probed by [BackendProbe.probe].
 enum BackendCheck { tokenMint, tokenMintAuth, liveKit, llmProxy }
@@ -128,7 +128,7 @@ class DioBackendProbe implements BackendProbe {
       return CheckResult(
         check: BackendCheck.tokenMint,
         status: ProbeStatus.error,
-        detail: _truncate('HTTP ${resp.statusCode}: $body'),
+        detail: truncateText('HTTP ${resp.statusCode}: $body'),
       );
     });
   }
@@ -247,7 +247,7 @@ class DioBackendProbe implements BackendProbe {
         return CheckResult(
           check: check,
           status: ProbeStatus.error,
-          detail: _truncate(detail),
+          detail: truncateText(detail),
         );
       }
       final (status, detail) = _classify(e);
@@ -291,21 +291,15 @@ class DioBackendProbe implements BackendProbe {
   (ProbeStatus, String) _classify(Object error) {
     var current = error;
     for (var depth = 0; depth < 8; depth++) {
-      if (current is SocketException || current is TimeoutException) {
+      if (isNetworkError(current)) {
         return (ProbeStatus.unreachable, 'unreachable');
       }
       if (current is DioException) {
-        if (current.type == DioExceptionType.connectionTimeout ||
-            current.type == DioExceptionType.sendTimeout ||
-            current.type == DioExceptionType.receiveTimeout ||
-            current.type == DioExceptionType.connectionError) {
-          return (ProbeStatus.unreachable, 'unreachable');
-        }
         if (current.error case final inner?) {
           current = inner;
           continue;
         }
-        return (ProbeStatus.error, _truncate('$current'));
+        return (ProbeStatus.error, describeDioError(current));
       }
       if (current is WebSocketChannelException) {
         if (_webPlatform) {
@@ -330,17 +324,9 @@ class DioBackendProbe implements BackendProbe {
         // a network failure on web, since no upgrade-rejection marker exists.
         return (ProbeStatus.unreachable, 'unreachable');
       }
-      return (ProbeStatus.error, _truncate('$current'));
+      return (ProbeStatus.error, describeDioError(current));
     }
-    return (ProbeStatus.error, _truncate('$current'));
-  }
-
-  /// Caps the raw body/error text embedded in a [CheckResult.detail] so huge
-  /// responses do not blow up the settings screen.
-  static String _truncate(Object? text, [int limit = 120]) {
-    final s = '$text';
-    if (s.length <= limit) return s;
-    return '${s.substring(0, limit)}…';
+    return (ProbeStatus.error, truncateText('$current'));
   }
 
   /// Default connector: connects and waits for the handshake so failures

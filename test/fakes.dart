@@ -1,6 +1,13 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+
 import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
+import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/settings_store.dart';
+import 'package:ai_assistant/features/chat/chat_store.dart';
+import 'package:ai_assistant/features/chat/message_model.dart';
 
 /// In-memory [SettingsStore] for widget tests.
 class FakeSettingsStore implements SettingsStore {
@@ -47,5 +54,197 @@ class FakeProbe implements BackendProbe {
     calls++;
     lastSettings = settings;
     return status ?? const BackendStatus(checks: []);
+  }
+}
+/// In-memory [ChatStore] for notifier tests.
+class FakeChatStore implements ChatStore {
+  FakeChatStore({List<Conversation>? initial}) {
+    for (final c in initial ?? <Conversation>[]) {
+      _conversations[c.id] = c;
+    }
+  }
+
+  final Map<String, Conversation> _conversations = {};
+  final StreamController<List<Conversation>> _controller =
+      StreamController<List<Conversation>>.broadcast();
+
+  /// Number of [watchConversations] emissions produced.
+  int emitCount = 0;
+
+  List<Conversation> _sorted() {
+    final list = _conversations.values.toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return list;
+  }
+
+  void _emit() {
+    emitCount++;
+    if (_controller.hasListener) {
+      _controller.add(_sorted());
+    }
+  }
+
+  @override
+  Stream<List<Conversation>> watchConversations() async* {
+    yield _sorted();
+    yield* _controller.stream;
+  }
+
+  @override
+  Future<Conversation?> loadConversation(String id) async => _conversations[id];
+
+  @override
+  Future<void> saveConversation(Conversation c) async {
+    _conversations[c.id] = c;
+    _emit();
+  }
+
+  @override
+  Future<void> appendMessage(String conversationId, Message m) async {
+    final conv = _conversations[conversationId];
+    if (conv != null) {
+      _conversations[conversationId] = Conversation(
+        id: conv.id,
+        title: conv.title,
+        messages: [...conv.messages, m],
+        createdAt: conv.createdAt,
+        updatedAt: DateTime.now(),
+      );
+      _emit();
+    }
+  }
+
+  @override
+  Future<void> updateMessage(String conversationId, Message m) async {
+    final conv = _conversations[conversationId];
+    if (conv == null) return;
+    var found = false;
+    final messages = <Message>[];
+    for (final existing in conv.messages) {
+      if (existing.id == m.id) {
+        found = true;
+        messages.add(m);
+      } else {
+        messages.add(existing);
+      }
+    }
+    if (!found) messages.add(m);
+    _conversations[conversationId] = Conversation(
+      id: conv.id,
+      title: conv.title,
+      messages: messages,
+      createdAt: conv.createdAt,
+      updatedAt: DateTime.now(),
+    );
+    _emit();
+  }
+
+  @override
+  Future<void> deleteMessage(String conversationId, String messageId) async {
+    final conv = _conversations[conversationId];
+    if (conv == null) return;
+    _conversations[conversationId] = Conversation(
+      id: conv.id,
+      title: conv.title,
+      messages: [
+        for (final m in conv.messages)
+          if (m.id != messageId) m,
+      ],
+      createdAt: conv.createdAt,
+      updatedAt: DateTime.now(),
+    );
+    _emit();
+  }
+
+  @override
+  Future<void> deleteConversation(String id) async {
+    _conversations.remove(id);
+    _emit();
+  }
+
+  @override
+  Future<void> deleteAll() async {
+    _conversations.clear();
+    _emit();
+  }
+}
+
+/// Scripted [ChatClient] fake for notifier tests.
+class FakeChatClient implements ChatClient {
+  FakeChatClient({
+    List<ChatResult>? results,
+    this.error,
+    this.streamDeltas = const [],
+  }) : results = results ?? [];
+
+  /// Results consumed in order; the last one repeats once exhausted.
+  List<ChatResult> results = [];
+
+  /// If set, throws [error] on every [streamCompletions] call.
+  Object? error;
+
+  /// Per-call streamed content deltas delivered via [onContent].
+  List<List<String>> streamDeltas = const [];
+
+  /// When set, [streamCompletions] awaits this before returning, letting tests
+  /// pause mid-stream (for stop / dispose scenarios).
+  Completer<ChatResult>? hang;
+
+  /// The `messages` argument of each [streamCompletions] call.
+  final List<List<ApiMessage>> calls = [];
+
+  int callCount = 0;
+
+  /// The most recent `systemPrompt` passed to [streamCompletions].
+  String? lastSystemPrompt;
+
+  /// The most recent `tools` passed to [streamCompletions].
+  List<Map<String, Object?>>? lastTools;
+
+  @override
+  Future<ChatResult> streamCompletions({
+    required List<ApiMessage> messages,
+    String? systemPrompt,
+    int maxTokens = 4096,
+    int? temperature,
+    List<Map<String, Object?>>? tools,
+    bool enableThinking = false,
+    void Function(String text)? onContent,
+    void Function(int index, String name, String argsFragment)?
+        onToolCallDelta,
+    CancelToken? cancelToken,
+  }) async {
+    calls.add(messages);
+    lastSystemPrompt = systemPrompt;
+    lastTools = tools;
+    final index = callCount < results.length ? callCount : results.length - 1;
+    callCount++;
+    if (index >= 0 && index < streamDeltas.length) {
+      for (final delta in streamDeltas[index]) {
+        onContent?.call(delta);
+      }
+    }
+    final pendingHang = hang;
+    if (pendingHang != null) {
+      return pendingHang.future;
+    }
+    if (error != null) throw error!;
+    if (results.isEmpty) {
+      return const ChatResult(content: '', toolCalls: [], finishReason: 'stop');
+    }
+    return results[index];
+  }
+
+  @override
+  Future<ChatResult> completions({
+    required List<ApiMessage> messages,
+    String? systemPrompt,
+    int maxTokens = 4096,
+    int? temperature,
+    List<Map<String, Object?>>? tools,
+    bool enableThinking = false,
+    CancelToken? cancelToken,
+  }) {
+    throw UnimplementedError();
   }
 }

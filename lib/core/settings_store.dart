@@ -31,6 +31,7 @@ class SecureSettingsStore implements SettingsStore {
 
   static const _kHost = 'backend_host';
   static const _kSecret = 'backend_secret';
+  static const _kMcpSecret = 'backend_mcp_secret';
 
   final FlutterSecureStorage _storage;
 
@@ -41,18 +42,29 @@ class SecureSettingsStore implements SettingsStore {
       return null;
     }
     final secret = await _storage.read(key: _kSecret) ?? '';
-    return BackendSettings(host: host, secret: secret);
+    final mcpSecret = await _storage.read(key: _kMcpSecret);
+    return BackendSettings(
+      host: host,
+      secret: secret,
+      mcpSecret:
+          mcpSecret == null || mcpSecret.trim().isEmpty ? null : mcpSecret,
+    );
   }
 
   @override
   Future<void> save(BackendSettings settings) async {
     await _storage.write(key: _kHost, value: settings.trimmedHost);
     await _storage.write(key: _kSecret, value: settings.secret);
+    final mcpSecret = settings.trimmedMcpSecret;
+    if (mcpSecret != null) {
+      await _storage.write(key: _kMcpSecret, value: mcpSecret);
+    }
   }
 
   @override
   Future<void> clear() async {
     await _storage.delete(key: _kHost);
     await _storage.delete(key: _kSecret);
+    await _storage.delete(key: _kMcpSecret);
   }
 }

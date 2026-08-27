@@ -38,6 +38,17 @@ dependencies:
   dio: ^5.11.0
   flutter_secure_storage: ^9.2.2
   web_socket_channel: ^3.0.1
+  drift: ^2.34.3
+  drift_flutter: ^0.3.1
+  # flutter_markdown is deprecated on pub.dev; flutter_markdown_plus is the
+  # community-maintained replacement. Migrate in Phase 5 polish.
+  flutter_markdown: ^0.7.7+1
+  markdown: ^7.3.1
+  url_launcher: ^6.3.2
+  uuid: ^4.6.0
+  json_schema: ^5.2.2
+  freezed_annotation: ^3.1.0
+  json_annotation: ^4.12.0
 
 dev_dependencies:
   flutter_test:
@@ -50,6 +61,10 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
   http_mock_adapter: ^0.6.1
+  freezed: ^4.0.0
+  json_serializable: ^6.14.1
+  build_runner: ^2.16.0
+  drift_dev: ^2.34.3
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'features/settings/settings_screen.dart';
+import 'features/chat/chat_screen.dart';
 
 void main() => runApp(const ProviderScope(child: AiAssistantApp()));
 
@@ -13,7 +13,7 @@ class AiAssistantApp extends StatelessWidget {
     return MaterialApp(
       title: 'AI Assistant',
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-      home: const SettingsScreen(),
+      home: const ChatScreen(),
     );
   }
 }

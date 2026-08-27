@@ -117,4 +117,86 @@ void main() {
     expect(storage.values['backend_host'], 'tail.example');
     expect(storage.values['backend_secret'], 's3cret');
   });
+
+  test('mcpSecret round-trips and is stored trimmed', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(
+      const BackendSettings(
+        host: 'tail.example',
+        secret: 's3cret',
+        mcpSecret: '  mcp-token  ',
+      ),
+    );
+
+    expect(storage.values['backend_mcp_secret'], 'mcp-token');
+    final loaded = await store.load();
+    expect(loaded!.mcpSecret, 'mcp-token');
+  });
+
+  test('mcpSecret is not written when null', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(
+      const BackendSettings(host: 'tail.example', secret: 's3cret'),
+    );
+
+    expect(storage.values.containsKey('backend_mcp_secret'), isFalse);
+    final loaded = await store.load();
+    expect(loaded!.mcpSecret, isNull);
+  });
+
+  test('mcpSecret is not written when blank', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(
+      const BackendSettings(
+        host: 'tail.example',
+        secret: 's3cret',
+        mcpSecret: '   ',
+      ),
+    );
+
+    expect(storage.values.containsKey('backend_mcp_secret'), isFalse);
+    final loaded = await store.load();
+    expect(loaded!.mcpSecret, isNull);
+  });
+
+  test('load returns null mcpSecret when stored value is empty', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(
+      const BackendSettings(
+        host: 'tail.example',
+        secret: 's3cret',
+        mcpSecret: 'token',
+      ),
+    );
+    storage._values['backend_mcp_secret'] = '   ';
+    final loaded = await store.load();
+
+    expect(loaded!.mcpSecret, isNull);
+  });
+
+  test('clear removes all three keys', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(
+      const BackendSettings(
+        host: 'tail.example',
+        secret: 's3cret',
+        mcpSecret: 'token',
+      ),
+    );
+    await store.clear();
+
+    expect(await store.load(), isNull);
+    expect(storage.values, isEmpty);
+    expect(storage.values.containsKey('backend_mcp_secret'), isFalse);
+  });
 }
