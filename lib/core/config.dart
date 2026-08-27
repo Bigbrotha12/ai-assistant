@@ -38,4 +38,7 @@ class BackendConfig {
 
   /// voice-mcp: tool bridge (bearer-gated).
   static Uri mcp(String host) => Uri(scheme: 'http', host: host, port: 17601);
+
+  /// files service: bearer-gated upload/list/fetch/delete.
+  static Uri files(String host) => Uri(scheme: 'http', host: host, port: 17603);
 }

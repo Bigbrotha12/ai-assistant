@@ -32,12 +32,14 @@ void main() {
     test('toolDefinitions has the expected shape', () {
       final registry = buildDefaultToolRegistry();
       final defs = registry.toolDefinitions;
-      expect(defs, hasLength(1));
-      final def = defs.single;
-      expect(def['type'], 'function');
-      final fn = def['function'] as Map<String, Object?>;
-      expect(fn['name'], 'voices');
-      expect(fn['parameters'], isA<Map>());
+      expect(defs, hasLength(2));
+      final names = defs.map((d) => d['function'] as Map<String, Object?>)
+          .map((fn) => fn['name']);
+      expect(names, containsAll(['voices', 'files']));
+      final voices = defs.firstWhere(
+          (d) => (d['function'] as Map<String, Object?>)['name'] == 'voices');
+      final voicesFn = voices['function'] as Map<String, Object?>;
+      expect(voicesFn['parameters'], isA<Map>());
     });
 
     test('dispatch unknown tool returns error result', () async {
@@ -76,6 +78,47 @@ void main() {
       // 'text' is required and must be a string.
       final result = await registry.dispatch('echo', const {'text': 42});
       expect(result.ok, isFalse);
+    });
+
+    test('files tool is registered in the default registry', () {
+      final registry = buildDefaultToolRegistry();
+      expect(registry.has('files'), isTrue);
+      final tool = registry.find('files');
+      expect(tool, isNotNull);
+      expect(tool!.name, 'files');
+    });
+
+    test('files tool schema validates a valid action', () async {
+      final registry = buildDefaultToolRegistry();
+      final result =
+          await registry.dispatch('files', const {'action': 'list'});
+      expect(result.ok, isTrue);
+    });
+
+    test('files tool rejects an unknown action', () async {
+      final registry = buildDefaultToolRegistry();
+      final result = await registry.dispatch('files', const {'action': 'rm'});
+      expect(result.ok, isFalse);
+      expect(result.message, isNotEmpty);
+    });
+
+    test('files tool rejects missing action', () async {
+      final registry = buildDefaultToolRegistry();
+      final result = await registry.dispatch('files', const {});
+      expect(result.ok, isFalse);
+      expect(result.message, isNotEmpty);
+    });
+
+    test('files tool execute returns the neutral message', () async {
+      final registry = buildDefaultToolRegistry();
+      final result =
+          await registry.dispatch('files', const {'action': 'upload'});
+      expect(result.ok, isTrue);
+      expect(
+        result.message,
+        'File operations are not available on this device. '
+        'Upload files from the chat attachment picker.',
+      );
     });
   });
 }

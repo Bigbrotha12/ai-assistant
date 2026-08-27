@@ -4,8 +4,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/backend_probe.dart';
 import '../../core/backend_settings.dart';
 import '../../core/config.dart';
+import '../../core/files_providers.dart';
+import '../../core/files_service.dart';
 import '../../core/probe_providers.dart';
 import '../../core/settings_providers.dart';
+import '../attachments/files_screen.dart';
 
 /// App home screen: configure and verify connectivity to the self-hosted
 /// backend stack (token-mint, LiveKit, LLM proxy).
@@ -20,9 +23,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _hostController = TextEditingController();
   final _secretController = TextEditingController();
   final _mcpSecretController = TextEditingController();
+  final _filesSecretController = TextEditingController();
 
   bool _obscureSecret = true;
   bool _obscureMcpSecret = true;
+  bool _obscureFilesSecret = true;
   bool _probing = false;
   bool _didAutoProbe = false;
   BackendStatus? _status;
@@ -37,6 +42,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _hostController.addListener(_onFormChanged);
     _secretController.addListener(_onFormChanged);
     _mcpSecretController.addListener(_onFormChanged);
+    _filesSecretController.addListener(_onFormChanged);
     _handleSettings(ref.read(settingsProvider));
     _formListenersActive = true;
   }
@@ -54,9 +60,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _hostController.removeListener(_onFormChanged);
     _secretController.removeListener(_onFormChanged);
     _mcpSecretController.removeListener(_onFormChanged);
+    _filesSecretController.removeListener(_onFormChanged);
     _hostController.dispose();
     _secretController.dispose();
     _mcpSecretController.dispose();
+    _filesSecretController.dispose();
     super.dispose();
   }
 
@@ -91,6 +99,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
     if (_mcpSecretController.text.isEmpty) {
       _mcpSecretController.text = settings.mcpSecret ?? '';
+    }
+    if (_filesSecretController.text.isEmpty) {
+      _filesSecretController.text = settings.filesSecret ?? '';
     }
   }
 
@@ -132,6 +143,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         host: _hostController.text,
         secret: _secretController.text,
         mcpSecret: _mcpSecretController.text,
+        filesSecret: _filesSecretController.text,
       );
 
   Future<void> _save() async {
@@ -155,7 +167,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     await _runProbe(settings);
   }
 
-  /// Confirms and clears all saved settings (host, secret, MCP token).
+  /// Confirms and clears all saved settings (host, secret, MCP, files token).
   Future<void> _clearSettings() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -175,6 +187,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
+    setState(() {
+      _hostController.clear();
+      _secretController.clear();
+      _mcpSecretController.clear();
+      _filesSecretController.clear();
+    });
     await ref.read(settingsProvider.notifier).clear();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -291,6 +309,32 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     ),
                   ),
                 ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _filesSecretController,
+                  enabled: !isLoading,
+                  obscureText: _obscureFilesSecret,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  keyboardType: TextInputType.visiblePassword,
+                  decoration: InputDecoration(
+                    labelText: 'Files token (optional)',
+                    hintText: 'files service bearer token',
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        _obscureFilesSecret
+                            ? Icons.visibility_off
+                            : Icons.visibility,
+                      ),
+                      tooltip: _obscureFilesSecret
+                          ? 'Show files token'
+                          : 'Hide files token',
+                      onPressed: () => setState(
+                          () => _obscureFilesSecret = !_obscureFilesSecret),
+                    ),
+                  ),
+                ),
                 const SizedBox(height: 24),
                 Row(
                   children: [
@@ -311,6 +355,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ),
                 const SizedBox(height: 24),
                 _buildResults(context),
+                const SizedBox(height: 32),
+                _buildFiles(context),
                 const SizedBox(height: 32),
                 _buildDangerZone(context),
               ],
@@ -360,6 +406,98 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ],
         ),
       ],
+    );
+  }
+
+  /// "Files" section: connection status, file browser navigation, and cache
+  /// management (plan §3.14).
+  Widget _buildFiles(BuildContext context) {
+    final filesService = ref.watch(filesServiceProvider);
+    final connected = filesService is! NoOpFilesClient;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Files', style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Icon(
+              connected ? Icons.cloud_done : Icons.cloud_off,
+              size: 20,
+              color: connected
+                  ? Colors.green.shade600
+                  : Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                connected
+                    ? 'Files service connected'
+                    : 'Files service not configured',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: connected
+                          ? Colors.green.shade700
+                          : Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: _openFileBrowser,
+                icon: const Icon(Icons.folder_open),
+                label: const Text('File Browser'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _clearCache,
+                icon: const Icon(Icons.delete_sweep_outlined),
+                label: const Text('Clear Cache'),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// Pushes the [FilesScreen] file browser.
+  void _openFileBrowser() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const FilesScreen()),
+    );
+  }
+
+  /// Confirms and evicts expired cached files, then reports the result.
+  Future<void> _clearCache() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Clear Cache'),
+        content: const Text('Remove expired files from this device?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await ref.read(fileCacheProvider).evictExpired();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Cache cleared')),
     );
   }
 

@@ -6,6 +6,10 @@ import 'package:uuid/uuid.dart';
 
 import '../../core/chat_client.dart';
 import '../../core/chat_client_provider.dart';
+import '../../core/files_providers.dart';
+import '../attachments/file_model.dart';
+import '../attachments/file_store.dart';
+import '../attachments/upload_queue.dart';
 import 'chat_store.dart';
 import 'context_trimmer.dart';
 import 'database_providers.dart';
@@ -28,6 +32,11 @@ class ConversationState {
   /// True once the conversation has been loaded from the store.
   final bool isDbReady;
 
+  /// Live upload progress for attachment jobs, keyed by job id. A `done`
+  /// status carries the server file id; a `failed` status carries an error.
+  /// Updated as the upload queue reports progress.
+  final Map<String, UploadJobStatus> attachmentUploads;
+
   const ConversationState({
     required this.messages,
     this.isStreaming = false,
@@ -35,6 +44,7 @@ class ConversationState {
     this.pendingUserMessageId,
     this.failedMessageId,
     this.isDbReady = false,
+    this.attachmentUploads = const {},
   });
 
   ConversationState copyWith({
@@ -43,6 +53,7 @@ class ConversationState {
     Object? error = _sentinel,
     Object? pendingUserMessageId = _sentinel,
     Object? failedMessageId = _sentinel,
+    Object? attachmentUploads = _sentinel,
     bool? isDbReady,
   }) {
     return ConversationState(
@@ -55,6 +66,9 @@ class ConversationState {
       failedMessageId: identical(failedMessageId, _sentinel)
           ? this.failedMessageId
           : failedMessageId as String?,
+      attachmentUploads: identical(attachmentUploads, _sentinel)
+          ? this.attachmentUploads
+          : attachmentUploads as Map<String, UploadJobStatus>,
       isDbReady: isDbReady ?? this.isDbReady,
     );
   }
@@ -63,7 +77,8 @@ class ConversationState {
 const Object _sentinel = Object();
 
 const kSystemPrompt =
-    'You are a helpful voice assistant running on the user\'s self-hosted home AI stack. Be concise in casual chat but thorough when asked. You can call tools when they help. If a tool fails, say so plainly and offer alternatives.';
+    'You are a helpful voice assistant running on the user\'s self-hosted home AI stack. Be concise in casual chat but thorough when asked. You can call tools when they help. If a tool fails, say so plainly and offer alternatives. '
+    'The user may attach files to their messages. A file reference looks like [file:abc123]. Treat each [file:xxx] as an uploaded image. You do not see the image content in text form — you may reference the file by its ID if needed, but you do not need to describe images.';
 
 /// Drives the chat UI for a single conversation, streaming LLM completions and
 /// executing tools. Riverpod 3 family notifier; the conversation id is passed
@@ -95,19 +110,50 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   ChatClient? _client;
   ContextTrimmer? _trimmer;
   ToolRegistry? _registry;
+  FileStore? _fileStore;
+
+  /// Owned by this notifier and disposed with it (§3.3). Created in [build]
+  /// from [filesServiceProvider]; a [NoOpFilesClient] (no files secret
+  /// configured) fails uploads gracefully with a clear error.
+  UploadQueue? _queue;
+
+  /// Maps an upload job id to the user message it belongs to, so a completed
+  /// upload's `[file:<id>]` reference is appended to the right message.
+  final Map<String, String> _jobUserMessageId = {};
+
+  /// Upload job ids whose `[file:<id>]` reference has already been appended.
+  final Set<String> _appendedRefs = {};
+
+  /// Serializes [FileInfo] + message persistence across concurrently-completing
+  /// uploads. Without it, two jobs finishing back-to-back each write the full
+  /// user message and the later write can clobber the earlier ref.
+  Future<void> _persistChain = Future.value();
 
   @override
   Future<ConversationState> build() async {
     _store = ref.watch(chatStoreProvider);
-    _client = ref.watch(chatApiClientProvider);
+    // Read (not watch) the settings-dependent providers: both
+    // chatApiClientProvider and filesServiceProvider rebuild when the user
+    // saves settings, and re-running build() would dispose the UploadQueue
+    // owned here — silently cancelling any in-flight upload and losing the
+    // `[file:<id>]` ref. The client instances are snapshot at build time and
+    // stay pinned to this conversation's lifetime.
+    _client = ref.read(chatApiClientProvider);
     _trimmer = ref.watch(contextTrimmerProvider);
     _registry = ref.watch(toolRegistryProvider);
+    _fileStore = ref.watch(filesStoreProvider);
+    final queue = UploadQueue(filesService: ref.read(filesServiceProvider));
+    _queue = queue;
 
     // Wait for the database to be ready before loading messages.
     await ref.watch(databaseReadyProvider);
     if (!ref.mounted) return const ConversationState(messages: []);
 
+    queue.jobs.addListener(_onQueueChanged);
+
     ref.onDispose(() {
+      queue.jobs.removeListener(_onQueueChanged);
+      queue.dispose();
       _active?.cancel();
       _throttle?.cancel();
     });
@@ -121,7 +167,10 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     );
   }
 
-  Future<void> sendMessage(String text) async {
+  Future<void> sendMessage(
+    String text, {
+    List<AttachmentDraft> attachments = const [],
+  }) async {
     final current = state.value;
     if (current == null || current.isStreaming) return;
 
@@ -166,7 +215,174 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     }
     if (!ref.mounted) return;
 
-    await _runTurn();
+    try {
+      await _runTurn();
+    } catch (_) {
+      // A failed turn must NOT enqueue attachments: the UI retains the
+      // selection (chat_screen._send does not clear it on failure), so a
+      // retry re-sends exactly once instead of uploading the same files
+      // twice. Note: a *chat* error (network/tool) is handled inside
+      // _streamOnce/_onError and does not throw here, so uploads still start
+      // for a turn whose reply failed but whose message was persisted.
+      //
+      // An unexpected throw leaves the streaming flag set (only the success
+      // path / _onError clears it), which would wedge the conversation: the
+      // input stays disabled and the user could never retry. Clear it here so
+      // the UI is usable again, while still rethrowing so _send keeps the
+      // text + attachment selection intact.
+      final cur = state.value;
+      if (cur != null && ref.mounted) {
+        _setState(cur.copyWith(
+          isStreaming: false,
+          pendingUserMessageId: null,
+        ));
+      }
+      rethrow;
+    }
+    // §3.6: attachments upload asynchronously AFTER the turn succeeds, so the
+    // user's text is never blocked on slow uploads.
+    _enqueueAttachments(attachments, userMsg.id);
+  }
+
+  void _enqueueAttachments(List<AttachmentDraft> attachments, String userMsgId) {
+    final queue = _queue;
+    if (queue == null || attachments.isEmpty) return;
+    for (final draft in attachments) {
+      unawaited(_enqueueOne(queue, draft, userMsgId));
+    }
+  }
+
+  Future<void> _enqueueOne(
+    UploadQueue queue,
+    AttachmentDraft draft,
+    String userMsgId,
+  ) async {
+    try {
+      final jobId = await queue.enqueue(
+        path: draft.path,
+        filename: draft.filename,
+        sizeBytes: draft.sizeBytes,
+        mimeType: draft.mimeType,
+      );
+      _jobUserMessageId[jobId] = userMsgId;
+      // The upload may have already completed by the time the mapping above is
+      // recorded (an already-resolved service completes in a microtask);
+      // reconcile any such job now so its [file:<id>] ref is not dropped.
+      final jobs = queue.jobs.value;
+      if (jobs.any((j) => j.id == jobId && j.status == UploadStatus.done)) {
+        _handleCompletedJobs(jobs);
+      }
+    } catch (_) {
+      // Best-effort: a failed enqueue leaves no job to surface in state.
+    }
+  }
+
+  /// Mirrors the queue's live jobs into [ConversationState.attachmentUploads]
+  /// and, for newly-completed uploads, appends the `[file:<id>]` reference to
+  /// the owning user message (in-memory + persisted).
+  void _onQueueChanged() {
+    if (!ref.mounted) return;
+    final current = state.value;
+    if (current == null) return;
+
+    final jobs = _queue?.jobs.value ?? const <UploadJob>[];
+    final uploads = <String, UploadJobStatus>{};
+    for (final job in jobs) {
+      uploads[job.id] = UploadJobStatus(
+        jobId: job.id,
+        status: job.status,
+        progress: job.progress,
+        error: job.error,
+        serverFileId: job.serverFileId,
+        uri: job.uri,
+      );
+    }
+    _setState(current.copyWith(attachmentUploads: uploads));
+    _handleCompletedJobs(jobs);
+  }
+
+  void _handleCompletedJobs(List<UploadJob> jobs) {
+    for (final job in jobs) {
+      final serverFileId = job.serverFileId;
+      if (job.status != UploadStatus.done || serverFileId == null) continue;
+      // The jobId -> user message mapping is recorded a microtask after the
+      // job is enqueued; a very fast upload may finish first. Skip without
+      // marking the ref appended so [_enqueueOne]'s reconciliation can retry.
+      final userMsgId = _jobUserMessageId[job.id];
+      if (userMsgId == null) continue;
+      if (!_appendedRefs.add(job.id)) continue;
+
+      final cur = state.value;
+      if (cur == null) continue;
+      Message? updated;
+      for (final m in cur.messages) {
+        if (m.id == userMsgId) {
+          updated = m.copyWith(content: _appendFileRef(m.content, serverFileId));
+          break;
+        }
+      }
+      if (updated == null) continue;
+
+      _setState(cur.copyWith(messages: [
+        for (final m in cur.messages)
+          if (m.id == userMsgId) updated else m,
+      ]));
+      // Serialize persistence in completion order so two uploads finishing
+      // concurrently can't overwrite each other's [file:<id>] ref in the DB.
+      _persistChain = _persistChain.then(
+        (_) => _persistCompletedUpload(job, serverFileId, userMsgId),
+      );
+    }
+  }
+
+  /// Appends `[file:<id>]` to a user message's content (idempotent per id).
+  String _appendFileRef(String content, String fileId) {
+    final ref = '[file:$fileId]';
+    if (content.contains(ref)) return content;
+    return content.isEmpty ? ref : '$content $ref';
+  }
+
+  Future<void> _persistCompletedUpload(
+    UploadJob job,
+    String serverFileId,
+    String userMsgId,
+  ) async {
+    if (!ref.mounted) return;
+    try {
+      // Re-read the freshest in-memory content (every ref appended so far) so
+      // the write is consistent even if another upload completed meanwhile.
+      final message = _latestUserMessage(userMsgId);
+      if (message != null) {
+        await _store!.updateMessage(conversationId, message);
+      }
+    } catch (_) {
+      // Best-effort: the reference is already reflected in in-memory state.
+    }
+    if (!ref.mounted) return;
+    try {
+      await _fileStore!.saveFile(
+        FileInfo(
+          id: serverFileId,
+          filename: job.filename,
+          sizeBytes: job.sizeBytes,
+          mimeType: job.mimeType,
+          uploadedAt: DateTime.now(),
+        ),
+        conversationId: conversationId,
+      );
+    } catch (_) {
+      // Best-effort: a persistence failure must not crash the turn.
+    }
+  }
+
+  /// Returns the current in-memory user message for [userMsgId], or null.
+  Message? _latestUserMessage(String userMsgId) {
+    final cur = state.value;
+    if (cur == null) return null;
+    for (final m in cur.messages) {
+      if (m.id == userMsgId) return m;
+    }
+    return null;
   }
 
   Future<void> retry() async {

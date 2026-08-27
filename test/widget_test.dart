@@ -389,7 +389,8 @@ void main() {
       await tester.pumpWidget(settingsApp(store: store, probe: FakeProbe()));
       await tester.pumpAndSettle();
 
-      await tester.ensureVisible(find.text('Clear settings'));
+      await tester.scrollUntilVisible(find.text('Clear settings'), 200,
+          scrollable: find.byType(Scrollable).first);
       await tester.tap(find.text('Clear settings'));
       await tester.pumpAndSettle();
 
@@ -409,7 +410,8 @@ void main() {
       await tester.pumpWidget(settingsApp(store: store, probe: FakeProbe()));
       await tester.pumpAndSettle();
 
-      await tester.ensureVisible(find.text('Clear settings'));
+      await tester.scrollUntilVisible(find.text('Clear settings'), 200,
+          scrollable: find.byType(Scrollable).first);
       await tester.tap(find.text('Clear settings'));
       await tester.pumpAndSettle();
 

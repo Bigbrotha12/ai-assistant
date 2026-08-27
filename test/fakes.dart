@@ -1,11 +1,15 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
 import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client.dart';
+import 'package:ai_assistant/core/files_service.dart';
 import 'package:ai_assistant/core/settings_store.dart';
+import 'package:ai_assistant/features/attachments/file_model.dart';
+import 'package:ai_assistant/features/attachments/file_store.dart';
 import 'package:ai_assistant/features/chat/chat_store.dart';
 import 'package:ai_assistant/features/chat/message_model.dart';
 
@@ -71,6 +75,10 @@ class FakeChatStore implements ChatStore {
   /// Number of [watchConversations] emissions produced.
   int emitCount = 0;
 
+  /// When true, the next [updateMessage] call throws. Lets tests simulate an
+  /// unexpected failure mid-turn (distinct from a handled chat error).
+  bool failUpdateMessage = false;
+
   List<Conversation> _sorted() {
     final list = _conversations.values.toList()
       ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
@@ -116,6 +124,9 @@ class FakeChatStore implements ChatStore {
 
   @override
   Future<void> updateMessage(String conversationId, Message m) async {
+    if (failUpdateMessage) {
+      throw StateError('store unavailable');
+    }
     final conv = _conversations[conversationId];
     if (conv == null) return;
     var found = false;
@@ -246,5 +257,154 @@ class FakeChatClient implements ChatClient {
     CancelToken? cancelToken,
   }) {
     throw UnimplementedError();
+  }
+}
+
+/// Scripted [FilesClient] fake that records upload/fetch calls. Assign
+/// [uploadCompleter] to hold an upload in-flight, [uploadError] to fail it,
+/// or leave both null for an immediate success.
+class FakeFilesClient implements FilesClient {
+  FakeFilesClient({
+    this.uploadCompleter,
+    this.uploadError,
+    this.fetchError,
+    this.fetchBytes = const [1, 2, 3],
+    this.listError,
+    this.deleteError,
+    List<FileInfo>? files,
+  }) : files = files ?? [];
+
+  /// When set, [uploadFile] awaits this before returning (pausing the upload).
+  Completer<FileInfo>? uploadCompleter;
+
+  /// When set, every [uploadFile] throws [uploadError].
+  Object? uploadError;
+
+  /// When set, [fetchFile] throws [fetchError].
+  Object? fetchError;
+
+  /// Bytes returned by [fetchFile] unless [fetchError] is set.
+  final List<int> fetchBytes;
+
+  /// When set, every [listFiles] call throws.
+  Object? listError;
+
+  /// When set, every [deleteFile] call throws.
+  Object? deleteError;
+
+  /// Files returned by [listFiles]. Mutations (e.g. [deleteFile]) apply here so
+  /// a later list reflects them; assign directly to script results.
+  List<FileInfo> files;
+
+  /// The file ids passed to [deleteFile], in order.
+  final List<String> deletedIds = [];
+
+  /// Number of [listFiles] calls.
+  int listCalls = 0;
+
+  /// The arguments of each [uploadFile] call, in order.
+  final List<({String path, String filename, int sizeBytes, String mimeType})>
+      uploadCalls = [];
+
+  /// The file ids passed to [fetchFile], in order.
+  final List<String> fetchedIds = [];
+
+  @override
+  Future<FileInfo> uploadFile({
+    required String path,
+    required String filename,
+    required int sizeBytes,
+    required String mimeType,
+    CancelToken? cancelToken,
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    uploadCalls.add((
+      path: path,
+      filename: filename,
+      sizeBytes: sizeBytes,
+      mimeType: mimeType,
+    ));
+    final completer = uploadCompleter;
+    if (completer != null) {
+      return completer.future;
+    }
+    final error = uploadError;
+    if (error != null) throw error;
+    return FileInfo(
+      id: 'server-${uploadCalls.length}',
+      filename: filename,
+      sizeBytes: sizeBytes,
+      mimeType: mimeType,
+      uploadedAt: DateTime.now(),
+    );
+  }
+
+  @override
+  Future<Uint8List> fetchFile(String fileId) async {
+    fetchedIds.add(fileId);
+    final error = fetchError;
+    if (error != null) throw error;
+    return Uint8List.fromList(fetchBytes);
+  }
+
+  @override
+  Future<List<FileInfo>> listFiles() async {
+    listCalls++;
+    final error = listError;
+    if (error != null) throw error;
+    return List.of(files);
+  }
+
+  @override
+  Future<void> deleteFile(String fileId) async {
+    final error = deleteError;
+    if (error != null) throw error;
+    deletedIds.add(fileId);
+    files.removeWhere((f) => f.id == fileId);
+  }
+}
+
+/// In-memory [FileStore] for notifier tests.
+class FakeFileStore implements FileStore {
+  /// Every [FileInfo] passed to [saveFile], in order.
+  final List<FileInfo> saved = [];
+
+  /// The ids passed to [deleteFile], in order.
+  final List<String> deletedIds = [];
+
+  final Map<String, FileInfo> _files = {};
+  final Map<String, String> _links = {};
+
+  @override
+  Future<void> saveFile(FileInfo info, {String? conversationId}) async {
+    saved.add(info);
+    _files[info.id] = info;
+    if (conversationId != null) _links[info.id] = conversationId;
+  }
+
+  @override
+  Future<FileInfo?> getFileById(String id) async => _files[id];
+
+  @override
+  Future<List<FileInfo>> listFilesForConversation(String conversationId) async =>
+      [
+        for (final entry in _links.entries)
+          if (entry.value == conversationId) _files[entry.key]!,
+      ];
+
+  @override
+  Future<List<FileInfo>> listAllFiles() async => _files.values.toList();
+
+  @override
+  Future<void> deleteFile(String id) async {
+    deletedIds.add(id);
+    _files.remove(id);
+    _links.remove(id);
+  }
+
+  @override
+  Future<void> deleteAll() async {
+    _files.clear();
+    _links.clear();
   }
 }

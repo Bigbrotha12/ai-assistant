@@ -5,17 +5,27 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/chat_client_provider.dart';
+import 'package:ai_assistant/core/files_providers.dart';
+import 'package:ai_assistant/core/files_service.dart';
+import 'package:ai_assistant/features/attachments/file_model.dart';
 import 'package:ai_assistant/features/chat/chat_providers.dart';
 import 'package:ai_assistant/features/chat/database_providers.dart';
 import 'package:ai_assistant/features/chat/message_model.dart';
 
 import 'fakes.dart';
 
-ProviderContainer _container({FakeChatStore? store, FakeChatClient? client}) {
+ProviderContainer _container({
+  FakeChatStore? store,
+  FakeChatClient? client,
+  FakeFilesClient? filesService,
+  FakeFileStore? fileStore,
+}) {
   final container = ProviderContainer(
     overrides: [
       chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
       chatApiClientProvider.overrideWithValue(client ?? FakeChatClient()),
+      filesServiceProvider.overrideWithValue(filesService ?? FakeFilesClient()),
+      filesStoreProvider.overrideWithValue(fileStore ?? FakeFileStore()),
     ],
   );
   addTearDown(container.dispose);
@@ -29,6 +39,14 @@ void _keepAlive(ProviderContainer container, String id) {
     conversationProvider(id),
     (_, _) {},
   );
+}
+
+/// Drains the upload microtask pipeline. The fake client resolves without
+/// timers, so a couple of event-loop turns suffice for uploads to reach their
+/// terminal state and for ref-append / FileInfo persistence to complete.
+Future<void> _settle() async {
+  await Future<void>.delayed(Duration.zero);
+  await Future<void>.delayed(Duration.zero);
 }
 
 Conversation _existingConversation({List<Message> messages = const []}) =>
@@ -394,6 +412,8 @@ void main() {
         overrides: [
           chatStoreProvider.overrideWithValue(store),
           chatApiClientProvider.overrideWithValue(client),
+          filesServiceProvider.overrideWithValue(FakeFilesClient()),
+          filesStoreProvider.overrideWithValue(FakeFileStore()),
         ],
       );
       final notifier = container.read(conversationProvider('c1').notifier);
@@ -428,6 +448,256 @@ void main() {
       expect(conv, isNotNull);
       expect(conv!.title, 'This is my first message here');
       expect(conv.messages, hasLength(2));
+    });
+
+    test('sendMessage enqueues attachments after the turn and tracks progress',
+        () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'Here you go', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final upload = Completer<FileInfo>();
+      final files = FakeFilesClient(uploadCompleter: upload);
+      final fileStore = FakeFileStore();
+      final container = _container(
+        store: store,
+        client: client,
+        filesService: files,
+        fileStore: fileStore,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Check this', attachments: const [
+        AttachmentDraft(
+          path: '/tmp/a.jpg',
+          filename: 'a.jpg',
+          sizeBytes: 100,
+          mimeType: 'image/jpeg',
+        ),
+      ]);
+
+      // The turn completed before the upload resolved.
+      var state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.messages.last.content, 'Here you go');
+      expect(files.uploadCalls, hasLength(1));
+      expect(files.uploadCalls.single.path, '/tmp/a.jpg');
+
+      // The upload is in-flight: status shows uploading, no ref appended yet.
+      final jobId = state.attachmentUploads.keys.single;
+      expect(state.attachmentUploads[jobId]!.status, UploadStatus.uploading);
+      expect(state.messages.first.content, 'Check this');
+
+      // Completing the upload appends the file ref and persists FileInfo.
+      upload.complete(FileInfo(
+        id: 'fid-123',
+        filename: 'a.jpg',
+        sizeBytes: 100,
+        mimeType: 'image/jpeg',
+        uploadedAt: DateTime(2024, 1, 1),
+      ));
+      await _settle();
+
+      state = container.read(conversationProvider('c1')).value!;
+      final done = state.attachmentUploads[jobId]!;
+      expect(done.status, UploadStatus.done);
+      expect(done.serverFileId, 'fid-123');
+      expect(state.messages.first.content, 'Check this [file:fid-123]');
+
+      final persisted = await store.loadConversation('c1');
+      expect(persisted!.messages.first.content, 'Check this [file:fid-123]');
+
+      expect(fileStore.saved, hasLength(1));
+      expect(fileStore.saved.single.id, 'fid-123');
+      expect(fileStore.saved.single.uploadedAt, isNotNull);
+    });
+
+    test('multiple completed uploads append file refs and persist FileInfo',
+        () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final files = FakeFilesClient();
+      final fileStore = FakeFileStore();
+      final container = _container(
+        store: store,
+        client: client,
+        filesService: files,
+        fileStore: fileStore,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Two files', attachments: const [
+        AttachmentDraft(
+          path: '/a.jpg',
+          filename: 'a.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+        ),
+        AttachmentDraft(
+          path: '/b.png',
+          filename: 'b.png',
+          sizeBytes: 2,
+          mimeType: 'image/png',
+        ),
+      ]);
+      await _settle();
+
+      final state = container.read(conversationProvider('c1')).value!;
+      final uploads = state.attachmentUploads;
+      expect(uploads, hasLength(2));
+      expect(
+        uploads.values.map((u) => u.status).toSet(),
+        {UploadStatus.done},
+      );
+      expect(
+        uploads.values.map((u) => u.serverFileId).toSet(),
+        {'server-1', 'server-2'},
+      );
+
+      final userContent = state.messages.first.content;
+      expect(userContent.startsWith('Two files'), isTrue);
+      expect(userContent, contains('[file:server-1]'));
+      expect(userContent, contains('[file:server-2]'));
+
+      expect(fileStore.saved, hasLength(2));
+    });
+
+    test('failed uploads surface a failed status with error and no file ref',
+        () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final files = FakeFilesClient(
+        uploadError: const FilesServerError('upload boom'),
+      );
+      final fileStore = FakeFileStore();
+      final container = _container(
+        store: store,
+        client: client,
+        filesService: files,
+        fileStore: fileStore,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Send file', attachments: const [
+        AttachmentDraft(
+          path: '/a.jpg',
+          filename: 'a.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+        ),
+      ]);
+      await _settle();
+
+      final state = container.read(conversationProvider('c1')).value!;
+      final status = state.attachmentUploads.values.single;
+      expect(status.status, UploadStatus.failed);
+      expect(status.error, 'upload boom');
+      expect(status.serverFileId, isNull);
+
+      // No ref appended; nothing persisted.
+      expect(state.messages.first.content, 'Send file');
+      expect(fileStore.saved, isEmpty);
+    });
+
+    test('sendMessage without attachments leaves attachmentUploads empty',
+        () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final files = FakeFilesClient();
+      final container = _container(
+        store: store,
+        client: client,
+        filesService: files,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Hi');
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.attachmentUploads, isEmpty);
+      expect(files.uploadCalls, isEmpty);
+      expect(state.messages.last.content, 'ok');
+    });
+
+    test(
+        'a failed turn does not enqueue attachments so a retry uploads '
+        'exactly once', () async {
+      final store = FakeChatStore(initial: [_existingConversation()])
+        ..failUpdateMessage = true;
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final files = FakeFilesClient();
+      final fileStore = FakeFileStore();
+      final container = _container(
+        store: store,
+        client: client,
+        filesService: files,
+        fileStore: fileStore,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      final attachments = const [
+        AttachmentDraft(
+          path: '/a.jpg',
+          filename: 'a.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+        ),
+      ];
+
+      // The turn throws (unexpected store failure mid-stream); the attachments
+      // must NOT be enqueued so the UI's retained selection is re-sent once.
+      await expectLater(
+        notifier.sendMessage('Send file', attachments: attachments),
+        throwsA(isA<StateError>()),
+      );
+      await _settle();
+      expect(files.uploadCalls, isEmpty);
+
+      // The user presses Send again after the failure; uploads start exactly
+      // once — no duplicate server uploads or duplicated refs.
+      store.failUpdateMessage = false;
+      await notifier.sendMessage('Send file', attachments: attachments);
+      await _settle();
+
+      expect(files.uploadCalls, hasLength(1));
+      final state = container.read(conversationProvider('c1')).value!;
+      final uploads = state.attachmentUploads.values.toList();
+      expect(uploads, hasLength(1));
+      expect(uploads.single.status, UploadStatus.done);
+      // Exactly one [file:<id>] ref appended to the second user message.
+      final userMessages =
+          state.messages.where((m) => m.role == MessageRole.user).toList();
+      expect(userMessages, hasLength(2));
+      expect(userMessages.first.content, 'Send file');
+      expect(userMessages.last.content, 'Send file [file:server-1]');
     });
   });
 

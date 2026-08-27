@@ -1,5 +1,7 @@
 import 'package:json_schema/json_schema.dart';
 
+import '../attachments/tool_files.dart';
+
 /// A tool the model may call. Phase 2 is plumbing-only: the registry and
 /// validation exist, but only a placeholder `voices()` tool is registered.
 abstract class Tool {
@@ -85,5 +87,7 @@ class VoicesTool implements Tool {
   }
 }
 
-/// Builds the default registry containing the placeholder `voices()` tool.
-ToolRegistry buildDefaultToolRegistry() => ToolRegistry(tools: [VoicesTool()]);
+/// Builds the default registry containing the placeholder `voices()` tool and
+/// the `files()` stub.
+ToolRegistry buildDefaultToolRegistry() =>
+    ToolRegistry(tools: [VoicesTool(), FilesTool()]);

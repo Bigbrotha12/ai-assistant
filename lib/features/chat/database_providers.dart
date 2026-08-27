@@ -1,6 +1,7 @@
 import 'package:drift_flutter/drift_flutter.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../attachments/file_store.dart';
 import 'chat_store.dart';
 import 'database.dart';
 
@@ -14,4 +15,9 @@ final databaseProvider = Provider<AppDatabase>((ref) {
 /// Provides the [ChatStore] used to persist conversations and messages.
 final chatStoreProvider = Provider<ChatStore>(
   (ref) => DriftChatStore(ref.watch(databaseProvider)),
+);
+
+/// Provides the [FileStore] used to persist file attachment metadata.
+final filesStoreProvider = Provider<FileStore>(
+  (ref) => DriftFileStore(ref.watch(databaseProvider)),
 );

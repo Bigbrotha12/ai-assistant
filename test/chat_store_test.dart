@@ -1,3 +1,7 @@
+import 'dart:io';
+
+import 'package:ai_assistant/features/attachments/file_model.dart';
+import 'package:ai_assistant/features/attachments/file_store.dart';
 import 'package:ai_assistant/features/chat/chat_store.dart';
 import 'package:ai_assistant/features/chat/database.dart';
 import 'package:ai_assistant/features/chat/message_model.dart';
@@ -217,5 +221,83 @@ void main() {
     expect(conversations, isEmpty);
     expect(messages, isEmpty);
     expect(await store.watchConversations().first, isEmpty);
+  });
+
+  test('schemaVersion is 2 and a fresh database round-trips a FileRow',
+      () async {
+    expect(db.schemaVersion, 2);
+
+    await store.saveConversation(conversation(id: 'c1'));
+    final fileStore = DriftFileStore(db);
+    await fileStore.saveFile(
+      const FileInfo(
+        id: 'f1',
+        filename: 'photo.jpg',
+        sizeBytes: 1024,
+        mimeType: 'image/jpeg',
+      ),
+      conversationId: 'c1',
+    );
+
+    final loaded = await fileStore.getFileById('f1');
+    expect(loaded, isNotNull);
+    expect(loaded!.filename, 'photo.jpg');
+    expect(loaded.mimeType, 'image/jpeg');
+  });
+
+  test('migrating a v1 database creates the Files table and its index',
+      () async {
+    final dir = await Directory.systemTemp.createTemp('migration_test');
+    final file = File('${dir.path}/app.db');
+    addTearDown(() async {
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    // Build a v1 database containing only Conversations + Messages. The
+    // NativeDatabase setup hook marks the file as schema version 1 *before*
+    // drift's migration logic reads user_version, so opening AppDatabase (which
+    // is at schema version 2) runs the onUpgrade path instead of onCreate.
+    final v1 = AppDatabase(NativeDatabase(
+      file,
+      setup: (raw) => raw.execute('PRAGMA user_version = 1;'),
+    ));
+    final migrator = v1.createMigrator();
+    await migrator.createTable(v1.conversations);
+    await migrator.createTable(v1.messages);
+    await v1.close();
+
+    // Reopen with the current schema: onUpgrade must add the Files table and
+    // the per-conversation index.
+    final upgraded = AppDatabase(NativeDatabase(file));
+    addTearDown(upgraded.close);
+    await upgraded.customSelect('SELECT 1').get();
+
+    final upgradedStore = DriftChatStore(upgraded);
+    await upgradedStore.saveConversation(
+      conversation(id: 'c1', title: 'Migrated'),
+    );
+    final fileStore = DriftFileStore(upgraded);
+    await fileStore.saveFile(
+      const FileInfo(
+        id: 'f1',
+        filename: 'a.jpg',
+        sizeBytes: 1,
+        mimeType: 'image/jpeg',
+      ),
+      conversationId: 'c1',
+    );
+    final loaded = await fileStore.getFileById('f1');
+    expect(loaded, isNotNull);
+    expect(loaded!.id, 'f1');
+
+    final indexRows = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master "
+          "WHERE type = 'index' AND name = 'files_conversation_id_idx'",
+        )
+        .get();
+    expect(indexRows, hasLength(1));
   });
 }

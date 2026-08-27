@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -7,10 +8,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/chat_client_provider.dart';
+import 'package:ai_assistant/core/file_cache.dart';
+import 'package:ai_assistant/core/files_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/core/settings_providers.dart';
+import 'package:ai_assistant/features/attachments/file_attachment_chip.dart';
 import 'package:ai_assistant/features/chat/chat_screen.dart';
 import 'package:ai_assistant/features/chat/database_providers.dart';
+import 'package:ai_assistant/features/chat/message_bubble.dart';
 import 'package:ai_assistant/features/chat/message_model.dart';
 
 import 'fakes.dart';
@@ -302,5 +307,39 @@ void main() {
 
     expect(find.text('Backend not configured'), findsOneWidget);
     expect(find.text('Configure Backend'), findsOneWidget);
+  });
+
+  testWidgets(
+      'assistant message with a [file:...] ref renders a FileAttachmentChip '
+      'between text blocks', (tester) async {
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        filesServiceProvider.overrideWithValue(FakeFilesClient()),
+        fileCacheProvider.overrideWithValue(
+          FileCache(cacheDir: Directory.systemTemp),
+        ),
+        filesStoreProvider.overrideWithValue(FakeFileStore()),
+      ],
+      child: const MaterialApp(
+        home: Scaffold(
+          body: MessageBubble(
+            message: Message(
+              id: 'a1',
+              role: MessageRole.assistant,
+              content: 'Here is the file [file:abc123] for you.',
+              createdAt: null,
+            ),
+          ),
+        ),
+      ),
+    ));
+    await tester.pump();
+
+    expect(find.byType(FileAttachmentChip), findsOneWidget);
+    // The chip is the bare file id (no filename context in the content).
+    expect(find.text('abc123'), findsOneWidget);
+    // Surrounding text still renders.
+    expect(find.textContaining('Here is the file'), findsOneWidget);
+    expect(find.textContaining('for you'), findsOneWidget);
   });
 }

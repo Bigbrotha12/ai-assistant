@@ -199,4 +199,137 @@ void main() {
     expect(storage.values, isEmpty);
     expect(storage.values.containsKey('backend_mcp_secret'), isFalse);
   });
+
+  group('filesSecret', () {
+    test('filesSecret round-trips and is stored trimmed', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          secret: 's3cret',
+          filesSecret: '  files-token  ',
+        ),
+      );
+
+      expect(storage.values['backend_files_secret'], 'files-token');
+      final loaded = await store.load();
+      expect(loaded!.filesSecret, 'files-token');
+    });
+
+    test('filesSecret is not written when null', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(host: 'tail.example', secret: 's3cret'),
+      );
+
+      expect(storage.values.containsKey('backend_files_secret'), isFalse);
+      final loaded = await store.load();
+      expect(loaded!.filesSecret, isNull);
+    });
+
+    test('filesSecret is not written when blank', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          secret: 's3cret',
+          filesSecret: '   ',
+        ),
+      );
+
+      expect(storage.values.containsKey('backend_files_secret'), isFalse);
+      final loaded = await store.load();
+      expect(loaded!.filesSecret, isNull);
+    });
+
+    test('load returns null filesSecret when stored value is empty', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          secret: 's3cret',
+          filesSecret: 'token',
+        ),
+      );
+      storage._values['backend_files_secret'] = '   ';
+      final loaded = await store.load();
+
+      expect(loaded!.filesSecret, isNull);
+    });
+
+    test('clear removes the files secret key', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          secret: 's3cret',
+          filesSecret: 'token',
+        ),
+      );
+      await store.clear();
+
+      expect(storage.values.isEmpty, isTrue);
+      expect(storage.values.containsKey('backend_files_secret'), isFalse);
+    });
+
+    test('saving with the files secret cleared deletes the stored secret',
+        () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          secret: 's3cret',
+          filesSecret: 'old-token',
+        ),
+      );
+      expect(storage.values.containsKey('backend_files_secret'), isTrue);
+
+      // Token rotation: the user clears the field and saves; the stale secret
+      // must not linger (otherwise load() still returns it).
+      await store.save(
+        const BackendSettings(host: 'tail.example', secret: 's3cret'),
+      );
+
+      expect(storage.values.containsKey('backend_files_secret'), isFalse);
+      final loaded = await store.load();
+      expect(loaded, isNotNull);
+      expect(loaded!.filesSecret, isNull);
+    });
+  });
+
+  test('saving with the mcp secret cleared deletes the stored secret',
+      () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(
+      const BackendSettings(
+        host: 'tail.example',
+        secret: 's3cret',
+        mcpSecret: 'old-token',
+      ),
+    );
+    expect(storage.values.containsKey('backend_mcp_secret'), isTrue);
+
+    await store.save(
+      const BackendSettings(host: 'tail.example', secret: 's3cret'),
+    );
+
+    expect(storage.values.containsKey('backend_mcp_secret'), isFalse);
+    final loaded = await store.load();
+    expect(loaded, isNotNull);
+    expect(loaded!.mcpSecret, isNull);
+  });
 }

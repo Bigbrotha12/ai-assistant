@@ -4,11 +4,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../core/files_providers.dart';
+import '../../core/files_service.dart';
 import '../../core/settings_providers.dart';
+import '../attachments/attachment_picker.dart';
+import '../attachments/file_model.dart';
 import '../settings/settings_screen.dart';
 import 'chat_providers.dart';
 import 'conversation_list.dart';
 import 'message_list.dart';
+import 'message_model.dart';
 
 /// Main conversation screen. Renders the message list plus an input bar, and
 /// drives a single conversation via [conversationProvider].
@@ -25,15 +30,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _uuid = const Uuid();
   String _conversationId = const Uuid().v4();
 
+  /// Files selected for the next message, cleared after a successful send.
+  List<AttachmentDraft> _attachments = [];
+
+  /// Mirrors [ConversationState.attachmentUploads] so the picker can observe
+  /// status changes live.
+  final ValueNotifier<Map<String, UploadJobStatus>> _uploadStatus =
+      ValueNotifier(const {});
+
   @override
   void dispose() {
     _input.dispose();
     _scroll.dispose();
+    _uploadStatus.dispose();
     super.dispose();
   }
 
   void _newChat() {
-    setState(() => _conversationId = _uuid.v4());
+    setState(() {
+      _conversationId = _uuid.v4();
+      _attachments.clear();
+      _uploadStatus.value = const {};
+    });
     _input.clear();
   }
 
@@ -54,10 +72,37 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // silently lost.
     final state = ref.read(conversationProvider(_conversationId)).value;
     if (state == null || state.isStreaming) return;
+
+    final attachments = List<AttachmentDraft>.from(_attachments);
+
+    // Critical (§3.6): the input is only cleared once the message has actually
+    // been persisted. If the send fails before persisting (the notifier throws
+    // before appending the user message), the input and attachment selection
+    // are preserved so the user can retry.
+    try {
+      await ref
+          .read(conversationProvider(_conversationId).notifier)
+          .sendMessage(text, attachments: attachments);
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
+
+    final after = ref.read(conversationProvider(_conversationId)).value;
+    final persisted = after != null &&
+        after.messages.length > state.messages.length &&
+        after.messages[state.messages.length].role == MessageRole.user &&
+        after.messages[state.messages.length].content == text;
+    if (!persisted) return;
+
     _input.clear();
-    await ref
-        .read(conversationProvider(_conversationId).notifier)
-        .sendMessage(text);
+    setState(() {
+      _attachments.clear();
+      _uploadStatus.value =
+          ref.read(conversationProvider(_conversationId)).value
+                  ?.attachmentUploads ??
+              const {};
+    });
   }
 
   @override
@@ -68,8 +113,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final isDbReady = state?.isDbReady ?? false;
     final error = state?.error;
 
+    // Mirror the conversation's live upload progress into the picker's
+    // notifier so AttachmentRow overlays update as jobs progress / complete /
+    // fail. Runs on every rebuild while a provider change fires, so
+    // `_uploadStatus` always reflects the current conversation.
+    ref.listen<AsyncValue<ConversationState>>(
+      conversationProvider(_conversationId),
+      (_, next) {
+        _uploadStatus.value = next.value?.attachmentUploads ?? const {};
+      },
+    );
+
+    // Map each selected draft to its upload job (by local path) so the row can
+    // look up a status overlay; drafts still being composed have none.
+    final uploadStatus = state?.attachmentUploads ?? const {};
+    final draftToJobId = <String, String>{
+      for (final status in uploadStatus.values)
+        if (status.uri != null) status.uri!: status.jobId,
+    };
+
     final settings = ref.watch(settingsProvider).value;
     final settingsValid = settings?.isValid ?? false;
+
+    // The files service is a NoOp until a files secret is configured; the
+    // picker is then disabled with an explanatory hint.
+    final filesConfigured = ref.watch(filesServiceProvider) is! NoOpFilesClient;
+    final showAttachmentRow = filesConfigured || _attachments.isNotEmpty;
 
     final canSend = !isStreaming && isDbReady && _input.text.trim().isNotEmpty;
 
@@ -123,6 +192,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 .read(conversationProvider(_conversationId).notifier)
                 .stop(),
             onChanged: () => setState(() {}),
+            attachmentRow: showAttachmentRow
+                ? AttachmentRow(
+                    attachments: _attachments,
+                    onChanged: (updated) =>
+                        setState(() => _attachments = updated),
+                    uploadStatus: _uploadStatus,
+                    draftToJobId: draftToJobId,
+                    enabled: filesConfigured,
+                  )
+                : null,
           ),
         ],
       ),
@@ -162,7 +241,8 @@ class _ConfigureBanner extends ConsumerWidget {
   }
 }
 
-/// Bottom input bar: multiline text field with a Send / Stop button.
+/// Bottom input bar: multiline text field with a Send / Stop button, plus an
+/// optional attachment picker row above it.
 class _InputBar extends StatelessWidget {
   const _InputBar({
     required this.controller,
@@ -172,6 +252,7 @@ class _InputBar extends StatelessWidget {
     required this.onSend,
     required this.onStop,
     required this.onChanged,
+    this.attachmentRow,
   });
 
   final TextEditingController controller;
@@ -181,6 +262,9 @@ class _InputBar extends StatelessWidget {
   final VoidCallback onSend;
   final VoidCallback onStop;
   final VoidCallback onChanged;
+
+  /// Rendered above the text field when non-null.
+  final Widget? attachmentRow;
 
   @override
   Widget build(BuildContext context) {
@@ -192,40 +276,51 @@ class _InputBar extends StatelessWidget {
         top: false,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Expanded(
-                child: TextField(
-                  controller: controller,
-                  enabled: !isStreaming && isDbReady,
-                  minLines: 1,
-                  maxLines: 5,
-                  onChanged: (_) => onChanged(),
-                  textInputAction: TextInputAction.newline,
-                  decoration: const InputDecoration(
-                    hintText: 'Message…',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.all(Radius.circular(24)),
+              if (attachmentRow != null) ...[
+                attachmentRow!,
+                const SizedBox(height: 8),
+              ],
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: controller,
+                      enabled: !isStreaming && isDbReady,
+                      minLines: 1,
+                      maxLines: 5,
+                      onChanged: (_) => onChanged(),
+                      textInputAction: TextInputAction.newline,
+                      decoration: const InputDecoration(
+                        hintText: 'Message…',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.all(Radius.circular(24)),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                      ),
                     ),
-                    contentPadding:
-                        EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                   ),
-                ),
+                  const SizedBox(width: 8),
+                  if (isStreaming)
+                    IconButton(
+                      icon: Icon(Icons.stop, color: scheme.onSurface),
+                      tooltip: 'Stop',
+                      onPressed: onStop,
+                    )
+                  else
+                    IconButton(
+                      icon: Icon(Icons.send, color: scheme.primary),
+                      tooltip: 'Send',
+                      onPressed: canSend ? onSend : null,
+                    ),
+                ],
               ),
-              const SizedBox(width: 8),
-              if (isStreaming)
-                IconButton(
-                  icon: Icon(Icons.stop, color: scheme.onSurface),
-                  tooltip: 'Stop',
-                  onPressed: onStop,
-                )
-              else
-                IconButton(
-                  icon: Icon(Icons.send, color: scheme.primary),
-                  tooltip: 'Send',
-                  onPressed: canSend ? onSend : null,
-                ),
             ],
           ),
         ),

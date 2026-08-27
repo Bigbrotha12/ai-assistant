@@ -29,17 +29,49 @@ class Messages extends Table {
   Set<Column> get primaryKey => {id};
 }
 
-@DriftDatabase(tables: [Conversations, Messages])
+/// Metadata for a file attachment.
+///
+/// `conversationId` is nullable because files can exist outside a
+/// conversation (the file browser lists files across all conversations).
+/// The local `id` is the server-assigned id; `serverFileId` stores the same
+/// value for future-proofing (see `DriftFileStore` mapping notes).
+@TableIndex(name: 'files_conversation_id_idx', columns: {#conversationId})
+@DataClassName('FileRow')
+class Files extends Table {
+  TextColumn get id => text()();
+  TextColumn get conversationId => text()
+      .nullable()
+      .references(Conversations, #id, onDelete: KeyAction.cascade)();
+  TextColumn get serverFileId => text()();
+  TextColumn get localPath => text()();
+  TextColumn get filename => text()();
+  IntColumn get sizeBytes => integer()();
+  TextColumn get mimeType => text()();
+  DateTimeColumn get createdAt => dateTime()();
+  DateTimeColumn get updatedAt => dateTime()();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+/// Index for the per-conversation file listing / cascade. The table grows with
+/// every upload, so scanning without an index gets progressively slower.
+
+@DriftDatabase(tables: [Conversations, Messages, Files])
 class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
         onCreate: (m) => m.createAll(),
         onUpgrade: (m, from, to) async {
+          if (from < 2) {
+            await m.createTable(files);
+            await m.createIndex(filesConversationIdIdx);
+          }
           // Phase 5: memories table + FTS5 land here.
         },
         beforeOpen: (details) async {

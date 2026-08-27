@@ -32,6 +32,10 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Used to attach photos to your chat messages</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Used to pick photos to attach to your chat messages</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
