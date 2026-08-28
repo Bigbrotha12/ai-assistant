@@ -58,16 +58,37 @@ class Files extends Table {
 /// Index for the per-conversation file listing / cascade. The table grows with
 /// every upload, so scanning without an index gets progressively slower.
 
-@DriftDatabase(tables: [Conversations, Messages, Files])
+/// A single deferred memory: free-form text with optional provenance and
+/// date-weighted retrieval via the FTS5 index (`memories_fts`).
+///
+/// The `updated_at` index backs `listMemories` (ORDER BY updated_at DESC) and
+/// `compact` (WHERE updated_at < cutoff); without it both scan the whole table.
+@TableIndex(name: 'memories_updated_at_idx', columns: {#updatedAt})
+@DataClassName('MemoryRow')
+class Memories extends Table {
+  TextColumn get id => text()(); // UUID PK
+  TextColumn get content => text()(); // the memory text
+  TextColumn get source => text().nullable()(); // provenance (conversation id, 'manual')
+  DateTimeColumn get createdAt => dateTime()();
+  DateTimeColumn get updatedAt => dateTime()();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+@DriftDatabase(tables: [Conversations, Messages, Files, Memories])
 class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
-        onCreate: (m) => m.createAll(),
+        onCreate: (m) async {
+          await m.createAll();
+          await _createMemoryFts(m);
+        },
         onUpgrade: (m, from, to) async {
           if (from < 2) {
             await m.createTable(files);
@@ -76,7 +97,12 @@ class AppDatabase extends _$AppDatabase {
           if (from < 3) {
             await m.alterTable(TableMigration(files, newColumns: [files.description]));
           }
-          // Phase 5: memories+FTS5 deferred to v4 (no consumer feature yet).
+          if (from < 4) {
+            await m.createTable(memories);
+            await m.createIndex(memoriesUpdatedAtIdx);
+            await _createMemoryFts(m);
+          }
+          // v4: memories table + FTS5 full-text search (see DriftMemoryStore).
         },
         beforeOpen: (details) async {
           // SQLite does NOT enable FK enforcement by default — without this
@@ -84,4 +110,41 @@ class AppDatabase extends _$AppDatabase {
           await customStatement('PRAGMA foreign_keys = ON');
         },
       );
+
+  /// Creates the external-content FTS5 index (`memories_fts`) over the
+  /// `memories` table plus the triggers that keep it in sync.
+  ///
+  /// FTS sync invariant: `memories` must be created first, then `memories_fts`,
+  /// then the triggers — in that order, and before any row is written. A row
+  /// inserted while the FTS table or triggers are missing (or written via raw
+  /// SQL that bypasses the triggers) leaves `memories` ahead of the index, and
+  /// a later FTS `'delete'` command raises SQLITE_CORRUPT.
+  ///
+  /// Created via raw SQL (rather than a `.drift` file) because drift-file
+  /// statements cannot reference tables declared in Dart, which rules out both
+  /// the `content='memories'` back-reference and the date-weighted MATCH query.
+  /// Idempotent so both onCreate and onUpgrade can run it.
+  static Future<void> _createMemoryFts(Migrator m) async {
+    final db = m.database;
+    await db.customStatement(
+      'CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING '
+      "fts5(content, content='memories', content_rowid='rowid')",
+    );
+    await db.customStatement('''
+      CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+      END;
+    ''');
+    await db.customStatement('''
+      CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+      END;
+    ''');
+    await db.customStatement('''
+      CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+      END;
+    ''');
+  }
 }

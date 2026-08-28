@@ -5,6 +5,8 @@ import 'package:ai_assistant/features/attachments/file_store.dart';
 import 'package:ai_assistant/features/chat/chat_store.dart';
 import 'package:ai_assistant/features/chat/database.dart';
 import 'package:ai_assistant/features/chat/message_model.dart';
+import 'package:ai_assistant/features/memory/memory_model.dart';
+import 'package:ai_assistant/features/memory/memory_store.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -223,9 +225,9 @@ void main() {
     expect(await store.watchConversations().first, isEmpty);
   });
 
-  test('schemaVersion is 3 and a fresh database round-trips a FileRow',
+  test('schemaVersion is 4 and a fresh database round-trips a FileRow',
       () async {
-    expect(db.schemaVersion, 3);
+    expect(db.schemaVersion, 4);
 
     await store.saveConversation(conversation(id: 'c1'));
     final fileStore = DriftFileStore(db);
@@ -299,5 +301,69 @@ void main() {
         )
         .get();
     expect(indexRows, hasLength(1));
+  });
+
+  test('migrating a v3 database creates the memories and memories_fts tables',
+      () async {
+    final dir = await Directory.systemTemp.createTemp('migration_v3_test');
+    final file = File('${dir.path}/app.db');
+    addTearDown(() async {
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    // Build a v3 database containing Conversations + Messages + Files. The
+    // NativeDatabase setup hook marks the file as schema version 3 *before*
+    // drift's migration logic reads user_version, so opening AppDatabase (which
+    // is at schema version 4) runs the onUpgrade path instead of onCreate.
+    final v3 = AppDatabase(NativeDatabase(
+      file,
+      setup: (raw) => raw.execute('PRAGMA user_version = 3;'),
+    ));
+    final migrator = v3.createMigrator();
+    await migrator.createTable(v3.conversations);
+    await migrator.createTable(v3.messages);
+    await migrator.createTable(v3.files);
+    await migrator.createIndex(v3.filesConversationIdIdx);
+    await v3.close();
+
+    // Reopen with the current schema: onUpgrade must add the memories table,
+    // the FTS5 virtual table and its sync triggers.
+    final upgraded = AppDatabase(NativeDatabase(file));
+    addTearDown(upgraded.close);
+    await upgraded.customSelect('SELECT 1').get();
+
+    final memoryTables = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master "
+          "WHERE type IN ('table', 'view') "
+          "AND name IN ('memories', 'memories_fts')",
+        )
+        .get();
+    expect(memoryTables.map((r) => r.read<String>('name')).toSet(),
+        {'memories', 'memories_fts'});
+
+    final indexRows = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master "
+          "WHERE type = 'index' AND name = 'memories_updated_at_idx'",
+        )
+        .get();
+    expect(indexRows, hasLength(1));
+
+    final memoryStore = DriftMemoryStore(upgraded);
+    await memoryStore.saveMemory(
+      Memory(
+        id: 'mem1',
+        content: 'migrated memory with a fox',
+        createdAt: DateTime(2024, 1, 1),
+        updatedAt: DateTime(2024, 1, 1),
+      ),
+    );
+
+    expect(await memoryStore.getMemory('mem1'), isNotNull);
+    final hits = await memoryStore.searchMemories('fox');
+    expect(hits.map((m) => m.id).toList(), ['mem1']);
   });
 }
