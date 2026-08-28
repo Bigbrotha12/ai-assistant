@@ -34,6 +34,8 @@
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Used to attach photos to your chat messages</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Used to capture voice messages for AI conversation</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Used to pick photos to attach to your chat messages</string>
 	<key>UIApplicationSceneManifest</key>

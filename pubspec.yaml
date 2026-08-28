@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.13.1
+  sdk: ^3.13.0
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -53,6 +53,18 @@ dependencies:
   image_picker: ^1.1.2
   open_file: ^3.5.10
   path_provider: ^2.1.5
+
+  # Voice Conversation (Phase 4): LiveKit data channel, mic capture, TTS playback,
+  # device info for capability detection, on-device STT/TTS engines.
+  livekit_client: ^2.11.0
+  just_audio: ^0.10.6
+  record: ^6.2.1
+  audio_session: ^0.1.25
+  device_info_plus: ^12.4.0
+  whisper_kit: ^0.3.1
+  onnxruntime: ^1.4.1
+  # VAD for voice activity detection during mic capture.
+  # flutter_vad: ^0.1.2  # — not published on pub.dev; add when available
 
 dev_dependencies:
   flutter_test:

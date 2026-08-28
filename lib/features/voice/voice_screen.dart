@@ -1,0 +1,924 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:uuid/uuid.dart';
+
+import '../settings/settings_screen.dart';
+import '../../core/settings_providers.dart';
+import 'engine_config.dart';
+import 'engine_errors.dart';
+import 'engine_manager.dart';
+import 'engine_manager_provider.dart';
+import 'model_downloader.dart';
+import 'voice_capture_providers.dart';
+import 'voice_controller.dart';
+import 'voice_controller_provider.dart';
+
+/// Full-screen live voice conversation UI.
+///
+/// Consumes the existing voice providers ([voiceConversationStateProvider],
+/// [voiceCapturePipelineProvider] and the engine status providers); it does not
+/// reimplement any audio service. Tapping the mic ensures a LiveKit session
+/// first, then starts the capture pipeline (VAD-gated).
+class VoiceScreen extends ConsumerStatefulWidget {
+  const VoiceScreen({super.key});
+
+  @override
+  ConsumerState<VoiceScreen> createState() => _VoiceScreenState();
+}
+
+class _VoiceScreenState extends ConsumerState<VoiceScreen> {
+  /// Per-screen room name so each visit joins an isolated session.
+  final _roomId = const Uuid().v4();
+  final _logScroll = ScrollController();
+
+  /// Ordered, de-duplicated user transcripts shown as chat bubbles.
+  final _transcripts = <String>[];
+
+  bool _micBusy = false;
+
+  /// Mirrors [VoiceCapturePipeline.isRecording] for states where the server
+  /// connection is down but local capture is still active.
+  bool _localRecording = false;
+
+  bool _engineBusy = false;
+
+  /// Errors raised outside the controller (e.g. mic permission before the
+  /// pipeline starts) so they surface in the same banner as state errors.
+  String? _localError;
+
+  @override
+  void dispose() {
+    _logScroll.dispose();
+    if (ref.exists(voiceCapturePipelineProvider)) {
+      final pipeline = ref.read(voiceCapturePipelineProvider);
+      if (pipeline.isRecording) {
+        unawaited(pipeline.stopRecording());
+      }
+    }
+    if (ref.exists(voiceControllerProvider)) {
+      unawaited(ref.read(voiceControllerProvider).disconnect());
+    }
+    super.dispose();
+  }
+
+  /// Appends a freshly recognised user utterance to the log, falling back from
+  /// the on-device transcript to the server transcript. Empty/unchanged text is
+  /// ignored so the list stays stable across unrelated state updates.
+  void _appendTranscript(VoiceConversationState state) {
+    final text = state.onDeviceTranscript ?? state.lastTranscript;
+    if (text == null || text.trim().isEmpty) return;
+    if (_transcripts.isNotEmpty && _transcripts.last == text) return;
+    setState(() => _transcripts.add(text));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_logScroll.hasClients) {
+        _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
+      }
+    });
+  }
+
+  Future<void> _tapMic() async {
+    if (_micBusy) return;
+    final pipeline = ref.read(voiceCapturePipelineProvider);
+
+    if (pipeline.isRecording) {
+      setState(() => _micBusy = true);
+      try {
+        await pipeline.stopRecording();
+        if (mounted) {
+          setState(() => _localRecording = false);
+        }
+      } catch (_) {
+        // Failures surface through the conversation state; never crash.
+      } finally {
+        if (mounted) setState(() => _micBusy = false);
+      }
+      return;
+    }
+
+    final controller = ref.read(voiceControllerProvider);
+    setState(() {
+      _micBusy = true;
+      _localError = null;
+    });
+    try {
+      // The conversation runs over a LiveKit data channel; make sure a room is
+      // joined before capturing, otherwise the controller refuses recording.
+      if (!controller.state.isConnected) {
+        await controller.connectToRoom(roomName: _roomId);
+      }
+      if (!controller.state.isConnected) {
+        return; // Connection error is already surfaced through the state.
+      }
+      await pipeline.startRecording();
+      if (mounted) {
+        setState(() => _localRecording = true);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _localError = e.toString());
+      }
+    } finally {
+      if (mounted) setState(() => _micBusy = false);
+    }
+  }
+
+  Future<void> _downloadModels() async {
+    setState(() => _engineBusy = true);
+    try {
+      await ref.read(voiceEngineStatusProvider.notifier).downloadAllModels();
+    } finally {
+      if (mounted) setState(() => _engineBusy = false);
+    }
+  }
+
+  /// Re-attempts a LiveKit connection, then restarts local capture if the
+  /// connection succeeds. Used by the error banner's retry action.
+  Future<void> _retryConnection() async {
+    if (_micBusy) return;
+    final pipeline = ref.read(voiceCapturePipelineProvider);
+    final controller = ref.read(voiceControllerProvider);
+    setState(() {
+      _micBusy = true;
+      _localError = null;
+    });
+    try {
+      if (!controller.state.isConnected) {
+        await controller.connectToRoom(roomName: _roomId);
+      }
+      if (controller.state.isConnected) {
+        if (pipeline.isRecording) {
+          await pipeline.stopRecording();
+        } else {
+          await pipeline.startRecording();
+          if (mounted) setState(() => _localRecording = true);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _localError = e.toString());
+      }
+    } finally {
+      if (mounted) setState(() => _micBusy = false);
+    }
+  }
+
+  /// Opens the system settings page for this app when the platform supports
+  /// the `app-settings:` URI (e.g. iOS); a no-op elsewhere so the action never
+  /// crashes.
+  Future<void> _openAppSettings() async {
+    final uri = Uri.parse('app-settings:');
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  void _openBackendSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(voiceConversationStateProvider);
+    ref.listen(voiceConversationStateProvider, (_, next) {
+      _appendTranscript(next);
+    });
+
+    final scheme = Theme.of(context).colorScheme;
+    final recording = state.isRecording || _localRecording;
+    final error = state.error ?? _localError;
+    final settingsValid = ref.watch(settingsProvider).value?.isValid ?? false;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Voice Conversation')),
+      body: SafeArea(
+        child: Column(
+          children: [
+            if (!settingsValid)
+              const _ConfigureBanner()
+            else
+              _FallbackBanner(),
+            if (error != null)
+              _ErrorBanner(
+                error: error,
+                onOpenSettings: _openAppSettings,
+                onConfigureBackend: _openBackendSettings,
+                onRetry: _retryConnection,
+              ),
+            Padding(
+              padding: const EdgeInsets.only(top: 16),
+              child: _StatusHeader(
+                recording: recording,
+                aiSpeaking: state.isAiSpeaking,
+                connected: state.isConnected,
+                paused: state.isPaused,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 44,
+              child: _Waveform(active: recording, color: scheme.primary),
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: _MicButton(
+                recording: recording,
+                busy: _micBusy,
+                onPressed: _tapMic,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: _LiveTranscriptCard(
+                transcript: state.onDeviceTranscript ?? state.lastTranscript,
+                recording: recording,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: _MessageLog(
+                controller: _logScroll,
+                entries: _transcripts,
+                aiSpeaking: state.isAiSpeaking,
+                connected: state.isConnected,
+              ),
+            ),
+            _EngineStatusBar(
+              downloading: _engineBusy,
+              onDownload: _downloadModels,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Banner shown when a voice session error is active: microphone permission
+/// and backend configuration get dedicated actions, connection errors get a
+/// retry action, everything else is shown as-is.
+///
+/// Classifies [EngineError]s by type where possible and falls back to
+/// string-matching for errors raised by external services (Dio, LiveKit).
+class _ErrorBanner extends StatelessWidget {
+  const _ErrorBanner({
+    required this.error,
+    required this.onOpenSettings,
+    required this.onConfigureBackend,
+    required this.onRetry,
+  });
+
+  final Object error;
+  final Future<void> Function() onOpenSettings;
+  final VoidCallback onConfigureBackend;
+  final Future<void> Function() onRetry;
+
+  String get _detail => error.toString();
+  bool get _permissionDenied => _detail.toLowerCase().contains('permission');
+
+  bool get _needsConfiguration =>
+      _detail.toLowerCase().contains('token minting') ||
+      _detail.toLowerCase().contains('not configured');
+
+  bool get _connectionFailed =>
+      _detail.toLowerCase().contains('livekit') ||
+      _detail.toLowerCase().contains('connect') ||
+      _detail.toLowerCase().contains('signaling');
+
+  String get _message {
+    if (error is EngineModelNotFoundError) {
+      return 'Local speech-to-text model is missing. Download it below to '
+          'enable on-device recognition.';
+    }
+    if (error is EngineInferenceError) {
+      return 'On-device sound processing failed. Offline speech and voice '
+          'fall back to the server.';
+    }
+    if (_permissionDenied) {
+      return 'Microphone permission denied. Allow microphone access in system '
+          'settings to use voice conversation.';
+    }
+    if (_needsConfiguration) {
+      return 'Voice backend is not configured. Set up the backend host and '
+          'secret to start a conversation.';
+    }
+    if (_connectionFailed) {
+      return 'Could not connect to the voice backend. Check your connection '
+          'and try again.';
+    }
+    return _detail;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final buttonStyle = TextButton.styleFrom(
+      foregroundColor: scheme.onErrorContainer,
+    );
+    return Material(
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Icon(Icons.error_outline, color: scheme.onErrorContainer),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                _message,
+                style: TextStyle(color: scheme.onErrorContainer),
+              ),
+            ),
+            if (_permissionDenied)
+              TextButton(
+                style: buttonStyle,
+                onPressed: onOpenSettings,
+                child: const Text('Open Settings'),
+              )
+            else if (_needsConfiguration)
+              TextButton(
+                style: buttonStyle,
+                onPressed: onConfigureBackend,
+                child: const Text('Configure'),
+              )
+            else if (_connectionFailed)
+              TextButton(
+                style: buttonStyle,
+                onPressed: onRetry,
+                child: const Text('Retry'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Non-blocking inline banner prompting the user to configure the backend,
+/// mirroring the ChatScreen banner. Shown when [settingsProvider] is invalid.
+class _ConfigureBanner extends ConsumerWidget {
+  const _ConfigureBanner();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Icon(Icons.settings_outlined, color: scheme.onErrorContainer),
+            const SizedBox(width: 12),
+            const Expanded(child: Text('Backend not configured')),
+            TextButton(
+              style: TextButton.styleFrom(
+                foregroundColor: scheme.onErrorContainer,
+              ),
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const SettingsScreen()),
+              ),
+              child: const Text('Configure Backend'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Non-blocking banner describing partial model availability: shown when an
+/// on-device engine is missing/failed but its server-side counterpart can
+/// still service the conversation.
+class _FallbackBanner extends ConsumerWidget {
+  const _FallbackBanner();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final statuses = ref.watch(voiceEngineStatusProvider);
+    final (stt, tts) = (
+      statuses[EngineConfig.whisperTinyId] ?? VoiceEngineStatus.notStarted,
+      statuses[EngineConfig.kokoro82mId] ?? VoiceEngineStatus.notStarted,
+    );
+    // Engines surfaced as `unavailable` are intentionally off (e.g. TTS is
+    // gated until its model/tokenizer lands) — they should neither show a
+    // download prompt nor trigger the fallback banner.
+    final sttAvailable = stt != VoiceEngineStatus.unavailable;
+    final ttsAvailable = tts != VoiceEngineStatus.unavailable;
+    final sttReady = stt == VoiceEngineStatus.ready;
+    final ttsReady = tts == VoiceEngineStatus.ready;
+
+    final String message;
+    if (sttAvailable && !sttReady) {
+      message = ttsAvailable && !ttsReady
+          ? 'On-device voice models not downloaded — download them below.'
+          : 'Local speech-to-text unavailable — using server transcription.';
+    } else if (ttsAvailable && !ttsReady) {
+      message = 'Local text-to-speech unavailable — using server voice.';
+    } else {
+      return const SizedBox.shrink();
+    }
+
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHighest,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Icon(Icons.info_outline, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: TextStyle(color: scheme.onSurfaceVariant),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact summary of the live conversation state at the top of the screen.
+class _StatusHeader extends StatelessWidget {
+  const _StatusHeader({
+    required this.recording,
+    required this.aiSpeaking,
+    required this.connected,
+    required this.paused,
+  });
+
+  final bool recording;
+  final bool aiSpeaking;
+  final bool connected;
+  final bool paused;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final (icon, color, label) = paused
+        ? (Icons.pause_circle_outline, scheme.onSurfaceVariant, 'Paused')
+        : recording
+            ? (Icons.mic, scheme.error, 'Recording…')
+            : aiSpeaking
+                ? (Icons.volume_up, scheme.primary, 'AI is speaking…')
+                : connected
+                    ? (Icons.check_circle, Colors.green.shade600, 'Connected')
+                    : (Icons.mic_none, scheme.onSurfaceVariant,
+                        'Tap the mic to start');
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, color: color, size: 20),
+        const SizedBox(width: 8),
+        Text(
+          label,
+          style: theme.textTheme.titleSmall?.copyWith(color: color),
+        ),
+      ],
+    );
+  }
+}
+
+/// Large circular microphone / stop button that toggles recording.
+class _MicButton extends StatelessWidget {
+  const _MicButton({
+    required this.recording,
+    required this.busy,
+    required this.onPressed,
+  });
+
+  final bool recording;
+  final bool busy;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return FilledButton(
+      onPressed: busy ? null : onPressed,
+      style: FilledButton.styleFrom(
+        shape: const CircleBorder(),
+        padding: const EdgeInsets.all(28),
+        backgroundColor: recording ? scheme.error : scheme.primary,
+        foregroundColor: recording ? scheme.onError : scheme.onPrimary,
+        disabledBackgroundColor: scheme.surfaceContainerHighest,
+        disabledForegroundColor: scheme.onSurfaceVariant,
+      ),
+      child: SizedBox(
+        width: 44,
+        height: 44,
+        child: Icon(recording ? Icons.stop : Icons.mic, size: 36),
+      ),
+    );
+  }
+}
+
+/// Animated bar visualiser that pulses while recording and collapses to a
+/// flat row when idle.
+class _Waveform extends StatefulWidget {
+  const _Waveform({required this.active, required this.color});
+
+  final bool active;
+  final Color color;
+
+  @override
+  State<_Waveform> createState() => _WaveformState();
+}
+
+class _WaveformState extends State<_Waveform>
+    with SingleTickerProviderStateMixin {
+  static const _barCount = 9;
+
+  late final AnimationController _controller;
+  bool _wasActive = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    );
+    if (widget.active) _controller.repeat();
+    _wasActive = widget.active;
+  }
+
+  @override
+  void didUpdateWidget(covariant _Waveform oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active == _wasActive) return;
+    _wasActive = widget.active;
+    if (widget.active) {
+      _controller.repeat();
+    } else {
+      _controller.stop();
+      _controller.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  double _barHeight(int index, double t) {
+    if (!widget.active) return 6;
+    final wave = math.sin((t * 2 * math.pi) + index * 0.9);
+    return 8 + 24 * (0.5 + 0.5 * wave);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final t = widget.active ? _controller.value : 0.0;
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            for (var i = 0; i < _barCount; i++) ...[
+              Container(
+                width: 5,
+                height: _barHeight(i, t),
+                decoration: BoxDecoration(
+                  color: widget.color,
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              ),
+              if (i != _barCount - 1) const SizedBox(width: 5),
+            ],
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Card showing the most recent recognised user speech.
+class _LiveTranscriptCard extends StatelessWidget {
+  const _LiveTranscriptCard({required this.transcript, required this.recording});
+
+  final String? transcript;
+  final bool recording;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final text = transcript?.trim();
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Live transcript',
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: scheme.primary,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              (text == null || text.isEmpty)
+                  ? (recording ? 'Listening…' : 'Tap the mic and start speaking')
+                  : text,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Scrollable conversation log: recognised user utterances as right-aligned
+/// bubbles and a live left-aligned bubble while the AI is speaking.
+class _MessageLog extends StatelessWidget {
+  const _MessageLog({
+    required this.controller,
+    required this.entries,
+    required this.aiSpeaking,
+    required this.connected,
+  });
+
+  final ScrollController controller;
+  final List<String> entries;
+  final bool aiSpeaking;
+  final bool connected;
+
+  @override
+  Widget build(BuildContext context) {
+    final itemCount = entries.length + (aiSpeaking ? 1 : 0);
+    if (itemCount == 0) {
+      return Center(
+        child: Text(
+          connected
+              ? 'Nothing yet — start speaking'
+              : 'Tap the mic to start a conversation',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+        ),
+      );
+    }
+    return ListView.builder(
+      controller: controller,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      itemCount: itemCount,
+      itemBuilder: (context, index) {
+        if (index >= entries.length) {
+          return const _AssistantSpeakingBubble();
+        }
+        return _UserBubble(text: entries[index]);
+      },
+    );
+  }
+}
+
+/// Right-aligned transcript bubble styled as a user message.
+class _UserBubble extends StatelessWidget {
+  const _UserBubble({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: scheme.primaryContainer,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(16),
+            bottomRight: Radius.circular(4),
+          ),
+        ),
+        child: Text(text, style: TextStyle(color: scheme.onPrimaryContainer)),
+      ),
+    );
+  }
+}
+
+/// Left-aligned bubble shown while TTS audio from the AI is playing back.
+class _AssistantSpeakingBubble extends StatelessWidget {
+  const _AssistantSpeakingBubble();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(4),
+            bottomRight: Radius.circular(16),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              'Assistant is speaking…',
+              style: TextStyle(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom bar with per-engine readiness chips (STT/TTS) and model download
+/// progress / retry actions.
+class _EngineStatusBar extends ConsumerWidget {
+  const _EngineStatusBar({required this.downloading, required this.onDownload});
+
+  final bool downloading;
+  final Future<void> Function() onDownload;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final statuses = ref.watch(voiceEngineStatusProvider);
+    final progress = ref.watch(modelDownloadProgressProvider).value;
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerLow,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: _EngineStatusChip(
+                      label: 'Whisper',
+                      status:
+                          statuses[EngineConfig.whisperTinyId] ??
+                          VoiceEngineStatus.notStarted,
+                      progress: progress,
+                      onAction: downloading ? null : onDownload,
+                    ),
+                  ),
+                  // Engines surfaced as `unavailable` are intentionally off —
+                  // hide their chip entirely instead of offering a download
+                  // that can never succeed.
+                  if (statuses[EngineConfig.kokoro82mId] !=
+                      VoiceEngineStatus.unavailable) ...[
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _EngineStatusChip(
+                        label: 'Kokoro',
+                        status:
+                            statuses[EngineConfig.kokoro82mId] ??
+                            VoiceEngineStatus.notStarted,
+                        progress: progress,
+                        onAction: downloading ? null : onDownload,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+              if (downloading) ...[
+                const SizedBox(height: 8),
+                const LinearProgressIndicator(minHeight: 2),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Single engine readiness chip: status icon, label, progress or action.
+class _EngineStatusChip extends StatelessWidget {
+  const _EngineStatusChip({
+    required this.label,
+    required this.status,
+    required this.progress,
+    required this.onAction,
+  });
+
+  final String label;
+  final VoiceEngineStatus status;
+  final ModelDownloadProgress? progress;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final downloading = status == VoiceEngineStatus.downloading;
+    final needsAction = status == VoiceEngineStatus.failed ||
+        status == VoiceEngineStatus.notStarted;
+    final actionLabel =
+        status == VoiceEngineStatus.failed ? 'Retry' : 'Download';
+    final percent = progress?.percent;
+
+    final (icon, color, subtitle) = switch (status) {
+      VoiceEngineStatus.ready => (
+          Icons.check_circle,
+          Colors.green.shade600,
+          'ready',
+        ),
+      VoiceEngineStatus.downloading => (
+          Icons.downloading,
+          scheme.primary,
+          percent == null ? 'downloading…' : 'downloading ${(percent * 100).round()}%',
+        ),
+      VoiceEngineStatus.failed => (
+          Icons.error_outline,
+          scheme.error,
+          'download failed',
+        ),
+      VoiceEngineStatus.notStarted => (
+          Icons.download_outlined,
+          scheme.onSurfaceVariant,
+          'not downloaded',
+        ),
+      VoiceEngineStatus.unavailable => (
+          Icons.block,
+          scheme.onSurfaceVariant,
+          'unavailable',
+        ),
+    };
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: color, size: 18),
+              const SizedBox(width: 6),
+              Expanded(child: Text(label, style: theme.textTheme.labelLarge)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(color: color),
+          ),
+          if (needsAction) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: onAction,
+                icon: const Icon(Icons.download, size: 18),
+                label: Text(actionLabel),
+              ),
+            ),
+          ] else if (downloading) ...[
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: percent, minHeight: 4),
+          ],
+        ],
+      ),
+    );
+  }
+}

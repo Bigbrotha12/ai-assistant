@@ -10,6 +10,8 @@ import '../../core/settings_providers.dart';
 import '../attachments/attachment_picker.dart';
 import '../attachments/file_model.dart';
 import '../settings/settings_screen.dart';
+import '../voice/voice_screen.dart';
+import '../voice/voice_settings_screen.dart';
 import 'chat_providers.dart';
 import 'conversation_list.dart';
 import 'message_list.dart';
@@ -153,6 +155,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   _newChat();
                 case 'history':
                   _openHistory();
+                case 'voice':
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const VoiceSettingsScreen(),
+                    ),
+                  );
                 case 'settings':
                   Navigator.of(context).push(
                     MaterialPageRoute(builder: (_) => const SettingsScreen()),
@@ -162,10 +170,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             itemBuilder: (context) => const [
               PopupMenuItem(value: 'new', child: Text('New Chat')),
               PopupMenuItem(value: 'history', child: Text('History')),
+              PopupMenuItem(value: 'voice', child: Text('Voice')),
               PopupMenuItem(value: 'settings', child: Text('Settings')),
             ],
           ),
         ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        tooltip: 'Voice Conversation',
+        onPressed: () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const VoiceScreen()),
+        ),
+        child: const Icon(Icons.mic),
       ),
       body: Column(
         children: [
@@ -319,6 +335,7 @@ class _InputBar extends StatelessWidget {
                       tooltip: 'Send',
                       onPressed: canSend ? onSend : null,
                     ),
+                  const SizedBox(width: 56),
                 ],
               ),
             ],
