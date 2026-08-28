@@ -6,8 +6,18 @@
     android:shortcutLongLabel="@string/shortcut_chat_long">
     <intent
       android:action="android.intent.action.VIEW"
-      android:targetPackage="com.aiassistant.app"
-      android:targetClass="com.aiassistant.app.MainActivity"
+      android:targetPackage="dev.bigbrotha.ai_assistant"
+      android:targetClass="dev.bigbrotha.ai_assistant.MainActivity"
       android:data="aiassistant://chat" />
+  </shortcut>
+  <shortcut
+    android:shortcutId="open_voice"
+    android:shortcutShortLabel="@string/shortcut_voice"
+    android:shortcutLongLabel="@string/shortcut_voice_long">
+    <intent
+      android:action="android.intent.action.VIEW"
+      android:targetPackage="dev.bigbrotha.ai_assistant"
+      android:targetClass="dev.bigbrotha.ai_assistant.MainActivity"
+      android:data="aiassistant://voice" />
   </shortcut>
 </shortcuts>

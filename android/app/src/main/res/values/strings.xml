@@ -2,4 +2,6 @@
 <resources>
   <string name="shortcut_chat">Chat</string>
   <string name="shortcut_chat_long">Open chat</string>
+  <string name="shortcut_voice">Voice</string>
+  <string name="shortcut_voice_long">Open voice conversation</string>
 </resources>

@@ -21,6 +21,13 @@ class BackendConfig {
     defaultValue: '',
   );
 
+  /// ntfy server base URL for push notifications. Empty (default) disables
+  /// notifications — the notifier server is out of scope until it exists.
+  static const String defaultNotifUrl = String.fromEnvironment(
+    'NOTIF_URL',
+    defaultValue: '',
+  );
+
   /// Resolves the effective storage base URL from three sources (in precedence):
   /// 1. Runtime settings override (`settings.storageUrl`), non-blank.
   /// 2. Compile-time env default (`STORAGE_URL` dart-define), non-blank.

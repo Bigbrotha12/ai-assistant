@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'engine_config.dart';
+import 'engine_manager.dart';
+import 'engine_manager_provider.dart';
 import 'engine_registry.dart';
+import 'model_downloader.dart';
 import 'voice_settings.dart';
 import 'voice_settings_providers.dart';
 
@@ -274,6 +277,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
             onChanged: (value) => setState(() => _minTurnSeconds = value),
           ),
           const SizedBox(height: 24),
+          const _ModelsSection(),
+          const SizedBox(height: 24),
           Row(
             children: [
               Expanded(
@@ -291,6 +296,175 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
               ),
             ],
           ),
+        ],
+      ),
+    );
+  }
+}
+
+/// On-device model download status section: per-model readiness chips plus a
+/// download/retry action and live progress. Mirrors the voice screen's engine
+/// status bar so users can manage models from settings without starting a
+/// conversation.
+class _ModelsSection extends ConsumerStatefulWidget {
+  const _ModelsSection();
+
+  @override
+  ConsumerState<_ModelsSection> createState() => _ModelsSectionState();
+}
+
+class _ModelsSectionState extends ConsumerState<_ModelsSection> {
+  bool _busy = false;
+
+  Future<void> _downloadAll() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await ref.read(voiceEngineStatusProvider.notifier).downloadAllModels();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final statuses = ref.watch(voiceEngineStatusProvider);
+    final progress = ref.watch(modelDownloadProgressProvider).value;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('On-device models', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: _ModelStatusChip(
+                label: 'Whisper',
+                status: statuses[EngineConfig.whisperTinyId] ??
+                    VoiceEngineStatus.notStarted,
+                progress: progress,
+                onAction: _busy ? null : _downloadAll,
+              ),
+            ),
+            const SizedBox(width: 12),
+            if (statuses[EngineConfig.kokoro82mId] !=
+                VoiceEngineStatus.unavailable) ...[
+              Expanded(
+                child: _ModelStatusChip(
+                  label: 'Kokoro',
+                  status: statuses[EngineConfig.kokoro82mId] ??
+                      VoiceEngineStatus.notStarted,
+                  progress: progress,
+                  onAction: _busy ? null : _downloadAll,
+                ),
+              ),
+            ],
+          ],
+        ),
+        if (_busy) ...[
+          const SizedBox(height: 8),
+          const LinearProgressIndicator(minHeight: 2),
+        ],
+      ],
+    );
+  }
+}
+
+/// Single model readiness chip: status icon, label, and download/retry action.
+class _ModelStatusChip extends StatelessWidget {
+  const _ModelStatusChip({
+    required this.label,
+    required this.status,
+    required this.progress,
+    required this.onAction,
+  });
+
+  final String label;
+  final VoiceEngineStatus status;
+  final ModelDownloadProgress? progress;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final downloading = status == VoiceEngineStatus.downloading;
+    final needsAction =
+        status == VoiceEngineStatus.failed ||
+        status == VoiceEngineStatus.notStarted;
+    final actionLabel =
+        status == VoiceEngineStatus.failed ? 'Retry' : 'Download';
+    final percent = progress?.percent;
+
+    final (icon, color, subtitle) = switch (status) {
+      VoiceEngineStatus.ready => (
+          Icons.check_circle,
+          Colors.green.shade600,
+          'ready',
+        ),
+      VoiceEngineStatus.downloading => (
+          Icons.downloading,
+          scheme.primary,
+          percent == null
+              ? 'downloading…'
+              : 'downloading ${(percent * 100).round()}%',
+        ),
+      VoiceEngineStatus.failed => (
+          Icons.error_outline,
+          scheme.error,
+          'download failed',
+        ),
+      VoiceEngineStatus.notStarted => (
+          Icons.download_outlined,
+          scheme.onSurfaceVariant,
+          'not downloaded',
+        ),
+      VoiceEngineStatus.unavailable => (
+          Icons.block,
+          scheme.onSurfaceVariant,
+          'unavailable',
+        ),
+    };
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: color, size: 18),
+              const SizedBox(width: 6),
+              Expanded(child: Text(label, style: theme.textTheme.labelLarge)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(color: color),
+          ),
+          if (needsAction) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: onAction,
+                icon: const Icon(Icons.download, size: 18),
+                label: Text(actionLabel),
+              ),
+            ),
+          ] else if (downloading) ...[
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: percent, minHeight: 4),
+          ],
         ],
       ),
     );
