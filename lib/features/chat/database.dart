@@ -49,6 +49,7 @@ class Files extends Table {
   TextColumn get mimeType => text()();
   DateTimeColumn get createdAt => dateTime()();
   DateTimeColumn get updatedAt => dateTime()();
+  TextColumn get description => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {id};
@@ -62,7 +63,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -72,7 +73,10 @@ class AppDatabase extends _$AppDatabase {
             await m.createTable(files);
             await m.createIndex(filesConversationIdIdx);
           }
-          // Phase 5: memories table + FTS5 land here.
+          if (from < 3) {
+            await m.alterTable(TableMigration(files, newColumns: [files.description]));
+          }
+          // Phase 5: memories+FTS5 deferred to v4 (no consumer feature yet).
         },
         beforeOpen: (details) async {
           // SQLite does NOT enable FK enforcement by default — without this

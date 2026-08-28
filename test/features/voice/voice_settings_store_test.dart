@@ -107,4 +107,60 @@ void main() {
     expect(await store.load(), isNull);
     expect(storage.values, isEmpty);
   });
+
+  test('visionEnabled key round-trips', () async {
+    await store.save(const VoiceSettings(visionEnabled: false));
+    final loaded = await store.load();
+    expect(loaded, isNotNull);
+    expect(loaded!.visionEnabled, false);
+
+    await store.save(const VoiceSettings(visionEnabled: true));
+    final loaded2 = await store.load();
+    expect(loaded2!.visionEnabled, true);
+  });
+
+  test('minTurnSeconds parses from string', () async {
+    await storage.write(key: 'voice_stt_engine', value: 'whisper_tiny');
+    await storage.write(key: 'voice_min_turn_seconds', value: '1.5');
+
+    final loaded = await store.load();
+    expect(loaded, isNotNull);
+    expect(loaded!.minTurnSeconds, 1.5);
+  });
+
+  test('vadSensitivity parses from string', () async {
+    await storage.write(key: 'voice_stt_engine', value: 'whisper_tiny');
+    await storage.write(key: 'voice_vad_sensitivity', value: '0.8');
+
+    final loaded = await store.load();
+    expect(loaded, isNotNull);
+    expect(loaded!.vadSensitivity, 0.8);
+  });
+
+  test('clear removes all 6 keys', () async {
+    await store.save(const VoiceSettings(
+      sttEngine: 'test_stt',
+      ttsEngine: 'test_tts',
+      vadSensitivity: 0.9,
+      preferredLanguage: 'fr',
+      minTurnSeconds: 1.0,
+      visionEnabled: false,
+    ));
+
+    final allKeys = const [
+      'voice_stt_engine',
+      'voice_tts_engine',
+      'voice_vad_sensitivity',
+      'voice_language',
+      'voice_min_turn_seconds',
+      'voice_vision_enabled',
+    ];
+    for (final key in allKeys) {
+      expect(storage.values.containsKey(key), isTrue, reason: key);
+    }
+
+    await store.clear();
+    expect(storage.values, isEmpty);
+    expect(await store.load(), isNull);
+  });
 }

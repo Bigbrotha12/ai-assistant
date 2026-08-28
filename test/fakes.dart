@@ -374,6 +374,7 @@ class FakeFileStore implements FileStore {
 
   final Map<String, FileInfo> _files = {};
   final Map<String, String> _links = {};
+  final Map<String, String> _descriptions = {};
 
   @override
   Future<void> saveFile(FileInfo info, {String? conversationId}) async {
@@ -406,5 +407,50 @@ class FakeFileStore implements FileStore {
   Future<void> deleteAll() async {
     _files.clear();
     _links.clear();
+    _descriptions.clear();
+  }
+
+  @override
+  Future<String?> descriptionFor(String fileId) async => _descriptions[fileId];
+
+  @override
+  Future<void> setDescription(String fileId, String description) async {
+    _descriptions[fileId] = description;
+  }
+}
+
+/// Minimal fake [Dio] that records requests and returns a scripted response.
+class FakeDio {
+  FakeDio({this.response});
+
+  Response? response;
+  String? lastPath;
+  dynamic lastBody;
+  final List<RequestOptions> requests = [];
+
+  Future<Response<T>> get<T>(
+    String path, {
+    Object? data,
+    Map<String, dynamic>? queryParameters,
+    Options? options,
+    CancelToken? cancelToken,
+  }) async {
+    requests.add(RequestOptions(path: path, data: data));
+    lastPath = path;
+    return response as Response<T>;
+  }
+
+  Future<Response<T>> post<T>(
+    String? path, {
+    Object? data,
+    Map<String, dynamic>? queryParameters,
+    Options? options,
+    CancelToken? cancelToken,
+    void Function(int sent, int total)? onSendProgress,
+  }) async {
+    requests.add(RequestOptions(path: path ?? '', data: data));
+    lastPath = path;
+    lastBody = data;
+    return response as Response<T>;
   }
 }

@@ -115,3 +115,43 @@ Map<String, dynamic> _serializeToolCall(ToolCall call) => {
         'arguments': jsonEncode(call.args ?? const <String, dynamic>{}),
       },
     };
+
+/// Expands `[file:<id>]` references in user messages by replacing them with
+/// `[Image: <description>]` text using the provided [descriptions] map.
+///
+/// Only the first two file refs per message are expanded (to bound cost).
+/// Returns a new list with new Message objects (content replaced only).
+List<Message> expandFileRefs(List<Message> messages, Map<String, String> descriptions) {
+  if (descriptions.isEmpty) return messages;
+  final result = <Message>[];
+  for (final m in messages) {
+    if (m.role != MessageRole.user) {
+      result.add(m);
+      continue;
+    }
+    final content = m.content;
+    final refRegex = RegExp(r'\[file:([^\]]+)\]');
+    final matches = refRegex.allMatches(content).toList();
+    if (matches.isEmpty) {
+      result.add(m);
+      continue;
+    }
+    // Only expand the first two refs.
+    var count = 0;
+    var expanded = content;
+    for (final match in matches) {
+      if (count >= 2) break;
+      final id = match.group(1)!;
+      final desc = descriptions[id];
+      if (desc != null) {
+        expanded = expanded.replaceFirst(
+          '[file:$id]',
+          '[Image: $desc]',
+        );
+        count++;
+      }
+    }
+    result.add(m.copyWith(content: expanded));
+  }
+  return result;
+}

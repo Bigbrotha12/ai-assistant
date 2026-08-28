@@ -183,4 +183,82 @@ void main() {
       expect(result[1].content, 'end');
     });
   });
+
+  group('expandFileRefs', () {
+    test('returns original list when descriptions is empty', () {
+      final messages = [
+        Message(id: '1', role: MessageRole.user, content: '[file:abc123]'),
+      ];
+      final result = expandFileRefs(messages, {});
+      expect(result, same(messages));
+    });
+
+    test('returns unchanged list when no file refs exist', () {
+      final descriptions = {'abc123': 'A cat'};
+      final messages = [
+        Message(id: '1', role: MessageRole.user, content: 'Hello'),
+      ];
+      final result = expandFileRefs(messages, descriptions);
+      expect(result, hasLength(1));
+      expect(result[0].content, 'Hello');
+    });
+
+    test('expands a single file ref in a user message', () {
+      final descriptions = {'abc123': 'A cat'};
+      final messages = [
+        Message(id: '1', role: MessageRole.user, content: 'What is this? [file:abc123]'),
+      ];
+      final result = expandFileRefs(messages, descriptions);
+      expect(result, hasLength(1));
+      expect(result[0].content, 'What is this? [Image: A cat]');
+    });
+
+    test('expands at most two file refs per message', () {
+      final descriptions = {
+        'abc123': 'A cat',
+        'def456': 'A dog',
+        'ghi789': 'A bird',
+      };
+      final messages = [
+        Message(id: '1', role: MessageRole.user, content: '[file:abc123] and [file:def456] and [file:ghi789]'),
+      ];
+      final result = expandFileRefs(messages, descriptions);
+      expect(result, hasLength(1));
+      expect(result[0].content, '[Image: A cat] and [Image: A dog] and [file:ghi789]');
+    });
+
+    test('non-user messages are not expanded', () {
+      final descriptions = {'abc123': 'A cat'};
+      final messages = [
+        Message(id: '1', role: MessageRole.assistant, content: '[file:abc123]'),
+      ];
+      final result = expandFileRefs(messages, descriptions);
+      expect(result, hasLength(1));
+      expect(result[0].content, '[file:abc123]');
+    });
+
+    test('missing description entries are skipped', () {
+      final descriptions = {'xyz': 'Unknown'};
+      final messages = [
+        Message(id: '1', role: MessageRole.user, content: '[file:abc123]'),
+      ];
+      final result = expandFileRefs(messages, descriptions);
+      expect(result, hasLength(1));
+      expect(result[0].content, '[file:abc123]');
+    });
+
+    test('multiple messages are processed independently', () {
+      final descriptions = {'a': 'First', 'b': 'Second'};
+      final messages = [
+        Message(id: '1', role: MessageRole.user, content: '[file:a]'),
+        Message(id: '2', role: MessageRole.assistant, content: 'middle'),
+        Message(id: '3', role: MessageRole.user, content: '[file:b]'),
+      ];
+      final result = expandFileRefs(messages, descriptions);
+      expect(result, hasLength(3));
+      expect(result[0].content, '[Image: First]');
+      expect(result[1].content, 'middle');
+      expect(result[2].content, '[Image: Second]');
+    });
+  });
 }

@@ -216,6 +216,9 @@ class FakeVadProcessor implements VadProcessor {
     lastSensitivity = sensitivity;
   }
 
+  @override
+  void setMinSilenceSeconds(double seconds) {}
+
   void emitState(VadState next) {
     _state = next;
     if (!_stateChanges.isClosed) {

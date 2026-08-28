@@ -125,4 +125,21 @@ void main() {
     final remaining = await db.select(db.files).get();
     expect(remaining.map((r) => r.id).toSet(), {'f3'});
   });
+
+  test('descriptionFor returns null for unknown id, and stored description for known id', () async {
+    expect(await store.descriptionFor('missing'), isNull);
+
+    await store.saveFile(file(id: 'f1'));
+    await store.setDescription('f1', 'A photo of the beach');
+
+    expect(await store.descriptionFor('f1'), 'A photo of the beach');
+  });
+
+  test('setDescription persists and is readable via descriptionFor', () async {
+    await store.saveFile(file(id: 'f1'));
+    await store.setDescription('f1', 'first');
+    await store.setDescription('f1', 'second');
+
+    expect(await store.descriptionFor('f1'), 'second');
+  });
 }

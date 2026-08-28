@@ -33,6 +33,7 @@ class SecureSettingsStore implements SettingsStore {
   static const _kSecret = 'backend_secret';
   static const _kMcpSecret = 'backend_mcp_secret';
   static const _kFilesSecret = 'backend_files_secret';
+  static const _kStorageUrl = 'backend_storage_url';
 
   final FlutterSecureStorage _storage;
 
@@ -45,6 +46,7 @@ class SecureSettingsStore implements SettingsStore {
     final secret = await _storage.read(key: _kSecret) ?? '';
     final mcpSecret = await _storage.read(key: _kMcpSecret);
     final filesSecret = await _storage.read(key: _kFilesSecret);
+    final storageUrl = await _storage.read(key: _kStorageUrl);
     return BackendSettings(
       host: host,
       secret: secret,
@@ -52,6 +54,8 @@ class SecureSettingsStore implements SettingsStore {
           mcpSecret == null || mcpSecret.trim().isEmpty ? null : mcpSecret,
       filesSecret:
           filesSecret == null || filesSecret.trim().isEmpty ? null : filesSecret,
+      storageUrl:
+          storageUrl == null || storageUrl.trim().isEmpty ? null : storageUrl,
     );
   }
 
@@ -73,6 +77,12 @@ class SecureSettingsStore implements SettingsStore {
     } else {
       await _storage.delete(key: _kFilesSecret);
     }
+    final storageUrl = settings.trimmedStorageUrl;
+    if (storageUrl != null) {
+      await _storage.write(key: _kStorageUrl, value: storageUrl);
+    } else {
+      await _storage.delete(key: _kStorageUrl);
+    }
   }
 
   @override
@@ -81,5 +91,6 @@ class SecureSettingsStore implements SettingsStore {
     await _storage.delete(key: _kSecret);
     await _storage.delete(key: _kMcpSecret);
     await _storage.delete(key: _kFilesSecret);
+    await _storage.delete(key: _kStorageUrl);
   }
 }

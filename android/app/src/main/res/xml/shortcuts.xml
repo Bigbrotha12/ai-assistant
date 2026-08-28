@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+  <shortcut
+    android:shortcutId="open_chat"
+    android:shortcutShortLabel="@string/shortcut_chat"
+    android:shortcutLongLabel="@string/shortcut_chat_long">
+    <intent
+      android:action="android.intent.action.VIEW"
+      android:targetPackage="com.aiassistant.app"
+      android:targetClass="com.aiassistant.app.MainActivity"
+      android:data="aiassistant://chat" />
+  </shortcut>
+</shortcuts>

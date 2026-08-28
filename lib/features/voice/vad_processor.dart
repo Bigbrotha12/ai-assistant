@@ -27,6 +27,9 @@ abstract interface class VadProcessor {
   /// Adjust sensitivity (0.0 = least sensitive, 1.0 = most sensitive).
   void setSensitivity(double sensitivity);
 
+  /// Minimum silence duration in seconds before end-of-utterance is detected.
+  void setMinSilenceSeconds(double seconds);
+
   /// Release resources.
   void dispose();
 }
@@ -40,10 +43,15 @@ abstract interface class VadProcessor {
 /// Note: the `flutter_vad` package is not published on pub.dev, so this
 /// provides a lightweight fallback using signal energy alone.
 class EnergyBasedVadProcessor implements VadProcessor {
-  EnergyBasedVadProcessor({double sensitivity = 0.5})
-      : _sensitivity = sensitivity.clamp(0.0, 1.0);
+  EnergyBasedVadProcessor({
+    double sensitivity = 0.5,
+    double minSilenceSeconds = 0.35,
+   }) : _sensitivity = sensitivity.clamp(0.0, 1.0),
+        // ignore: prefer_initializing_formals — field must stay mutable for setMinSilenceSeconds()
+        _minSilenceSeconds = minSilenceSeconds;
 
   double _sensitivity;
+  double _minSilenceSeconds;
   VadState _state = VadState.idle;
   DateTime? _speechStartTime;
   DateTime? _silenceStartTime;
@@ -55,7 +63,8 @@ class EnergyBasedVadProcessor implements VadProcessor {
 
   /// Minimum duration of below-threshold energy before speech is declared
   /// ended.
-  static const _minSilenceDuration = Duration(milliseconds: 350);
+  Duration get _minSilenceDuration =>
+      Duration(milliseconds: (_minSilenceSeconds * 1000).round());
 
   /// Start threshold in dBFS.  Higher sensitivity → lower (more negative)
   /// threshold.
@@ -73,6 +82,11 @@ class EnergyBasedVadProcessor implements VadProcessor {
   @override
   void setSensitivity(double sensitivity) {
     _sensitivity = sensitivity.clamp(0.0, 1.0);
+  }
+
+  @override
+  void setMinSilenceSeconds(double seconds) {
+    _minSilenceSeconds = seconds;
   }
 
   @override

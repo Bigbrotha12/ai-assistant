@@ -5,6 +5,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/backend_settings.dart';
+import '../../core/network_banner.dart';
 import '../../core/config.dart';
 import '../../core/files_providers.dart';
 import '../../core/settings_providers.dart';
@@ -72,6 +73,9 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
           : _tokenMinter(settings, ref.read(dioProvider)),
       sttEngine: sttEngine,
       ttsEngine: ttsEngine,
+      onNetworkError: () {
+        ref.read(networkStatusProvider.notifier).set(NetworkStatus.disconnected);
+      },
     );
 
     // Engines register asynchronously (model-dir resolution happens on a

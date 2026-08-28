@@ -945,6 +945,17 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
     type: DriftSqlType.dateTime,
     requiredDuringInsert: true,
   );
+  static const VerificationMeta _descriptionMeta = const VerificationMeta(
+    'description',
+  );
+  @override
+  late final GeneratedColumn<String> description = GeneratedColumn<String>(
+    'description',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
   @override
   List<GeneratedColumn> get $columns => [
     id,
@@ -956,6 +967,7 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
     mimeType,
     createdAt,
     updatedAt,
+    description,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -1042,6 +1054,15 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
     } else if (isInserting) {
       context.missing(_updatedAtMeta);
     }
+    if (data.containsKey('description')) {
+      context.handle(
+        _descriptionMeta,
+        description.isAcceptableOrUnknown(
+          data['description']!,
+          _descriptionMeta,
+        ),
+      );
+    }
     return context;
   }
 
@@ -1087,6 +1108,10 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
         DriftSqlType.dateTime,
         data['${effectivePrefix}updated_at'],
       )!,
+      description: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}description'],
+      ),
     );
   }
 
@@ -1106,6 +1131,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   final String mimeType;
   final DateTime createdAt;
   final DateTime updatedAt;
+  final String? description;
   const FileRow({
     required this.id,
     this.conversationId,
@@ -1116,6 +1142,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
     required this.mimeType,
     required this.createdAt,
     required this.updatedAt,
+    this.description,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -1131,6 +1158,9 @@ class FileRow extends DataClass implements Insertable<FileRow> {
     map['mime_type'] = Variable<String>(mimeType);
     map['created_at'] = Variable<DateTime>(createdAt);
     map['updated_at'] = Variable<DateTime>(updatedAt);
+    if (!nullToAbsent || description != null) {
+      map['description'] = Variable<String>(description);
+    }
     return map;
   }
 
@@ -1147,6 +1177,9 @@ class FileRow extends DataClass implements Insertable<FileRow> {
       mimeType: Value(mimeType),
       createdAt: Value(createdAt),
       updatedAt: Value(updatedAt),
+      description: description == null && nullToAbsent
+          ? const Value.absent()
+          : Value(description),
     );
   }
 
@@ -1165,6 +1198,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
       mimeType: serializer.fromJson<String>(json['mimeType']),
       createdAt: serializer.fromJson<DateTime>(json['createdAt']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
+      description: serializer.fromJson<String?>(json['description']),
     );
   }
   @override
@@ -1180,6 +1214,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
       'mimeType': serializer.toJson<String>(mimeType),
       'createdAt': serializer.toJson<DateTime>(createdAt),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
+      'description': serializer.toJson<String?>(description),
     };
   }
 
@@ -1193,6 +1228,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
     String? mimeType,
     DateTime? createdAt,
     DateTime? updatedAt,
+    Value<String?> description = const Value.absent(),
   }) => FileRow(
     id: id ?? this.id,
     conversationId: conversationId.present
@@ -1205,6 +1241,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
     mimeType: mimeType ?? this.mimeType,
     createdAt: createdAt ?? this.createdAt,
     updatedAt: updatedAt ?? this.updatedAt,
+    description: description.present ? description.value : this.description,
   );
   FileRow copyWithCompanion(FilesCompanion data) {
     return FileRow(
@@ -1221,6 +1258,9 @@ class FileRow extends DataClass implements Insertable<FileRow> {
       mimeType: data.mimeType.present ? data.mimeType.value : this.mimeType,
       createdAt: data.createdAt.present ? data.createdAt.value : this.createdAt,
       updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
+      description: data.description.present
+          ? data.description.value
+          : this.description,
     );
   }
 
@@ -1235,7 +1275,8 @@ class FileRow extends DataClass implements Insertable<FileRow> {
           ..write('sizeBytes: $sizeBytes, ')
           ..write('mimeType: $mimeType, ')
           ..write('createdAt: $createdAt, ')
-          ..write('updatedAt: $updatedAt')
+          ..write('updatedAt: $updatedAt, ')
+          ..write('description: $description')
           ..write(')'))
         .toString();
   }
@@ -1251,6 +1292,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
     mimeType,
     createdAt,
     updatedAt,
+    description,
   );
   @override
   bool operator ==(Object other) =>
@@ -1264,7 +1306,8 @@ class FileRow extends DataClass implements Insertable<FileRow> {
           other.sizeBytes == this.sizeBytes &&
           other.mimeType == this.mimeType &&
           other.createdAt == this.createdAt &&
-          other.updatedAt == this.updatedAt);
+          other.updatedAt == this.updatedAt &&
+          other.description == this.description);
 }
 
 class FilesCompanion extends UpdateCompanion<FileRow> {
@@ -1277,6 +1320,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
   final Value<String> mimeType;
   final Value<DateTime> createdAt;
   final Value<DateTime> updatedAt;
+  final Value<String?> description;
   final Value<int> rowid;
   const FilesCompanion({
     this.id = const Value.absent(),
@@ -1288,6 +1332,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     this.mimeType = const Value.absent(),
     this.createdAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
+    this.description = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   FilesCompanion.insert({
@@ -1300,6 +1345,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     required String mimeType,
     required DateTime createdAt,
     required DateTime updatedAt,
+    this.description = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : id = Value(id),
        serverFileId = Value(serverFileId),
@@ -1319,6 +1365,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     Expression<String>? mimeType,
     Expression<DateTime>? createdAt,
     Expression<DateTime>? updatedAt,
+    Expression<String>? description,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -1331,6 +1378,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
       if (mimeType != null) 'mime_type': mimeType,
       if (createdAt != null) 'created_at': createdAt,
       if (updatedAt != null) 'updated_at': updatedAt,
+      if (description != null) 'description': description,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -1345,6 +1393,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     Value<String>? mimeType,
     Value<DateTime>? createdAt,
     Value<DateTime>? updatedAt,
+    Value<String?>? description,
     Value<int>? rowid,
   }) {
     return FilesCompanion(
@@ -1357,6 +1406,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
       mimeType: mimeType ?? this.mimeType,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
+      description: description ?? this.description,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -1391,6 +1441,9 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     if (updatedAt.present) {
       map['updated_at'] = Variable<DateTime>(updatedAt.value);
     }
+    if (description.present) {
+      map['description'] = Variable<String>(description.value);
+    }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
     }
@@ -1409,6 +1462,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
           ..write('mimeType: $mimeType, ')
           ..write('createdAt: $createdAt, ')
           ..write('updatedAt: $updatedAt, ')
+          ..write('description: $description, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -2221,6 +2275,7 @@ typedef $$FilesTableCreateCompanionBuilder = FilesCompanion Function({
   required String mimeType,
   required DateTime createdAt,
   required DateTime updatedAt,
+  Value<String?> description,
   Value<int> rowid,
 });
 typedef $$FilesTableUpdateCompanionBuilder = FilesCompanion Function({
@@ -2233,6 +2288,7 @@ typedef $$FilesTableUpdateCompanionBuilder = FilesCompanion Function({
   Value<String> mimeType,
   Value<DateTime> createdAt,
   Value<DateTime> updatedAt,
+  Value<String?> description,
   Value<int> rowid,
 });
 
@@ -2303,6 +2359,11 @@ class $$FilesTableFilterComposer extends Composer<_$AppDatabase, $FilesTable> {
 
   ColumnFilters<DateTime> get updatedAt => $composableBuilder(
     column: $table.updatedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get description => $composableBuilder(
+    column: $table.description,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -2379,6 +2440,11 @@ class $$FilesTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<String> get description => $composableBuilder(
+    column: $table.description,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   $$ConversationsTableOrderingComposer get conversationId {
     final $$ConversationsTableOrderingComposer composer = $composerBuilder(
       composer: this,
@@ -2437,6 +2503,11 @@ class $$FilesTableAnnotationComposer
 
   GeneratedColumn<DateTime> get updatedAt =>
       $composableBuilder(column: $table.updatedAt, builder: (column) => column);
+
+  GeneratedColumn<String> get description => $composableBuilder(
+    column: $table.description,
+    builder: (column) => column,
+  );
 
   $$ConversationsTableAnnotationComposer get conversationId {
     final $$ConversationsTableAnnotationComposer composer = $composerBuilder(
@@ -2499,6 +2570,7 @@ class $$FilesTableTableManager
                 Value<String> mimeType = const Value.absent(),
                 Value<DateTime> createdAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
+                Value<String?> description = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => FilesCompanion(
                 id: id,
@@ -2510,6 +2582,7 @@ class $$FilesTableTableManager
                 mimeType: mimeType,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
+                description: description,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -2523,6 +2596,7 @@ class $$FilesTableTableManager
                 required String mimeType,
                 required DateTime createdAt,
                 required DateTime updatedAt,
+                Value<String?> description = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => FilesCompanion.insert(
                 id: id,
@@ -2534,6 +2608,7 @@ class $$FilesTableTableManager
                 mimeType: mimeType,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
+                description: description,
                 rowid: rowid,
               ),
           withReferenceMapper: (p0) => p0

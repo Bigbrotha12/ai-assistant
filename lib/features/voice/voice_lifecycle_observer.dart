@@ -6,13 +6,18 @@ import 'package:flutter/widgets.dart';
 /// Voice calls disconnect on background and reset to idle on foreground. The
 /// underlying audio services (mic capture, playback) are stopped so no audio
 /// leaks while the app is not visible.
+///
+/// Teardown fires only on `paused`, `hidden`, and `detached` states.
+/// Transient `inactive` interruptions (iOS control-center, incoming calls) are
+/// handled by the audio-focus-loss mechanism (see PLAN.md gotcha #1) so they
+/// do NOT tear down the session.
 class VoiceLifecycleObserver with WidgetsBindingObserver {
   VoiceLifecycleObserver({
     required this.onBackground,
     this.onForeground,
   });
 
-  /// Invoked when the app becomes `paused` or `inactive` (i.e. losing
+  /// Invoked when the app becomes `paused`, `hidden`, or `detached` (i.e. losing
   /// foreground visibility). Should stop recording, playback, and disconnect.
   final Future<void> Function() onBackground;
 
@@ -28,6 +33,7 @@ class VoiceLifecycleObserver with WidgetsBindingObserver {
       case AppLifecycleState.resumed:
         onForeground?.call();
       case AppLifecycleState.inactive:
+        // Handled by audio-focus-loss; do NOT tear down the session.
       case AppLifecycleState.paused:
       case AppLifecycleState.hidden:
       case AppLifecycleState.detached:

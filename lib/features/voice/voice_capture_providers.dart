@@ -8,12 +8,16 @@ import 'voice_settings_providers.dart';
 
 /// Voice activity detection processor.
 ///
-/// Sensitivity is sourced from persisted [VoiceSettings]. The provider
-/// rebuilds (creating a fresh processor) when the setting changes.
+/// Sensitivity and minimum silence duration are sourced from persisted
+/// [VoiceSettings]. The provider rebuilds (creating a fresh processor)
+/// when settings change, ensuring the new processor starts with the
+/// correct values.
 final vadProcessorProvider = Provider<VadProcessor>((ref) {
   final settingsAsync = ref.watch(voiceSettingsProvider);
   final sensitivity = settingsAsync.value?.vadSensitivity ?? 0.5;
-  final processor = EnergyBasedVadProcessor(sensitivity: sensitivity);
+  final minSilence = settingsAsync.value?.minTurnSeconds ?? 0.5;
+  final processor =
+      EnergyBasedVadProcessor(sensitivity: sensitivity, minSilenceSeconds: minSilence);
   ref.onDispose(processor.dispose);
   return processor;
 });

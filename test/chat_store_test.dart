@@ -223,9 +223,9 @@ void main() {
     expect(await store.watchConversations().first, isEmpty);
   });
 
-  test('schemaVersion is 2 and a fresh database round-trips a FileRow',
+  test('schemaVersion is 3 and a fresh database round-trips a FileRow',
       () async {
-    expect(db.schemaVersion, 2);
+    expect(db.schemaVersion, 3);
 
     await store.saveConversation(conversation(id: 'c1'));
     final fileStore = DriftFileStore(db);

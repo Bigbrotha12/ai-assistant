@@ -25,7 +25,7 @@ final filesServiceProvider = Provider<FilesClient>((ref) {
   }
   return FilesClientImpl(
     dio: ref.watch(dioProvider),
-    baseUrl: BackendConfig.files(host).toString(),
+    baseUrl: BackendConfig.effectiveStorageUrl(host, settings?.storageUrl).toString(),
     bearerToken: filesSecret,
   );
 });

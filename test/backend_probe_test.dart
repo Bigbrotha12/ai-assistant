@@ -79,6 +79,11 @@ void registerAllOk(DioAdapter adapter) {
   adapter.onGet(_tokenMintUrl, (r) => r.reply(200, {'status': 'ok'}));
   adapter.onPost(_tokenMintTokenUrl, (r) => r.reply(200, {'token': 'tok'}));
   adapter.onPost(_llmProxyUrl, (r) => r.reply(200, {'id': 'chat-1'}));
+  adapter.onGet('http://myhost:9091/v1/models', (r) {
+    return r.reply(200, {'data': [
+      {'id': 'model.vl', 'capabilities': {'vision': true}},
+    ]});
+  });
 }
 
 /// Minimal stand-in for a browser `DomException` (dart:html / package:web),
@@ -429,6 +434,7 @@ void main() {
         BackendCheck.tokenMintAuth,
         BackendCheck.liveKit,
         BackendCheck.llmProxy,
+        BackendCheck.vision,
       ]);
       for (final check in BackendCheck.values) {
         expect(status.resultFor(check)!.status, ProbeStatus.ok,
@@ -500,7 +506,7 @@ void main() {
           await probe.probe(_settings).timeout(const Duration(seconds: 5));
 
       expect(status, isA<BackendStatus>());
-      expect(status.checks, hasLength(4));
+      expect(status.checks, hasLength(5));
     });
   });
 
@@ -532,7 +538,7 @@ void main() {
         const BackendSettings(host: 'https://evil.example', secret: 's3cret'),
       );
 
-      expect(status.checks, hasLength(4));
+      expect(status.checks, hasLength(5));
       for (final check in status.checks) {
         expect(check.status, isNot(ProbeStatus.ok));
       }

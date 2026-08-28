@@ -55,7 +55,7 @@ void main() {
     test('posts a multipart form with progress and returns FileInfo', () async {
       final (dio, adapter) = _makeDio();
       adapter.onPost(
-        '$_base/upload',
+        '$_base/files',
         (r) => r.reply(200, {
           'id': 'f1',
           'filename': 'photo.jpg',
@@ -83,13 +83,13 @@ void main() {
     test('maps a non-2xx response to FilesServerError', () async {
       final (dio, adapter) = _makeDio();
       adapter.onPost(
-        '$_base/upload',
+        '$_base/files',
         (r) => r.throws(
           500,
           DioException(
-            requestOptions: RequestOptions(path: '$_base/upload'),
+            requestOptions: RequestOptions(path: '$_base/files'),
             response: Response(
-              requestOptions: RequestOptions(path: '$_base/upload'),
+              requestOptions: RequestOptions(path: '$_base/files'),
               statusCode: 500,
             ),
             type: DioExceptionType.badResponse,
@@ -114,11 +114,11 @@ void main() {
     test('maps a connection error to FilesNetworkError', () async {
       final (dio, adapter) = _makeDio();
       adapter.onPost(
-        '$_base/upload',
+        '$_base/files',
         (r) => r.throws(
           0,
           DioException(
-            requestOptions: RequestOptions(path: '$_base/upload'),
+            requestOptions: RequestOptions(path: '$_base/files'),
             type: DioExceptionType.connectionError,
           ),
         ),
@@ -157,7 +157,7 @@ void main() {
 
       final req = adapter.requests.single;
       expect(req.method, 'POST');
-      expect(req.path, '$_base/upload');
+      expect(req.path, '$_base/files');
       expect(req.headers['Authorization'], 'Bearer $_token');
       expect(req.followRedirects, isFalse);
       expect(req.data, isA<FormData>());
@@ -175,7 +175,7 @@ void main() {
     test('parses a list body', () async {
       final (dio, adapter) = _makeDio();
       adapter.onGet(
-        '$_base/list',
+        '$_base/files',
         (r) => r.reply(200, [
           {'id': 'f1', 'filename': 'a.jpg', 'sizeBytes': 1, 'mimeType': 'image/jpeg'},
         ]),
@@ -191,7 +191,7 @@ void main() {
     test('parses a {"files": [...]} body', () async {
       final (dio, adapter) = _makeDio();
       adapter.onGet(
-        '$_base/list',
+        '$_base/files',
         (r) => r.reply(200, {
           'files': [
             {'id': 'f2', 'filename': 'b.png', 'sizeBytes': 2, 'mimeType': 'image/png'},
@@ -207,7 +207,7 @@ void main() {
 
     test('returns an empty list for a bare/empty body', () async {
       final (dio, adapter) = _makeDio();
-      adapter.onGet('$_base/list', (r) => r.reply(200, {}));
+      adapter.onGet('$_base/files', (r) => r.reply(200, {}));
       final client = _client(dio);
 
       expect(await client.listFiles(), isEmpty);
@@ -218,7 +218,7 @@ void main() {
     test('returns raw bytes', () async {
       final (dio, adapter) = _makeDio();
       adapter.onGet(
-        '$_base/fetch/f1',
+        '$_base/files/f1',
         (r) => r.reply(200, Uint8List.fromList([1, 2, 3, 4])),
       );
       final client = _client(dio);
@@ -230,7 +230,7 @@ void main() {
 
     test('rejects an unsafe file id before making a request', () async {
       final (dio, adapter) = _makeDio();
-      adapter.onGet('$_base/fetch/x', (r) => r.reply(200, [1]));
+      adapter.onGet('$_base/files/x', (r) => r.reply(200, [1]));
       final client = _client(dio);
 
       expect(

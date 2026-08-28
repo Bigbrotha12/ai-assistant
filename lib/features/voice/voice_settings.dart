@@ -8,12 +8,16 @@ class VoiceSettings {
     this.ttsEngine = 'kokoro_82m',
     this.vadSensitivity = 0.5,
     this.preferredLanguage = 'en',
+    this.minTurnSeconds = 0.5,
+    this.visionEnabled = true,
   });
 
   final String sttEngine;
   final String ttsEngine;
   final double vadSensitivity;
   final String preferredLanguage;
+  final double minTurnSeconds;
+  final bool visionEnabled;
 
   /// True when both engine identifiers are non-blank.
   bool get isValid =>
@@ -24,11 +28,15 @@ class VoiceSettings {
     String? ttsEngine,
     double? vadSensitivity,
     String? preferredLanguage,
+    double? minTurnSeconds,
+    bool? visionEnabled,
   }) => VoiceSettings(
     sttEngine: sttEngine ?? this.sttEngine,
     ttsEngine: ttsEngine ?? this.ttsEngine,
     vadSensitivity: vadSensitivity ?? this.vadSensitivity,
     preferredLanguage: preferredLanguage ?? this.preferredLanguage,
+    minTurnSeconds: minTurnSeconds ?? this.minTurnSeconds,
+    visionEnabled: visionEnabled ?? this.visionEnabled,
   );
 
   @override
@@ -37,9 +45,11 @@ class VoiceSettings {
       other.sttEngine == sttEngine &&
       other.ttsEngine == ttsEngine &&
       other.vadSensitivity == vadSensitivity &&
-      other.preferredLanguage == preferredLanguage;
+      other.preferredLanguage == preferredLanguage &&
+      other.minTurnSeconds == minTurnSeconds &&
+      other.visionEnabled == visionEnabled;
 
   @override
   int get hashCode =>
-      Object.hash(sttEngine, ttsEngine, vadSensitivity, preferredLanguage);
+      Object.hash(sttEngine, ttsEngine, vadSensitivity, preferredLanguage, minTurnSeconds, visionEnabled);
 }

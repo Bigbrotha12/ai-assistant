@@ -394,7 +394,7 @@ void main() {
       await tester.tap(find.text('Clear settings'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Clear saved host, secret and MCP token?'), findsOneWidget);
+      expect(find.text('Clear saved host, secret, MCP token, files token, and storage URL?'), findsOneWidget);
 
       await tester.tap(find.text('Clear'));
       await tester.pumpAndSettle();

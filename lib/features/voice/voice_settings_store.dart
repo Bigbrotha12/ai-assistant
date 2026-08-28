@@ -36,6 +36,8 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
   static const _kVoiceTtsEngine = 'voice_tts_engine';
   static const _kVoiceVadSensitivity = 'voice_vad_sensitivity';
   static const _kVoiceLanguage = 'voice_language';
+  static const _kMinTurnSeconds = 'voice_min_turn_seconds';
+  static const _kVisionEnabled = 'voice_vision_enabled';
 
   final FlutterSecureStorage _storage;
 
@@ -49,12 +51,22 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
 
     final vadStr = await _storage.read(key: _kVoiceVadSensitivity);
     final language = await _storage.read(key: _kVoiceLanguage);
+    final minTurnStr = await _storage.read(key: _kMinTurnSeconds);
+    final visionEnabledRaw = await _storage.read(key: _kVisionEnabled);
 
     return VoiceSettings(
       sttEngine: sttEngine ?? VoiceSettings().sttEngine,
       ttsEngine: ttsEngine ?? VoiceSettings().ttsEngine,
-      vadSensitivity: _parseDouble(vadStr),
+      vadSensitivity: vadStr != null
+          ? double.tryParse(vadStr) ?? VoiceSettings().vadSensitivity
+          : VoiceSettings().vadSensitivity,
       preferredLanguage: language ?? VoiceSettings().preferredLanguage,
+      minTurnSeconds: minTurnStr != null
+          ? double.tryParse(minTurnStr) ?? VoiceSettings().minTurnSeconds
+          : VoiceSettings().minTurnSeconds,
+      visionEnabled: visionEnabledRaw != null
+          ? visionEnabledRaw == 'true'
+          : VoiceSettings().visionEnabled,
     );
   }
 
@@ -70,6 +82,14 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
       key: _kVoiceLanguage,
       value: settings.preferredLanguage,
     );
+    await _storage.write(
+      key: _kMinTurnSeconds,
+      value: settings.minTurnSeconds.toString(),
+    );
+    await _storage.write(
+      key: _kVisionEnabled,
+      value: settings.visionEnabled.toString(),
+    );
   }
 
   @override
@@ -78,14 +98,7 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
     await _storage.delete(key: _kVoiceTtsEngine);
     await _storage.delete(key: _kVoiceVadSensitivity);
     await _storage.delete(key: _kVoiceLanguage);
-  }
-}
-
-double _parseDouble(String? raw) {
-  if (raw == null) return 0.5;
-  try {
-    return double.parse(raw);
-  } catch (_) {
-    return 0.5;
+    await _storage.delete(key: _kMinTurnSeconds);
+    await _storage.delete(key: _kVisionEnabled);
   }
 }

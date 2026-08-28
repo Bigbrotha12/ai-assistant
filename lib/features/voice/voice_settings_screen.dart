@@ -30,6 +30,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
   late String _ttsEngine;
   late double _vadSensitivity;
   late String _language;
+  late double _minTurnSeconds;
+  late bool _visionEnabled;
 
   @override
   void initState() {
@@ -47,6 +49,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
     _ttsEngine = defaults.ttsEngine;
     _vadSensitivity = defaults.vadSensitivity;
     _language = defaults.preferredLanguage;
+    _minTurnSeconds = defaults.minTurnSeconds;
+    _visionEnabled = defaults.visionEnabled;
   }
 
   void _apply(VoiceSettings settings) {
@@ -54,6 +58,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
     _ttsEngine = settings.ttsEngine;
     _vadSensitivity = settings.vadSensitivity;
     _language = settings.preferredLanguage;
+    _minTurnSeconds = settings.minTurnSeconds;
+    _visionEnabled = settings.visionEnabled;
   }
 
   /// Repopulates the form from the persisted provider (fires after a save,
@@ -95,6 +101,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
       ttsEngine: _ttsEngine,
       vadSensitivity: _vadSensitivity,
       preferredLanguage: _language,
+      minTurnSeconds: _minTurnSeconds,
+      visionEnabled: _visionEnabled,
     );
     try {
       await ref.read(voiceSettingsProvider.notifier).save(settings);
@@ -232,6 +240,38 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
                 if (value != null) setState(() => _language = value);
               },
             ),
+          ),
+          const SizedBox(height: 24),
+          Text('Vision', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 4),
+          SwitchListTile(
+            title: const Text('Describe images automatically'),
+            subtitle: Text(
+              'Use a vision model to describe attached images for the AI',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            value: _visionEnabled,
+            onChanged: (value) => setState(() => _visionEnabled = value),
+          ),
+          const SizedBox(height: 16),
+          Text('Min silence (seconds)', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 4),
+          Text(
+            'How long silence must last before the turn ends. '
+            'Shorter values end turns faster but may cut off speech.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          Slider(
+            value: _minTurnSeconds,
+            min: 0.1,
+            max: 3.0,
+            divisions: 28,
+            label: _minTurnSeconds.toStringAsFixed(1),
+            onChanged: (value) => setState(() => _minTurnSeconds = value),
           ),
           const SizedBox(height: 24),
           Row(

@@ -24,6 +24,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _secretController = TextEditingController();
   final _mcpSecretController = TextEditingController();
   final _filesSecretController = TextEditingController();
+  final _storageUrlController = TextEditingController();
 
   bool _obscureSecret = true;
   bool _obscureMcpSecret = true;
@@ -43,6 +44,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _secretController.addListener(_onFormChanged);
     _mcpSecretController.addListener(_onFormChanged);
     _filesSecretController.addListener(_onFormChanged);
+    _storageUrlController.addListener(_onFormChanged);
     _handleSettings(ref.read(settingsProvider));
     _formListenersActive = true;
   }
@@ -61,10 +63,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _secretController.removeListener(_onFormChanged);
     _mcpSecretController.removeListener(_onFormChanged);
     _filesSecretController.removeListener(_onFormChanged);
+    _storageUrlController.removeListener(_onFormChanged);
     _hostController.dispose();
     _secretController.dispose();
     _mcpSecretController.dispose();
     _filesSecretController.dispose();
+    _storageUrlController.dispose();
     super.dispose();
   }
 
@@ -88,6 +92,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     return null;
   }
 
+  String? _storageUrlError(String url) {
+    final trimmed = url.trim();
+    if (trimmed.isEmpty) return null;
+    try {
+      final uri = Uri.parse(trimmed);
+      if (uri.scheme.isEmpty || uri.host.isEmpty) {
+        return 'Enter a full URL (e.g. http://host:port)';
+      }
+    } catch (_) {
+      return 'Invalid URL';
+    }
+    return null;
+  }
+
   /// Fills the text controllers from [settings] unless the user already
   /// started editing.
   void _populateControllers(BackendSettings settings) {
@@ -102,6 +120,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
     if (_filesSecretController.text.isEmpty) {
       _filesSecretController.text = settings.filesSecret ?? '';
+    }
+    if (_storageUrlController.text.isEmpty) {
+      _storageUrlController.text = settings.storageUrl ?? '';
     }
   }
 
@@ -144,6 +165,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         secret: _secretController.text,
         mcpSecret: _mcpSecretController.text,
         filesSecret: _filesSecretController.text,
+        storageUrl: _storageUrlController.text,
       );
 
   Future<void> _save() async {
@@ -167,13 +189,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     await _runProbe(settings);
   }
 
-  /// Confirms and clears all saved settings (host, secret, MCP, files token).
+  /// Confirms and clears all saved settings (host, secret, MCP, files token, storage URL).
   Future<void> _clearSettings() async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Clear settings'),
-        content: const Text('Clear saved host, secret and MCP token?'),
+        content: const Text('Clear saved host, secret, MCP token, files token, and storage URL?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -187,12 +209,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-    setState(() {
-      _hostController.clear();
-      _secretController.clear();
-      _mcpSecretController.clear();
-      _filesSecretController.clear();
-    });
+      setState(() {
+        _hostController.clear();
+        _secretController.clear();
+        _mcpSecretController.clear();
+        _filesSecretController.clear();
+        _storageUrlController.clear();
+      });
     await ref.read(settingsProvider.notifier).clear();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -233,9 +256,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final hostText = _hostController.text;
     final secretText = _secretController.text;
     final hostError = _hostError(hostText);
+    final storageUrlError = _storageUrlError(_storageUrlController.text);
     final formValid =
         BackendSettings(host: hostText, secret: secretText).isValid;
-    final canTest = !isLoading && !_probing && hostError == null;
+    final canTest = !isLoading && !_probing && hostError == null && storageUrlError == null;
     // Save requires a structurally valid host AND a non-blank secret, so an
     // invalid configuration is never persisted.
     final canSave = canTest && formValid;
@@ -334,6 +358,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                           () => _obscureFilesSecret = !_obscureFilesSecret),
                     ),
                   ),
+                ),
+                const SizedBox(height: 16),
+                Text('Storage', style: Theme.of(context).textTheme.titleSmall),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _storageUrlController,
+                  enabled: !isLoading,
+                  decoration: InputDecoration(
+                    labelText: 'Storage service URL (optional)',
+                    hintText: 'e.g. http://minio:9000',
+                    border: const OutlineInputBorder(),
+                    helperText: 'Leave blank to use <host>:17603',
+                    errorText: _storageUrlError(_storageUrlController.text),
+                  ),
+                  keyboardType: TextInputType.url,
                 ),
                 const SizedBox(height: 24),
                 Row(

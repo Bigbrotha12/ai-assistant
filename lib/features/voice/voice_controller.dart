@@ -132,6 +132,7 @@ final class VoiceController {
     this.onTranscript,
     this.onDeviceTranscript,
     this.onError,
+    this.onNetworkError,
   }) {
     // Mic frames → LiveKit data channel.
     _micSubscription = micCapture.audioStream.listen(_onMicAudio);
@@ -176,6 +177,10 @@ final class VoiceController {
 
   /// Reports failures encountered by the session.
   void Function(Object error)? onError;
+
+  /// Called when a network-level error is detected. Null when the caller
+  /// does not need network status notifications.
+  final void Function()? onNetworkError;
 
   late final StreamSubscription<List<int>> _micSubscription;
   late final StreamSubscription<List<int>> _audioSubscription;
@@ -417,6 +422,21 @@ final class VoiceController {
     // Keep the thrown object so typed error classification stays possible.
     _update(_state.copyWith(error: error));
     onError?.call(error);
+    final isNet = error is Exception && _isNetworkError(error);
+    if (isNet) {
+      onNetworkError?.call();
+    }
+  }
+
+  /// Heuristic check: is this exception likely a network failure?
+  static bool _isNetworkError(Object error) {
+    final msg = error.toString().toLowerCase();
+    return msg.contains('dioexception') ||
+        msg.contains('socket') ||
+        msg.contains('connection') ||
+        msg.contains('network') ||
+        msg.contains('timeout') ||
+        msg.contains('ioexception');
   }
 
   /// Tears down this controller. The underlying services remain owned by

@@ -1,3 +1,5 @@
+import 'package:drift/drift.dart';
+
 import '../chat/database.dart';
 import 'file_model.dart';
 
@@ -21,6 +23,12 @@ abstract interface class FileStore {
 
   /// Removes every file row.
   Future<void> deleteAll();
+
+  /// Returns the stored description for [fileId], or null when absent.
+  Future<String?> descriptionFor(String fileId);
+
+  /// Persists [description] for [fileId], replacing any existing value.
+  Future<void> setDescription(String fileId, String description);
 }
 
 /// Drift-backed [FileStore].
@@ -63,6 +71,20 @@ class DriftFileStore implements FileStore {
   @override
   Future<void> deleteAll() async {
     await _db.delete(_db.files).go();
+  }
+
+  @override
+  Future<String?> descriptionFor(String fileId) async {
+    final row = await (_db.select(_db.files)..where((t) => t.id.equals(fileId)))
+        .getSingleOrNull();
+    return row?.description;
+  }
+
+  @override
+  Future<void> setDescription(String fileId, String description) async {
+    await (_db.update(_db.files)..where((t) => t.id.equals(fileId))).write(
+      FilesCompanion(description: Value(description)),
+    );
   }
 
   /// Mapping decision (per plan fix M15):

@@ -83,6 +83,12 @@ class FilesClientImpl implements FilesClient {
   /// Only URL-safe ids are ever interpolated into request paths (SSRF guard).
   static final RegExp _safeId = RegExp(r'^[a-zA-Z0-9._-]+$');
 
+  /// REST contract (single /files prefix):
+  /// POST /files — upload (multipart/form-data)
+  /// GET  /files — list
+  /// GET  /files/{id} — fetch
+  /// DELETE /files/{id} — delete
+  ///
   /// Large files on a tailnet can take a while; uploads/fetches get 120s.
   static const Duration _timeout = Duration(seconds: 120);
 
@@ -110,7 +116,7 @@ class FilesClientImpl implements FilesClient {
     });
     try {
       final response = await _dio.post<Map<String, dynamic>>(
-        '$_baseUrl/upload',
+        '$_baseUrl/files',
         data: form,
         options: _auth(),
         cancelToken: cancelToken,
@@ -130,7 +136,7 @@ class FilesClientImpl implements FilesClient {
   Future<List<FileInfo>> listFiles() async {
     try {
       final response = await _dio.get<dynamic>(
-        '$_baseUrl/list',
+        '$_baseUrl/files',
         options: _auth(),
       );
       return _parseFileInfoList(response.data);
@@ -144,7 +150,7 @@ class FilesClientImpl implements FilesClient {
     _assertSafeId(fileId);
     try {
       final response = await _dio.get<List<int>>(
-        '$_baseUrl/fetch/$fileId',
+        '$_baseUrl/files/$fileId',
         options: Options(
           headers: {'Authorization': 'Bearer $_bearerToken'},
           followRedirects: false,

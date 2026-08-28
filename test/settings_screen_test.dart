@@ -33,12 +33,20 @@ class FakeFileCache extends FileCache {
 }
 
 void main() {
-  Widget settingsApp({
+  Widget settingsApp(
+    WidgetTester tester, {
     required FakeSettingsStore store,
     required FilesClient filesClient,
     required FileCache fileCache,
     FakeProbe? probe,
   }) {
+    // The settings form is tall (host, secret, MCP, files token, storage URL,
+    // probe results, Files section, danger zone). Use a tall test viewport so
+    // every section is laid out without scrolling — ListView builds children
+    // lazily, so off-screen widgets are absent from the tree.
+    tester.view.physicalSize = const Size(800, 1800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
     return ProviderScope(
       overrides: [
         settingsStoreProvider.overrideWithValue(store),
@@ -59,7 +67,7 @@ void main() {
         filesSecret: 'files-token',
       ),
     );
-    await tester.pumpWidget(settingsApp(
+    await tester.pumpWidget(settingsApp(tester,
       store: store,
       filesClient: NoOpFilesClient(),
       fileCache: FakeFileCache(),
@@ -72,7 +80,7 @@ void main() {
 
   testWidgets('save persists the files token', (tester) async {
     final store = FakeSettingsStore();
-    await tester.pumpWidget(settingsApp(
+    await tester.pumpWidget(settingsApp(tester,
       store: store,
       filesClient: NoOpFilesClient(),
       fileCache: FakeFileCache(),
@@ -94,7 +102,7 @@ void main() {
 
   testWidgets('shows Files service not configured for a no-op client',
       (tester) async {
-    await tester.pumpWidget(settingsApp(
+    await tester.pumpWidget(settingsApp(tester,
       store: FakeSettingsStore(),
       filesClient: NoOpFilesClient(),
       fileCache: FakeFileCache(),
@@ -114,7 +122,7 @@ void main() {
         filesSecret: 'files-token',
       ),
     );
-    await tester.pumpWidget(settingsApp(
+    await tester.pumpWidget(settingsApp(tester,
       store: store,
       filesClient: FakeFilesClient(),
       fileCache: FakeFileCache(),
@@ -128,7 +136,7 @@ void main() {
   testWidgets('Clear Cache confirms, evicts expired files, and shows a SnackBar',
       (tester) async {
     final cache = FakeFileCache();
-    await tester.pumpWidget(settingsApp(
+    await tester.pumpWidget(settingsApp(tester,
       store: FakeSettingsStore(),
       filesClient: NoOpFilesClient(),
       fileCache: cache,
@@ -146,7 +154,7 @@ void main() {
   });
 
   testWidgets('File Browser button pushes the FilesScreen', (tester) async {
-    await tester.pumpWidget(settingsApp(
+    await tester.pumpWidget(settingsApp(tester,
       store: FakeSettingsStore(),
       filesClient: FakeFilesClient(),
       fileCache: FakeFileCache(),

@@ -9,7 +9,7 @@ import 'config.dart';
 import 'network_errors.dart';
 
 /// Individual backend endpoint probed by [BackendProbe.probe].
-enum BackendCheck { tokenMint, tokenMintAuth, liveKit, llmProxy }
+enum BackendCheck { tokenMint, tokenMintAuth, liveKit, llmProxy, vision }
 
 /// Human-readable label for a [BackendCheck], used by the settings screen.
 extension BackendCheckLabel on BackendCheck {
@@ -18,6 +18,7 @@ extension BackendCheckLabel on BackendCheck {
         BackendCheck.tokenMintAuth => 'Shared secret',
         BackendCheck.liveKit => 'LiveKit signaling',
         BackendCheck.llmProxy => 'LLM proxy',
+        BackendCheck.vision => 'Vision (VL)',
       };
 }
 
@@ -70,7 +71,7 @@ bool debugWebPlatform = kIsWeb;
 /// Probes reachability and readiness of the backend voice stack.
 abstract interface class BackendProbe {
   /// Probes the full backend chain concurrently; results ordered
-  /// [BackendCheck.tokenMint, tokenMintAuth, liveKit, llmProxy].
+  /// [BackendCheck.tokenMint, tokenMintAuth, liveKit, llmProxy, vision].
   Future<BackendStatus> probe(BackendSettings settings);
 }
 
@@ -107,6 +108,7 @@ class DioBackendProbe implements BackendProbe {
       _probeTokenMintAuth(settings),
       _probeLiveKit(settings),
       _probeLlmProxy(settings),
+      _probeVision(settings),
     ]);
     return BackendStatus(checks: results);
   }
@@ -228,6 +230,62 @@ class DioBackendProbe implements BackendProbe {
       },
       httpError: _llmProxyHttpDetail,
     );
+  }
+
+  Future<CheckResult> _probeVision(BackendSettings settings) async {
+    final host = settings.trimmedHost;
+    try {
+      final modelsUrl = BackendConfig.llmProxy(host).replace(path: '/v1/models');
+      final response = await _dio
+          .getUri(
+            modelsUrl,
+            options: Options(
+              connectTimeout: const Duration(seconds: 5),
+              receiveTimeout: const Duration(seconds: 5),
+            ),
+          )
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) {
+        return CheckResult(
+          check: BackendCheck.vision,
+          status: ProbeStatus.error,
+          detail: 'HTTP ${response.statusCode}',
+        );
+      }
+      final data = response.data as Map<String, dynamic>?;
+      final models = data?['data'] as List?;
+      if (models == null) {
+        return const CheckResult(
+          check: BackendCheck.vision,
+          status: ProbeStatus.unreachable,
+          detail: 'no data in models response',
+        );
+      }
+      for (final model in models) {
+        if (model is Map<String, dynamic>) {
+          final id = model['id'] as String?;
+          if (id == 'model.vl') {
+            return const CheckResult(
+              check: BackendCheck.vision,
+              status: ProbeStatus.ok,
+              detail: 'model.vl available',
+            );
+          }
+        }
+      }
+      return const CheckResult(
+        check: BackendCheck.vision,
+        status: ProbeStatus.unreachable,
+        detail: 'model.vl not found',
+      );
+    } catch (e) {
+      final (status, detail) = _classify(e);
+      return CheckResult(
+        check: BackendCheck.vision,
+        status: status,
+        detail: detail,
+      );
+    }
   }
 
   /// Runs [run], translating non-2xx responses into error results and every

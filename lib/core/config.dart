@@ -15,6 +15,24 @@ class BackendConfig {
     'TOKEN_MINT_SHARED_SECRET',
   );
 
+  /// Dev-only fallback storage URL; the runtime settings value always wins.
+  static const String defaultStorageUrl = String.fromEnvironment(
+    'STORAGE_URL',
+    defaultValue: '',
+  );
+
+  /// Resolves the effective storage base URL from three sources (in precedence):
+  /// 1. Runtime settings override (`settings.storageUrl`), non-blank.
+  /// 2. Compile-time env default (`STORAGE_URL` dart-define), non-blank.
+  /// 3. Host-derived (`host:17603`).
+  static String effectiveStorageUrl(String host, String? settingsUrl) {
+    final s = settingsUrl?.trim();
+    if (s != null && s.isNotEmpty) return s;
+    final e = defaultStorageUrl.trim();
+    if (e.isNotEmpty) return e;
+    return files(host).toString();
+  }
+
   /// token-mint: exchanges the shared secret for short-lived LiveKit JWTs.
   static Uri tokenMint(String host) => Uri(scheme: 'http', host: host, port: 17602);
 
