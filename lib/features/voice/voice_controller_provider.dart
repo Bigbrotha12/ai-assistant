@@ -37,7 +37,10 @@ final micCaptureServiceProvider = Provider<MicCaptureService>((ref) {
 });
 
 /// Audio playback of received AI TTS frames.
-final audioPlaybackServiceProvider = Provider<AudioPlaybackService>((ref) {
+///
+/// Typed as [AudioPlayback] so tests can substitute an in-memory fake without
+/// bootstrapping a real audio player.
+final audioPlaybackServiceProvider = Provider<AudioPlayback>((ref) {
   final service = AudioPlaybackService(
     audioSession: ref.watch(audioSessionManagerProvider),
   );

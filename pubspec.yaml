@@ -53,6 +53,8 @@ dependencies:
   image_picker: ^1.1.2
   open_file: ^3.5.10
   path_provider: ^2.1.5
+  # Persisted app-tier preference (core vs premium). Non-sensitive.
+  shared_preferences: ^2.5.5
 
   # Voice Conversation (Phase 4): LiveKit data channel, mic capture, TTS playback,
   # device info for capability detection, on-device STT/TTS engines.
@@ -92,6 +94,32 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # Design system fonts (see docs/design-system.md). Both are variable fonts;
+  # each declared weight maps to the same file so the named weight is applied.
+  fonts:
+    - family: Manrope
+      fonts:
+        - asset: assets/fonts/Manrope-Variable.ttf
+          weight: 400
+        - asset: assets/fonts/Manrope-Variable.ttf
+          weight: 500
+        - asset: assets/fonts/Manrope-Variable.ttf
+          weight: 600
+        - asset: assets/fonts/Manrope-Variable.ttf
+          weight: 700
+        - asset: assets/fonts/Manrope-Variable.ttf
+          weight: 800
+    - family: EBGaramond
+      fonts:
+        - asset: assets/fonts/EBGaramond-Variable.ttf
+          weight: 400
+        - asset: assets/fonts/EBGaramond-Variable.ttf
+          weight: 500
+        - asset: assets/fonts/EBGaramond-Variable.ttf
+          weight: 600
+        - asset: assets/fonts/EBGaramond-Variable.ttf
+          weight: 700
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -7,15 +7,22 @@ import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client_provider.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/core/settings_providers.dart';
+import 'package:ai_assistant/core/theme_providers.dart';
+import 'package:ai_assistant/core/widgets/speak_button.dart';
 import 'package:ai_assistant/features/chat/database_providers.dart';
 import 'package:ai_assistant/features/settings/settings_screen.dart';
+import 'package:ai_assistant/features/voice/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/voice_capture_providers.dart';
+import 'package:ai_assistant/features/voice/voice_controller_provider.dart';
+import 'package:ai_assistant/features/voice/voice_settings_providers.dart';
 import 'package:ai_assistant/main.dart';
 
 import 'fakes.dart';
+import 'features/voice/voice_test_fakes.dart';
 
 void main() {
-  /// Full app under test. Booting the real [AiAssistantApp] lands on
-  /// ChatScreen, so the chat provider graph must be resolvable too.
+  /// Full app under test. Booting the real [AiAssistantApp] lands on the
+  /// voice home screen, so the voice provider graph must be resolvable too.
   Widget app({
     required FakeSettingsStore store,
     required FakeProbe probe,
@@ -28,6 +35,19 @@ void main() {
           backendProbeProvider.overrideWithValue(probe),
           chatStoreProvider.overrideWithValue(chatStore),
           chatApiClientProvider.overrideWithValue(client),
+          // The voice home boots the real audio stack (LiveKit, record,
+          // just_audio, secure storage, path_provider); none of that exists in
+          // widget tests, so every voice service is faked.
+          engineManagerProvider.overrideWithValue(FakeEngineManager()),
+          liveKitServiceProvider.overrideWithValue(FakeLiveKitService()),
+          micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
+          audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+          audioSessionManagerProvider
+              .overrideWithValue(FakeAudioSessionManager()),
+          vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
+          voiceSettingsStoreProvider
+              .overrideWithValue(FakeVoiceSettingsStore()),
+          appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
         ],
         child: const AiAssistantApp(),
       );
@@ -42,12 +62,22 @@ void main() {
         overrides: [
           settingsStoreProvider.overrideWithValue(store),
           backendProbeProvider.overrideWithValue(probe),
+          appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
         ],
         child: const MaterialApp(home: SettingsScreen()),
       );
 
-  group('chat home', () {
-    testWidgets('smoke: app boots to ChatScreen with valid settings',
+  group('voice home', () {
+    /// Bounded pump: the voice home keeps idle animations running (the speak
+    /// button's breathing pulse + ring repeat forever), so [`pumpAndSettle`]
+    /// would time out. Fixed-duration pumps settle providers and route
+    /// transitions without waiting for an idle frame.
+    Future<void> pumpBounded(WidgetTester tester) async {
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+    }
+
+    testWidgets('smoke: app boots to VoiceScreen with valid settings',
         (tester) async {
       final store = FakeSettingsStore(
         stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
@@ -58,12 +88,12 @@ void main() {
         chatStore: FakeChatStore(),
         client: FakeChatClient(),
       ));
-      await tester.pumpAndSettle();
+      await pumpBounded(tester);
 
       expect(find.text('AI Assistant'), findsOneWidget);
-      expect(find.text('Message…'), findsOneWidget);
-      final textField = tester.widget<TextField>(find.byType(TextField));
-      expect(textField.enabled, isTrue);
+      expect(find.byType(SpeakButton), findsOneWidget);
+      expect(find.text('PRESS AND HOLD TO TALK'), findsOneWidget);
+      expect(find.text('Transcript'), findsOneWidget);
       expect(find.text('Backend not configured'), findsNothing);
     });
 
@@ -75,7 +105,7 @@ void main() {
         chatStore: FakeChatStore(),
         client: FakeChatClient(),
       ));
-      await tester.pumpAndSettle();
+      await pumpBounded(tester);
 
       expect(find.text('Backend not configured'), findsOneWidget);
       expect(find.text('Configure Backend'), findsOneWidget);
@@ -91,12 +121,16 @@ void main() {
         chatStore: FakeChatStore(),
         client: FakeChatClient(),
       ));
-      await tester.pumpAndSettle();
+      await pumpBounded(tester);
 
       await tester.tap(find.byIcon(Icons.more_vert));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
       await tester.tap(find.text('Settings'));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
 
       expect(find.text('Backend host'), findsOneWidget);
       expect(find.text('Shared secret'), findsOneWidget);

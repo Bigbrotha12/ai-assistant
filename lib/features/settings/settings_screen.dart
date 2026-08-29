@@ -8,6 +8,7 @@ import '../../core/files_providers.dart';
 import '../../core/files_service.dart';
 import '../../core/probe_providers.dart';
 import '../../core/settings_providers.dart';
+import '../../core/theme_providers.dart';
 import '../attachments/files_screen.dart';
 
 /// App home screen: configure and verify connectivity to the self-hosted
@@ -398,6 +399,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 _buildFiles(context),
                 const SizedBox(height: 32),
                 _buildDangerZone(context),
+                const SizedBox(height: 32),
+                _buildAppearance(context),
               ],
             ),
           ),
@@ -552,6 +555,46 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           onPressed: _clearSettings,
           icon: Icon(Icons.delete_outline, color: scheme.error),
           label: Text('Clear settings', style: TextStyle(color: scheme.error)),
+        ),
+      ],
+    );
+  }
+
+  /// "Appearance" section: visual tier toggle (standard core vs premium
+  /// paper-and-gold). Adding the section at the *end* of the list keeps the
+  /// text-field indices used by the settings tests stable.
+  Widget _buildAppearance(BuildContext context) {
+    final theme = Theme.of(context);
+    final tier = ref.watch(appTierProvider).value ?? AppTier.standard;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Appearance', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        Text(
+          'Premium: warm paper surfaces, gold accents, serif headlines.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 12),
+        SegmentedButton<AppTier>(
+          segments: const [
+            ButtonSegment(
+              value: AppTier.standard,
+              label: Text('Standard'),
+              icon: Icon(Icons.light_mode_outlined),
+            ),
+            ButtonSegment(
+              value: AppTier.premium,
+              label: Text('Premium'),
+              icon: Icon(Icons.auto_awesome_outlined),
+            ),
+          ],
+          selected: {tier},
+          onSelectionChanged: (selection) {
+            ref.read(appTierProvider.notifier).setTier(selection.first);
+          },
         ),
       ],
     );

@@ -2,11 +2,61 @@ import 'dart:async';
 
 import 'package:ai_assistant/features/voice/audio_playback_service.dart';
 import 'package:ai_assistant/features/voice/audio_session_manager.dart';
+import 'package:ai_assistant/features/voice/engine_manager.dart';
 import 'package:ai_assistant/features/voice/livekit_service.dart';
 import 'package:ai_assistant/features/voice/mic_capture_service.dart';
+import 'package:ai_assistant/features/voice/model_downloader.dart';
 import 'package:ai_assistant/features/voice/stt_engine.dart';
 import 'package:ai_assistant/features/voice/tts_engine.dart';
 import 'package:ai_assistant/features/voice/vad_processor.dart';
+import 'package:ai_assistant/features/voice/voice_settings.dart';
+import 'package:ai_assistant/features/voice/voice_settings_store.dart';
+
+/// In-memory [EngineManager] double for widget tests.
+///
+/// The real manager resolves model paths via `path_provider` and downloads
+/// executables, which is neither available nor desirable in tests. All
+/// overrides are no-ops with hollow statuses.
+class FakeEngineManager extends EngineManager {
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  Future<void> get initialized async {}
+
+  @override
+  Map<String, VoiceEngineStatus> get allStatuses => const {};
+
+  @override
+  SttEngine? get sttEngine => null;
+
+  @override
+  TtsEngine? get ttsEngine => null;
+
+  @override
+  Stream<ModelDownloadProgress> get downloadProgress => const Stream.empty();
+
+  @override
+  Future<bool> ensureModelsDownloaded({
+    void Function(String modelId)? progress,
+  }) async => false;
+}
+
+/// In-memory [VoiceSettingsStore] double returning default settings.
+class FakeVoiceSettingsStore implements VoiceSettingsStore {
+  FakeVoiceSettingsStore([this.saved = const VoiceSettings()]);
+
+  VoiceSettings? saved;
+
+  @override
+  Future<VoiceSettings?> load() async => saved;
+
+  @override
+  Future<void> save(VoiceSettings settings) async => saved = settings;
+
+  @override
+  Future<void> clear() async => saved = null;
+}
 
 /// In-memory [LiveKitService] double used across voice controller tests.
 ///

@@ -8,10 +8,24 @@ import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/files_service.dart';
 import 'package:ai_assistant/core/settings_store.dart';
+import 'package:ai_assistant/core/theme_providers.dart';
 import 'package:ai_assistant/features/attachments/file_model.dart';
 import 'package:ai_assistant/features/attachments/file_store.dart';
 import 'package:ai_assistant/features/chat/chat_store.dart';
 import 'package:ai_assistant/features/chat/message_model.dart';
+
+/// In-memory [AppTierStore] for widget tests.
+class FakeAppTierStore implements AppTierStore {
+  FakeAppTierStore([this.saved]);
+
+  AppTier? saved;
+
+  @override
+  Future<AppTier?> load() async => saved;
+
+  @override
+  Future<void> save(AppTier tier) async => saved = tier;
+}
 
 /// In-memory [SettingsStore] for widget tests.
 class FakeSettingsStore implements SettingsStore {

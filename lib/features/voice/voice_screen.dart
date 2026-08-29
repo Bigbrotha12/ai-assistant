@@ -6,8 +6,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 
+import '../chat/chat_screen.dart';
 import '../settings/settings_screen.dart';
 import '../../core/settings_providers.dart';
+import '../../core/theme.dart';
+import '../../core/widgets/golden_pill.dart';
+import '../../core/widgets/speak_button.dart';
 import 'engine_config.dart';
 import 'engine_errors.dart';
 import 'engine_manager.dart';
@@ -16,13 +20,16 @@ import 'model_downloader.dart';
 import 'voice_capture_providers.dart';
 import 'voice_controller.dart';
 import 'voice_controller_provider.dart';
+import 'voice_settings_screen.dart';
 
-/// Full-screen live voice conversation UI.
+/// Voice-first home screen: a single large hold-to-talk [SpeakButton], a
+/// quiet status line, and a Transcript [GoldenPill] whose panel expands
+/// upward from the bottom of the screen.
 ///
 /// Consumes the existing voice providers ([voiceConversationStateProvider],
 /// [voiceCapturePipelineProvider] and the engine status providers); it does not
-/// reimplement any audio service. Tapping the mic ensures a LiveKit session
-/// first, then starts the capture pipeline (VAD-gated).
+/// reimplement any audio service. Pressing the speak button ensures a LiveKit
+/// session first, then starts the capture pipeline (VAD-gated).
 class VoiceScreen extends ConsumerStatefulWidget {
   const VoiceScreen({super.key});
 
@@ -46,6 +53,10 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
   bool _engineBusy = false;
 
+  /// Whether the live transcript panel is expanded (docs: chevron points up
+  /// because the panel rises from the bottom).
+  bool _transcriptOpen = false;
+
   /// Errors raised outside the controller (e.g. mic permission before the
   /// pipeline starts) so they surface in the same banner as state errors.
   String? _localError;
@@ -53,15 +64,12 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   @override
   void dispose() {
     _logScroll.dispose();
-    if (ref.exists(voiceCapturePipelineProvider)) {
-      final pipeline = ref.read(voiceCapturePipelineProvider);
-      if (pipeline.isRecording) {
-        unawaited(pipeline.stopRecording());
-      }
-    }
-    if (ref.exists(voiceControllerProvider)) {
-      unawaited(ref.read(voiceControllerProvider).disconnect());
-    }
+    // The voice providers own their teardown: `VoiceCapturePipelineNotifier`
+    // and `VoiceControllerNotifier` dispose the pipeline (stopping any active
+    // recording) and the controller (disconnecting the room) via their
+    // `ref.onDispose` callbacks once the last listener — this screen and the
+    // conversation-state notifier — is gone. Calling `ref.read(...)` here is
+    // both unsafe (Riverpod forbids ref after unmount) and unnecessary.
     super.dispose();
   }
 
@@ -80,33 +88,21 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     });
   }
 
-  Future<void> _tapMic() async {
+  /// Starts a hold-to-talk recording: stops any active recording (toggle), or
+  /// ensures a LiveKit room then starts the capture pipeline.
+  Future<void> _holdStart() async {
     if (_micBusy) return;
     final pipeline = ref.read(voiceCapturePipelineProvider);
-
     if (pipeline.isRecording) {
-      setState(() => _micBusy = true);
-      try {
-        await pipeline.stopRecording();
-        if (mounted) {
-          setState(() => _localRecording = false);
-        }
-      } catch (_) {
-        // Failures surface through the conversation state; never crash.
-      } finally {
-        if (mounted) setState(() => _micBusy = false);
-      }
+      await _holdEnd();
       return;
     }
-
     final controller = ref.read(voiceControllerProvider);
     setState(() {
       _micBusy = true;
       _localError = null;
     });
     try {
-      // The conversation runs over a LiveKit data channel; make sure a room is
-      // joined before capturing, otherwise the controller refuses recording.
       if (!controller.state.isConnected) {
         await controller.connectToRoom(roomName: _roomId);
       }
@@ -123,6 +119,20 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       }
     } finally {
       if (mounted) setState(() => _micBusy = false);
+    }
+  }
+
+  /// Stops the hold-to-talk recording on release.
+  Future<void> _holdEnd() async {
+    final pipeline = ref.read(voiceCapturePipelineProvider);
+    if (!pipeline.isRecording) return;
+    try {
+      await pipeline.stopRecording();
+      if (mounted) {
+        setState(() => _localRecording = false);
+      }
+    } catch (_) {
+      // Failures surface through the conversation state; never crash.
     }
   }
 
@@ -176,11 +186,15 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     }
   }
 
-  void _openBackendSettings() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const SettingsScreen()),
-    );
+  void _push(Widget screen) {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => screen));
   }
+
+  void _openBackendSettings() => _push(const SettingsScreen());
+
+  void _openChat() => _push(const ChatScreen());
+
+  void _openVoiceSettings() => _push(const VoiceSettingsScreen());
 
   @override
   Widget build(BuildContext context) {
@@ -190,12 +204,36 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     });
 
     final scheme = Theme.of(context).colorScheme;
+    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
     final recording = state.isRecording || _localRecording;
     final error = state.error ?? _localError;
     final settingsValid = ref.watch(settingsProvider).value?.isValid ?? false;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Voice Conversation')),
+      appBar: AppBar(
+        title: const Text('AI Assistant'),
+        actions: [
+          IconButton(
+            tooltip: 'Chat',
+            icon: const Icon(Icons.chat_bubble_outline),
+            onPressed: _openChat,
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              switch (value) {
+                case 'voice-settings':
+                  _openVoiceSettings();
+                case 'settings':
+                  _openBackendSettings();
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'voice-settings', child: Text('Voice Settings')),
+              PopupMenuItem(value: 'settings', child: Text('Settings')),
+            ],
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Column(
           children: [
@@ -210,43 +248,108 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                 onConfigureBackend: _openBackendSettings,
                 onRetry: _retryConnection,
               ),
-            Padding(
-              padding: const EdgeInsets.only(top: 16),
-              child: _StatusHeader(
-                recording: recording,
-                aiSpeaking: state.isAiSpeaking,
-                connected: state.isConnected,
-                paused: state.isPaused,
-              ),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              height: 44,
-              child: _Waveform(active: recording, color: scheme.primary),
-            ),
-            const SizedBox(height: 8),
-            Center(
-              child: _MicButton(
-                recording: recording,
-                busy: _micBusy,
-                onPressed: _tapMic,
-              ),
-            ),
-            const SizedBox(height: 16),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: _LiveTranscriptCard(
-                transcript: state.onDeviceTranscript ?? state.lastTranscript,
-                recording: recording,
-              ),
-            ),
-            const SizedBox(height: 12),
             Expanded(
-              child: _MessageLog(
-                controller: _logScroll,
-                entries: _transcripts,
-                aiSpeaking: state.isAiSpeaking,
-                connected: state.isConnected,
+              child: Column(
+                children: [
+                  Expanded(
+                    child: Center(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 12,
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            _HeroStatus(
+                              recording: recording,
+                              aiSpeaking: state.isAiSpeaking,
+                              connected: state.isConnected,
+                              paused: state.isPaused,
+                              premium: tier.premium,
+                            ),
+                            if (tier.premium) ...[
+                              const SizedBox(height: 10),
+                              Text(
+                                'Speak',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .displaySmall
+                                    ?.copyWith(
+                                      color: scheme.onSurface,
+                                    ),
+                              ),
+                            ],
+                            AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 200),
+                              child: recording || state.isAiSpeaking
+                                  ? Padding(
+                                      key: const ValueKey('waveform'),
+                                      padding: const EdgeInsets.only(top: 16),
+                                      child: _Waveform(
+                                        active: recording,
+                                        color: tier.premium
+                                            ? AppColors.goldBase
+                                            : scheme.primary,
+                                      ),
+                                    )
+                                  : const SizedBox(
+                                      key: ValueKey('waveform-idle'),
+                                      height: 22,
+                                    ),
+                            ),
+                            const SizedBox(height: 20),
+                            SpeakButton(
+                              recording: recording,
+                              aiSpeaking: state.isAiSpeaking,
+                              busy: _micBusy,
+                              onHoldStart: _holdStart,
+                              onHoldEnd: _holdEnd,
+                            ),
+                            const SizedBox(height: 18),
+                            Text(
+                              'PRESS AND HOLD TO TALK',
+                              style: Theme.of(context).textTheme.labelSmall
+                                  ?.copyWith(
+                                    letterSpacing: 1.4,
+                                    color: tier.premium
+                                        ? AppColors.goldDark
+                                        : scheme.onSurfaceVariant,
+                                  ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  // Transcript panel: expands upward from the pill, so the
+                  // pill's chevron points UP when closed and DOWN when open.
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeOutCubic,
+                    alignment: Alignment.topCenter,
+                    child: _transcriptOpen
+                        ? SizedBox(
+                            height: 176,
+                            child: _MessageLog(
+                              controller: _logScroll,
+                              entries: _transcripts,
+                              aiSpeaking: state.isAiSpeaking,
+                              connected: state.isConnected,
+                            ),
+                          )
+                        : const SizedBox(width: double.infinity),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 14, top: 8),
+                    child: GoldenPill(
+                      label: 'Transcript',
+                      trailing: _transcripts.isEmpty ? null : '${_transcripts.length}',
+                      open: _transcriptOpen,
+                      onTap: () => setState(() => _transcriptOpen = !_transcriptOpen),
+                    ),
+                  ),
+                ],
               ),
             ),
             _EngineStatusBar(
@@ -256,6 +359,52 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Quiet status line above the speak button (§3.4): idle copy, or the live
+/// state (recording / AI speaking / paused / connected).
+class _HeroStatus extends StatelessWidget {
+  const _HeroStatus({
+    required this.recording,
+    required this.aiSpeaking,
+    required this.connected,
+    required this.paused,
+    required this.premium,
+  });
+
+  final bool recording;
+  final bool aiSpeaking;
+  final bool connected;
+  final bool paused;
+  final bool premium;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+
+    final (icon, color, label) = paused
+        ? (Icons.pause_circle_outline, scheme.onSurfaceVariant, 'Paused')
+        : recording
+            ? (Icons.mic, premium ? AppColors.goldDark : scheme.error, 'Listening…')
+            : aiSpeaking
+                ? (Icons.volume_up, premium ? AppColors.goldBase : scheme.primary, 'AI is speaking…')
+                : connected
+                    ? (Icons.check_circle, premium ? AppColors.goldBase : scheme.primary, 'Connected')
+                    : (Icons.mic_none, scheme.onSurfaceVariant, 'Press and hold to talk');
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, color: color, size: 18),
+        const SizedBox(width: 8),
+        Text(
+          label,
+          style: theme.textTheme.labelMedium?.copyWith(color: color),
+        ),
+      ],
     );
   }
 }
@@ -447,84 +596,8 @@ class _FallbackBanner extends ConsumerWidget {
   }
 }
 
-/// Compact summary of the live conversation state at the top of the screen.
-class _StatusHeader extends StatelessWidget {
-  const _StatusHeader({
-    required this.recording,
-    required this.aiSpeaking,
-    required this.connected,
-    required this.paused,
-  });
-
-  final bool recording;
-  final bool aiSpeaking;
-  final bool connected;
-  final bool paused;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final (icon, color, label) = paused
-        ? (Icons.pause_circle_outline, scheme.onSurfaceVariant, 'Paused')
-        : recording
-            ? (Icons.mic, scheme.error, 'Recording…')
-            : aiSpeaking
-                ? (Icons.volume_up, scheme.primary, 'AI is speaking…')
-                : connected
-                    ? (Icons.check_circle, Colors.green.shade600, 'Connected')
-                    : (Icons.mic_none, scheme.onSurfaceVariant,
-                        'Tap the mic to start');
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(icon, color: color, size: 20),
-        const SizedBox(width: 8),
-        Text(
-          label,
-          style: theme.textTheme.titleSmall?.copyWith(color: color),
-        ),
-      ],
-    );
-  }
-}
-
-/// Large circular microphone / stop button that toggles recording.
-class _MicButton extends StatelessWidget {
-  const _MicButton({
-    required this.recording,
-    required this.busy,
-    required this.onPressed,
-  });
-
-  final bool recording;
-  final bool busy;
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return FilledButton(
-      onPressed: busy ? null : onPressed,
-      style: FilledButton.styleFrom(
-        shape: const CircleBorder(),
-        padding: const EdgeInsets.all(28),
-        backgroundColor: recording ? scheme.error : scheme.primary,
-        foregroundColor: recording ? scheme.onError : scheme.onPrimary,
-        disabledBackgroundColor: scheme.surfaceContainerHighest,
-        disabledForegroundColor: scheme.onSurfaceVariant,
-      ),
-      child: SizedBox(
-        width: 44,
-        height: 44,
-        child: Icon(recording ? Icons.stop : Icons.mic, size: 36),
-      ),
-    );
-  }
-}
-
 /// Animated bar visualiser that pulses while recording and collapses to a
-/// flat row when idle.
+/// flat row when idle (kept small so the hero speaks for itself).
 class _Waveform extends StatefulWidget {
   const _Waveform({required this.active, required this.color});
 
@@ -573,9 +646,9 @@ class _WaveformState extends State<_Waveform>
   }
 
   double _barHeight(int index, double t) {
-    if (!widget.active) return 6;
+    if (!widget.active) return 4;
     final wave = math.sin((t * 2 * math.pi) + index * 0.9);
-    return 8 + 24 * (0.5 + 0.5 * wave);
+    return 6 + 14 * (0.5 + 0.5 * wave);
   }
 
   @override
@@ -590,59 +663,18 @@ class _WaveformState extends State<_Waveform>
           children: [
             for (var i = 0; i < _barCount; i++) ...[
               Container(
-                width: 5,
+                width: 4,
                 height: _barHeight(i, t),
                 decoration: BoxDecoration(
                   color: widget.color,
                   borderRadius: BorderRadius.circular(3),
                 ),
               ),
-              if (i != _barCount - 1) const SizedBox(width: 5),
+              if (i != _barCount - 1) const SizedBox(width: 4),
             ],
           ],
         );
       },
-    );
-  }
-}
-
-/// Card showing the most recent recognised user speech.
-class _LiveTranscriptCard extends StatelessWidget {
-  const _LiveTranscriptCard({required this.transcript, required this.recording});
-
-  final String? transcript;
-  final bool recording;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final text = transcript?.trim();
-    return Card(
-      margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Live transcript',
-              style: theme.textTheme.labelMedium?.copyWith(
-                color: scheme.primary,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              (text == null || text.isEmpty)
-                  ? (recording ? 'Listening…' : 'Tap the mic and start speaking')
-                  : text,
-              maxLines: 4,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.bodyMedium,
-            ),
-          ],
-        ),
-      ),
     );
   }
 }
@@ -670,7 +702,7 @@ class _MessageLog extends StatelessWidget {
         child: Text(
           connected
               ? 'Nothing yet — start speaking'
-              : 'Tap the mic to start a conversation',
+              : 'Hold the button to start a conversation',
           style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
@@ -779,7 +811,7 @@ class _EngineStatusBar extends ConsumerWidget {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -860,7 +892,9 @@ class _EngineStatusChip extends StatelessWidget {
       VoiceEngineStatus.downloading => (
           Icons.downloading,
           scheme.primary,
-          percent == null ? 'downloading…' : 'downloading ${(percent * 100).round()}%',
+          percent == null
+              ? 'downloading…'
+              : 'downloading ${(percent * 100).round()}%',
         ),
       VoiceEngineStatus.failed => (
           Icons.error_outline,
@@ -880,11 +914,11 @@ class _EngineStatusChip extends StatelessWidget {
     };
 
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: scheme.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: scheme.outlineVariant),
+        color: scheme.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(AppRadii.lg),
+        border: Border.all(color: scheme.outline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -896,7 +930,7 @@ class _EngineStatusChip extends StatelessWidget {
               Expanded(child: Text(label, style: theme.textTheme.labelLarge)),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 2),
           Text(
             subtitle,
             maxLines: 1,
@@ -904,7 +938,7 @@ class _EngineStatusChip extends StatelessWidget {
             style: theme.textTheme.bodySmall?.copyWith(color: color),
           ),
           if (needsAction) ...[
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             Align(
               alignment: Alignment.centerLeft,
               child: TextButton.icon(
@@ -914,7 +948,7 @@ class _EngineStatusChip extends StatelessWidget {
               ),
             ),
           ] else if (downloading) ...[
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             LinearProgressIndicator(value: percent, minHeight: 4),
           ],
         ],

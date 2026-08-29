@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../core/theme.dart';
 import '../attachments/file_attachment_chip.dart';
 import 'markdown_renderer.dart';
 import 'message_model.dart';
@@ -23,14 +24,37 @@ class MessageBubble extends StatelessWidget {
 
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final tier = theme.extension<TierTheme>() ?? const TierTheme(premium: false);
 
     final isUser = message.role == MessageRole.user;
 
+    // §4.2 bubbles: user = primary-tint fill with a 4px "tail" on the lower
+    // right; assistant = raised surface with an outline (premium: paper +
+    // hairline gold) and a 4px tail on the lower left. Gold stays an accent.
     final background = isUser
-        ? scheme.primaryContainer
-        : scheme.surfaceContainerHighest;
+        ? (tier.premium ? AppColors.primarySoft : scheme.primaryContainer)
+        : (tier.premium ? AppColors.paperRaised : scheme.surfaceContainerLowest);
     final foreground =
         isUser ? scheme.onPrimaryContainer : scheme.onSurface;
+    final borderRadius = isUser
+        ? const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(16),
+            bottomRight: Radius.circular(4),
+          )
+        : const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(4),
+            bottomRight: Radius.circular(16),
+          );
+    final border = isUser
+        ? null
+        : Border.all(
+            color: tier.premium ? AppColors.goldBase : scheme.outline,
+            width: tier.premium ? 1 : 1,
+          );
 
     final content = isUser
         ? Text(
@@ -51,7 +75,8 @@ class MessageBubble extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
             color: background,
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: borderRadius,
+            border: border,
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

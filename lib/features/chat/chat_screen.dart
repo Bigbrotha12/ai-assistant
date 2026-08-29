@@ -7,6 +7,8 @@ import 'package:uuid/uuid.dart';
 import '../../core/files_providers.dart';
 import '../../core/files_service.dart';
 import '../../core/settings_providers.dart';
+import '../../core/theme.dart';
+import '../../core/widgets/gold_band.dart';
 import '../attachments/attachment_picker.dart';
 import '../attachments/file_model.dart';
 import '../settings/settings_screen.dart';
@@ -107,6 +109,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     });
   }
 
+  /// Voice shortcut FAB. In the premium tier the FAB gets a metallic gold
+  /// ring (§3.2: gold on the edge, never as a fill).
+  Widget _buildVoiceFab() {
+    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
+    final fab = FloatingActionButton(
+      tooltip: 'Voice Conversation',
+      onPressed: () => Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const VoiceScreen()),
+      ),
+      child: const Icon(Icons.mic),
+    );
+    if (!tier.premium) return fab;
+    return GoldEdge(
+      bandWidth: GoldBand.cta,
+      radius: AppRadii.pill,
+      fill: AppColors.paperRaised,
+      child: Padding(
+        padding: const EdgeInsets.all(GoldBand.cta),
+        child: fab,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final stateAsync = ref.watch(conversationProvider(_conversationId));
@@ -176,13 +201,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        tooltip: 'Voice Conversation',
-        onPressed: () => Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => const VoiceScreen()),
-        ),
-        child: const Icon(Icons.mic),
-      ),
+      floatingActionButton: _buildVoiceFab(),
       body: Column(
         children: [
           if (!settingsValid) _ConfigureBanner(),
@@ -285,9 +304,17 @@ class _InputBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
     return Material(
       color: scheme.surface,
-      elevation: 4,
+      // Hairline divider instead of a cast shadow; premium upgrades it to a
+      // gold hairline (§3.2).
+      shape: Border(
+        top: BorderSide(
+          color: tier.premium ? AppColors.goldBase : scheme.outline,
+          width: tier.premium ? GoldBand.hairline : 1.0,
+        ),
+      ),
       child: SafeArea(
         top: false,
         child: Padding(
@@ -312,13 +339,6 @@ class _InputBar extends StatelessWidget {
                       textInputAction: TextInputAction.newline,
                       decoration: const InputDecoration(
                         hintText: 'Message…',
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.all(Radius.circular(24)),
-                        ),
-                        contentPadding: EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 12,
-                        ),
                       ),
                     ),
                   ),
