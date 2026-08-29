@@ -1,18 +1,29 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/auth_client.dart';
+import '../../core/auth_client_provider.dart';
+import '../../core/auth_credentials_providers.dart';
 import '../../core/backend_probe.dart';
 import '../../core/backend_settings.dart';
+import '../../core/backend_validation.dart';
 import '../../core/config.dart';
 import '../../core/files_providers.dart';
 import '../../core/files_service.dart';
+import '../../core/prefs_options.dart';
+import '../../core/prefs_providers.dart';
+import '../../core/prefs_store.dart';
 import '../../core/probe_providers.dart';
 import '../../core/settings_providers.dart';
 import '../../core/theme_providers.dart';
+import '../../core/widgets/probe_status_row.dart';
+import '../../features/voice/voice_settings.dart';
+import '../../features/voice/voice_settings_providers.dart';
 import '../attachments/files_screen.dart';
+import '../auth/auth_flow.dart';
 
 /// App home screen: configure and verify connectivity to the self-hosted
-/// backend stack (token-mint, LiveKit, LLM proxy).
+/// backend gateway (auth, inference, vision).
 class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
 
@@ -22,17 +33,30 @@ class SettingsScreen extends ConsumerStatefulWidget {
 
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _hostController = TextEditingController();
-  final _secretController = TextEditingController();
   final _mcpSecretController = TextEditingController();
   final _filesSecretController = TextEditingController();
   final _storageUrlController = TextEditingController();
 
-  bool _obscureSecret = true;
   bool _obscureMcpSecret = true;
   bool _obscureFilesSecret = true;
   bool _probing = false;
   bool _didAutoProbe = false;
   BackendStatus? _status;
+
+  /// Dev vs production environment; saved together with the backend form and
+  /// drives the http/https scheme used by every derived backend URI.
+  BackendEnvironment _environment = BackendConfig.defaultEnvironment;
+
+  /// Whether the account re-auth form ([AuthFlow]) is revealed in the Account
+  /// section, and (when it is) whether it was opened by "Rotate key".
+  bool _authFlowVisible = false;
+  bool _authFlowForRotation = false;
+
+  /// The key id / session token of the credentials being rotated, captured
+  /// when "Rotate key" is tapped so the superseded key can be revoked once the
+  /// rotation succeeds (the fresh session replaces them in the store).
+  String? _rotationOldKeyId;
+  String? _rotationOldSessionToken;
 
   /// Guards controller listeners until after [initState], when a setState()
   /// triggered by the initial field population is no longer needed.
@@ -42,7 +66,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   void initState() {
     super.initState();
     _hostController.addListener(_onFormChanged);
-    _secretController.addListener(_onFormChanged);
     _mcpSecretController.addListener(_onFormChanged);
     _filesSecretController.addListener(_onFormChanged);
     _storageUrlController.addListener(_onFormChanged);
@@ -61,50 +84,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   @override
   void dispose() {
     _hostController.removeListener(_onFormChanged);
-    _secretController.removeListener(_onFormChanged);
     _mcpSecretController.removeListener(_onFormChanged);
     _filesSecretController.removeListener(_onFormChanged);
     _storageUrlController.removeListener(_onFormChanged);
     _hostController.dispose();
-    _secretController.dispose();
     _mcpSecretController.dispose();
     _filesSecretController.dispose();
     _storageUrlController.dispose();
     super.dispose();
-  }
-
-  /// Validates the host field, returning an error message or null when the
-  /// host is usable as a URI authority (no scheme, path, whitespace, or other
-  /// invalid characters).
-  String? _hostError(String host) {
-    final trimmed = host.trim();
-    if (trimmed.isEmpty) {
-      return 'Enter the backend host';
-    }
-    if (RegExp(r'\s').hasMatch(trimmed)) {
-      return 'Host must not contain whitespace';
-    }
-    if (trimmed.contains('://') || trimmed.contains('/')) {
-      return 'Enter a host name, not a URL';
-    }
-    if (RegExp(r'[^a-zA-Z0-9.\-:]').hasMatch(trimmed)) {
-      return 'Host contains invalid characters';
-    }
-    return null;
-  }
-
-  String? _storageUrlError(String url) {
-    final trimmed = url.trim();
-    if (trimmed.isEmpty) return null;
-    try {
-      final uri = Uri.parse(trimmed);
-      if (uri.scheme.isEmpty || uri.host.isEmpty) {
-        return 'Enter a full URL (e.g. http://host:port)';
-      }
-    } catch (_) {
-      return 'Invalid URL';
-    }
-    return null;
   }
 
   /// Fills the text controllers from [settings] unless the user already
@@ -112,9 +99,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   void _populateControllers(BackendSettings settings) {
     if (_hostController.text.isEmpty) {
       _hostController.text = settings.host;
-    }
-    if (_secretController.text.isEmpty) {
-      _secretController.text = settings.secret;
     }
     if (_mcpSecretController.text.isEmpty) {
       _mcpSecretController.text = settings.mcpSecret ?? '';
@@ -162,12 +146,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   BackendSettings _settingsFromForm() => BackendSettings(
-        host: _hostController.text,
-        secret: _secretController.text,
-        mcpSecret: _mcpSecretController.text,
-        filesSecret: _filesSecretController.text,
-        storageUrl: _storageUrlController.text,
-      );
+      host: _hostController.text,
+      environment: _environment,
+      mcpSecret: _mcpSecretController.text,
+      filesSecret: _filesSecretController.text,
+      storageUrl: _storageUrlController.text,
+    );
 
   Future<void> _save() async {
     final settings = _settingsFromForm();
@@ -190,13 +174,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     await _runProbe(settings);
   }
 
-  /// Confirms and clears all saved settings (host, secret, MCP, files token, storage URL).
+  /// Confirms and clears all saved settings (host, MCP, files token, storage URL).
   Future<void> _clearSettings() async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Clear settings'),
-        content: const Text('Clear saved host, secret, MCP token, files token, and storage URL?'),
+        content: const Text('Clear saved host, MCP token, files token, and storage URL?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -212,7 +196,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     if (confirmed != true || !mounted) return;
       setState(() {
         _hostController.clear();
-        _secretController.clear();
         _mcpSecretController.clear();
         _filesSecretController.clear();
         _storageUrlController.clear();
@@ -236,15 +219,85 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   void _handleSettings(AsyncValue<BackendSettings?> value) {
     final fallback = BackendSettings(
       host: BackendConfig.defaultHost,
-      secret: BackendConfig.defaultSecret,
+      environment: BackendConfig.defaultEnvironment,
     );
     value.when(
       data: (settings) {
         _populateControllers(settings ?? fallback);
+        _environment = (settings ?? fallback).environment;
         _maybeAutoProbe(settings);
       },
-      error: (_, _) => _populateControllers(fallback),
+      error: (_, _) {
+        _populateControllers(fallback);
+        _environment = fallback.environment;
+      },
       loading: () {},
+    );
+  }
+
+  /// Shared AuthFlow completion handler for both "Sign in" and "Rotate key".
+  /// The key was already minted and persisted by [AuthFlow]; here we only
+  /// revoke the superseded key (rotation), collapse the form and confirm.
+  Future<void> _onAuthSuccess(AuthSession session) async {
+    final wasRotation = _authFlowForRotation;
+    final oldKeyId = _rotationOldKeyId;
+    final oldSessionToken = _rotationOldSessionToken;
+    setState(() {
+      _authFlowVisible = false;
+      _authFlowForRotation = false;
+      _rotationOldKeyId = null;
+      _rotationOldSessionToken = null;
+    });
+    if (wasRotation) {
+      // Best-effort server cleanup: revoke the superseded key (using the
+      // fresh session, which belongs to the same account) and sign the old
+      // session out. The new key is already persisted and usable, so a
+      // failure here must not surface.
+      final auth = ref.read(authClientProvider);
+      try {
+        if (oldKeyId != null) {
+          await auth.revokeApiKey(sessionToken: session.token, keyId: oldKeyId);
+        }
+        if (oldSessionToken != null) {
+          await auth.signOut(sessionToken: oldSessionToken);
+        }
+      } catch (_) {
+        // Swallow: the old key stays server-side but is no longer used.
+      }
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(wasRotation ? 'New API key minted' : 'Signed in'),
+      ),
+    );
+  }
+
+  /// Client-side sign-out. Revokes the stored API key and signs the session
+  /// out on the server (best-effort, so an unreachable gateway still signs
+  /// out locally), then clears the persisted credentials.
+  Future<void> _signOut() async {
+    setState(() => _authFlowVisible = false);
+    final creds = ref.read(authCredentialsProvider).value;
+    if (creds != null) {
+      final sessionToken = creds.sessionToken;
+      final keyId = creds.keyId;
+      final auth = ref.read(authClientProvider);
+      try {
+        if (sessionToken != null && keyId != null) {
+          await auth.revokeApiKey(sessionToken: sessionToken, keyId: keyId);
+        }
+        if (sessionToken != null) {
+          await auth.signOut(sessionToken: sessionToken);
+        }
+      } catch (_) {
+        // Best-effort: revocation must not block local sign-out.
+      }
+    }
+    await ref.read(authCredentialsProvider.notifier).clear();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Signed out')),
     );
   }
 
@@ -255,15 +308,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
     final isLoading = settingsAsync.isLoading;
     final hostText = _hostController.text;
-    final secretText = _secretController.text;
-    final hostError = _hostError(hostText);
-    final storageUrlError = _storageUrlError(_storageUrlController.text);
-    final formValid =
-        BackendSettings(host: hostText, secret: secretText).isValid;
+    final hostError = validateHost(hostText);
+    final storageUrlError = validateStorageUrl(_storageUrlController.text);
+    // Test and Save both require a structurally valid host and storage URL.
     final canTest = !isLoading && !_probing && hostError == null && storageUrlError == null;
-    // Save requires a structurally valid host AND a non-blank secret, so an
-    // invalid configuration is never persisted.
-    final canSave = canTest && formValid;
+    final canSave = canTest;
 
     return Scaffold(
       appBar: AppBar(title: const Text('AI Assistant')),
@@ -286,27 +335,32 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
-                TextField(
-                  controller: _secretController,
-                  enabled: !isLoading,
-                  obscureText: _obscureSecret,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  keyboardType: TextInputType.visiblePassword,
-                  decoration: InputDecoration(
-                    labelText: 'Shared secret',
-                    border: const OutlineInputBorder(),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _obscureSecret
-                            ? Icons.visibility_off
-                            : Icons.visibility,
-                      ),
-                      tooltip: _obscureSecret ? 'Show secret' : 'Hide secret',
-                      onPressed: () =>
-                          setState(() => _obscureSecret = !_obscureSecret),
+                Text('Environment', style: Theme.of(context).textTheme.titleSmall),
+                const SizedBox(height: 8),
+                SegmentedButton<BackendEnvironment>(
+                  segments: const [
+                    ButtonSegment(
+                      value: BackendEnvironment.dev,
+                      label: Text('Dev'),
+                      icon: Icon(Icons.code),
                     ),
-                  ),
+                    ButtonSegment(
+                      value: BackendEnvironment.production,
+                      label: Text('Production'),
+                      icon: Icon(Icons.cloud_outlined),
+                    ),
+                  ],
+                  selected: {_environment},
+                  onSelectionChanged: (selection) {
+                    setState(() => _environment = selection.first);
+                  },
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Controls the http/https scheme used by backend endpoints.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                 ),
                 const SizedBox(height: 16),
                 TextField(
@@ -371,7 +425,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     hintText: 'e.g. http://minio:9000',
                     border: const OutlineInputBorder(),
                     helperText: 'Leave blank to use <host>:17603',
-                    errorText: _storageUrlError(_storageUrlController.text),
+                    errorText: validateStorageUrl(_storageUrlController.text),
                   ),
                   keyboardType: TextInputType.url,
                 ),
@@ -401,6 +455,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 _buildDangerZone(context),
                 const SizedBox(height: 32),
                 _buildAppearance(context),
+                const SizedBox(height: 32),
+                _buildGeneral(context),
+                const SizedBox(height: 32),
+                _buildAccount(context),
               ],
             ),
           ),
@@ -444,7 +502,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           children: [
             for (final check in BackendCheck.values)
               if (status.resultFor(check) case final result?)
-                _CheckRow(result: result, label: check.label),
+                ProbeStatusRow(result: result, label: check.label),
           ],
         ),
       ],
@@ -599,6 +657,151 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       ],
     );
   }
+
+  /// "General" section: preferred language (stored in voice settings) and date
+  /// format (stored in prefs), symmetric with the Appearance section. Appended
+  /// at the end of the list so the text-field indices used by the settings
+  /// tests stay stable.
+  Widget _buildGeneral(BuildContext context) {
+    final theme = Theme.of(context);
+    final voice =
+        ref.watch(voiceSettingsProvider).value ?? const VoiceSettings();
+    final prefs = ref.watch(appPrefsProvider).value ?? const AppPrefs();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('General', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        InputDecorator(
+          decoration: const InputDecoration(
+            labelText: 'Language',
+            helperText: 'Spoken language for voice conversations',
+            border: OutlineInputBorder(),
+          ),
+          child: DropdownButton<String>(
+            key: const Key('settings-language'),
+            value: voice.preferredLanguage,
+            isExpanded: true,
+            isDense: true,
+            underline: const SizedBox.shrink(),
+            items: [
+              for (final (code, name) in languageOptions(voice.preferredLanguage))
+                DropdownMenuItem(value: code, child: Text(name)),
+            ],
+            onChanged: (value) {
+              if (value == null) return;
+              ref.read(voiceSettingsProvider.notifier).save(
+                    voice.copyWith(preferredLanguage: value),
+                  );
+            },
+          ),
+        ),
+        const SizedBox(height: 16),
+        InputDecorator(
+          decoration: const InputDecoration(
+            labelText: 'Date format',
+            border: OutlineInputBorder(),
+          ),
+          child: DropdownButton<String>(
+            key: const Key('settings-date-format'),
+            value: prefs.dateFormat,
+            isExpanded: true,
+            isDense: true,
+            underline: const SizedBox.shrink(),
+            items: [
+              for (final (code, label) in dateFormatOptions(prefs.dateFormat))
+                DropdownMenuItem(value: code, child: Text(label)),
+            ],
+            onChanged: (value) {
+              if (value == null) return;
+              ref.read(appPrefsProvider.notifier).save(
+                    prefs.copyWith(dateFormat: value),
+                  );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// "Account" section: signed-in email (or a sign-in prompt) with Sign out /
+  /// Rotate key actions. The shared [AuthFlow] mints and persists a fresh API
+  /// key on success, so this section only reacts to the stored credentials.
+  /// Appended at the end of the list so the text-field indices used by the
+  /// settings tests stay stable.
+  Widget _buildAccount(BuildContext context) {
+    final theme = Theme.of(context);
+    final creds = ref.watch(authCredentialsProvider).value;
+    final signedIn = creds != null && creds.apiKey.isNotEmpty;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('Account', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        if (signedIn) ...[
+          Text(
+            creds.email != null ? 'Signed in as ${creds.email}' : 'Signed in',
+            style: theme.textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _signOut,
+                  child: const Text('Sign out'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () {
+                    final creds =
+                        ref.read(authCredentialsProvider).value;
+                    setState(() {
+                      _authFlowForRotation = true;
+                      _authFlowVisible = true;
+                      // Remember what is being replaced so the superseded key
+                      // can be revoked once the rotation completes.
+                      _rotationOldKeyId = creds?.keyId;
+                      _rotationOldSessionToken = creds?.sessionToken;
+                    });
+                  },
+                  child: const Text('Rotate key'),
+                ),
+              ),
+            ],
+          ),
+        ] else ...[
+          Text(
+            'Not signed in',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: () => setState(() {
+              _authFlowForRotation = false;
+              _authFlowVisible = true;
+            }),
+            child: const Text('Sign in'),
+          ),
+        ],
+        if (_authFlowVisible) ...[
+          const SizedBox(height: 16),
+          if (signedIn)
+            Text(
+              'Sign in again to mint a new key.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          AuthFlow(onSuccess: _onAuthSuccess),
+        ],
+      ],
+    );
+  }
 }
 
 /// Inline MaterialBanner-style notice shown when saved settings could not be
@@ -625,47 +828,6 @@ class _SettingsLoadErrorBanner extends StatelessWidget {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// Single probe result row: status icon, check label, and detail text.
-class _CheckRow extends StatelessWidget {
-  const _CheckRow({required this.result, required this.label});
-
-  final CheckResult result;
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final (icon, color) = switch (result.status) {
-      ProbeStatus.ok => (Icons.check_circle, Colors.green.shade600),
-      ProbeStatus.error => (Icons.error, Colors.orange.shade800),
-      ProbeStatus.unreachable => (Icons.cloud_off, Colors.grey.shade600),
-    };
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 20),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label, style: theme.textTheme.bodyLarge),
-                Text(
-                  result.detail,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
       ),
     );
   }

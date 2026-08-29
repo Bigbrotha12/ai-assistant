@@ -1,9 +1,16 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'auth_credentials_providers.dart';
 import 'backend_probe.dart';
 
 /// Provides the concrete [BackendProbe] used to verify connectivity to the
-/// backend stack from the settings screen.
+/// backend gateway from the settings screen. Probe requests authenticate with
+/// the persisted API key ([authCredentialsProvider]).
 final backendProbeProvider = Provider<BackendProbe>(
-  (ref) => DioBackendProbe(),
+  (ref) => DioBackendProbe(
+    apiKeyReader: () async {
+      final credentials = await ref.read(authCredentialsProvider.future);
+      return credentials?.apiKey;
+    },
+  ),
 );

@@ -37,7 +37,6 @@ dependencies:
   flutter_riverpod: ^3.4.2
   dio: ^5.11.0
   flutter_secure_storage: ^9.2.2
-  web_socket_channel: ^3.0.1
   drift: ^2.34.3
   drift_flutter: ^0.3.1
   # flutter_markdown is deprecated on pub.dev; flutter_markdown_plus is the
@@ -56,9 +55,8 @@ dependencies:
   # Persisted app-tier preference (core vs premium). Non-sensitive.
   shared_preferences: ^2.5.5
 
-  # Voice Conversation (Phase 4): LiveKit data channel, mic capture, TTS playback,
+  # Voice Conversation (Phase 4): mic capture, TTS playback,
   # device info for capability detection, on-device STT/TTS engines.
-  livekit_client: ^2.11.0
   just_audio: ^0.10.6
   record: ^6.2.1
   audio_session: ^0.1.25

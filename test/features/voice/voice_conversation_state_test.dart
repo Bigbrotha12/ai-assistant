@@ -9,7 +9,6 @@ void main() {
       expect(s.isRecording, isFalse);
       expect(s.isAiSpeaking, isFalse);
       expect(s.isPaused, isFalse);
-      expect(s.currentRoomName, isNull);
       expect(s.error, isNull);
       expect(s.lastTranscript, isNull);
       expect(s.onDeviceTranscript, isNull);
@@ -19,7 +18,6 @@ void main() {
       final s = VoiceConversationState.initial();
       final next = s.copyWith(
         isConnected: true,
-        currentRoomName: 'room-a',
         isRecording: true,
         isAiSpeaking: true,
         isPaused: true,
@@ -29,7 +27,6 @@ void main() {
       );
 
       expect(next.isConnected, isTrue);
-      expect(next.currentRoomName, 'room-a');
       expect(next.isRecording, isTrue);
       expect(next.isAiSpeaking, isTrue);
       expect(next.isPaused, isTrue);
@@ -49,18 +46,15 @@ void main() {
 
     test('copyWith can clear nullable fields back to null', () {
       final s = VoiceConversationState.initial().copyWith(
-        currentRoomName: 'room',
         error: 'boom',
         lastTranscript: 't',
         onDeviceTranscript: 'd',
       );
       final cleared = s.copyWith(
-        currentRoomName: null,
         error: null,
         lastTranscript: null,
         onDeviceTranscript: null,
       );
-      expect(cleared.currentRoomName, isNull);
       expect(cleared.error, isNull);
       expect(cleared.lastTranscript, isNull);
       expect(cleared.onDeviceTranscript, isNull);
@@ -87,7 +81,6 @@ void main() {
         base.copyWith(error: 'x'),
         base.copyWith(lastTranscript: 'x'),
         base.copyWith(onDeviceTranscript: 'x'),
-        base.copyWith(currentRoomName: 'r'),
       ];
       for (final v in variants) {
         expect(v, isNot(base));

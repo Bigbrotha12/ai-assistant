@@ -1,34 +1,42 @@
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/features/voice/voice_capture_pipeline.dart';
 import 'package:ai_assistant/features/voice/voice_controller.dart';
 import 'package:ai_assistant/features/voice/vad_processor.dart';
 
+import '../../fakes.dart';
 import 'voice_test_fakes.dart';
 
 void main() {
-  late FakeLiveKitService liveKit;
+  late FakeChatClient chat;
   late FakeMicCaptureService mic;
   late FakeAudioPlayback playback;
   late FakeVadProcessor vad;
   late FakeAudioSessionManager audioSession;
   late FakeSttEngine stt;
+  late FakeTtsEngine tts;
   late VoiceController controller;
   late VoiceCapturePipeline pipeline;
 
   setUp(() {
-    liveKit = FakeLiveKitService();
+    chat = FakeChatClient(
+      results: [
+        ChatResult(content: 'got it', toolCalls: const [], finishReason: 'stop'),
+      ],
+    );
     mic = FakeMicCaptureService();
     playback = FakeAudioPlayback();
     vad = FakeVadProcessor();
     audioSession = FakeAudioSessionManager();
     stt = FakeSttEngine(transcript: 'recognized speech');
+    tts = FakeTtsEngine();
     controller = VoiceController(
-      liveKit: liveKit,
+      chatClient: chat,
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
-      tokenMinter: (_) async => 'token',
+      ttsEngine: tts,
     );
     pipeline = VoiceCapturePipeline(
       micCapture: mic,
@@ -44,14 +52,13 @@ void main() {
     }
     await pipeline.dispose();
     await controller.dispose();
-    await liveKit.dispose();
     await mic.dispose();
     await playback.dispose();
   });
 
-  test('speechStopped flushes the buffered mic audio to on-device STT',
+  test('speechStopped flushes the buffered mic audio on to the text turn',
       () async {
-    await controller.connectToRoom(roomName: 'room-1');
+    await controller.startConversation();
 
     // Mic streams to both the pipeline (for VAD) and the controller (which
     // buffers every chunk while an STT engine is configured) — a broadcast
@@ -70,24 +77,26 @@ void main() {
     vad.emitState(VadState.speechStopped);
     await pumpEventQueue();
     await pumpEventQueue();
+    await pumpEventQueue();
 
     // The exact utterance seen by the controller is flushed through.
     expect(stt.transcribed, isNotEmpty);
     expect(stt.transcribed.single, isNotEmpty);
     expect(controller.state.onDeviceTranscript, 'recognized speech');
 
-    // Mic forwarding is gated off again after the utterance ends.
-    expect(controller.state.isRecording, isTrue); // capture still running
-    liveKit.sentAudio.clear();
-    mic.emitChunk([9, 9, 9]);
-    await pumpEventQueue();
-    // While speech is silent, nothing is forwarded to the data channel.
-    expect(liveKit.sentAudio, isEmpty);
+    // The recognised utterance drives the LLM reply and TTS playback.
+    expect(chat.calls, hasLength(1));
+    expect(chat.calls.single.single.role, 'user');
+    expect(tts.synthesized, contains('got it'));
+    expect(playback.playedChunks, isNotEmpty);
+
+    // Capture is still running after the utterance ends.
+    expect(controller.state.isRecording, isTrue);
   });
 
   test('buffer is cleared between utterances so flushes do not repeat audio',
       () async {
-    await controller.connectToRoom(roomName: 'room-1');
+    await controller.startConversation();
     await pipeline.startRecording();
 
     // Utterance 1.

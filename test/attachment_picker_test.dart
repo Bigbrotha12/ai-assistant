@@ -335,7 +335,7 @@ void main() {
       return ProviderScope(
         overrides: [
           settingsStoreProvider.overrideWithValue(FakeSettingsStore(
-            stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+            stored: const BackendSettings(host: 'myhost'),
           )),
           backendProbeProvider.overrideWithValue(FakeProbe()),
           chatStoreProvider.overrideWithValue(FakeChatStore()),

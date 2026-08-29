@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/core/auth_client.dart';
+import 'package:ai_assistant/core/auth_client_provider.dart';
+import 'package:ai_assistant/core/auth_credentials_providers.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/chat_client_provider.dart';
@@ -13,6 +16,7 @@ import 'package:ai_assistant/core/files_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/core/settings_providers.dart';
 import 'package:ai_assistant/features/attachments/file_attachment_chip.dart';
+import 'package:ai_assistant/features/auth/auth_flow.dart';
 import 'package:ai_assistant/features/chat/chat_screen.dart';
 import 'package:ai_assistant/features/chat/database_providers.dart';
 import 'package:ai_assistant/features/chat/message_bubble.dart';
@@ -25,6 +29,8 @@ Widget chatApp({
   required FakeProbe probe,
   required FakeChatStore chatStore,
   required FakeChatClient client,
+  FakeAuthCredentialsStore? authCredentialsStore,
+  FakeAuthClient? authClient,
 }) {
   return ProviderScope(
     overrides: [
@@ -32,6 +38,9 @@ Widget chatApp({
       backendProbeProvider.overrideWithValue(probe),
       chatStoreProvider.overrideWithValue(chatStore),
       chatApiClientProvider.overrideWithValue(client),
+      if (authCredentialsStore != null)
+        authCredentialsStoreProvider.overrideWithValue(authCredentialsStore),
+      if (authClient != null) authClientProvider.overrideWithValue(authClient),
     ],
     child: const MaterialApp(home: ChatScreen()),
   );
@@ -41,7 +50,7 @@ void main() {
   testWidgets('ChatScreen renders empty state with input enabled',
       (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     await tester.pumpWidget(chatApp(
       store: store,
@@ -64,7 +73,7 @@ void main() {
   testWidgets('typing and tapping Send appends a user bubble and assistant reply',
       (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient(
       results: const [
@@ -94,7 +103,7 @@ void main() {
 
   testWidgets('assistant reply renders markdown', (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient(
       results: const [
@@ -124,7 +133,7 @@ void main() {
   testWidgets('markdown images never render an Image widget (SSRF guard)',
       (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient(
       results: const [
@@ -157,7 +166,7 @@ void main() {
   testWidgets('tool-call chip renders when assistant message has toolCalls',
       (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient(
       results: const [
@@ -189,7 +198,7 @@ void main() {
   testWidgets('Stop button appears while streaming and stops the stream',
       (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient(
       results: const [
@@ -226,7 +235,7 @@ void main() {
   testWidgets('error banner and Retry button appear when client errors',
       (tester) async {
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient()..error = 'boom';
     await tester.pumpWidget(chatApp(
@@ -245,11 +254,89 @@ void main() {
     expect(find.text('Retry'), findsOneWidget);
   });
 
+  testWidgets(
+      'a 401 failure renders the ReauthCard and completing AuthFlow clears it',
+      (tester) async {
+    final store = FakeSettingsStore(
+      stored: const BackendSettings(host: 'myhost'),
+    );
+    // First send 401s; the retry after re-auth must succeed.
+    final client = FakeChatClient()
+      ..error = const ChatServerError('HTTP 401', statusCode: 401);
+    final authClient = FakeAuthClient(
+      onSignIn: (email, password) async =>
+          AuthSession(token: 'tok-1', email: email),
+      onMintApiKey: (token) async =>
+        const MintedApiKey(key: 'sk-fresh', id: 'key-id-fresh'),
+    );
+    await tester.pumpWidget(chatApp(
+      store: store,
+      probe: FakeProbe(),
+      chatStore: FakeChatStore(),
+      client: client,
+      authCredentialsStore: FakeAuthCredentialsStore(),
+      authClient: authClient,
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'Hello');
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    // A 401 surfaces the re-auth card, not the generic error banner.
+    expect(find.byType(ReauthCard), findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+    expect(find.text('Session expired'), findsOneWidget);
+
+    // Allow the post-re-auth retry to succeed, then complete AuthFlow.
+    client.error = null;
+    await tester.enterText(find.byKey(const Key('auth-email')), 'me@example.com');
+    await tester.enterText(
+      find.byKey(const Key('auth-password')),
+      's3cret',
+    );
+    await tester.tap(find.byKey(const Key('auth-submit')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ReauthCard), findsNothing);
+    expect(find.text('Hello'), findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+  });
+
+  testWidgets('ReauthCard dismiss clears the auth-required state',
+      (tester) async {
+    final store = FakeSettingsStore(
+      stored: const BackendSettings(host: 'myhost'),
+    );
+    final client = FakeChatClient()
+      ..error = const ChatServerError('HTTP 401', statusCode: 401);
+    await tester.pumpWidget(chatApp(
+      store: store,
+      probe: FakeProbe(),
+      chatStore: FakeChatStore(),
+      client: client,
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'Hello');
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ReauthCard), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('reauth-dismiss')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ReauthCard), findsNothing);
+  });
+
   testWidgets('History screen lists conversations and delete removes one',
       (tester) async {
     final now = DateTime.now();
     final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+      stored: const BackendSettings(host: 'myhost'),
     );
     final chatStore = FakeChatStore(
       initial: [

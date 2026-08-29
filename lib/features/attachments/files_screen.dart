@@ -144,9 +144,10 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
   }
 
   Future<void> _copyLink(FileInfo file) async {
-    final host =
-        ref.read(settingsProvider).value?.host ?? BackendConfig.defaultHost;
-    final url = '${BackendConfig.files(host).toString()}/fetch/${file.id}';
+    final settings = ref.read(settingsProvider).value;
+    final host = settings?.host ?? BackendConfig.defaultHost;
+    final url =
+        '${BackendConfig.files(host, environment: settings?.environment).toString()}/fetch/${file.id}';
     await Clipboard.setData(ClipboardData(text: url));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(

@@ -139,9 +139,11 @@ class _ScriptedAdapter implements HttpClientAdapter {
   void close({bool force = false}) {}
 }
 
-ChatApiClient _client(_ScriptedAdapter adapter) => ChatApiClient(
+ChatApiClient _client(_ScriptedAdapter adapter, {String? apiKey}) =>
+    ChatApiClient(
       baseUrl: 'http://192.168.1.5:9091',
       dio: Dio()..httpClientAdapter = adapter,
+      apiKey: apiKey,
     );
 
 void main() {
@@ -425,6 +427,117 @@ void main() {
         (adapter.requests.single.data as Map<String, dynamic>)['stream'],
         isFalse,
       );
+    });
+  });
+
+  group('bearer auth header', () {
+    test('streamCompletions sends Authorization: Bearer <key> when apiKey set',
+        () async {
+      final adapter = _ScriptedAdapter([
+        _StreamAction([
+          frame(chunk(content: 'Hello')),
+          frame(chunk(finishReason: 'stop')),
+        ]),
+      ]);
+      final client = _client(adapter, apiKey: 'sk-test123');
+
+      await client.streamCompletions(messages: messages);
+
+      final req = adapter.requests.single;
+      expect(req.headers['Authorization'], 'Bearer sk-test123');
+      expect(req.headers['accept'], 'text/event-stream');
+    });
+
+    test('completions sends Authorization: Bearer <key> when apiKey set',
+        () async {
+      final adapter = _ScriptedAdapter([
+        _JsonAction({
+          'id': 'chatcmpl-4',
+          'object': 'chat.completion',
+          'choices': [
+            {
+              'index': 0,
+              'finish_reason': 'stop',
+              'message': {
+                'role': 'assistant',
+                'content': 'Plain answer',
+              },
+            },
+          ],
+        }),
+      ]);
+      final client = _client(adapter, apiKey: 'sk-test123');
+
+      await client.completions(messages: messages);
+
+      expect(
+        adapter.requests.single.headers['Authorization'],
+        'Bearer sk-test123',
+      );
+    });
+
+    test('no Authorization header when apiKey is null', () async {
+      final adapter = _ScriptedAdapter([
+        _StreamAction([
+          frame(chunk(content: 'Hello')),
+          frame(chunk(finishReason: 'stop')),
+        ]),
+      ]);
+      final client = _client(adapter); // apiKey stays null
+
+      await client.streamCompletions(messages: messages);
+
+      final req = adapter.requests.single;
+      expect(req.headers.containsKey('Authorization'), isFalse);
+      expect(req.headers['accept'], 'text/event-stream');
+    });
+
+    test('streamed-tool-call fallback also carries the bearer header',
+        () async {
+      final adapter = _ScriptedAdapter([
+        _StreamAction([
+          frame(chunk(toolCalls: [
+            toolCall(index: 0, id: 'call_1', name: 'get_weather', arguments: '{"city":'),
+          ])),
+          frame(chunk(toolCalls: [
+            toolCall(index: 0, arguments: '"Paris"'),
+          ])),
+          frame(chunk(finishReason: 'tool_calls')),
+        ]),
+        _JsonAction({
+          'id': 'chatcmpl-5',
+          'object': 'chat.completion',
+          'choices': [
+            {
+              'index': 0,
+              'finish_reason': 'tool_calls',
+              'message': {
+                'role': 'assistant',
+                'content': null,
+                'tool_calls': [
+                  {
+                    'id': 'call_1',
+                    'type': 'function',
+                    'function': {
+                      'name': 'get_weather',
+                      'arguments': '{"city": "Paris"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ]);
+      final client = _client(adapter, apiKey: 'sk-test123');
+
+      final result = await client.streamCompletions(messages: messages);
+
+      expect(result.toolCalls, hasLength(1));
+      expect(adapter.callCount, 2);
+      for (final req in adapter.requests) {
+        expect(req.headers['Authorization'], 'Bearer sk-test123');
+      }
     });
   });
 }

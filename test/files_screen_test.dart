@@ -74,7 +74,7 @@ void main() {
     return ProviderScope(
       overrides: [
         settingsStoreProvider.overrideWithValue(FakeSettingsStore(
-          stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+          stored: const BackendSettings(host: 'myhost'),
         )),
         filesServiceProvider.overrideWithValue(filesClient),
         filesStoreProvider.overrideWithValue(store ?? FakeFileStore()),

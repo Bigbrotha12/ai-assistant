@@ -9,7 +9,7 @@ import 'audio_session_manager.dart';
 import 'wav_util.dart';
 
 /// Default sample rate of the PCM audio played back by [AudioPlaybackService].
-/// Matches the format used by the voice data channel (16 kHz mono 16-bit).
+/// Matches the format used by the voice conversation (16 kHz mono 16-bit).
 const int kPlaybackSampleRate = 16000;
 
 /// Minimal playback surface consumed by higher layers (e.g. [VoiceController]).

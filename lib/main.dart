@@ -1,12 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'core/onboarding_gate.dart';
 import 'core/theme.dart';
 import 'core/theme_providers.dart';
 import 'core/widgets/gold_band.dart';
-import 'features/chat/chat_screen.dart';
-import 'features/voice/voice_screen.dart';
-import 'features/widgets/launcher_shortcuts.dart';
 
 void main() => runApp(const ProviderScope(child: AiAssistantApp()));
 
@@ -39,14 +37,10 @@ class AiAssistantApp extends ConsumerWidget {
                 ],
               )
           : null,
-      // The app is voice-first: a normal launch (and the `open_voice`
-      // shortcut) lands on the voice home; the `open_chat` shortcut opens
-      // the chat screen directly. Chat stays reachable from the voice
-      // home's menu.
-      home: switch (resolveInitialTarget()) {
-        LauncherShortcutTarget.chat => const ChatScreen(),
-        _ => const VoiceScreen(),
-      },
+      // The startup gate decides between onboarding and the voice-first home:
+      // a configured app lands on the voice home (or the `open_chat` shortcut
+      // target); a not-yet-configured app lands on onboarding.
+      home: const OnboardingGate(),
     );
   }
 }

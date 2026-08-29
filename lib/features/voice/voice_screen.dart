@@ -4,14 +4,17 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:uuid/uuid.dart';
 
 import '../chat/chat_screen.dart';
 import '../settings/settings_screen.dart';
+import '../../core/app_startup.dart';
+import '../../core/auth_credentials_providers.dart';
+import '../../core/chat_client.dart';
 import '../../core/settings_providers.dart';
 import '../../core/theme.dart';
 import '../../core/widgets/golden_pill.dart';
 import '../../core/widgets/speak_button.dart';
+import '../auth/auth_flow.dart';
 import 'engine_config.dart';
 import 'engine_errors.dart';
 import 'engine_manager.dart';
@@ -28,8 +31,8 @@ import 'voice_settings_screen.dart';
 ///
 /// Consumes the existing voice providers ([voiceConversationStateProvider],
 /// [voiceCapturePipelineProvider] and the engine status providers); it does not
-/// reimplement any audio service. Pressing the speak button ensures a LiveKit
-/// session first, then starts the capture pipeline (VAD-gated).
+/// reimplement any audio service. Pressing the speak button starts the text
+/// conversation session, then begins the capture pipeline (VAD-gated).
 class VoiceScreen extends ConsumerStatefulWidget {
   const VoiceScreen({super.key});
 
@@ -38,8 +41,6 @@ class VoiceScreen extends ConsumerStatefulWidget {
 }
 
 class _VoiceScreenState extends ConsumerState<VoiceScreen> {
-  /// Per-screen room name so each visit joins an isolated session.
-  final _roomId = const Uuid().v4();
   final _logScroll = ScrollController();
 
   /// Ordered, de-duplicated user transcripts shown as chat bubbles.
@@ -66,7 +67,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     _logScroll.dispose();
     // The voice providers own their teardown: `VoiceCapturePipelineNotifier`
     // and `VoiceControllerNotifier` dispose the pipeline (stopping any active
-    // recording) and the controller (disconnecting the room) via their
+    // recording) and the controller (ending the conversation) via their
     // `ref.onDispose` callbacks once the last listener — this screen and the
     // conversation-state notifier — is gone. Calling `ref.read(...)` here is
     // both unsafe (Riverpod forbids ref after unmount) and unnecessary.
@@ -74,10 +75,11 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   }
 
   /// Appends a freshly recognised user utterance to the log, falling back from
-  /// the on-device transcript to the server transcript. Empty/unchanged text is
-  /// ignored so the list stays stable across unrelated state updates.
+  /// the on-device transcript to the assistant reply when an on-device engine
+  /// is unavailable. Empty/unchanged text is ignored so the list stays stable
+  /// across unrelated state updates.
   void _appendTranscript(VoiceConversationState state) {
-    final text = state.onDeviceTranscript ?? state.lastTranscript;
+    final text = state.onDeviceTranscript;
     if (text == null || text.trim().isEmpty) return;
     if (_transcripts.isNotEmpty && _transcripts.last == text) return;
     setState(() => _transcripts.add(text));
@@ -89,7 +91,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   }
 
   /// Starts a hold-to-talk recording: stops any active recording (toggle), or
-  /// ensures a LiveKit room then starts the capture pipeline.
+  /// starts the text conversation session then begins the capture pipeline.
   Future<void> _holdStart() async {
     if (_micBusy) return;
     final pipeline = ref.read(voiceCapturePipelineProvider);
@@ -104,10 +106,10 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     });
     try {
       if (!controller.state.isConnected) {
-        await controller.connectToRoom(roomName: _roomId);
+        await controller.startConversation();
       }
       if (!controller.state.isConnected) {
-        return; // Connection error is already surfaced through the state.
+        return; // Session error is already surfaced through the state.
       }
       await pipeline.startRecording();
       if (mounted) {
@@ -145,8 +147,8 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     }
   }
 
-  /// Re-attempts a LiveKit connection, then restarts local capture if the
-  /// connection succeeds. Used by the error banner's retry action.
+  /// Restarts the text conversation session, then restarts local capture if
+  /// the session is active. Used by the error banner's retry action.
   Future<void> _retryConnection() async {
     if (_micBusy) return;
     final pipeline = ref.read(voiceCapturePipelineProvider);
@@ -157,7 +159,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     });
     try {
       if (!controller.state.isConnected) {
-        await controller.connectToRoom(roomName: _roomId);
+        await controller.startConversation();
       }
       if (controller.state.isConnected) {
         if (pipeline.isRecording) {
@@ -207,7 +209,15 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
     final recording = state.isRecording || _localRecording;
     final error = state.error ?? _localError;
-    final settingsValid = ref.watch(settingsProvider).value?.isValid ?? false;
+    // A gateway 401 (missing/invalid API key) surfaces the shared re-auth card
+    // instead of the generic error banner.
+    final authRequired = error != null && isAuthRequiredError(error);
+    // Mirrors the onboarding gate's configured rule (API key + explicitly
+    // stored, valid host), so the banner never disagrees with the gate.
+    final configured = isConfigured(
+      credentials: ref.watch(authCredentialsProvider).value,
+      stored: ref.watch(settingsProvider).value,
+    );
 
     return Scaffold(
       appBar: AppBar(
@@ -237,17 +247,30 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            if (!settingsValid)
+            if (!configured)
               const _ConfigureBanner()
             else
               _FallbackBanner(),
             if (error != null)
-              _ErrorBanner(
-                error: error,
-                onOpenSettings: _openAppSettings,
-                onConfigureBackend: _openBackendSettings,
-                onRetry: _retryConnection,
-              ),
+              authRequired
+                  ? Flexible(
+                      fit: FlexFit.loose,
+                      child: SingleChildScrollView(
+                        child: ReauthCard(
+                          onSuccess: (_) => _retryConnection(),
+                          onDismiss: () {
+                            ref.read(voiceControllerProvider).clearError();
+                            setState(() => _localError = null);
+                          },
+                        ),
+                      ),
+                    )
+                  : _ErrorBanner(
+                      error: error,
+                      onOpenSettings: _openAppSettings,
+                      onConfigureBackend: _openBackendSettings,
+                      onRetry: _retryConnection,
+                    ),
             Expanded(
               child: Column(
                 children: [
@@ -414,7 +437,8 @@ class _HeroStatus extends StatelessWidget {
 /// retry action, everything else is shown as-is.
 ///
 /// Classifies [EngineError]s by type where possible and falls back to
-/// string-matching for errors raised by external services (Dio, LiveKit).
+/// string-matching for errors raised by external services (Dio, the chat
+/// client).
 class _ErrorBanner extends StatelessWidget {
   const _ErrorBanner({
     required this.error,
@@ -432,13 +456,10 @@ class _ErrorBanner extends StatelessWidget {
   bool get _permissionDenied => _detail.toLowerCase().contains('permission');
 
   bool get _needsConfiguration =>
-      _detail.toLowerCase().contains('token minting') ||
       _detail.toLowerCase().contains('not configured');
 
   bool get _connectionFailed =>
-      _detail.toLowerCase().contains('livekit') ||
-      _detail.toLowerCase().contains('connect') ||
-      _detail.toLowerCase().contains('signaling');
+      _detail.toLowerCase().contains('connect');
 
   String get _message {
     if (error is EngineModelNotFoundError) {

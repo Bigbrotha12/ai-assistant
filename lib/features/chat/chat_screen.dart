@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../core/auth_client.dart';
 import '../../core/files_providers.dart';
 import '../../core/files_service.dart';
 import '../../core/settings_providers.dart';
@@ -11,6 +12,7 @@ import '../../core/theme.dart';
 import '../../core/widgets/gold_band.dart';
 import '../attachments/attachment_picker.dart';
 import '../attachments/file_model.dart';
+import '../auth/auth_flow.dart';
 import '../settings/settings_screen.dart';
 import '../voice/voice_screen.dart';
 import '../voice/voice_settings_screen.dart';
@@ -66,6 +68,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (selected != null && mounted) {
       setState(() => _conversationId = selected);
     }
+  }
+
+  /// Re-authentication succeeded: the [AuthFlow] already minted + persisted a
+  /// fresh API key. Swap the conversation's pinned client for one carrying the
+  /// new key, then re-send the failed message.
+  Future<void> _onReauthSuccess(AuthSession session) async {
+    if (!mounted) return;
+    final notifier = ref.read(conversationProvider(_conversationId).notifier);
+    notifier.refreshClient();
+    await notifier.retry();
   }
 
   Future<void> _send() async {
@@ -139,6 +151,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final isStreaming = state?.isStreaming ?? false;
     final isDbReady = state?.isDbReady ?? false;
     final error = state?.error;
+    final authRequired = state?.authRequired ?? false;
 
     // Mirror the conversation's live upload progress into the picker's
     // notifier so AttachmentRow overlays update as jobs progress / complete /
@@ -205,11 +218,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       body: Column(
         children: [
           if (!settingsValid) _ConfigureBanner(),
+          if (authRequired)
+            ReauthCard(
+              onSuccess: _onReauthSuccess,
+              onDismiss: () => ref
+                  .read(conversationProvider(_conversationId).notifier)
+                  .dismissAuthRequired(),
+            ),
           Expanded(
             child: MessageList(
               messages: state?.messages ?? const [],
               isStreaming: isStreaming,
-              error: error,
+              error: authRequired ? null : error,
               onRetry: () => ref
                   .read(conversationProvider(_conversationId).notifier)
                   .retry(),

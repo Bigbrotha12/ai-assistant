@@ -1,23 +1,59 @@
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/features/voice/engine_errors.dart';
 import 'package:ai_assistant/features/voice/voice_controller.dart';
 
+import '../../fakes.dart';
 import 'voice_test_fakes.dart';
 
 void main() {
+  test('startConversation activates the session and endConversation teardown',
+      () async {
+    final chat = FakeChatClient();
+    final mic = FakeMicCaptureService();
+    final playback = FakeAudioPlayback();
+
+    final controller = VoiceController(
+      chatClient: chat,
+      micCapture: mic,
+      playback: playback,
+    );
+
+    await controller.startConversation();
+    expect(controller.state.isConnected, isTrue);
+
+    await controller.startRecording();
+    expect(controller.state.isRecording, isTrue);
+
+    await controller.endConversation();
+    expect(controller.state.isConnected, isFalse);
+    expect(controller.state.isRecording, isFalse);
+
+    await controller.dispose();
+    await mic.dispose();
+    await playback.dispose();
+  });
+
   test('flushTranscriptionBuffer clears the buffer immediately', () async {
-    final liveKit = FakeLiveKitService();
+    final chat = FakeChatClient(
+      results: [
+        ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
+      ],
+    );
     final mic = FakeMicCaptureService();
     final playback = FakeAudioPlayback();
     final stt = FakeSttEngine(transcript: 'hello world');
+    final tts = FakeTtsEngine();
 
     final controller = VoiceController(
-      liveKit: liveKit,
+      chatClient: chat,
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
+      ttsEngine: tts,
     );
+    await controller.startConversation();
 
     mic.emitChunk([1, 2, 3]);
     await pumpEventQueue();
@@ -31,24 +67,74 @@ void main() {
     expect(stt.transcribed.single, [1, 2, 3]);
     expect(stt.sampleRates.single, 16000);
 
+    // The recognised utterance is sent to the chat client for a reply.
+    expect(chat.calls.single.single.role, 'user');
+    expect(chat.calls.single.single.content, 'hello world');
+
     await controller.dispose();
-    await liveKit.dispose();
+    await mic.dispose();
+    await playback.dispose();
+  });
+
+  test('flushTranscriptionBuffer sends the utterance and speaks the reply',
+      () async {
+    final chat = FakeChatClient(
+      streamDeltas: [
+        ['Hello', ' there'],
+      ],
+      results: [
+        ChatResult(content: 'Hello there', toolCalls: const [], finishReason: 'stop'),
+      ],
+    );
+    final mic = FakeMicCaptureService();
+    final playback = FakeAudioPlayback();
+    final stt = FakeSttEngine(transcript: 'hello world');
+    final tts = FakeTtsEngine();
+
+    final controller = VoiceController(
+      chatClient: chat,
+      micCapture: mic,
+      playback: playback,
+      sttEngine: stt,
+      ttsEngine: tts,
+    );
+    await controller.startConversation();
+
+    final replies = <String>[];
+    controller.onTranscript = replies.add;
+
+    mic.emitChunk([1, 2, 3]);
+    await pumpEventQueue();
+    await controller.flushTranscriptionBuffer();
+    await pumpEventQueue();
+    await pumpEventQueue();
+    await pumpEventQueue();
+
+    // The streamed reply is accumulated into state and finalised.
+    expect(controller.state.lastTranscript, 'Hello there');
+    expect(replies, ['Hello there']);
+    // The reply text is synthesised by the on-device TTS engine.
+    expect(tts.synthesized, ['Hello there']);
+    expect(playback.playedChunks, isNotEmpty);
+
+    await controller.dispose();
     await mic.dispose();
     await playback.dispose();
   });
 
   test('flushTranscriptionBuffer reports engine failures by type', () async {
-    final liveKit = FakeLiveKitService();
+    final chat = FakeChatClient();
     final mic = FakeMicCaptureService();
     final playback = FakeAudioPlayback();
     final stt = FakeSttEngine()..error = const EngineInferenceError('boom');
 
     final controller = VoiceController(
-      liveKit: liveKit,
+      chatClient: chat,
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
     );
+    await controller.startConversation();
 
     mic.emitChunk([1, 2, 3]);
     await pumpEventQueue();
@@ -61,106 +147,81 @@ void main() {
     expect((controller.state.error! as EngineInferenceError).message, 'boom');
 
     await controller.dispose();
-    await liveKit.dispose();
     await mic.dispose();
     await playback.dispose();
   });
 
-  test('disconnected event clears the optimistic connected state', () async {
-    final liveKit = FakeLiveKitService();
+  test('chat client failures surface the error and stop the turn', () async {
+    final failure = ChatServerError('boom');
+    final chat = FakeChatClient()..error = failure;
     final mic = FakeMicCaptureService();
     final playback = FakeAudioPlayback();
 
     final controller = VoiceController(
-      liveKit: liveKit,
+      chatClient: chat,
       micCapture: mic,
       playback: playback,
-      tokenMinter: (_) async => 'token',
     );
+    await controller.startConversation();
 
-    await controller.connectToRoom(roomName: 'room-1');
+    await controller.sendText('hello');
+    await pumpEventQueue();
+
+    expect(controller.state.error, same(failure));
+    expect(controller.state.lastTranscript, isNull);
+
+    await controller.dispose();
+    await mic.dispose();
+    await playback.dispose();
+  });
+
+  test('a gateway 401 surfaces as an auth-required error', () async {
+    final failure = const ChatServerError('HTTP 401', statusCode: 401);
+    final chat = FakeChatClient()..error = failure;
+    final mic = FakeMicCaptureService();
+    final playback = FakeAudioPlayback();
+
+    final controller = VoiceController(
+      chatClient: chat,
+      micCapture: mic,
+      playback: playback,
+    );
+    await controller.startConversation();
+
+    await controller.sendText('hello');
+    await pumpEventQueue();
+
+    expect(controller.state.error, isA<ChatServerError>());
+    expect(
+      (controller.state.error! as ChatServerError).statusCode,
+      401,
+    );
+    // The UI classifies this as "re-auth required", not a network error.
+    expect(isAuthRequiredError(controller.state.error!), isTrue);
+
+    // Dismissing clears the error without tearing the session down.
+    controller.clearError();
+    expect(controller.state.error, isNull);
     expect(controller.state.isConnected, isTrue);
-    expect(controller.state.currentRoomName, 'room-1');
-
-    // Server-initiated drop while the local client never called disconnect().
-    liveKit.emitDisconnected();
-    await pumpEventQueue();
-
-    expect(controller.state.isConnected, isFalse);
-    expect(controller.state.currentRoomName, isNull);
 
     await controller.dispose();
-    await liveKit.dispose();
-    await mic.dispose();
-    await playback.dispose();
-  });
-
-  test('idle/recording/aiSpeaking events leave connected state untouched',
-      () async {
-    final liveKit = FakeLiveKitService();
-    final mic = FakeMicCaptureService();
-    final playback = FakeAudioPlayback();
-
-    final controller = VoiceController(
-      liveKit: liveKit,
-      micCapture: mic,
-      playback: playback,
-      tokenMinter: (_) async => 'token',
-    );
-
-    await controller.connectToRoom(roomName: 'room-1');
-    liveKit
-      ..emitServerTranscript('hi')
-      ..emitAiAudio([1, 2, 3]);
-    liveKit.emitDisconnected();
-    await pumpEventQueue();
-
-    // Non-disconnect events do not flap isConnected.
-    expect(controller.state.lastTranscript, 'hi');
-    expect(controller.state.isAiSpeaking, isTrue);
-
-    await controller.dispose();
-    await liveKit.dispose();
-    await mic.dispose();
-    await playback.dispose();
-  });
-
-  test('TokenMinter failure surfaces the original error object', () async {
-    final liveKit = FakeLiveKitService();
-    final mic = FakeMicCaptureService();
-    final playback = FakeAudioPlayback();
-
-    final connectFailure = StateError('token minting unavailable');
-    final controller = VoiceController(
-      liveKit: liveKit,
-      micCapture: mic,
-      playback: playback,
-      tokenMinter: (_) async => throw connectFailure,
-    );
-
-    await controller.connectToRoom(roomName: 'room-1');
-
-    expect(controller.state.isConnected, isFalse);
-    expect(controller.state.error, same(connectFailure));
-
-    await controller.dispose();
-    await liveKit.dispose();
     await mic.dispose();
     await playback.dispose();
   });
 
   test('empty transcript does not update state or fire callbacks', () async {
-    final liveKit = FakeLiveKitService();
+    final chat = FakeChatClient();
     final mic = FakeMicCaptureService();
     final playback = FakeAudioPlayback();
     final stt = FakeSttEngine(transcript: '   ');
 
     final controller = VoiceController(
-      liveKit: liveKit,
+      chatClient: chat,
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
     );
+    await controller.startConversation();
     final transcripts = <String>[];
     controller.onTranscript = transcripts.add;
 
@@ -169,9 +230,29 @@ void main() {
 
     expect(transcripts, isEmpty);
     expect(controller.state.onDeviceTranscript, isNull);
+    expect(chat.calls, isEmpty);
 
     await controller.dispose();
-    await liveKit.dispose();
+    await mic.dispose();
+    await playback.dispose();
+  });
+
+  test('sendText with empty input is a no-op', () async {
+    final chat = FakeChatClient();
+    final mic = FakeMicCaptureService();
+    final playback = FakeAudioPlayback();
+
+    final controller = VoiceController(
+      chatClient: chat,
+      micCapture: mic,
+      playback: playback,
+    );
+    await controller.startConversation();
+
+    await controller.sendText('   ');
+    expect(chat.calls, isEmpty);
+
+    await controller.dispose();
     await mic.dispose();
     await playback.dispose();
   });

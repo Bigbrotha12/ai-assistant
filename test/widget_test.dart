@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/core/auth_credentials_providers.dart';
+import 'package:ai_assistant/core/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client_provider.dart';
+import 'package:ai_assistant/core/prefs_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/core/settings_providers.dart';
 import 'package:ai_assistant/core/theme_providers.dart';
@@ -23,23 +26,36 @@ import 'features/voice/voice_test_fakes.dart';
 void main() {
   /// Full app under test. Booting the real [AiAssistantApp] lands on the
   /// voice home screen, so the voice provider graph must be resolvable too.
+  ///
+  /// The onboarding gate only routes to the voice home when an explicitly
+  /// stored, valid host is present, so the harness defaults to one (pass
+  /// [store] to override, e.g. to exercise the onboarding path).
   Widget app({
-    required FakeSettingsStore store,
+    FakeSettingsStore? store,
     required FakeProbe probe,
     required FakeChatStore chatStore,
     required FakeChatClient client,
-  }) =>
-      ProviderScope(
+  }) {
+    final settingsStore =
+        store ?? FakeSettingsStore(stored: const BackendSettings(host: 'myhost'));
+    return ProviderScope(
         overrides: [
-          settingsStoreProvider.overrideWithValue(store),
+          settingsStoreProvider.overrideWithValue(settingsStore),
+          // The app home is now the onboarding gate, which also reads the
+          // auth and prefs stores before routing to the voice home.
+          authCredentialsStoreProvider.overrideWithValue(
+            FakeAuthCredentialsStore(
+              stored: const AuthCredentials(apiKey: 'test-key'),
+            ),
+          ),
+          appPrefsStoreProvider.overrideWithValue(FakePrefsStore()),
           backendProbeProvider.overrideWithValue(probe),
           chatStoreProvider.overrideWithValue(chatStore),
           chatApiClientProvider.overrideWithValue(client),
-          // The voice home boots the real audio stack (LiveKit, record,
-          // just_audio, secure storage, path_provider); none of that exists in
+          // The voice home boots the real audio stack (record, just_audio,
+          // secure storage, path_provider); none of that exists in
           // widget tests, so every voice service is faked.
           engineManagerProvider.overrideWithValue(FakeEngineManager()),
-          liveKitServiceProvider.overrideWithValue(FakeLiveKitService()),
           micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
           audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
           audioSessionManagerProvider
@@ -51,6 +67,7 @@ void main() {
         ],
         child: const AiAssistantApp(),
       );
+  }
 
   /// Settings screen pumped directly, wrapped in the minimal provider graph
   /// it needs (it does not depend on the chat providers).
@@ -80,7 +97,7 @@ void main() {
     testWidgets('smoke: app boots to VoiceScreen with valid settings',
         (tester) async {
       final store = FakeSettingsStore(
-        stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+        stored: const BackendSettings(host: 'myhost'),
       );
       await tester.pumpWidget(app(
         store: store,
@@ -97,8 +114,10 @@ void main() {
       expect(find.text('Backend not configured'), findsNothing);
     });
 
-    testWidgets('smoke: app shows the Configure Backend banner when settings '
-        'invalid', (tester) async {
+    testWidgets('app without stored settings routes to onboarding (define-only '
+        'builds are not considered configured)', (tester) async {
+      // No explicitly stored host: the gate must guide the user through
+      // onboarding instead of booting to a localhost-pointed voice home.
       await tester.pumpWidget(app(
         store: FakeSettingsStore(),
         probe: FakeProbe(),
@@ -107,13 +126,14 @@ void main() {
       ));
       await pumpBounded(tester);
 
-      expect(find.text('Backend not configured'), findsOneWidget);
-      expect(find.text('Configure Backend'), findsOneWidget);
+      expect(find.text('Account'), findsOneWidget);
+      expect(find.byType(SpeakButton), findsNothing);
+      expect(find.text('Backend not configured'), findsNothing);
     });
 
     testWidgets('Settings screen opens from the app bar menu', (tester) async {
       final store = FakeSettingsStore(
-        stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+        stored: const BackendSettings(host: 'myhost'),
       );
       await tester.pumpWidget(app(
         store: store,
@@ -133,7 +153,6 @@ void main() {
       await tester.pump(const Duration(milliseconds: 300));
 
       expect(find.text('Backend host'), findsOneWidget);
-      expect(find.text('Shared secret'), findsOneWidget);
       expect(find.text('MCP token (optional)'), findsOneWidget);
     });
   });
@@ -146,21 +165,20 @@ void main() {
 
       expect(find.text('AI Assistant'), findsOneWidget);
       expect(find.text('Backend host'), findsOneWidget);
-      expect(find.text('Shared secret'), findsOneWidget);
       expect(probe.calls, 0);
     });
 
     testWidgets('prefills the form from saved settings', (tester) async {
       final store = FakeSettingsStore(
-        stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+        stored: const BackendSettings(host: 'myhost'),
       );
       await tester.pumpWidget(settingsApp(store: store, probe: FakeProbe()));
       await tester.pumpAndSettle();
 
       final hostField = tester.widget<TextField>(find.byType(TextField).at(0));
-      final secretField = tester.widget<TextField>(find.byType(TextField).at(1));
+      final mcpField = tester.widget<TextField>(find.byType(TextField).at(1));
       expect(hostField.controller!.text, 'myhost');
-      expect(secretField.controller!.text, 's3cret');
+      expect(mcpField.controller!.text, '');
     });
 
     testWidgets('save persists settings and shows a SnackBar', (tester) async {
@@ -170,7 +188,6 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -183,27 +200,28 @@ void main() {
     });
 
     testWidgets('shows per-check probe result rows', (tester) async {
+      // The Environment section added to the settings form pushes the probe
+      // results below the 600px default test viewport; use a tall viewport so
+      // the lazy ListView builds the result rows.
+      tester.view.physicalSize = const Size(800, 1800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
       final probe = FakeProbe(
         status: const BackendStatus(checks: [
           CheckResult(
-            check: BackendCheck.tokenMint,
+            check: BackendCheck.auth,
             status: ProbeStatus.ok,
-            detail: 'reachable',
+            detail: 'API key valid',
           ),
           CheckResult(
-            check: BackendCheck.tokenMintAuth,
-            status: ProbeStatus.error,
-            detail: 'shared secret rejected (401)',
-          ),
-          CheckResult(
-            check: BackendCheck.liveKit,
-            status: ProbeStatus.ok,
-            detail: 'signaling reachable',
-          ),
-          CheckResult(
-            check: BackendCheck.llmProxy,
+            check: BackendCheck.inference,
             status: ProbeStatus.ok,
             detail: 'inference ready',
+          ),
+          CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.unreachable,
+            detail: 'model.vl not found',
           ),
         ]),
       );
@@ -211,7 +229,6 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'myhost');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
       await tester.tap(find.text('Test connection'));
       await tester.pumpAndSettle();
 
@@ -219,40 +236,35 @@ void main() {
       await tester.tap(find.text('Some backend services are unavailable'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Token mint'), findsOneWidget);
-      expect(find.text('reachable'), findsOneWidget);
-      // 'Shared secret' appears both as the secret field's label and the
-      // tokenMintAuth row label; the row is proven by its detail text below.
-      expect(find.text('Shared secret'), findsWidgets);
-      expect(find.text('shared secret rejected (401)'), findsOneWidget);
+      expect(find.text('Auth'), findsOneWidget);
+      expect(find.text('API key valid'), findsOneWidget);
+      expect(find.text('Inference'), findsOneWidget);
+      expect(find.text('inference ready'), findsOneWidget);
+      expect(find.text('Vision (VL)'), findsOneWidget);
+      expect(find.text('model.vl not found'), findsOneWidget);
       expect(probe.calls, 1);
     });
 
     testWidgets('auto-probes valid saved settings once on load', (tester) async {
       final store = FakeSettingsStore(
-        stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+        stored: const BackendSettings(host: 'myhost'),
       );
       final probe = FakeProbe(
         status: const BackendStatus(checks: [
           CheckResult(
-            check: BackendCheck.tokenMint,
+            check: BackendCheck.auth,
             status: ProbeStatus.ok,
-            detail: 'reachable',
+            detail: 'API key valid',
           ),
           CheckResult(
-            check: BackendCheck.tokenMintAuth,
-            status: ProbeStatus.ok,
-            detail: 'shared secret valid',
-          ),
-          CheckResult(
-            check: BackendCheck.liveKit,
-            status: ProbeStatus.ok,
-            detail: 'signaling reachable',
-          ),
-          CheckResult(
-            check: BackendCheck.llmProxy,
+            check: BackendCheck.inference,
             status: ProbeStatus.ok,
             detail: 'inference ready',
+          ),
+          CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.ok,
+            detail: 'model.vl available',
           ),
         ]),
       );
@@ -260,10 +272,11 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(probe.calls, 1);
-      expect(probe.lastSettings, const BackendSettings(host: 'myhost', secret: 's3cret'));
+      expect(probe.lastSettings, const BackendSettings(host: 'myhost'));
     });
 
-    testWidgets('Save is disabled while the secret is blank', (tester) async {
+    testWidgets('Save and Test are enabled with a valid host alone',
+        (tester) async {
       final store = FakeSettingsStore();
       final probe = FakeProbe();
       await tester.pumpWidget(settingsApp(store: store, probe: probe));
@@ -275,9 +288,8 @@ void main() {
       final saveButton = tester.widget<OutlinedButton>(
         find.widgetWithText(OutlinedButton, 'Save'),
       );
-      expect(saveButton.onPressed, isNull);
+      expect(saveButton.onPressed, isNotNull);
 
-      // A valid host alone still allows probing (produces an informative 401).
       final testButton = tester.widget<FilledButton>(
         find.widgetWithText(FilledButton, 'Test connection'),
       );
@@ -292,7 +304,6 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -311,7 +322,6 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'myhost');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
       await tester.pump();
 
       await tester.tap(find.text('Test connection'));
@@ -334,7 +344,6 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'myhost');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -354,7 +363,6 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'https://evil.example');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
       await tester.pump();
 
       expect(find.text('Enter a host name, not a URL'), findsOneWidget);
@@ -381,14 +389,13 @@ void main() {
       final store = FakeSettingsStore(
         stored: const BackendSettings(
           host: 'myhost',
-          secret: 's3cret',
           mcpSecret: 'mcp-token',
         ),
       );
       await tester.pumpWidget(settingsApp(store: store, probe: FakeProbe()));
       await tester.pumpAndSettle();
 
-      final mcpField = tester.widget<TextField>(find.byType(TextField).at(2));
+      final mcpField = tester.widget<TextField>(find.byType(TextField).at(1));
       expect(mcpField.controller!.text, 'mcp-token');
     });
 
@@ -399,8 +406,7 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
-      await tester.enterText(find.byType(TextField).at(1), 's3cret');
-      await tester.enterText(find.byType(TextField).at(2), 'mcp-token');
+      await tester.enterText(find.byType(TextField).at(1), 'mcp-token');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -416,7 +422,6 @@ void main() {
       final store = FakeSettingsStore(
         stored: const BackendSettings(
           host: 'myhost',
-          secret: 's3cret',
           mcpSecret: 'mcp-token',
         ),
       );
@@ -428,7 +433,7 @@ void main() {
       await tester.tap(find.text('Clear settings'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Clear saved host, secret, MCP token, files token, and storage URL?'), findsOneWidget);
+      expect(find.text('Clear saved host, MCP token, files token, and storage URL?'), findsOneWidget);
 
       await tester.tap(find.text('Clear'));
       await tester.pumpAndSettle();
@@ -439,7 +444,7 @@ void main() {
 
     testWidgets('Clear settings cancels without clearing', (tester) async {
       final store = FakeSettingsStore(
-        stored: const BackendSettings(host: 'myhost', secret: 's3cret'),
+        stored: const BackendSettings(host: 'myhost'),
       );
       await tester.pumpWidget(settingsApp(store: store, probe: FakeProbe()));
       await tester.pumpAndSettle();

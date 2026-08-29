@@ -9,9 +9,11 @@ import 'voice_controller.dart';
 
 /// Orchestrates mic capture → VAD → VoiceController.
 ///
-/// Manages the lifecycle of microphone audio capture, feeds chunks through
-/// the [VadProcessor], and gates audio forwarding to the [VoiceController]
-/// based on speech activity.
+/// Manages the lifecycle of microphone audio capture and feeds chunks through
+/// the [VadProcessor]. On the end of an utterance, the pipeline triggers the
+/// [VoiceController]'s text turn (flush buffered mic audio → on-device STT →
+/// LLM reply → on-device TTS), so transmission happens at the text-turn
+/// boundary rather than over any raw-audio channel.
 class VoiceCapturePipeline {
   VoiceCapturePipeline({
     required this.micCapture,
@@ -31,7 +33,8 @@ class VoiceCapturePipeline {
   /// Platform audio session manager.
   final AudioSessionManager audioSession;
 
-  /// Conversation controller receiving qualified audio for transmission.
+  /// Conversation controller receiving mic audio for on-device STT and
+  /// driving the text-turn flow.
   final VoiceController voiceController;
 
   StreamSubscription<List<int>>? _micSubscription;
@@ -48,8 +51,9 @@ class VoiceCapturePipeline {
 
   /// Start capturing microphone audio and running VAD.
   ///
-  /// When the VAD detects speech, audio is forwarded to the
-  /// [VoiceController] for transmission over the LiveKit data channel.
+  /// When the VAD detects the end of speech, the utterance is flushed through
+  /// the [VoiceController]'s text-turn flow (on-device STT → LLM → on-device
+  /// TTS).
   Future<void> startRecording() async {
     if (_isRecording) return;
 
@@ -82,11 +86,11 @@ class VoiceCapturePipeline {
   void _onVadStateChange(VadState state) {
     switch (state) {
       case VadState.speechStarted:
-        voiceController.setMicAudioEnabled(true);
+        break;
       case VadState.speechStopped:
-        voiceController.setMicAudioEnabled(false);
-        // End-of-utterance: flush the buffered mic audio to the on-device STT
-        // engine. flushTranscriptionBuffer copies and clears the buffer
+        // End-of-utterance: flush the buffered mic audio through the
+        // controller's text turn (on-device STT → LLM → TTS).
+        // flushTranscriptionBuffer copies and clears the buffer
         // synchronously before its first await, so a new utterance cannot
         // interleave with the transcript being produced.
         unawaited(voiceController.flushTranscriptionBuffer());
@@ -104,8 +108,6 @@ class VoiceCapturePipeline {
     _vadSubscription = null;
     await _micSubscription?.cancel();
     _micSubscription = null;
-
-    voiceController.setMicAudioEnabled(false);
 
     // Mic may already be stopped if an interruption is in progress.
     if (!_isPaused) {
@@ -125,7 +127,6 @@ class VoiceCapturePipeline {
   void _handleInterruption(bool isInterrupted) {
     if (isInterrupted) {
       _isPaused = true;
-      voiceController.setMicAudioEnabled(false);
       unawaited(_pauseForInterruption());
     } else {
       unawaited(_resumeAfterInterruption());

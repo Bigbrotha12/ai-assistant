@@ -3,10 +3,13 @@ import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
+import 'package:ai_assistant/core/auth_client.dart';
+import 'package:ai_assistant/core/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/files_service.dart';
+import 'package:ai_assistant/core/prefs_store.dart';
 import 'package:ai_assistant/core/settings_store.dart';
 import 'package:ai_assistant/core/theme_providers.dart';
 import 'package:ai_assistant/features/attachments/file_model.dart';
@@ -466,5 +469,119 @@ class FakeDio {
     lastPath = path;
     lastBody = data;
     return response as Response<T>;
+  }
+}
+
+/// In-memory [AuthCredentialsStore] for widget tests.
+class FakeAuthCredentialsStore implements AuthCredentialsStore {
+  FakeAuthCredentialsStore({this.stored});
+
+  AuthCredentials? stored;
+
+  /// When true, the next [save] throws and leaves [stored] unchanged.
+  bool failNextSave = false;
+
+  /// Number of [save] calls.
+  int saveCalls = 0;
+
+  @override
+  Future<AuthCredentials?> load() async => stored;
+
+  @override
+  Future<void> save(AuthCredentials credentials) async {
+    saveCalls++;
+    if (failNextSave) {
+      failNextSave = false;
+      throw StateError('storage unavailable');
+    }
+    stored = credentials;
+  }
+
+  @override
+  Future<void> clear() async {
+    stored = null;
+  }
+}
+
+/// In-memory [AppPrefsStore] for widget tests.
+class FakePrefsStore implements AppPrefsStore {
+  FakePrefsStore({AppPrefs? initial})
+      : prefs = initial ?? const AppPrefs();
+
+  AppPrefs prefs;
+
+  /// When true, the next [save] throws and leaves [prefs] unchanged.
+  bool failNextSave = false;
+
+  @override
+  Future<AppPrefs> load() async => prefs;
+
+  @override
+  Future<void> save(AppPrefs value) async {
+    if (failNextSave) {
+      failNextSave = false;
+      throw StateError('storage unavailable');
+    }
+    prefs = value;
+  }
+}
+
+/// In-memory [AuthClient] for widget/notifier tests.
+class FakeAuthClient implements AuthClient {
+  FakeAuthClient({
+    this.onSignUp,
+    this.onSignIn,
+    this.onMintApiKey,
+    this.onSignOut,
+    this.onRevokeApiKey,
+  });
+
+  Future<AuthSession> Function(String name, String email, String password)? onSignUp;
+  Future<AuthSession> Function(String email, String password)? onSignIn;
+  Future<MintedApiKey> Function(String sessionToken)? onMintApiKey;
+  Future<void> Function(String sessionToken)? onSignOut;
+  Future<void> Function(String sessionToken, String keyId)? onRevokeApiKey;
+
+  final List<String> signOutTokens = [];
+  final List<(String, String)> revokeCalls = [];
+
+  @override
+  Future<AuthSession> signUp({
+    required String name,
+    required String email,
+    required String password,
+  }) =>
+      onSignUp != null
+          ? onSignUp!(name, email, password)
+          : Future.error(UnimplementedError('signUp not stubbed'));
+
+  @override
+  Future<AuthSession> signIn({
+    required String email,
+    required String password,
+  }) =>
+      onSignIn != null
+          ? onSignIn!(email, password)
+          : Future.error(UnimplementedError('signIn not stubbed'));
+
+  @override
+  Future<MintedApiKey> mintApiKey({required String sessionToken}) =>
+      onMintApiKey != null
+          ? onMintApiKey!(sessionToken)
+          : Future.error(UnimplementedError('mintApiKey not stubbed'));
+
+  @override
+  Future<void> signOut({required String sessionToken}) async {
+    signOutTokens.add(sessionToken);
+    await onSignOut?.call(sessionToken);
+  }
+
+  @override
+  Future<void> revokeApiKey({
+    required String sessionToken,
+    required String keyId,
+  }) async {
+    revokeCalls.add((sessionToken, keyId));
+    await onRevokeApiKey?.call(sessionToken, keyId);
   }
 }

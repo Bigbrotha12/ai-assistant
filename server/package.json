@@ -1,0 +1,32 @@
+{
+  "name": "ai-assistant-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Text-only Hono gateway: better-auth (/api/auth/*) + OpenAI-compatible inference proxy (/v1/*) for the AI Assistant Flutter app.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "migrate": "auth migrate"
+  },
+  "dependencies": {
+    "@better-auth/api-key": "^1.7.2",
+    "@hono/node-server": "^2.1.1",
+    "better-auth": "^1.7.2",
+    "better-sqlite3": "^12.2.0",
+    "dotenv": "^17.4.2",
+    "hono": "^4.13.5",
+    "zod": "^4.5.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.0.0",
+    "auth": "^1.7.2",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
+  }
+}

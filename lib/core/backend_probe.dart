@@ -1,29 +1,34 @@
-import 'dart:io' show WebSocketException;
-
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
-import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'backend_settings.dart';
 import 'config.dart';
 import 'network_errors.dart';
 
 /// Individual backend endpoint probed by [BackendProbe.probe].
-enum BackendCheck { tokenMint, tokenMintAuth, liveKit, llmProxy, vision }
+enum BackendCheck { auth, inference, vision }
 
 /// Human-readable label for a [BackendCheck], used by the settings screen.
 extension BackendCheckLabel on BackendCheck {
   String get label => switch (this) {
-        BackendCheck.tokenMint => 'Token mint',
-        BackendCheck.tokenMintAuth => 'Shared secret',
-        BackendCheck.liveKit => 'LiveKit signaling',
-        BackendCheck.llmProxy => 'LLM proxy',
+        BackendCheck.auth => 'Auth',
+        BackendCheck.inference => 'Inference',
         BackendCheck.vision => 'Vision (VL)',
       };
 }
 
 /// Verdict for a single check.
-enum ProbeStatus { ok, error, unreachable }
+enum ProbeStatus {
+  ok,
+  error,
+
+  /// The stored API key was rejected by the backend (HTTP 401). Downstream UI
+  /// routes this to a re-authentication flow.
+  unauthorized,
+
+  /// No API key is stored, so the authenticated checks cannot run.
+  noCredentials,
+  unreachable,
+}
 
 /// Outcome of probing one backend endpoint.
 class CheckResult {
@@ -57,32 +62,31 @@ class BackendStatus {
       checks.isNotEmpty && checks.every((c) => c.status == ProbeStatus.ok);
 }
 
-/// Creates a WebSocket connection attempt (injectable for tests).
-typedef WebSocketConnector = Future<WebSocketChannel> Function(Uri uri);
+/// Reads the stored API key used to authenticate probe requests (injectable
+/// for tests). Null/blank means no credentials are available.
+typedef ApiKeyReader = Future<String?> Function();
 
-/// Test-only override for the web platform.
-///
-/// `kIsWeb` is a compile-time constant, so the web-specific failure
-/// classification cannot be exercised from VM tests without this hook. It
-/// defaults to [kIsWeb] and is never set in production code.
-@visibleForTesting
-bool debugWebPlatform = kIsWeb;
-
-/// Probes reachability and readiness of the backend voice stack.
+/// Probes reachability and readiness of the backend gateway.
 abstract interface class BackendProbe {
-  /// Probes the full backend chain concurrently; results ordered
-  /// [BackendCheck.tokenMint, tokenMintAuth, liveKit, llmProxy, vision].
+  /// Probes the gateway chain concurrently; results ordered
+  /// [BackendCheck.auth, inference, vision].
   Future<BackendStatus> probe(BackendSettings settings);
 }
 
-/// [BackendProbe] over HTTP (token-mint, LLM proxy) and WebSocket (LiveKit).
+/// [BackendProbe] over the authenticated gateway (auth, inference, vision).
+///
+/// All three checks authenticate with the API key from the injected
+/// [ApiKeyReader]. HTTP 401 surfaces as [ProbeStatus.unauthorized] (so the UI
+/// can route to re-auth); a missing key surfaces as
+/// [ProbeStatus.noCredentials].
 class DioBackendProbe implements BackendProbe {
   DioBackendProbe({
     Dio? dio,
-    WebSocketConnector? wsConnector,
-    Duration tokenMintTimeout = const Duration(seconds: 8),
-    Duration liveKitTimeout = const Duration(seconds: 8),
-    Duration llmTimeout = const Duration(seconds: 25),
+    ApiKeyReader? apiKeyReader,
+    this.model = 'Qwen3-8B-Q4_K_M.gguf',
+    Duration authTimeout = const Duration(seconds: 8),
+    Duration inferenceTimeout = const Duration(seconds: 25),
+    Duration visionTimeout = const Duration(seconds: 5),
   })  : _dio = dio ??
             Dio(
               BaseOptions(
@@ -90,223 +94,218 @@ class DioBackendProbe implements BackendProbe {
                 receiveTimeout: const Duration(seconds: 8),
               ),
             ),
-        _wsConnector = wsConnector ?? _connect,
+        _apiKeyReader = apiKeyReader ?? (() async => null),
         _timeouts = (
-          tokenMint: tokenMintTimeout,
-          liveKit: liveKitTimeout,
-          llm: llmTimeout,
+          auth: authTimeout,
+          inference: inferenceTimeout,
+          vision: visionTimeout,
         );
 
   final Dio _dio;
-  final WebSocketConnector _wsConnector;
-  final ({Duration tokenMint, Duration liveKit, Duration llm}) _timeouts;
+  final ApiKeyReader _apiKeyReader;
+
+  /// Model identifier used by the inference probe ping, mirroring the default
+  /// the real chat client sends.
+  final String model;
+  final ({Duration auth, Duration inference, Duration vision}) _timeouts;
 
   @override
   Future<BackendStatus> probe(BackendSettings settings) async {
     final results = await Future.wait([
-      _probeTokenMint(settings),
-      _probeTokenMintAuth(settings),
-      _probeLiveKit(settings),
-      _probeLlmProxy(settings),
+      _probeAuth(settings),
+      _probeInference(settings),
       _probeVision(settings),
     ]);
     return BackendStatus(checks: results);
   }
 
-  Future<CheckResult> _probeTokenMint(BackendSettings settings) {
-    final host = settings.trimmedHost;
-    return _guard(BackendCheck.tokenMint, () async {
-      final resp = await _dio
-          .getUri(BackendConfig.tokenMintHealthz(host))
-          .timeout(_timeouts.tokenMint);
-      final body = resp.data;
-      if (resp.statusCode == 200 && body is Map && body['status'] == 'ok') {
-        return const CheckResult(
-          check: BackendCheck.tokenMint,
-          status: ProbeStatus.ok,
-          detail: 'reachable',
-        );
-      }
-      return CheckResult(
-        check: BackendCheck.tokenMint,
-        status: ProbeStatus.error,
-        detail: truncateText('HTTP ${resp.statusCode}: $body'),
-      );
-    });
+  /// The stored API key, or null when absent/blank.
+  Future<String?> _readApiKey() async {
+    final key = await _apiKeyReader();
+    return (key == null || key.isEmpty) ? null : key;
   }
 
-  Future<CheckResult> _probeTokenMintAuth(BackendSettings settings) {
+  Future<CheckResult> _probeAuth(BackendSettings settings) async {
+    final apiKey = await _readApiKey();
+    if (apiKey == null) {
+      return const CheckResult(
+        check: BackendCheck.auth,
+        status: ProbeStatus.noCredentials,
+        detail: 'no API key stored',
+      );
+    }
     final host = settings.trimmedHost;
     return _guard(
-      BackendCheck.tokenMintAuth,
+      BackendCheck.auth,
       () async {
+        final url = BackendConfig.llmProxy(
+          host,
+          environment: settings.environment,
+        ).replace(path: '/v1/auth/check');
         final resp = await _dio
-            .postUri(
-              BackendConfig.tokenMintToken(host),
-              data: {
-                'identity': 'mobile-probe',
-                'room': 'voicebot-room',
-                'name': 'Mobile',
-              },
+            .getUri(
+              url,
               options: Options(
-                headers: {'Authorization': 'Bearer ${settings.secret}'},
-                // The bearer secret must never be replayed to a redirect
-                // target on another origin.
+                headers: {'Authorization': 'Bearer $apiKey'},
+                // The API key must never be replayed to a redirect target on
+                // another origin.
                 followRedirects: false,
               ),
             )
-            .timeout(_timeouts.tokenMint);
+            .timeout(_timeouts.auth);
         if (resp.statusCode == 200) {
           return const CheckResult(
-            check: BackendCheck.tokenMintAuth,
+            check: BackendCheck.auth,
             status: ProbeStatus.ok,
-            detail: 'shared secret valid',
+            detail: 'API key valid',
           );
         }
         return CheckResult(
-          check: BackendCheck.tokenMintAuth,
+          check: BackendCheck.auth,
           status: ProbeStatus.error,
           detail: 'HTTP ${resp.statusCode}',
         );
       },
-      httpError: _tokenMintAuthHttpDetail,
+      httpError: (e) => _authHttpError(BackendCheck.auth, e),
     );
   }
 
-  Future<CheckResult> _probeLiveKit(BackendSettings settings) async {
-    try {
-      final channel = await _wsConnector(
-        BackendConfig.liveKitWs(settings.trimmedHost),
-      ).timeout(_timeouts.liveKit);
-      try {
-        await channel.sink.close();
-      } catch (_) {
-        // Best-effort close; the server may already have closed the socket.
-      }
+  Future<CheckResult> _probeInference(BackendSettings settings) async {
+    final apiKey = await _readApiKey();
+    if (apiKey == null) {
       return const CheckResult(
-        check: BackendCheck.liveKit,
-        status: ProbeStatus.ok,
-        detail: 'signaling reachable',
-      );
-    } catch (e) {
-      final (status, detail) = _classify(e);
-      return CheckResult(
-        check: BackendCheck.liveKit,
-        status: status,
-        detail: detail,
+        check: BackendCheck.inference,
+        status: ProbeStatus.noCredentials,
+        detail: 'no API key stored',
       );
     }
-  }
-
-  Future<CheckResult> _probeLlmProxy(BackendSettings settings) {
     final host = settings.trimmedHost;
     return _guard(
-      BackendCheck.llmProxy,
+      BackendCheck.inference,
       () async {
         final resp = await _dio
             .postUri(
-              BackendConfig.llmCompletions(host),
+              BackendConfig.llmCompletions(
+                host,
+                environment: settings.environment,
+              ),
               data: {
+                'model': model,
                 'messages': [
                   {'role': 'user', 'content': 'ping'},
                 ],
                 'max_tokens': 1,
                 'stream': false,
               },
+              options: Options(
+                headers: {'Authorization': 'Bearer $apiKey'},
+                followRedirects: false,
+              ),
             )
-            .timeout(_timeouts.llm);
+            .timeout(_timeouts.inference);
         if (resp.statusCode == 200) {
           return const CheckResult(
-            check: BackendCheck.llmProxy,
+            check: BackendCheck.inference,
             status: ProbeStatus.ok,
             detail: 'inference ready',
           );
         }
         return CheckResult(
-          check: BackendCheck.llmProxy,
+          check: BackendCheck.inference,
           status: ProbeStatus.error,
           detail: 'HTTP ${resp.statusCode}',
         );
       },
-      httpError: _llmProxyHttpDetail,
+      httpError: (e) => _inferenceHttpError(BackendCheck.inference, e),
     );
   }
 
   Future<CheckResult> _probeVision(BackendSettings settings) async {
+    final apiKey = await _readApiKey();
+    if (apiKey == null) {
+      return const CheckResult(
+        check: BackendCheck.vision,
+        status: ProbeStatus.noCredentials,
+        detail: 'no API key stored',
+      );
+    }
     final host = settings.trimmedHost;
-    try {
-      final modelsUrl = BackendConfig.llmProxy(host).replace(path: '/v1/models');
-      final response = await _dio
-          .getUri(
-            modelsUrl,
-            options: Options(
-              connectTimeout: const Duration(seconds: 5),
-              receiveTimeout: const Duration(seconds: 5),
-            ),
-          )
-          .timeout(const Duration(seconds: 5));
-      if (response.statusCode != 200) {
-        return CheckResult(
-          check: BackendCheck.vision,
-          status: ProbeStatus.error,
-          detail: 'HTTP ${response.statusCode}',
-        );
-      }
-      final data = response.data as Map<String, dynamic>?;
-      final models = data?['data'] as List?;
-      if (models == null) {
+    return _guard(
+      BackendCheck.vision,
+      () async {
+        final modelsUrl = BackendConfig.llmProxy(
+          host,
+          environment: settings.environment,
+        ).replace(path: '/v1/models');
+        final response = await _dio
+            .getUri(
+              modelsUrl,
+              options: Options(
+                headers: {'Authorization': 'Bearer $apiKey'},
+                connectTimeout: _timeouts.vision,
+                receiveTimeout: _timeouts.vision,
+                followRedirects: false,
+              ),
+            )
+            .timeout(_timeouts.vision);
+        if (response.statusCode != 200) {
+          return CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.error,
+            detail: 'HTTP ${response.statusCode}',
+          );
+        }
+        final data = response.data as Map<String, dynamic>?;
+        final models = data?['data'] as List?;
+        if (models == null) {
+          return const CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.unreachable,
+            detail: 'no data in models response',
+          );
+        }
+        for (final model in models) {
+          if (model is Map<String, dynamic>) {
+            final id = model['id'] as String?;
+            if (id == 'model.vl') {
+              return const CheckResult(
+                check: BackendCheck.vision,
+                status: ProbeStatus.ok,
+                detail: 'model.vl available',
+              );
+            }
+          }
+        }
         return const CheckResult(
           check: BackendCheck.vision,
           status: ProbeStatus.unreachable,
-          detail: 'no data in models response',
+          detail: 'model.vl not found',
         );
-      }
-      for (final model in models) {
-        if (model is Map<String, dynamic>) {
-          final id = model['id'] as String?;
-          if (id == 'model.vl') {
-            return const CheckResult(
-              check: BackendCheck.vision,
-              status: ProbeStatus.ok,
-              detail: 'model.vl available',
-            );
-          }
-        }
-      }
-      return const CheckResult(
-        check: BackendCheck.vision,
-        status: ProbeStatus.unreachable,
-        detail: 'model.vl not found',
-      );
-    } catch (e) {
-      final (status, detail) = _classify(e);
-      return CheckResult(
-        check: BackendCheck.vision,
-        status: status,
-        detail: detail,
-      );
-    }
+      },
+      httpError: (e) => _visionHttpError(BackendCheck.vision, e),
+    );
   }
 
   /// Runs [run], translating non-2xx responses into error results and every
-  /// other failure through [_classify]. [httpError] customizes the detail for
-  /// HTTP error responses of the probe at hand.
+  /// other failure through [_classify]. [httpError] fully customizes the
+  /// result of an HTTP error response (e.g. mapping 401 to unauthorized).
   Future<CheckResult> _guard(
     BackendCheck check,
     Future<CheckResult> Function() run, {
-    String Function(DioException error)? httpError,
+    CheckResult Function(DioException error)? httpError,
   }) async {
     try {
       return await run();
     } on DioException catch (e) {
       if (e.type == DioExceptionType.badResponse) {
-        final detail = httpError?.call(e) ??
-            'HTTP ${e.response?.statusCode}: ${e.response?.data}';
-        return CheckResult(
-          check: check,
-          status: ProbeStatus.error,
-          detail: truncateText(detail),
-        );
+        final result = httpError?.call(e) ??
+            CheckResult(
+              check: check,
+              status: ProbeStatus.error,
+              detail:
+                  truncateText('HTTP ${e.response?.statusCode}: ${e.response?.data}'),
+            );
+        return result;
       }
       final (status, detail) = _classify(e);
       return CheckResult(check: check, status: status, detail: detail);
@@ -316,82 +315,78 @@ class DioBackendProbe implements BackendProbe {
     }
   }
 
-  static String _tokenMintAuthHttpDetail(DioException e) {
+  static CheckResult _authHttpError(BackendCheck check, DioException e) {
     final code = e.response?.statusCode;
-    return switch (code) {
-      401 => 'shared secret rejected (401)',
-      403 => '403: reserved identity or unknown room',
-      503 => 'server not ready (503)',
-      _ => 'HTTP $code',
-    };
-  }
-
-  static String _llmProxyHttpDetail(DioException e) {
-    final code = e.response?.statusCode;
-    return switch (code) {
-      503 => 'RabbitMQ not reachable (503)',
-      502 || 504 => 'backend not ready ($code)',
-      400 || 422 => 'proxy returned $code (unexpected request shape)',
-      _ => 'HTTP $code',
-    };
-  }
-
-  /// Whether failures should be classified the way the web platform surfaces
-  /// them (see [_classify]).
-  bool get _webPlatform => debugWebPlatform || kIsWeb;
-
-  /// Classifies a failure into (status, detail) by walking the wrapped-cause
-  /// chain. Network-family failures (dio timeouts/connection errors,
-  /// SocketException, TimeoutException) map to unreachable. A
-  /// [WebSocketChannelException] that is not a network failure proves the
-  /// signaling endpoint answered, so it maps to ok. Anything else is an error
-  /// carrying its own detail.
-  (ProbeStatus, String) _classify(Object error) {
-    var current = error;
-    for (var depth = 0; depth < 8; depth++) {
-      if (isNetworkError(current)) {
-        return (ProbeStatus.unreachable, 'unreachable');
-      }
-      if (current is DioException) {
-        if (current.error case final inner?) {
-          current = inner;
-          continue;
-        }
-        return (ProbeStatus.error, describeDioError(current));
-      }
-      if (current is WebSocketChannelException) {
-        if (_webPlatform) {
-          // On the web the HTML channel surfaces every connect failure
-          // (browser DomException/ErrorEvent-style causes, or a bare
-          // 'WebSocket connection failed.') as a WebSocketChannelException with
-          // no explicit "server rejected the upgrade" marker, so any such
-          // exception means the host was never reached.
-          return (ProbeStatus.unreachable, 'unreachable');
-        }
-        final inner = current.inner;
-        if (inner == null || inner is WebSocketException) {
-          // The server answered but rejected the upgrade (e.g. no token
-          // provided), which still proves the signaling endpoint is up.
-          return (ProbeStatus.ok, 'signaling reachable (server responded)');
-        }
-        current = inner;
-        continue;
-      }
-      if (_webPlatform) {
-        // Any other browser-level failure (DomException, ErrorEvent, ...) is
-        // a network failure on web, since no upgrade-rejection marker exists.
-        return (ProbeStatus.unreachable, 'unreachable');
-      }
-      return (ProbeStatus.error, describeDioError(current));
+    if (code == 401) {
+      return CheckResult(
+        check: check,
+        status: ProbeStatus.unauthorized,
+        detail: 'API key rejected (401)',
+      );
     }
-    return (ProbeStatus.error, truncateText('$current'));
+    return CheckResult(
+      check: check,
+      status: ProbeStatus.error,
+      detail: 'HTTP $code',
+    );
   }
 
-  /// Default connector: connects and waits for the handshake so failures
-  /// surface here instead of as unhandled stream errors.
-  static Future<WebSocketChannel> _connect(Uri uri) async {
-    final channel = WebSocketChannel.connect(uri);
-    await channel.ready;
-    return channel;
+  static CheckResult _inferenceHttpError(BackendCheck check, DioException e) {
+    final code = e.response?.statusCode;
+    if (code == 401) {
+      return CheckResult(
+        check: check,
+        status: ProbeStatus.unauthorized,
+        detail: 'API key rejected (401)',
+      );
+    }
+    return switch (code) {
+      503 => CheckResult(
+          check: check,
+          status: ProbeStatus.error,
+          detail: 'RabbitMQ not reachable (503)',
+        ),
+      502 || 504 => CheckResult(
+          check: check,
+          status: ProbeStatus.error,
+          detail: 'backend not ready ($code)',
+        ),
+      400 || 422 => CheckResult(
+          check: check,
+          status: ProbeStatus.error,
+          detail: 'proxy returned $code (unexpected request shape)',
+        ),
+      _ => CheckResult(
+          check: check,
+          status: ProbeStatus.error,
+          detail: 'HTTP $code',
+        ),
+    };
+  }
+
+  static CheckResult _visionHttpError(BackendCheck check, DioException e) {
+    final code = e.response?.statusCode;
+    if (code == 401) {
+      return CheckResult(
+        check: check,
+        status: ProbeStatus.unauthorized,
+        detail: 'API key rejected (401)',
+      );
+    }
+    return CheckResult(
+      check: check,
+      status: ProbeStatus.error,
+      detail: 'HTTP $code',
+    );
+  }
+
+  /// Classifies a non-HTTP failure into (status, detail). Network-family
+  /// failures map to unreachable; anything else is an error carrying its own
+  /// detail.
+  (ProbeStatus, String) _classify(Object error) {
+    if (isNetworkError(error)) {
+      return (ProbeStatus.unreachable, 'unreachable');
+    }
+    return (ProbeStatus.error, describeDioError(error));
   }
 }

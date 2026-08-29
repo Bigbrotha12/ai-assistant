@@ -42,6 +42,11 @@ class ConversationState {
   /// Updated as the upload queue reports progress.
   final Map<String, UploadJobStatus> attachmentUploads;
 
+  /// True when the last failure was a gateway 401 (missing/invalid API key).
+  /// Distinct from [error]: the UI renders the re-auth card instead of a
+  /// generic message.
+  final bool authRequired;
+
   const ConversationState({
     required this.messages,
     this.isStreaming = false,
@@ -50,6 +55,7 @@ class ConversationState {
     this.failedMessageId,
     this.isDbReady = false,
     this.attachmentUploads = const {},
+    this.authRequired = false,
   });
 
   ConversationState copyWith({
@@ -60,6 +66,7 @@ class ConversationState {
     Object? failedMessageId = _sentinel,
     Object? attachmentUploads = _sentinel,
     bool? isDbReady,
+    Object? authRequired = _sentinel,
   }) {
     return ConversationState(
       messages: messages ?? this.messages,
@@ -75,6 +82,9 @@ class ConversationState {
           ? this.attachmentUploads
           : attachmentUploads as Map<String, UploadJobStatus>,
       isDbReady: isDbReady ?? this.isDbReady,
+      authRequired: identical(authRequired, _sentinel)
+          ? this.authRequired
+          : authRequired as bool,
     );
   }
 }
@@ -197,6 +207,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       isStreaming: true,
       error: null,
       failedMessageId: null,
+      authRequired: false,
     ));
 
     // Brand-new conversations need their row created first (the message row's
@@ -517,6 +528,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       isStreaming: true,
       error: null,
       failedMessageId: null,
+      authRequired: false,
     ));
 
     await _runTurn();
@@ -639,6 +651,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
           pendingUserMessageId: null,
           error: null,
           failedMessageId: null,
+          authRequired: false,
         ));
         _pendingAssistantId = null;
         _pendingContent = null;
@@ -680,6 +693,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
           pendingUserMessageId: null,
           error: null,
           failedMessageId: null,
+          authRequired: false,
         ));
         _pendingAssistantId = null;
         _pendingContent = null;
@@ -726,6 +740,21 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     return _pendingContent?.toString() ?? '';
   }
 
+  /// Re-resolves the [ChatClient] from [chatApiClientProvider]. Called after a
+  /// re-auth mints a fresh API key: the pinned client instance is swapped so
+  /// the next [retry] authorizes with the new key (the client is deliberately
+  /// read — not watched — at build time, see [build]).
+  void refreshClient() {
+    _client = ref.read(chatApiClientProvider);
+  }
+
+  /// Clears the auth-required flag (e.g. the user dismissed the re-auth card).
+  void dismissAuthRequired() {
+    final current = state.value;
+    if (current == null || !current.authRequired) return;
+    _setState(current.copyWith(authRequired: false));
+  }
+
   Future<void> _onError(Object error, String assistantId, CancelToken token) async {
     if (!ref.mounted) return;
     final cur = state.value;
@@ -740,6 +769,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       _pendingContent = null;
       return;
     }
+
+    // A gateway 401 means the API key is missing/invalid: surface the distinct
+    // auth-required state (the UI renders the re-auth card) instead of a
+    // generic error message.
+    final authRequired = isAuthRequiredError(error);
 
     final message = switch (error) {
       ChatNetworkError(:final message) => message,
@@ -784,9 +818,10 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(cur.copyWith(
       messages: messages,
       isStreaming: false,
-      error: message,
+      error: authRequired ? null : message,
       pendingUserMessageId: null,
       failedMessageId: assistantId,
+      authRequired: authRequired,
     ));
     _pendingAssistantId = null;
     _pendingContent = null;

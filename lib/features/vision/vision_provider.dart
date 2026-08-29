@@ -4,6 +4,8 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/app_startup.dart';
+import '../../core/auth_credentials_providers.dart';
 import '../../core/config.dart';
 import '../../core/files_providers.dart';
 import '../../core/settings_providers.dart';
@@ -38,6 +40,11 @@ final visionClientProvider =
 class VisionClientNotifier extends AsyncNotifier<VisionClient> {
   @override
   Future<VisionClient> build() async {
+    // Watch the credentials so the notifier rebuilds with a fresh key when the
+    // user signs in again — and the probe/describe calls stay authorized.
+    // Awaited (not `.value`) so the build never races a still-loading store.
+    final apiKey = (await ref.watch(authCredentialsProvider.future))?.apiKey;
+
     // Check VRAM headroom first (cheap, local).
     final gate = ref.read(vramGateProvider);
     final hasHeadroom = await gate.hasHeadroom();
@@ -47,25 +54,38 @@ class VisionClientNotifier extends AsyncNotifier<VisionClient> {
     final visionEnabled = voiceSettings?.visionEnabled ?? true;
     if (!visionEnabled) return const NoOpVisionClient();
 
-    // Lightweight check: query /v1/models for model.vl on the backend.
+    // Lightweight check: query /v1/models for model.vl on the backend. The
+    // preflight must carry the bearer API key too — an unauthenticated probe
+    // would 401 and silently disable vision via [NoOpVisionClient].
     final backend = await ref.read(settingsProvider.future);
     if (backend == null) return const NoOpVisionClient();
-    final baseUrl =
-        BackendConfig.llmProxy(backend.trimmedHost).toString().replaceAll(RegExp(r'/$'), '');
-    if (!await _hasVisionBackend(baseUrl, ref.read(dioProvider))) {
+    final baseUrl = BackendConfig.llmProxy(
+      effectiveHost(backend),
+      environment: effectiveEnvironment(backend),
+    ).toString().replaceAll(RegExp(r'/$'), '');
+    if (!await _hasVisionBackend(baseUrl, ref.read(dioProvider), apiKey)) {
       return const NoOpVisionClient();
     }
 
-    return VisionApiClient(baseUrl: baseUrl);
+    return VisionApiClient(baseUrl: baseUrl, apiKey: apiKey);
   }
 
   /// Queries the backend's /v1/models to check for [kVisionModelRoute].
-  /// Returns false on any failure.
-  Future<bool> _hasVisionBackend(String baseUrl, Dio dio) async {
+  /// Returns false on any failure. The bearer key (when set) is attached so
+  /// the probe is authorized like the describe call itself.
+  Future<bool> _hasVisionBackend(
+    String baseUrl,
+    Dio dio,
+    String? apiKey,
+  ) async {
     try {
       final response = await dio.get(
         '$baseUrl/v1/models',
         options: Options(
+          headers: {
+            if (apiKey != null && apiKey.isNotEmpty)
+              'Authorization': 'Bearer $apiKey',
+          },
           connectTimeout: const Duration(seconds: 5),
           receiveTimeout: const Duration(seconds: 5),
         ),

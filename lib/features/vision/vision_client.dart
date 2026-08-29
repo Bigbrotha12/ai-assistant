@@ -58,9 +58,15 @@ class VisionApiClient implements VisionClient {
   VisionApiClient({
     required this.baseUrl,
     Dio? dio,
+    this.apiKey,
   }) : _dio = dio ?? Dio();
 
   final String baseUrl;
+
+  /// Gateway bearer API key sent as `Authorization: Bearer <apiKey>` on every
+  /// request. Null when no key is available.
+  final String? apiKey;
+
   final Dio _dio;
 
   static const Duration _connectTimeout = Duration(seconds: 8);
@@ -90,12 +96,19 @@ class VisionApiClient implements VisionClient {
       'max_tokens': kMaxDescriptionTokens,
     };
 
+    final headers = <String, Object?>{};
+    final key = apiKey;
+    if (key != null && key.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $key';
+    }
+
     Response<Map<String, dynamic>> response;
     try {
       response = await _dio.post<Map<String, dynamic>>(
         _endpoint,
         data: body,
         options: Options(
+          headers: headers,
           connectTimeout: _connectTimeout,
           receiveTimeout: _receiveTimeout,
         ),

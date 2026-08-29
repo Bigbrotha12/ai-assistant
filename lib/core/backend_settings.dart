@@ -1,15 +1,18 @@
-/// Runtime-entered backend configuration (host + shared secret).
+/// Runtime-entered backend configuration (host + environment + service tokens).
 class BackendSettings {
   const BackendSettings({
     required this.host,
-    required this.secret,
+    this.environment = BackendEnvironment.dev,
     this.mcpSecret,
     this.filesSecret,
     this.storageUrl,
   });
 
   final String host;
-  final String secret;
+
+  /// Dev vs production deployment; selects the http/https scheme used by every
+  /// derived backend URI.
+  final BackendEnvironment environment;
 
   /// Optional voice-mcp bearer token. When blank/null no MCP auth is used.
   final String? mcpSecret;
@@ -21,9 +24,9 @@ class BackendSettings {
   /// Optional storage service URL. When null/blank derived from host:17603.
   final String? storageUrl;
 
-  /// True when both host and shared secret are non-blank. The MCP and files
-  /// tokens are optional and not required for validity.
-  bool get isValid => host.trim().isNotEmpty && secret.trim().isNotEmpty;
+  /// True when the host is non-blank. The MCP and files tokens are optional
+  /// and not required for validity.
+  bool get isValid => host.trim().isNotEmpty;
 
   String get trimmedHost => host.trim();
 
@@ -44,14 +47,14 @@ class BackendSettings {
 
   BackendSettings copyWith({
     String? host,
-    String? secret,
+    BackendEnvironment? environment,
     String? mcpSecret,
     String? filesSecret,
     String? storageUrl,
   }) =>
       BackendSettings(
         host: host ?? this.host,
-        secret: secret ?? this.secret,
+        environment: environment ?? this.environment,
         mcpSecret: mcpSecret ?? this.mcpSecret,
         filesSecret: filesSecret ?? this.filesSecret,
         storageUrl: storageUrl ?? this.storageUrl,
@@ -61,11 +64,23 @@ class BackendSettings {
   bool operator ==(Object other) =>
       other is BackendSettings &&
       other.host == host &&
-      other.secret == secret &&
+      other.environment == environment &&
       other.mcpSecret == mcpSecret &&
       other.filesSecret == filesSecret &&
       other.storageUrl == storageUrl;
 
   @override
-  int get hashCode => Object.hash(host, secret, mcpSecret, filesSecret, storageUrl);
+  int get hashCode =>
+      Object.hash(host, environment, mcpSecret, filesSecret, storageUrl);
+}
+
+/// Deployment environment; selects the URI scheme for backend endpoints.
+enum BackendEnvironment {
+  dev('http'),
+  production('https');
+
+  const BackendEnvironment(this.scheme);
+
+  /// The URI scheme used by derived backend endpoints in this environment.
+  final String scheme;
 }

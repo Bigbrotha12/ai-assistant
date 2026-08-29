@@ -63,11 +63,11 @@ void main() {
     final store = SecureSettingsStore(storage: InMemorySecureStorage());
 
     await store.save(
-      const BackendSettings(host: 'tail.example', secret: 's3cret'),
+      const BackendSettings(host: 'tail.example'),
     );
     final loaded = await store.load();
 
-    expect(loaded, const BackendSettings(host: 'tail.example', secret: 's3cret'));
+    expect(loaded, const BackendSettings(host: 'tail.example'));
   });
 
   test('load returns null when nothing has been saved', () async {
@@ -76,19 +76,50 @@ void main() {
     expect(await store.load(), isNull);
   });
 
-  test('load returns settings when host saved but secret is empty', () async {
+  test('load returns settings when only the host has been saved', () async {
     final store = SecureSettingsStore(storage: InMemorySecureStorage());
 
-    await store.save(const BackendSettings(host: 'tail.example', secret: ''));
+    await store.save(const BackendSettings(host: 'tail.example'));
     final loaded = await store.load();
 
-    expect(loaded, const BackendSettings(host: 'tail.example', secret: ''));
+    expect(loaded, const BackendSettings(host: 'tail.example'));
+  });
+
+  test('environment round-trips and defaults to dev', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(const BackendSettings(host: 'tail.example'));
+    final dev = await store.load();
+    expect(dev!.environment, BackendEnvironment.dev);
+    expect(storage.values['backend_environment'], 'dev');
+
+    await store.save(
+      const BackendSettings(
+        host: 'tail.example',
+        environment: BackendEnvironment.production,
+      ),
+    );
+    final prod = await store.load();
+    expect(prod!.environment, BackendEnvironment.production);
+    expect(storage.values['backend_environment'], 'production');
+  });
+
+  test('an unknown stored environment resolves to dev', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureSettingsStore(storage: storage);
+
+    await store.save(const BackendSettings(host: 'tail.example'));
+    storage._values['backend_environment'] = 'staging';
+    final loaded = await store.load();
+
+    expect(loaded!.environment, BackendEnvironment.dev);
   });
 
   test('load returns null when host is blank', () async {
     final store = SecureSettingsStore(storage: InMemorySecureStorage());
 
-    await store.save(const BackendSettings(host: '   ', secret: 's3cret'));
+    await store.save(const BackendSettings(host: '   '));
 
     expect(await store.load(), isNull);
   });
@@ -98,7 +129,7 @@ void main() {
     final store = SecureSettingsStore(storage: storage);
 
     await store.save(
-      const BackendSettings(host: 'tail.example', secret: 's3cret'),
+      const BackendSettings(host: 'tail.example'),
     );
     await store.clear();
 
@@ -111,11 +142,11 @@ void main() {
     final store = SecureSettingsStore(storage: storage);
 
     await store.save(
-      const BackendSettings(host: '  tail.example  ', secret: 's3cret'),
+      const BackendSettings(host: '  tail.example  '),
     );
 
     expect(storage.values['backend_host'], 'tail.example');
-    expect(storage.values['backend_secret'], 's3cret');
+    expect(storage.values['backend_environment'], 'dev');
   });
 
   test('mcpSecret round-trips and is stored trimmed', () async {
@@ -125,7 +156,6 @@ void main() {
     await store.save(
       const BackendSettings(
         host: 'tail.example',
-        secret: 's3cret',
         mcpSecret: '  mcp-token  ',
       ),
     );
@@ -140,7 +170,7 @@ void main() {
     final store = SecureSettingsStore(storage: storage);
 
     await store.save(
-      const BackendSettings(host: 'tail.example', secret: 's3cret'),
+      const BackendSettings(host: 'tail.example'),
     );
 
     expect(storage.values.containsKey('backend_mcp_secret'), isFalse);
@@ -155,7 +185,6 @@ void main() {
     await store.save(
       const BackendSettings(
         host: 'tail.example',
-        secret: 's3cret',
         mcpSecret: '   ',
       ),
     );
@@ -172,7 +201,6 @@ void main() {
     await store.save(
       const BackendSettings(
         host: 'tail.example',
-        secret: 's3cret',
         mcpSecret: 'token',
       ),
     );
@@ -189,7 +217,6 @@ void main() {
     await store.save(
       const BackendSettings(
         host: 'tail.example',
-        secret: 's3cret',
         mcpSecret: 'token',
       ),
     );
@@ -208,7 +235,6 @@ void main() {
       await store.save(
         const BackendSettings(
           host: 'tail.example',
-          secret: 's3cret',
           filesSecret: '  files-token  ',
         ),
       );
@@ -223,7 +249,7 @@ void main() {
       final store = SecureSettingsStore(storage: storage);
 
       await store.save(
-        const BackendSettings(host: 'tail.example', secret: 's3cret'),
+        const BackendSettings(host: 'tail.example'),
       );
 
       expect(storage.values.containsKey('backend_files_secret'), isFalse);
@@ -238,7 +264,6 @@ void main() {
       await store.save(
         const BackendSettings(
           host: 'tail.example',
-          secret: 's3cret',
           filesSecret: '   ',
         ),
       );
@@ -255,7 +280,6 @@ void main() {
       await store.save(
         const BackendSettings(
           host: 'tail.example',
-          secret: 's3cret',
           filesSecret: 'token',
         ),
       );
@@ -272,7 +296,6 @@ void main() {
       await store.save(
         const BackendSettings(
           host: 'tail.example',
-          secret: 's3cret',
           filesSecret: 'token',
         ),
       );
@@ -290,7 +313,6 @@ void main() {
       await store.save(
         const BackendSettings(
           host: 'tail.example',
-          secret: 's3cret',
           filesSecret: 'old-token',
         ),
       );
@@ -299,7 +321,7 @@ void main() {
       // Token rotation: the user clears the field and saves; the stale secret
       // must not linger (otherwise load() still returns it).
       await store.save(
-        const BackendSettings(host: 'tail.example', secret: 's3cret'),
+        const BackendSettings(host: 'tail.example'),
       );
 
       expect(storage.values.containsKey('backend_files_secret'), isFalse);
@@ -317,14 +339,13 @@ void main() {
     await store.save(
       const BackendSettings(
         host: 'tail.example',
-        secret: 's3cret',
         mcpSecret: 'old-token',
       ),
     );
     expect(storage.values.containsKey('backend_mcp_secret'), isTrue);
 
     await store.save(
-      const BackendSettings(host: 'tail.example', secret: 's3cret'),
+      const BackendSettings(host: 'tail.example'),
     );
 
     expect(storage.values.containsKey('backend_mcp_secret'), isFalse);

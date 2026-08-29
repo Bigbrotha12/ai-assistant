@@ -30,7 +30,7 @@ class SecureSettingsStore implements SettingsStore {
             );
 
   static const _kHost = 'backend_host';
-  static const _kSecret = 'backend_secret';
+  static const _kEnvironment = 'backend_environment';
   static const _kMcpSecret = 'backend_mcp_secret';
   static const _kFilesSecret = 'backend_files_secret';
   static const _kStorageUrl = 'backend_storage_url';
@@ -43,13 +43,16 @@ class SecureSettingsStore implements SettingsStore {
     if (host == null || host.trim().isEmpty) {
       return null;
     }
-    final secret = await _storage.read(key: _kSecret) ?? '';
+    final environmentRaw = await _storage.read(key: _kEnvironment);
+    final environment =
+        BackendEnvironment.values.asNameMap()[environmentRaw] ??
+            BackendEnvironment.dev;
     final mcpSecret = await _storage.read(key: _kMcpSecret);
     final filesSecret = await _storage.read(key: _kFilesSecret);
     final storageUrl = await _storage.read(key: _kStorageUrl);
     return BackendSettings(
       host: host,
-      secret: secret,
+      environment: environment,
       mcpSecret:
           mcpSecret == null || mcpSecret.trim().isEmpty ? null : mcpSecret,
       filesSecret:
@@ -62,7 +65,10 @@ class SecureSettingsStore implements SettingsStore {
   @override
   Future<void> save(BackendSettings settings) async {
     await _storage.write(key: _kHost, value: settings.trimmedHost);
-    await _storage.write(key: _kSecret, value: settings.secret);
+    await _storage.write(
+      key: _kEnvironment,
+      value: settings.environment.name,
+    );
     final mcpSecret = settings.trimmedMcpSecret;
     if (mcpSecret != null) {
       await _storage.write(key: _kMcpSecret, value: mcpSecret);
@@ -88,7 +94,7 @@ class SecureSettingsStore implements SettingsStore {
   @override
   Future<void> clear() async {
     await _storage.delete(key: _kHost);
-    await _storage.delete(key: _kSecret);
+    await _storage.delete(key: _kEnvironment);
     await _storage.delete(key: _kMcpSecret);
     await _storage.delete(key: _kFilesSecret);
     await _storage.delete(key: _kStorageUrl);

@@ -112,19 +112,26 @@ abstract interface class ChatClient {
   });
 }
 
-/// OpenAI-compatible chat completions client for the queues proxy
+/// OpenAI-compatible chat completions client for the gateway LLM proxy
 /// (`POST $baseUrl/v1/chat/completions`).
 class ChatApiClient implements ChatClient {
   ChatApiClient({
     required this.baseUrl,
     Dio? dio,
     this.model = 'Qwen3-8B-Q4_K_M.gguf',
+    this.apiKey,
   }) : _dio = dio ?? Dio();
 
   /// llmProxy(host), e.g. http://192.168.1.5:9091. No trailing slash.
   final String baseUrl;
 
   final String model;
+
+  /// Gateway bearer API key sent as `Authorization: Bearer <apiKey>` on every
+  /// request. Null when no key is available; requests then go out
+  /// unauthenticated (and the gateway 401s them).
+  final String? apiKey;
+
   final Dio _dio;
 
   static const Duration _connectTimeout = Duration(seconds: 8);
@@ -132,6 +139,25 @@ class ChatApiClient implements ChatClient {
   static const Duration _retryBackoff = Duration(seconds: 1);
 
   String get _endpoint => '$baseUrl/v1/chat/completions';
+
+  /// Builds the per-request [Options]. The bearer API key (when set) is
+  /// attached to every request so the gateway never 401s a chat call. The
+  /// streaming path also opts into an SSE `accept` header and stream response
+  /// type.
+  Options _options({bool stream = false}) {
+    final headers = <String, Object?>{};
+    if (stream) headers['accept'] = 'text/event-stream';
+    final key = apiKey;
+    if (key != null && key.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $key';
+    }
+    return Options(
+      headers: headers,
+      responseType: stream ? ResponseType.stream : null,
+      connectTimeout: _connectTimeout,
+      receiveTimeout: _receiveTimeout,
+    );
+  }
 
   /// Streams a chat completion. Calls [onContent] for each content delta
   /// (thinking already stripped by the SSE parser), [onToolCallDelta] for each
@@ -198,10 +224,7 @@ class ChatApiClient implements ChatClient {
       response = await _dio.post<Map<String, dynamic>>(
         _endpoint,
         data: body,
-        options: Options(
-          connectTimeout: _connectTimeout,
-          receiveTimeout: _receiveTimeout,
-        ),
+        options: _options(),
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
@@ -280,12 +303,7 @@ class ChatApiClient implements ChatClient {
       response = await _dio.post<ResponseBody>(
         _endpoint,
         data: body,
-        options: Options(
-          responseType: ResponseType.stream,
-          headers: const {'accept': 'text/event-stream'},
-          connectTimeout: _connectTimeout,
-          receiveTimeout: _receiveTimeout,
-        ),
+        options: _options(stream: true),
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
@@ -447,3 +465,9 @@ class ChatApiClient implements ChatClient {
     return decoded is Map<String, dynamic> ? decoded : null;
   }
 }
+
+/// True when [error] is a gateway authentication rejection (HTTP 401 from a
+/// chat/vision call), which drives the re-auth affordances in the chat and
+/// voice UIs.
+bool isAuthRequiredError(Object error) =>
+    error is ChatServerError && error.statusCode == 401;

@@ -101,6 +101,7 @@ class ModelDownloader {
       final dir = File(resolvedPath).parent;
       await dir.create(recursive: true);
 
+      int? expectedTotal;
       final response = await _dio.get<List<int>>(
         url,
         options: Options(
@@ -109,6 +110,7 @@ class ModelDownloader {
           maxRedirects: 5,
         ),
         onReceiveProgress: (received, total) {
+          if (total > 0) expectedTotal = total;
           final progress = total > 0 ? received / total : 0.0;
           _progressController.add(
             ModelDownloadProgress(percent: progress, status: 'downloading'),
@@ -125,9 +127,30 @@ class ModelDownloader {
       if (bytes == null) {
         throw Exception('download returned no data');
       }
+      if (bytes.isEmpty) {
+        throw Exception('download returned an empty file');
+      }
+      final expected = expectedTotal;
+      if (expected != null && bytes.length != expected) {
+        throw Exception(
+          'download size mismatch: expected $expected bytes, '
+          'got ${bytes.length}',
+        );
+      }
 
-      final file = File(resolvedPath);
-      await file.writeAsBytes(bytes);
+      // Write to a temp file in the same directory as the final model so a
+      // partial or interrupted download can never be mistaken for the real
+      // file. Only once the temp file is fully written and validated is it
+      // atomically renamed into place.
+      final tempPath = '$resolvedPath.part';
+      final tempFile = File(tempPath);
+      try {
+        await tempFile.writeAsBytes(bytes, flush: true);
+        await tempFile.rename(resolvedPath);
+      } catch (_) {
+        await _deleteIfExists(tempFile);
+        rethrow;
+      }
 
       _states[modelType] = Ready();
       _progressController.add(
@@ -144,6 +167,18 @@ class ModelDownloader {
         ModelDownloadProgress(percent: 0.0, status: 'error: $error'),
       );
       rethrow;
+    }
+  }
+
+  /// Best-effort deletion of a partially written temp file, swallowing any
+  /// secondary cleanup error so the original failure propagates.
+  static Future<void> _deleteIfExists(File file) async {
+    try {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {
+      // Intentionally ignored; the caller's error takes precedence.
     }
   }
 

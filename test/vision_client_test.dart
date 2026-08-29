@@ -78,11 +78,13 @@ class _ErrorAction extends _VisionAction {
 VisionApiClient _client(
   _ScriptedAdapter adapter, {
   String baseUrl = 'http://test.local',
+  String? apiKey,
 }) =>
-      VisionApiClient(
-        baseUrl: baseUrl,
-        dio: Dio()..httpClientAdapter = adapter,
-      );
+    VisionApiClient(
+      baseUrl: baseUrl,
+      dio: Dio()..httpClientAdapter = adapter,
+      apiKey: apiKey,
+    );
 
 void main() {
   group(VisionApiClient, () {
@@ -204,6 +206,44 @@ void main() {
               .having((e) => e.statusCode, 'statusCode', 503),
         ),
       );
+    });
+
+    test('describeImage sends Authorization: Bearer <key> when apiKey set',
+        () async {
+      adapter.addResponse({
+        'choices': [
+          {'message': {'content': 'A cat.'}},
+        ],
+      });
+      final authClient = _client(adapter, apiKey: 'sk-test123');
+
+      const imageBytes = [0x89, 0x50, 0x4E, 0x47];
+      await authClient.describeImage(
+        bytes: Uint8List.fromList(imageBytes),
+        mimeType: 'image/png',
+      );
+
+      expect(
+        adapter.requests.single.headers['Authorization'],
+        'Bearer sk-test123',
+      );
+    });
+
+    test('describeImage omits Authorization when apiKey is null', () async {
+      adapter.addResponse({
+        'choices': [
+          {'message': {'content': 'A cat.'}},
+        ],
+      });
+
+      const imageBytes = [0x89, 0x50, 0x4E, 0x47];
+      await client.describeImage(
+        bytes: Uint8List.fromList(imageBytes),
+        mimeType: 'image/png',
+      );
+
+      final req = adapter.requests.single;
+      expect(req.headers.containsKey('Authorization'), isFalse);
     });
   });
 

@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:ai_assistant/features/voice/audio_playback_service.dart';
 import 'package:ai_assistant/features/voice/audio_session_manager.dart';
 import 'package:ai_assistant/features/voice/engine_manager.dart';
-import 'package:ai_assistant/features/voice/livekit_service.dart';
 import 'package:ai_assistant/features/voice/mic_capture_service.dart';
 import 'package:ai_assistant/features/voice/model_downloader.dart';
 import 'package:ai_assistant/features/voice/stt_engine.dart';
@@ -56,78 +55,6 @@ class FakeVoiceSettingsStore implements VoiceSettingsStore {
 
   @override
   Future<void> clear() async => saved = null;
-}
-
-/// In-memory [LiveKitService] double used across voice controller tests.
-///
-/// Surfaces the same streams as the real service so the controller's wiring
-/// can be exercised without a Dart socket. Tests drive it through the
-/// `emit*` helpers and inspect `sentAudio`.
-class FakeLiveKitService implements LiveKitService {
-  final _audioReceived = StreamController<List<int>>.broadcast();
-  final _transcripts = StreamController<String>.broadcast();
-  final _events = StreamController<VoiceConversationEvent>.broadcast();
-
-  bool _connected = false;
-  String? _roomName;
-
-  /// Audio frames sent by the controller (mic → AI).
-  final List<List<int>> sentAudio = [];
-
-  /// Non-null makes [connect] throw this error.
-  Object? connectError;
-
-  @override
-  bool get isConnected => _connected;
-
-  @override
-  String? get currentRoomName => _roomName;
-
-  @override
-  Stream<List<int>> get audioDataReceived => _audioReceived.stream;
-
-  @override
-  Stream<String> get transcriptsReceived => _transcripts.stream;
-
-  @override
-  Stream<VoiceConversationEvent> get events => _events.stream;
-
-  @override
-  Future<void> connect({
-    required String roomName,
-    required String token,
-  }) async {
-    final error = connectError;
-    if (error != null) throw error;
-    _connected = true;
-    _roomName = roomName;
-  }
-
-  @override
-  Future<void> disconnect() async {
-    _connected = false;
-    _roomName = null;
-  }
-
-  @override
-  Future<void> sendAudioData(List<int> pcm16bit) async {
-    sentAudio.add(pcm16bit);
-  }
-
-  /// Injects an AI TTS chunk into `audioDataReceived`.
-  void emitAiAudio(List<int> chunk) => _audioReceived.add(chunk);
-
-  /// Injects a server transcript into `transcriptsReceived`.
-  void emitServerTranscript(String text) => _transcripts.add(text);
-
-  /// Emits a `disconnected` event (mirrors a server-initiated drop).
-  void emitDisconnected() => _events.add(VoiceConversationEvent.disconnected);
-
-  Future<void> dispose() async {
-    await _audioReceived.close();
-    await _transcripts.close();
-    await _events.close();
-  }
 }
 
 /// In-memory [MicCaptureService] double. Feed chunks through [emitChunk].

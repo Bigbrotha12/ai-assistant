@@ -1,33 +1,16 @@
 import 'dart:async';
 
-import 'package:dio/dio.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../core/backend_settings.dart';
+import '../../core/chat_client_provider.dart';
 import '../../core/network_banner.dart';
-import '../../core/config.dart';
-import '../../core/files_providers.dart';
-import '../../core/settings_providers.dart';
 import 'audio_playback_service.dart';
 import 'engine_manager_provider.dart';
-import 'livekit_service.dart';
 import 'mic_capture_service.dart';
 import 'voice_capture_providers.dart';
 import 'voice_controller.dart';
 import 'voice_lifecycle_observer.dart';
-
-/// Data-channel-only LiveKit session wired to the configured backend host.
-///
-/// Recreated when the backend host changes (a settings save disposes any
-/// in-flight session).
-final liveKitServiceProvider = Provider<LiveKitService>((ref) {
-  final settings = ref.watch(settingsProvider).value;
-  final host = settings?.trimmedHost ?? BackendConfig.defaultHost;
-  final service = LiveKitServiceImpl(host: host);
-  ref.onDispose(service.dispose);
-  return service;
-});
 
 /// Microphone capture streaming raw PCM16 chunks.
 final micCaptureServiceProvider = Provider<MicCaptureService>((ref) {
@@ -50,8 +33,9 @@ final audioPlaybackServiceProvider = Provider<AudioPlayback>((ref) {
 
 /// Owns the [VoiceController] for the current (or next) conversation.
 ///
-/// Rebuilds when backend settings change, creating a fresh controller wired
-/// to a session against the new host.
+/// Rebuilds when backend settings or auth credentials change (the latter
+/// matters after a re-auth mints a fresh API key): watching [chatApiClientProvider]
+/// creates a fresh controller wired to a client carrying the current key.
 final voiceControllerProvider =
     NotifierProvider<VoiceControllerNotifier, VoiceController>(
       VoiceControllerNotifier.new,
@@ -63,17 +47,13 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
 
   @override
   VoiceController build() {
-    final settings = ref.watch(settingsProvider).value;
     final engineManager = ref.watch(engineManagerProvider);
     final sttEngine = engineManager.sttEngine;
     final ttsEngine = engineManager.ttsEngine;
     final controller = VoiceController(
-      liveKit: ref.read(liveKitServiceProvider),
+      chatClient: ref.watch(chatApiClientProvider),
       micCapture: ref.read(micCaptureServiceProvider),
       playback: ref.read(audioPlaybackServiceProvider),
-      tokenMinter: settings == null
-          ? null
-          : _tokenMinter(settings, ref.read(dioProvider)),
       sttEngine: sttEngine,
       ttsEngine: ttsEngine,
       onNetworkError: () {
@@ -116,15 +96,15 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     return controller;
   }
 
-  /// Tears down recording and playback and disconnects the LiveKit room when
+  /// Tears down recording and playback and ends the text conversation when
   /// the app moves to the background. Voice calls are short-lived; dropping
-  /// the connection on background is the conservative, audio-safe choice.
+  /// the session on background is the conservative, audio-safe choice.
   Future<void> _handleBackground() async {
     final pipeline = ref.read(voiceCapturePipelineProvider);
     if (pipeline.isRecording) {
       await pipeline.stopRecording();
     }
-    await ref.read(voiceControllerProvider).disconnect();
+    await ref.read(voiceControllerProvider).endConversation();
   }
 
   /// Resets the session to idle on foreground. Deliberately does not
@@ -135,15 +115,6 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
       await controller.resumeAfterInterruption();
     }
   }
-
-  /// Binds token minting to the configured backend (shared token-mint secret).
-  VoiceTokenMinter _tokenMinter(BackendSettings settings, Dio dio) =>
-      (roomName) => mintToken(
-        host: settings.trimmedHost,
-        roomName: roomName,
-        secret: settings.secret.trim(),
-        dio: dio,
-      );
 }
 
 /// Reactive view of the current conversation's state.

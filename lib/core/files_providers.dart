@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'config.dart';
+import 'app_startup.dart';
 import 'file_cache.dart';
 import 'files_service.dart';
 import 'settings_providers.dart';
@@ -18,14 +19,18 @@ final dioProvider = Provider<Dio>((ref) => Dio());
 /// "Files service not configured"). Never throws.
 final filesServiceProvider = Provider<FilesClient>((ref) {
   final settings = ref.watch(settingsProvider).value;
-  final host = settings?.trimmedHost ?? BackendConfig.defaultHost;
+  final host = effectiveHost(settings);
   final filesSecret = settings?.filesSecret?.trim();
   if (filesSecret == null || filesSecret.isEmpty) {
     return NoOpFilesClient();
   }
   return FilesClientImpl(
     dio: ref.watch(dioProvider),
-    baseUrl: BackendConfig.effectiveStorageUrl(host, settings?.storageUrl).toString(),
+    baseUrl: BackendConfig.effectiveStorageUrl(
+      host,
+      settings?.storageUrl,
+      environment: effectiveEnvironment(settings),
+    ).toString(),
     bearerToken: filesSecret,
   );
 });
