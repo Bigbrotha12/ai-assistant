@@ -21,13 +21,20 @@ class AiAssistantApp extends ConsumerWidget {
     return MaterialApp(
       title: 'AI Assistant',
       theme: premium ? buildPremiumTheme() : buildCoreTheme(),
-      // The premium tier paints the paper grain behind every screen (the
-      // scaffold chrome is transparent so the texture shows through).
+      // The premium tier paints the warm-ivory paper base plus grain behind
+      // every screen (the scaffold chrome is transparent so both show
+      // through). The paper base is required: without it the translucent
+      // grain would let the window's dark background show through.
       builder: premium
           ? (context, child) => Stack(
                 fit: StackFit.expand,
                 children: [
-                  RepaintBoundary(child: PaperTexture()),
+                  RepaintBoundary(
+                    child: ColoredBox(
+                      color: AppColors.paperBase,
+                      child: PaperTexture(),
+                    ),
+                  ),
                   child!,
                 ],
               )

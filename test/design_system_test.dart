@@ -165,14 +165,19 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    testWidgets('premium app builder stacks paper behind the screen',
+    testWidgets('premium app builder layers paper base under grain behind the screen',
         (tester) async {
       await tester.pumpWidget(MaterialApp(
         theme: buildPremiumTheme(),
         builder: (context, child) => Stack(
           fit: StackFit.expand,
           children: [
-            RepaintBoundary(child: PaperTexture()),
+            RepaintBoundary(
+              child: ColoredBox(
+                color: AppColors.paperBase,
+                child: PaperTexture(),
+              ),
+            ),
             child!,
           ],
         ),
@@ -181,6 +186,17 @@ void main() {
 
       expect(find.text('I am paper'), findsOneWidget);
       expect(find.byType(PaperTexture), findsOneWidget);
+      // The translucent grain never floats over an empty backdrop: the
+      // warm-ivory paper base is painted behind it (design §3.1).
+      final backdrop = tester.widget<ColoredBox>(
+        find
+            .ancestor(
+              of: find.byType(PaperTexture),
+              matching: find.byType(ColoredBox),
+            )
+            .first,
+      );
+      expect(backdrop.color, AppColors.paperBase);
       expect(tester.takeException(), isNull);
     });
   });
