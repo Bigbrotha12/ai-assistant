@@ -122,7 +122,7 @@ class ChatApiClient implements ChatClient {
     this.apiKey,
   }) : _dio = dio ?? Dio();
 
-  /// llmProxy(host), e.g. http://192.168.1.5:9091. No trailing slash.
+  /// llmProxy(host), e.g. http://192.168.1.5:17600. No trailing slash.
   final String baseUrl;
 
   final String model;

@@ -141,7 +141,7 @@ class _ScriptedAdapter implements HttpClientAdapter {
 
 ChatApiClient _client(_ScriptedAdapter adapter, {String? apiKey}) =>
     ChatApiClient(
-      baseUrl: 'http://192.168.1.5:9091',
+      baseUrl: 'http://192.168.1.5:17600',
       dio: Dio()..httpClientAdapter = adapter,
       apiKey: apiKey,
     );

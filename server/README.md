@@ -13,34 +13,54 @@ The gateway never sees audio.
 
 ## Setup
 
+The primary dev workflow is a single command from the repo root:
+
+```bash
+./dev.sh
+```
+
+It creates `server/.env` (generating `BETTER_AUTH_SECRET` and defaulting
+`BETTER_AUTH_URL`/`INFERENCE_URL` for a local stack), installs dependencies,
+runs the migrations, starts the gateway in the background, and tears the whole
+stack down on exit. See the root [README](../README.md).
+
+To run the server standalone:
+
 ```bash
 cd server
 cp .env.example .env            # then edit the values (see env table below)
 npm install
 npm run migrate                 # creates the SQLite schema (better-auth CLI discovers src/auth.ts)
-npm run dev                     # starts on PORT (default 9091)
+npm run dev                     # starts on PORT (default 17600)
 ```
 
 Run `npm run migrate` **before** `npm start`/`npm run dev`: the server boots
 fine without a schema, but every request that touches the database (auth
 sign-up/sign-in, API-key mint) fails until the tables exist.
 
-`npm run migrate` runs the better-auth CLI (`auth`, the v1.7 CLI package — the old
-`@better-auth/cli` is deprecated and only supports better-auth ≤ 1.6). Equivalent
-manual invocation: `npx auth migrate`. It creates `DB_PATH` (default
+`npm run migrate` first runs the better-auth CLI (`auth`, the v1.7 CLI package — the old
+`@better-auth/cli` is deprecated and only supports better-auth ≤ 1.6), then chained
+`npm run migrate:ledger` (a small `tsx src/migrate-ledger.ts` script) which migrates the
+ledger DB to the current schema via `PRAGMA user_version`. So one command covers both
+databases. Equivalent manual invocation: `npx auth migrate`. It creates `DB_PATH` (default
 `./data/gateway.db`) with the `user`, `session`, `account`, `verification`, and
-`apikey` tables. Use `npx auth migrate --yes` to skip the interactive confirmation
-(e.g. in scripts/CI).
+`apikey` tables, and `LEDGER_DB_PATH` with the ledger tables (`ledger_task`,
+`ledger_step`, `ledger_chain`). Use `npx auth migrate --yes` to skip the interactive
+confirmation (e.g. in scripts/CI), and run `npm run migrate:ledger` on its own when only
+the ledger needs migrating.
 
 ## Environment
 
 | Variable            | Required | Default                | Description                                                                    |
 | ------------------- | -------- | ---------------------- | ------------------------------------------------------------------------------ |
 | `BETTER_AUTH_SECRET`| yes      | —                      | HMAC/verification secret, **≥ 32 chars**. `openssl rand -base64 32`.           |
-| `BETTER_AUTH_URL`   | yes      | —                      | Public base URL of the gateway, e.g. `http://localhost:9091`.                   |
+| `BETTER_AUTH_URL`   | yes      | —                      | Public base URL of the gateway, e.g. `http://localhost:17600`.                   |
 | `INFERENCE_URL`     | yes      | —                      | Base URL of the OpenAI-compatible engine. Must NOT equal this gateway's port.   |
-| `PORT`              | no       | `9091`                 | Gateway port (the Flutter app derives this as its backend base).                |
-| `DB_PATH`           | no       | `./data/gateway.db`    | SQLite file (dev only).                                                         |
+| `PORT`              | no       | `17600`                | Gateway port (the Flutter app derives this as its backend base).                |
+| `DB_PATH`           | no       | `./data/gateway.db`    | SQLite file for better-auth (dev only).                          |
+| `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
+| `LEDGER_STUCK_TIMEOUT_MS`| no | `10000`               | Heartbeat silence that marks a task `stuck`. **Must be < lease.** |
+| `LEDGER_LEASE_EXPIRY_MS`| no  | `60000`               | Worker lease expiry. Final tuning is Phase 4 (M5).               |
 | `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute per API key).             |
 | `INFERENCE_RATE_BURST`| no     | `20`                   | `/v1/chat/completions` burst ceiling (consecutive requests allowed at once).     |
 | `NODE_ENV`          | no       | `development`          | `production` switches on secure cookies.                                        |
@@ -118,6 +138,63 @@ terminator) directly; nothing is re-encoded or accumulated.
 3. All inference calls: `POST /v1/chat/completions` with
    `Authorization: Bearer <api-key>`.
 4. On `401`, re-sign-in and rotate the key (revoke the old one via `api-key/delete`).
+
+## Task ledger (`/ledger/*`)
+
+The gateway owns a durable, gateway-side task ledger (M1 of
+`docs/production-grade-improvement-plan.md` §3.3). It records worker steps,
+heartbeats/lease, a write-once hash chain, and owner binding.
+
+**Dedicated DB (decision).** The ledger lives in its own SQLite file
+(`LEDGER_DB_PATH`, default `./data/ledger.db`), *separate* from the better-auth
+DB (`DB_PATH`). It is append-only, write-once, and versioned independently via
+`PRAGMA user_version`; coupling it to the auth DB would entangle two schemas
+with unrelated lifecycles and force auth migrations to know about ledger
+tables. A dedicated file also lets ledger migrations evolve without touching
+the auth admin surface (user/session/apikey).
+
+**Design notes.**
+- `status` ∈ `queued | running | succeeded | failed | cancelled | stuck |
+  awaiting_review`. Transitions are validated (`assertTransition`):
+  `queued → running` (claim); `running → succeeded|failed|cancelled|stuck|
+  awaiting_review`; `stuck/awaiting_review → running` (resume).
+- **Threshold ordering is FIXED**: `LEDGER_STUCK_TIMEOUT_MS <
+  LEDGER_LEASE_EXPIRY_MS` (default stuck 10s < lease 60s), enforced in the
+  `Ledger` constructor (throws `INVALID_CONFIG` otherwise). Final tuning is
+  Phase 4 (M5).
+- **Append-only**: `ledger_step` and `ledger_chain` have `BEFORE UPDATE/DELETE`
+  triggers that reject mutation; `ledger_task` is the only mutable table.
+- **Hash chain**: each `ledger_chain` record is `sha256(prev_digest +
+  canonical step content + gateway ts)`, committed atomically with the step
+  append. First record's `prev_digest` is a per-task genesis. `verifyChain`
+  recomputes the chain and returns `false` on any tampering.
+- **Clock discipline**: step `ts` and heartbeats are stamped by the gateway
+  (`Date.now()`), never by the worker.
+- **Owner binding**: `createTask` sets `owner` (the API-key user id, via
+  `requireApiKey`); `appendStep`/`heartbeat`/`resumeTask` re-validate ownership
+  and reject non-owners (`FORBIDDEN`).
+- `intentKey` is stored raw with **no unique constraint** — canonicalization
+  and the unique constraint land in Phase 6 (M12).
+
+Endpoints (all require `Authorization: Bearer <api-key>`; owner is the key's
+user id):
+
+| Endpoint                        | Purpose                                                        |
+| ------------------------------- | -------------------------------------------------------------- |
+| `POST /ledger/tasks`            | Create a task (`intentKey` required; `spec`, `worker` optional). |
+| `GET  /ledger/tasks`            | List tasks.                                                    |
+| `GET  /ledger/tasks/:id`        | Get a task with its steps + chain.                             |
+| `POST /ledger/tasks/:id/claim`  | Take the lease; `queued → running`.                            |
+| `POST /ledger/tasks/:id/steps`  | Append a step + chain record (task must be `running`).         |
+| `POST /ledger/tasks/:id/heartbeat` | Renew the lease (owner must hold it).                       |
+| `POST /ledger/tasks/:id/resume` | Resume a `stuck`/`awaiting_review` task (owner only).          |
+| `POST /ledger/tasks/:id/complete` | Set a terminal status (`succeeded|failed|cancelled|awaiting_review`). |
+
+**Tests.** `npm test` runs the suite with Node's built-in runner via `tsx`
+(`tsx --test test/**/*.test.ts`). It covers lifecycle transitions,
+stuck<lease ordering, sequence-aware loop detection (`findLoop`), hash-chain
+verification + tamper detection, owner binding, and migration (fresh + upgrade
++ idempotency). `npm run typecheck` covers `src/` and `test/`.
 
 ## Production notes
 

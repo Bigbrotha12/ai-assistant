@@ -9,9 +9,9 @@ import 'package:ai_assistant/core/backend_settings.dart';
 
 const _host = 'myhost';
 const _apiKey = 'sk_test123';
-const _authUrl = 'http://myhost:9091/v1/auth/check';
-const _llmProxyUrl = 'http://myhost:9091/v1/chat/completions';
-const _modelsUrl = 'http://myhost:9091/v1/models';
+const _authUrl = 'http://myhost:17600/v1/auth/check';
+const _llmProxyUrl = 'http://myhost:17600/v1/chat/completions';
+const _modelsUrl = 'http://myhost:17600/v1/models';
 
 final _settings = const BackendSettings(host: _host);
 Future<String?> _key() async => _apiKey;

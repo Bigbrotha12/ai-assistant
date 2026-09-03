@@ -7,7 +7,7 @@ import 'package:http_mock_adapter/http_mock_adapter.dart';
 
 import 'package:ai_assistant/core/auth_client.dart';
 
-const _base = 'http://192.168.1.5:9091';
+const _base = 'http://192.168.1.5:17600';
 
 /// Fresh [Dio] wired to a mock adapter that matches on URL path only.
 (Dio, DioAdapter) makeDio() {

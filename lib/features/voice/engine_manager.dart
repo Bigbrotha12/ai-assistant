@@ -103,8 +103,12 @@ class EngineManager extends ChangeNotifier {
   ///
   /// [progress] is invoked with the model ID each time a download starts so
   /// the UI can display per-model progress. Models whose URL is not configured
-  /// (e.g. the Kokoro placeholder) are skipped and marked [unavailable] rather
+  /// (e.g. an unavailable Kokoro) are skipped and marked [unavailable] rather
   /// than attempted — a failing download would permanently poison the status.
+  ///
+  /// A "model" may consist of several artifacts (e.g. Kokoro's ONNX graph plus
+  /// its voices and tokenizer). All artifacts are downloaded to their canonical
+  /// file names before the model is reported [ready].
   ///
   /// Returns `true` when every usable model is available.
   Future<bool> ensureModelsDownloaded({
@@ -121,8 +125,9 @@ class EngineManager extends ChangeNotifier {
         continue;
       }
 
-      final filePath = '$dir/${config.fileName}';
-      if (File(filePath).existsSync()) {
+      final allTargets = config.allTargets(dir);
+      final missing = allTargets.where((t) => !File(t.path).existsSync());
+      if (missing.isEmpty) {
         _statuses[id] = VoiceEngineStatus.ready;
         continue;
       }
@@ -131,22 +136,28 @@ class EngineManager extends ChangeNotifier {
       progress(id);
 
       try {
-        // ModelDownloader writes to `<dir>/ggml<modelType>.bin`. We rename the
-        // result to the model's canonical file name once the download lands so
-        // the engines (and status checks) find the file at the expected path.
+        // Download the primary artifact first, then the secondary artifacts.
+        // Each lands at its canonical file name (the downloader's optional
+        // `fileName` bypasses the legacy `ggml<type>.bin` notation), so no
+        // post-download rename is required.
         await _downloader.downloadModel(
           modelType: config.downloaderType,
           url: config.url,
           destinationPath: dir,
+          fileName: config.fileName,
         );
-        final produced = '$dir/${config.downloaderType}.bin';
-        final target = '$dir/${config.fileName}';
-        if (produced != target && File(produced).existsSync()) {
-          final targetFile = File(target);
-          if (targetFile.existsSync()) targetFile.deleteSync();
-          await File(produced).rename(target);
+        for (final artifact in config.artifacts) {
+          await _downloader.downloadModel(
+            modelType: artifact.downloaderType,
+            url: artifact.url,
+            destinationPath: dir,
+            fileName: artifact.fileName,
+          );
         }
-        _statuses[id] = VoiceEngineStatus.ready;
+        // Only mark ready if every artifact actually landed.
+        _statuses[id] = allTargets.every((t) => File(t.path).existsSync())
+            ? VoiceEngineStatus.ready
+            : VoiceEngineStatus.failed;
       } catch (e) {
         _statuses[id] = VoiceEngineStatus.failed;
         if (kDebugMode) {
@@ -165,7 +176,8 @@ class EngineManager extends ChangeNotifier {
     for (final entry in _modelConfig.entries) {
       final config = entry.value;
       if (!config.downloadable) continue;
-      if (!File('$dir/${config.fileName}').existsSync()) {
+      final targets = config.allTargets(dir);
+      if (!targets.every((t) => File(t.path).existsSync())) {
         return false;
       }
     }
@@ -219,9 +231,21 @@ class EngineManager extends ChangeNotifier {
     ),
     EngineConfig.kokoro82mId: _ModelConfig(
       fileName: 'kokoro_82m.onnx',
-      downloaderType: 'kokoro_82m',
+      downloaderType: EngineConfig.kokoro82mId,
       url: EngineConfig.kokoro82mUrl,
       downloadable: EngineConfig.kokoro82mDownloadAvailable,
+      artifacts: [
+        _ArtifactConfig(
+          fileName: EngineConfig.kokoro82mVoicesFileName,
+          downloaderType: EngineConfig.kokoro82mVoicesId,
+          url: EngineConfig.kokoro82mVoicesUrl,
+        ),
+        _ArtifactConfig(
+          fileName: EngineConfig.kokoro82mTokenizerFileName,
+          downloaderType: EngineConfig.kokoro82mTokenizerId,
+          url: EngineConfig.kokoro82mTokenizerUrl,
+        ),
+      ],
     ),
   };
 
@@ -261,7 +285,7 @@ class EngineManager extends ChangeNotifier {
         _statuses[entry.key] = VoiceEngineStatus.unavailable;
         continue;
       }
-      if (File('$dir/${config.fileName}').existsSync()) {
+      if (config.allTargets(dir).every((t) => File(t.path).existsSync())) {
         _statuses[entry.key] = VoiceEngineStatus.ready;
       } else {
         _statuses.putIfAbsent(
@@ -286,13 +310,37 @@ class _ModelConfig {
     required this.downloaderType,
     required this.url,
     required this.downloadable,
+    this.artifacts = const [],
   });
   final String fileName;
   final String downloaderType;
   final String url;
 
+  /// Secondary artifacts (additional files) that make up this model, e.g.
+  /// Kokoro's voices and tokenizer. Downloaded alongside the primary file and
+  /// all must exist before the model is reported [ready].
+  final List<_ArtifactConfig> artifacts;
+
   /// False when the model has no usable download URL on this build — the
   /// engine is kept registered but surfaced as `unavailable` (never
   /// downloaded, never reported ready against a nonexistent artifact).
   final bool downloadable;
+
+  /// The absolute [File] targets for the primary file and every artifact that
+  /// must all be present for the model to be [VoiceEngineStatus.ready].
+  List<File> allTargets(String dir) => [
+        File('$dir/$fileName'),
+        for (final a in artifacts) File('$dir/${a.fileName}'),
+      ];
+}
+
+class _ArtifactConfig {
+  const _ArtifactConfig({
+    required this.fileName,
+    required this.downloaderType,
+    required this.url,
+  });
+  final String fileName;
+  final String downloaderType;
+  final String url;
 }

@@ -103,7 +103,7 @@ class BackendConfig {
 
   /// Gateway LLM proxy: OpenAI-compatible chat completions (streaming SSE).
   static Uri llmProxy(String host, {BackendEnvironment? environment}) =>
-      Uri(scheme: _scheme(environment), host: host, port: 9091);
+      Uri(scheme: _scheme(environment), host: host, port: 17600);
 
   /// Gateway LLM proxy chat completions endpoint: `POST /v1/chat/completions`.
   static Uri llmCompletions(String host, {BackendEnvironment? environment}) =>

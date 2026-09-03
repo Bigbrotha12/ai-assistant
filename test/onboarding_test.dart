@@ -6,12 +6,10 @@ import 'package:ai_assistant/core/auth_client.dart';
 import 'package:ai_assistant/core/auth_client_provider.dart';
 import 'package:ai_assistant/core/auth_credentials_providers.dart';
 import 'package:ai_assistant/core/auth_credentials_store.dart';
-import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/config.dart';
 import 'package:ai_assistant/core/prefs_providers.dart';
 import 'package:ai_assistant/core/prefs_store.dart';
-import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/core/settings_providers.dart';
 import 'package:ai_assistant/features/onboarding/onboarding_screen.dart';
 import 'package:ai_assistant/features/voice/engine_manager.dart';
@@ -86,7 +84,6 @@ void main() {
     required FakeAuthCredentialsStore auth,
     required FakePrefsStore prefs,
     required FakeAuthClient authClient,
-    required FakeProbe probe,
     required FakeVoiceSettingsStore voiceSettings,
     required EngineManager engine,
   }) {
@@ -96,7 +93,6 @@ void main() {
         authCredentialsStoreProvider.overrideWithValue(auth),
         appPrefsStoreProvider.overrideWithValue(prefs),
         authClientProvider.overrideWithValue(authClient),
-        backendProbeProvider.overrideWithValue(probe),
         voiceSettingsStoreProvider.overrideWithValue(voiceSettings),
         engineManagerProvider.overrideWithValue(engine),
       ],
@@ -112,7 +108,6 @@ void main() {
     FakeAuthCredentialsStore? auth,
     FakePrefsStore? prefs,
     FakeAuthClient? authClient,
-    FakeProbe? probe,
     FakeVoiceSettingsStore? voiceSettings,
     EngineManager? engine,
   }) async {
@@ -124,7 +119,6 @@ void main() {
       auth: auth ?? FakeAuthCredentialsStore(),
       prefs: prefs ?? FakePrefsStore(),
       authClient: authClient ?? successfulAuthClient(),
-      probe: probe ?? FakeProbe(),
       voiceSettings: voiceSettings ?? FakeVoiceSettingsStore(),
       engine: engine ?? FakeEngineManager(),
     ));
@@ -152,26 +146,20 @@ void main() {
 
   Future<void> completeFlow(WidgetTester tester) async {
     await signIn(tester);
-    await tapNext(tester); // Account → Backend
-    await tapNext(tester); // Backend → Region
+    await tapNext(tester); // Account → Region
     await tapNext(tester); // Region → Voice
     await tapNext(tester); // Voice → Finish
   }
 
   Future<void> completeFlowToVoice(WidgetTester tester) async {
     await signIn(tester);
-    await tapNext(tester); // Account → Backend
-    await tapNext(tester); // Backend → Region
+    await tapNext(tester); // Account → Region
     await tapNext(tester); // Region → Voice
   }
 
   group('step defaults and gating', () {
-    testWidgets('defaults are pre-filled (host, env, language, date)',
-        (tester) async {
+    testWidgets('defaults are pre-filled (language, date)', (tester) async {
       await pumpOnboarding(tester);
-
-      final host = tester.widget<TextField>(find.byKey(const Key('ob-host')));
-      expect(host.controller!.text, BackendConfig.defaultHost);
 
       final stepper = tester.widget<Stepper>(find.byType(Stepper));
       expect(stepper.currentStep, 0);
@@ -185,107 +173,25 @@ void main() {
       expect(dateFormat.value, 'en-US');
     });
 
-    testWidgets('probe failure is advisory and does not block Next',
-        (tester) async {
-      final probe = FakeProbe(
-        status: const BackendStatus(checks: [
-          CheckResult(
-              check: BackendCheck.auth,
-              status: ProbeStatus.error,
-              detail: 'unreachable'),
-          CheckResult(
-              check: BackendCheck.inference,
-              status: ProbeStatus.error,
-              detail: 'unreachable'),
-          CheckResult(
-              check: BackendCheck.vision,
-              status: ProbeStatus.error,
-              detail: 'unreachable'),
-        ]),
-      );
-      await pumpOnboarding(tester, probe: probe);
-      await signIn(tester);
-      await tapNext(tester); // → Backend (auto-probe fires)
-
-      // No re-auth affordance for a plain failure.
-      expect(find.text('Re-authenticate').hitTestable(), findsNothing);
-
-      // Next stays enabled: only structural validity gates it.
-      final next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNotNull);
-      expect(probe.calls, 1);
-
-      await tapNext(tester); // still advances
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 2);
-    });
-
-    testWidgets('probe 401 shows the re-authenticate affordance',
-        (tester) async {
-      final probe = FakeProbe(
-        status: const BackendStatus(checks: [
-          CheckResult(
-              check: BackendCheck.auth,
-              status: ProbeStatus.unauthorized,
-              detail: 'API key rejected (401)'),
-          CheckResult(
-              check: BackendCheck.inference,
-              status: ProbeStatus.unauthorized,
-              detail: 'API key rejected (401)'),
-          CheckResult(
-              check: BackendCheck.vision,
-              status: ProbeStatus.unauthorized,
-              detail: 'API key rejected (401)'),
-        ]),
-      );
-      await pumpOnboarding(tester, probe: probe);
-      await signIn(tester);
-      await tapNext(tester); // → Backend
-
-      expect(find.text('Re-authenticate').hitTestable(), findsOneWidget);
-
-      await tester.tap(find.text('Re-authenticate').hitTestable());
-      await tester.pumpAndSettle();
-
-      // Back to Account; Next is re-gated until a fresh key is minted.
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 0);
-      final next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNull);
-    });
-
-    testWidgets('host validation gates Next structurally', (tester) async {
-      await pumpOnboarding(tester);
-      await signIn(tester);
-      await tapNext(tester); // → Backend
-
-      await tester.enterText(
-          find.byKey(const Key('ob-host')), 'https://evil.example');
-      await tester.pump();
-
-      // Unique to the Backend step, so no hit-test scoping is needed.
-      expect(find.text('Enter a host name, not a URL'), findsOneWidget);
-      final next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNull);
-    });
-
     testWidgets('entered state survives Back and Next', (tester) async {
       await pumpOnboarding(tester);
       await signIn(tester);
-      await tapNext(tester); // → Backend
+      await tapNext(tester); // → Region
 
-      await tester.enterText(find.byKey(const Key('ob-host')), 'my.tailnet');
-      await tester.pump();
+      await tester.tap(find.byKey(const Key('ob-language')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Spanish').last);
+      await tester.pumpAndSettle();
 
       await tapBack(tester); // → Account
       expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 0);
       final email = tester.widget<TextField>(find.byKey(const Key('auth-email')));
       expect(email.controller!.text, 'user@example.com');
 
-      await tapNext(tester); // → Backend again
-      final host = tester.widget<TextField>(find.byKey(const Key('ob-host')));
-      expect(host.controller!.text, 'my.tailnet');
+      await tapNext(tester); // → Region again
+      final language = tester.widget<DropdownButton<String>>(
+          find.byKey(const Key('ob-language')));
+      expect(language.value, 'es');
     });
   });
 
@@ -369,7 +275,6 @@ void main() {
       );
 
       await signIn(tester);
-      await tapNext(tester); // → Backend
       await tapNext(tester); // → Region
       // Pick a non-default language so the persisted value is observable.
       await tester.tap(find.byKey(const Key('ob-language')));
@@ -389,7 +294,7 @@ void main() {
       expect(prefsStore.prefs.onboardingComplete, isTrue);
       expect(settingsStore.stored, isNotNull);
       expect(settingsStore.stored!.host, BackendConfig.defaultHost);
-      expect(settingsStore.stored!.environment, BackendEnvironment.dev);
+      expect(settingsStore.stored!.environment, BackendConfig.defaultEnvironment);
     });
 
     testWidgets('a mid-sequence failure keeps the user in onboarding with Retry',
@@ -423,7 +328,7 @@ void main() {
   });
 
   group('partial-finish entry', () {
-    testWidgets('a stored key with no host re-enters at the Backend step',
+    testWidgets('a stored key starts at the Account step (re-entry removed)',
         (tester) async {
       final authStore = FakeAuthCredentialsStore(
         stored: const AuthCredentials(apiKey: 'stored-key', email: 'a@b.com'),
@@ -431,18 +336,18 @@ void main() {
       final settingsStore = FakeSettingsStore();
       await pumpOnboarding(tester, auth: authStore, settings: settingsStore);
 
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 1);
-      // Host prefilled from the effective defaults — structurally valid, so
-      // the partial finish can proceed without re-entering the host.
-      final host = tester.widget<TextField>(find.byKey(const Key('ob-host')));
-      expect(host.controller!.text, BackendConfig.defaultHost);
+      // With the Backend step removed, a stored key no longer re-enters
+      // at step 1 — the stepper starts at Account (step 0).
+      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 0);
+
+      // But the account is pre-marked ready so Next can advance immediately.
       final next = tester.widget<FilledButton>(
           find.widgetWithText(FilledButton, 'Next').hitTestable());
       expect(next.onPressed, isNotNull);
 
       // Completing from the re-entry point persists the backend settings
       // last, which is what flips the gate to "configured".
-      await tapNext(tester); // Backend → Region
+      await tapNext(tester); // Account → Region
       await tapNext(tester); // Region → Voice
       await tapNext(tester); // Voice → Finish
       await tester
@@ -451,7 +356,7 @@ void main() {
 
       expect(settingsStore.stored, isNotNull);
       expect(settingsStore.stored!.host, BackendConfig.defaultHost);
-      expect(settingsStore.stored!.environment, BackendEnvironment.dev);
+      expect(settingsStore.stored!.environment, BackendConfig.defaultEnvironment);
     });
   });
 
@@ -461,31 +366,29 @@ void main() {
       await pumpOnboarding(tester, engine: engine);
       await completeFlowToVoice(tester);
 
-      // Kokoro is surfaced as unavailable on this build.
+      // Kokoro is now a real, downloadable model on this build (verified
+      // URLs are configured), so it renders as a not-yet-downloaded model
+      // rather than "unavailable".
       expect(find.text('Kokoro 82M').hitTestable(), findsOneWidget);
-      expect(find.text('unavailable').hitTestable(), findsOneWidget);
+      expect(find.text('not downloaded').hitTestable(), findsOneWidget);
 
       await tester.tap(find.text('Do it later').hitTestable());
       await tester.pumpAndSettle();
 
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 4);
+      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 3);
       expect(engine.downloadCalls, 0);
     });
   });
 
   group('secrets', () {
-    testWidgets('MCP and files tokens are obscured', (tester) async {
+    testWidgets('MCP and files tokens are not present in the onboarding flow',
+        (tester) async {
       await pumpOnboarding(tester);
       await signIn(tester);
-      await tapNext(tester); // → Backend
-      // The advanced fields only exist in the tree once expanded.
-      await tester.tap(find.text('Advanced').hitTestable());
-      await tester.pumpAndSettle();
-
-      final mcp = tester.widget<TextField>(find.byKey(const Key('ob-mcp')));
-      expect(mcp.obscureText, isTrue);
-      final files = tester.widget<TextField>(find.byKey(const Key('ob-files')));
-      expect(files.obscureText, isTrue);
+      await tapNext(tester); // → Region
+      // No Backend step means no secret fields exist in the tree.
+      expect(find.byKey(const Key('ob-mcp')), findsNothing);
+      expect(find.byKey(const Key('ob-files')), findsNothing);
     });
   });
 }

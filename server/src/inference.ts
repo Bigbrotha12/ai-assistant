@@ -9,18 +9,25 @@ function extractBearerToken(header: string | null | undefined): string | null {
   return match ? match[1]!.trim() : null;
 }
 
-function unauthorized(c: Context): Response {
+export function unauthorized(c: Context): Response {
   return c.json({ error: "unauthorized" }, 401);
 }
 
-async function requireApiKey(c: Context): Promise<string | null> {
+/**
+ * Verifies the `Authorization: Bearer <api-key>` header against the auth
+ * server and returns the owning user id, or null when the key is missing or
+ * invalid. The ledger routes reuse this for owner-bound authorization instead
+ * of duplicating bearer-token parsing. Callers must treat a non-null return
+ * as "this request is authenticated as `referenceId`".
+ */
+export async function requireApiKey(c: Context): Promise<string | null> {
   const token = extractBearerToken(c.req.header("authorization"));
   if (!token) return null;
   try {
     const result = await auth.api.verifyApiKey({
       body: { key: token },
     });
-    if (result.valid) return token;
+    if (result.valid && result.key) return result.key.referenceId;
   } catch {
     return null;
   }

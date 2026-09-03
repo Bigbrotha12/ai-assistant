@@ -4,20 +4,15 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../core/app_startup.dart';
 import '../../core/auth_client.dart';
 import '../../core/auth_credentials_providers.dart';
-import '../../core/backend_probe.dart';
 import '../../core/backend_settings.dart';
-import '../../core/backend_validation.dart';
 import '../../core/config.dart';
 import '../../core/prefs_options.dart';
 import '../../core/prefs_providers.dart';
 import '../../core/prefs_store.dart';
-import '../../core/probe_providers.dart';
 import '../../core/settings_providers.dart';
 import '../../core/theme.dart';
-import '../../core/widgets/probe_status_row.dart';
 import '../auth/auth_flow.dart';
 import '../voice/engine_config.dart';
 import '../voice/engine_manager.dart';
@@ -27,19 +22,18 @@ import '../voice/voice_settings.dart';
 import '../voice/voice_settings_providers.dart';
 
 /// Onboarding flow (plan §3.5): a themed vertical [Stepper] that walks the
-/// user through Account → Backend → Language & region → Voice & models →
-/// Finish, then persists everything in the §3.6 order (voice settings, prefs,
-/// backend settings last).
+/// user through Account → Language & region → Voice & models → Finish, then
+/// persists everything in the §3.6 order (voice settings, prefs, backend
+/// settings last — the backend settings are derived from compile-time defaults
+/// since the Backend step was removed: --dart-define values carry the host).
 ///
-/// All form state — controllers, obscured-secret flags, per-step selections,
-/// probe results — is hoisted on this screen and disposed here (no `ref` in
-/// `dispose`, Riverpod v3 convention). Back/Next preserve state because the
-/// controllers and selections live on the state, not inside the steps.
+/// All form state — controllers, per-step selections — is hoisted on this
+/// screen and disposed here (no `ref` in `dispose`, Riverpod v3 convention).
+/// Back/Next preserve state because the controllers and selections live on
+/// the state, not inside the steps.
 ///
 /// The gate mounts `const OnboardingScreen()` with no arguments; this widget
-/// keeps that exact contract. On mount, if a stored API key already exists
-/// (a user who completed Account but not Backend), the Stepper starts at the
-/// Backend step (§3.6 partial-finish re-entry).
+/// keeps that exact contract.
 class OnboardingScreen extends ConsumerStatefulWidget {
   const OnboardingScreen({super.key});
 
@@ -58,26 +52,11 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   bool _accountReady = false;
   String? _accountEmail;
 
-  // Backend.
-  final _hostController = TextEditingController();
-  final _mcpSecretController = TextEditingController();
-  final _filesSecretController = TextEditingController();
-  final _storageUrlController = TextEditingController();
-  bool _obscureMcpSecret = true;
-  bool _obscureFilesSecret = true;
-  BackendEnvironment _environment = BackendConfig.defaultEnvironment;
-  bool _environmentTouched = false;
-
   // Region.
   String _language = 'en';
   bool _languageTouched = false;
   String _dateFormat = 'en-US';
   bool _dateFormatTouched = false;
-
-  // Probe (advisory, never gates Next).
-  bool _probing = false;
-  bool _didAutoProbe = false;
-  BackendStatus? _probeStatus;
 
   // Models.
   bool _downloading = false;
@@ -86,43 +65,16 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   bool _saving = false;
   String? _saveError;
 
-  /// Guards the backend-controller listeners until after [initState], when a
-  /// setState() triggered by the initial field population is no longer needed.
-  bool _formListenersActive = false;
-
   @override
   void initState() {
     super.initState();
-    _hostController.addListener(_onBackendFormChanged);
-    _mcpSecretController.addListener(_onBackendFormChanged);
-    _filesSecretController.addListener(_onBackendFormChanged);
-    _storageUrlController.addListener(_onBackendFormChanged);
     _language = _inferLanguage();
     _dateFormat = _inferDateLocale();
-    // A stored key at mount means the Account step is already complete: start
-    // at the Backend step (plan §3.6). Read through the store (not the async
-    // provider) so direct-mount tests and the gate's guaranteed-resolved
-    // provider both behave the same.
     _checkStoredCredentials();
-    _formListenersActive = true;
-  }
-
-  /// Rebuilds on backend-field edits so host validation and the Next/Test
-  /// button states stay in sync with what the user typed.
-  void _onBackendFormChanged() {
-    if (_formListenersActive) setState(() {});
   }
 
   @override
   void dispose() {
-    _hostController.removeListener(_onBackendFormChanged);
-    _mcpSecretController.removeListener(_onBackendFormChanged);
-    _filesSecretController.removeListener(_onBackendFormChanged);
-    _storageUrlController.removeListener(_onBackendFormChanged);
-    _hostController.dispose();
-    _mcpSecretController.dispose();
-    _filesSecretController.dispose();
-    _storageUrlController.dispose();
     super.dispose();
   }
 
@@ -136,9 +88,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     setState(() {
       _accountReady = true;
       _accountEmail = creds.email;
-      if (_currentStep == 0) _currentStep = 1;
     });
-    _scheduleAutoProbe();
   }
 
   String _inferLanguage() {
@@ -158,27 +108,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // -------------------------------------------------------------------------
   // Provider reactions (prefill from saved state; never clobber edits)
   // -------------------------------------------------------------------------
-
-  void _onSettingsChanged(
-    AsyncValue<BackendSettings?>? previous,
-    AsyncValue<BackendSettings?> next,
-  ) {
-    if (next.isLoading) return;
-    final effective = effectiveSettings(next.value);
-    if (_hostController.text.isEmpty) _hostController.text = effective.host;
-    if (_mcpSecretController.text.isEmpty) {
-      _mcpSecretController.text = effective.mcpSecret ?? '';
-    }
-    if (_filesSecretController.text.isEmpty) {
-      _filesSecretController.text = effective.filesSecret ?? '';
-    }
-    if (_storageUrlController.text.isEmpty) {
-      _storageUrlController.text = effective.storageUrl ?? '';
-    }
-    if (!_environmentTouched) _environment = effective.environment;
-    _scheduleAutoProbe();
-    setState(() {});
-  }
 
   void _onPrefsChanged(
     AsyncValue<AppPrefs>? previous,
@@ -208,7 +137,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
 
   void _goToStep(int next) {
     setState(() => _currentStep = next);
-    if (next == 1) _scheduleAutoProbe();
   }
 
   void _onStepContinue() {
@@ -223,27 +151,13 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     if (_currentStep > 0) _goToStep(_currentStep - 1);
   }
 
-  static const int _stepsLength = 5;
+  static const int _stepsLength = 4;
 
-  /// True when the "Next" button for [index] may advance. Probe results are
-  /// advisory and never gate Next; only structural validity does.
+  /// True when the "Next" button for [index] may advance.
   bool _canContinue(int index) => switch (index) {
         0 => _accountReady,
-        1 => validateHost(_hostController.text) == null,
         _ => true,
       };
-
-  /// Auto-runs the probe once per session when the Backend step becomes the
-  /// current step with a structurally valid host (entering the step, or a
-  /// partial-finish re-entry once the stored host lands).
-  void _scheduleAutoProbe() {
-    if (_didAutoProbe || _currentStep != 1) return;
-    if (validateHost(_hostController.text) != null) return;
-    _didAutoProbe = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _runProbe(_probeSettings());
-    });
-  }
 
   // -------------------------------------------------------------------------
   // Account (via the shared AuthFlow)
@@ -269,241 +183,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         ),
         const SizedBox(height: 16),
         AuthFlow(onSuccess: _onAuthSuccess),
-      ],
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // Backend step
-  // -------------------------------------------------------------------------
-
-  BackendSettings _probeSettings() => BackendSettings(
-        host: _hostController.text,
-        environment: _environment,
-        mcpSecret: _mcpSecretController.text,
-        filesSecret: _filesSecretController.text,
-        storageUrl: _storageUrlController.text,
-      );
-
-  Future<void> _testConnection() => _runProbe(_probeSettings());
-
-  Future<void> _runProbe(BackendSettings settings) async {
-    if (_probing) return;
-    setState(() {
-      _probing = true;
-      _probeStatus = null;
-    });
-    final status = await ref.read(backendProbeProvider).probe(settings);
-    if (!mounted) return;
-    setState(() {
-      _probing = false;
-      _probeStatus = status;
-    });
-  }
-
-  /// A 401 (or a missing key) means the stored API key is unusable: jump back
-  /// to the Account step so a fresh key is minted. Never wipes credentials.
-  void _reathenticate() {
-    setState(() {
-      _accountReady = false;
-      _probeStatus = null;
-      _didAutoProbe = false;
-      _currentStep = 0;
-    });
-  }
-
-  bool get _needsReauth =>
-      _probeStatus?.checks.any(
-            (c) =>
-                c.status == ProbeStatus.unauthorized ||
-                c.status == ProbeStatus.noCredentials,
-          ) ??
-      false;
-
-  Widget _buildBackendStep() {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final hostError = validateHost(_hostController.text);
-    final canTest = !_probing && hostError == null;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text('Environment', style: theme.textTheme.titleSmall),
-        const SizedBox(height: 8),
-        SegmentedButton<BackendEnvironment>(
-          segments: const [
-            ButtonSegment(
-              value: BackendEnvironment.dev,
-              label: Text('Dev'),
-              icon: Icon(Icons.code),
-            ),
-            ButtonSegment(
-              value: BackendEnvironment.production,
-              label: Text('Production'),
-              icon: Icon(Icons.cloud_outlined),
-            ),
-          ],
-          selected: {_environment},
-          onSelectionChanged: (selection) {
-            setState(() {
-              _environment = selection.first;
-              _environmentTouched = true;
-            });
-          },
-        ),
-        const SizedBox(height: 16),
-        TextField(
-          key: const Key('ob-host'),
-          controller: _hostController,
-          decoration: InputDecoration(
-            labelText: 'Backend host',
-            hintText: 'tailnet IP or MagicDNS name',
-            border: const OutlineInputBorder(),
-            errorText: hostError,
-          ),
-          textInputAction: TextInputAction.next,
-        ),
-        const SizedBox(height: 8),
-        ExpansionTile(
-          title: Text('Advanced', style: theme.textTheme.titleSmall),
-          shape: const Border(),
-          collapsedShape: const Border(),
-          children: [
-            TextField(
-              key: const Key('ob-mcp'),
-              controller: _mcpSecretController,
-              obscureText: _obscureMcpSecret,
-              autocorrect: false,
-              enableSuggestions: false,
-              keyboardType: TextInputType.visiblePassword,
-              decoration: InputDecoration(
-                labelText: 'MCP token (optional)',
-                hintText: 'voice-mcp bearer token (Phase 4)',
-                border: const OutlineInputBorder(),
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _obscureMcpSecret ? Icons.visibility_off : Icons.visibility,
-                  ),
-                  tooltip:
-                      _obscureMcpSecret ? 'Show MCP token' : 'Hide MCP token',
-                  onPressed: () => setState(
-                      () => _obscureMcpSecret = !_obscureMcpSecret),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              key: const Key('ob-files'),
-              controller: _filesSecretController,
-              obscureText: _obscureFilesSecret,
-              autocorrect: false,
-              enableSuggestions: false,
-              keyboardType: TextInputType.visiblePassword,
-              decoration: InputDecoration(
-                labelText: 'Files token (optional)',
-                hintText: 'files service bearer token',
-                border: const OutlineInputBorder(),
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _obscureFilesSecret
-                        ? Icons.visibility_off
-                        : Icons.visibility,
-                  ),
-                  tooltip: _obscureFilesSecret
-                      ? 'Show files token'
-                      : 'Hide files token',
-                  onPressed: () => setState(
-                      () => _obscureFilesSecret = !_obscureFilesSecret),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              key: const Key('ob-storage'),
-              controller: _storageUrlController,
-              decoration: InputDecoration(
-                labelText: 'Storage service URL (optional)',
-                hintText: 'e.g. http://minio:9000',
-                border: const OutlineInputBorder(),
-                helperText: 'Leave blank to use <host>:17603',
-                errorText: validateStorageUrl(_storageUrlController.text),
-              ),
-              keyboardType: TextInputType.url,
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        OutlinedButton(
-          onPressed: canTest ? _testConnection : null,
-          child: const Text('Test connection'),
-        ),
-        const SizedBox(height: 12),
-        if (_probing)
-          const Row(
-            children: [
-              SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-              SizedBox(width: 12),
-              Text('Checking backend…'),
-            ],
-          )
-        else if (_probeStatus case final status?) _buildProbeResults(status),
-        if (_needsReauth) ...[
-          const SizedBox(height: 12),
-          Material(
-            color: scheme.errorContainer,
-            borderRadius: BorderRadius.circular(AppRadii.lg),
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  Icon(Icons.gpp_bad_outlined, color: scheme.onErrorContainer),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Your API key was rejected by the gateway.',
-                      style: TextStyle(color: scheme.onErrorContainer),
-                    ),
-                  ),
-                  TextButton(
-                    style: TextButton.styleFrom(
-                      foregroundColor: scheme.onErrorContainer,
-                    ),
-                    onPressed: _reathenticate,
-                    child: const Text('Re-authenticate'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ],
-    );
-  }
-
-  Widget _buildProbeResults(BackendStatus status) {
-    final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          status.allOk
-              ? 'All backend services reachable'
-              : 'Some backend services are unavailable',
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: status.allOk
-                ? Colors.green.shade700
-                : theme.colorScheme.error,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        const SizedBox(height: 4),
-        for (final check in BackendCheck.values)
-          if (status.resultFor(check) case final result?)
-            ProbeStatusRow(result: result, label: check.label, dense: true),
       ],
     );
   }
@@ -667,11 +346,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // Finish step
   // -------------------------------------------------------------------------
 
-  String get _environmentLabel => switch (_environment) {
-        BackendEnvironment.dev => 'Dev',
-        BackendEnvironment.production => 'Production',
-      };
-
   String get _modelsSummary {
     final stt = ref
             .read(voiceEngineStatusProvider)[EngineConfig.whisperTinyId] ??
@@ -708,12 +382,13 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
             onboardingComplete: true,
           ));
       // 3) Backend settings LAST — only this flips the gate to "configured".
+      //    The host and environment are derived from compile-time defaults
+      //    (--dart-define HOST_FQDN / PUBLIC_BACKEND_URL); the onboarding
+      //    flow no longer collects them interactively, so only the build-time
+      //    defaults are persisted (mcpSecret/filesSecret/storageUrl are not).
       await ref.read(settingsProvider.notifier).save(BackendSettings(
-            host: _hostController.text,
-            environment: _environment,
-            mcpSecret: _mcpSecretController.text,
-            filesSecret: _filesSecretController.text,
-            storageUrl: _storageUrlController.text,
+            host: BackendConfig.defaultHost,
+            environment: BackendConfig.defaultEnvironment,
           ));
       if (mounted) setState(() => _saving = false);
     } catch (e) {
@@ -736,13 +411,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         Text('Review your setup', style: theme.textTheme.titleMedium),
         const SizedBox(height: 12),
         _SummaryRow(label: 'Account email', value: _accountEmail ?? '—'),
-        _SummaryRow(label: 'Environment', value: _environmentLabel),
-        _SummaryRow(
-          label: 'Host',
-          value: _hostController.text.trim().isEmpty
-              ? '—'
-              : _hostController.text.trim(),
-        ),
         _SummaryRow(label: 'Language', value: _language),
         _SummaryRow(label: 'Date format', value: _dateFormat),
         _SummaryRow(label: 'Models', value: _modelsSummary),
@@ -813,7 +481,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
 
   @override
   Widget build(BuildContext context) {
-    ref.listen(settingsProvider, _onSettingsChanged);
     ref.listen(appPrefsProvider, _onPrefsChanged);
     ref.listen(voiceSettingsProvider, _onVoiceSettingsChanged);
 
@@ -826,31 +493,24 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         content: _buildAccountStep(),
       ),
       Step(
-        title: const Text('Backend'),
-        subtitle: const Text('Gateway host and environment'),
-        isActive: _currentStep >= 1,
-        state: _stepState(1),
-        content: _buildBackendStep(),
-      ),
-      Step(
         title: const Text('Language & region'),
         subtitle: const Text('Preferred language and date format'),
-        isActive: _currentStep >= 2,
-        state: _stepState(2),
+        isActive: _currentStep >= 1,
+        state: _stepState(1),
         content: _buildRegionStep(),
       ),
       Step(
         title: const Text('Voice & models'),
         subtitle: const Text('On-device model download'),
-        isActive: _currentStep >= 3,
-        state: _stepState(3),
+        isActive: _currentStep >= 2,
+        state: _stepState(2),
         content: _buildVoiceStep(),
       ),
       Step(
         title: const Text('Finish'),
         subtitle: const Text('Review and get started'),
-        isActive: _currentStep >= 4,
-        state: _stepState(4),
+        isActive: _currentStep >= 3,
+        state: _stepState(3),
         content: _buildFinishStep(),
       ),
     ];

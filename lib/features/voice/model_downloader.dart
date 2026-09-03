@@ -74,22 +74,28 @@ class ModelDownloader {
   /// In-memory state keyed by model type (e.g. `'whisper_tiny'`).
   final Map<String, ModelDownloadState> _states = {};
 
-  /// Downloads the model identified by [modelType] from its configured URL.
+  /// Downloads the model identified by [modelType] from [url].
   ///
-  /// Uses [EngineConfig] for the default URL and model type mapping.
-  /// If [url] is provided it overrides the default; if [destinationPath]
-  /// is provided it overrides the default location.
+  /// Callers own the [modelType]→[url] mapping (via [EngineConfig] / the
+  /// engine manager), so [url] is required rather than re-derived here. If
+  /// [destinationPath] is provided it overrides the default location.
+  ///
+  /// [fileName] optionally overrides the output file name. When omitted the
+  /// legacy `ggml<modelType>.bin` convention is used; when provided the bytes
+  /// land directly at `$dir/$fileName` (used by Kokoro's secondary artifacts —
+  /// the voices and tokenizer — whose names differ from their model type).
   Future<void> downloadModel({
     required String modelType,
-    String? url,
+    required String url,
     String? destinationPath,
+    String? fileName,
   }) async {
-    final resolvedUrl = url ?? _resolveUrl(modelType);
     final dir = destinationPath ?? (await _modelDirectory).path;
-    final resolvedPath = '$dir/ggml$modelType.bin';
+    final resolvedPath =
+        fileName != null ? '$dir/$fileName' : '$dir/ggml$modelType.bin';
 
     _states[modelType] = Downloading();
-    await _doDownload(modelType, resolvedUrl, resolvedPath);
+    await _doDownload(modelType, url, resolvedPath);
   }
 
   Future<void> _doDownload(
@@ -185,16 +191,6 @@ class ModelDownloader {
   /// Returns the current state for [modelType].
   ModelDownloadState getState(String modelType) =>
       _states[modelType] ?? NotStarted();
-
-  String _resolveUrl(String modelType) {
-    if (modelType == EngineConfig.whisperTinyId) {
-      return EngineConfig.whisperTinyUrl;
-    }
-    if (modelType == EngineConfig.kokoro82mId) {
-      return EngineConfig.kokoro82mUrl;
-    }
-    throw ArgumentError.value(modelType, 'modelType', 'Unknown model type');
-  }
 
   /// Closes the progress stream controller.
   void dispose() => _progressController.close();
