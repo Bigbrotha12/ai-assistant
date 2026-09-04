@@ -24,6 +24,7 @@ class VoiceConversationState {
     this.isPaused = false,
     this.error,
     this.lastTranscript,
+    this.lastReply,
     this.onDeviceTranscript,
   });
 
@@ -54,6 +55,12 @@ class VoiceConversationState {
   /// yet). This replaces the old server transcript echo.
   final String? lastTranscript;
 
+  /// The assistant's final reply for the last completed turn (null until a
+  /// turn completes). Unlike [lastTranscript] this is NOT updated during
+  /// streaming — it flips once per turn, so UI transcripts can append the
+  /// assistant's message exactly once.
+  final String? lastReply;
+
   /// Transcript produced by the on-device STT engine for the last recognised
   /// user utterance (null when no local engine is active or nothing has been
   /// transcribed yet).
@@ -66,6 +73,7 @@ class VoiceConversationState {
     bool? isPaused,
     Object? error = _unset,
     Object? lastTranscript = _unset,
+    Object? lastReply = _unset,
     Object? onDeviceTranscript = _unset,
   }) => VoiceConversationState(
     isConnected: isConnected ?? this.isConnected,
@@ -76,6 +84,9 @@ class VoiceConversationState {
     lastTranscript: identical(lastTranscript, _unset)
         ? this.lastTranscript
         : lastTranscript as String?,
+    lastReply: identical(lastReply, _unset)
+        ? this.lastReply
+        : lastReply as String?,
     onDeviceTranscript: identical(onDeviceTranscript, _unset)
         ? this.onDeviceTranscript
         : onDeviceTranscript as String?,
@@ -92,6 +103,7 @@ class VoiceConversationState {
       other.isPaused == isPaused &&
       other.error == error &&
       other.lastTranscript == lastTranscript &&
+      other.lastReply == lastReply &&
       other.onDeviceTranscript == onDeviceTranscript;
 
   @override
@@ -102,6 +114,7 @@ class VoiceConversationState {
     isPaused,
     error,
     lastTranscript,
+    lastReply,
     onDeviceTranscript,
   );
 
@@ -110,7 +123,8 @@ class VoiceConversationState {
       'VoiceConversationState(connected: $isConnected, '
       'recording: $isRecording, aiSpeaking: $isAiSpeaking, paused: $isPaused, '
       'error: $error, '
-      'transcript: $lastTranscript, deviceTranscript: $onDeviceTranscript)';
+      'transcript: $lastTranscript, reply: $lastReply, '
+      'deviceTranscript: $onDeviceTranscript)';
 }
 
 /// Orchestrates a turn-based text voice conversation.
@@ -378,7 +392,9 @@ final class VoiceController {
       debugPrint('VoiceController: sendText "${trimmed.substring(0, trimmed.length.clamp(0, 60))}"');
     }
     try {
-      _update(_state.copyWith(lastTranscript: null, error: null));
+      // Clearing lastReply too: consecutive identical replies must still
+      // flip the field so per-turn listeners fire.
+      _update(_state.copyWith(lastTranscript: null, lastReply: null, error: null));
       final buffer = StringBuffer();
       final result = await chatClient.streamCompletions(
         messages: [ApiMessage(role: 'user', content: trimmed)],
@@ -392,7 +408,7 @@ final class VoiceController {
       final streamed = buffer.toString().trim();
       final reply = streamed.isNotEmpty ? streamed : result.content.trim();
       if (reply.isNotEmpty) {
-        _update(_state.copyWith(lastTranscript: reply));
+        _update(_state.copyWith(lastTranscript: reply, lastReply: reply));
         onTranscript?.call(reply);
         await synthesizeOnDevice(reply);
       }

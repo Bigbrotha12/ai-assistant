@@ -403,6 +403,9 @@ void main() {
       expect(stt.transcribed[1], everyElement(2));
       expect(chat.callCount, 2);
       expect(playback.playedChunks, hasLength(2));
+      // The final reply is exposed exactly once per completed turn (cleared
+      // at the start of the next), so per-turn listeners fire reliably.
+      expect(controller.state.lastReply, 'hi there');
 
       await controller.dispose();
       await mic.dispose();

@@ -44,7 +44,8 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   final _logScroll = ScrollController();
 
   /// Ordered, de-duplicated user transcripts shown as chat bubbles.
-  final _transcripts = <String>[];
+  /// Transcript log: user utterances and assistant replies, in order.
+  final _transcripts = <_LogEntry>[];
 
   bool _micBusy = false;
 
@@ -77,15 +78,36 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     super.dispose();
   }
 
-  /// Appends a freshly recognised user utterance to the log, falling back from
-  /// the on-device transcript to the assistant reply when an on-device engine
-  /// is unavailable. Empty/unchanged text is ignored so the list stays stable
-  /// across unrelated state updates.
+  /// Appends a freshly recognised user utterance to the log. Empty text is
+  /// ignored so the list stays stable across unrelated state updates.
   void _appendTranscript(VoiceConversationState state) {
     final text = state.onDeviceTranscript;
     if (text == null || text.trim().isEmpty) return;
-    if (_transcripts.isNotEmpty && _transcripts.last == text) return;
-    setState(() => _transcripts.add(text));
+    if (_transcripts.isNotEmpty &&
+        _transcripts.last.fromUser &&
+        _transcripts.last.text == text) {
+      return;
+    }
+    setState(() => _transcripts.add(_LogEntry(text, fromUser: true)));
+    _scrollLogToEnd();
+  }
+
+  /// Appends the assistant's final reply to the log. [lastReply] is cleared
+  /// at the start of each turn and set once at its end, so this fires exactly
+  /// once per completed turn (even for identical reply text).
+  void _appendAssistantReply(VoiceConversationState state) {
+    final text = state.lastReply;
+    if (text == null || text.trim().isEmpty) return;
+    if (_transcripts.isNotEmpty &&
+        !_transcripts.last.fromUser &&
+        _transcripts.last.text == text) {
+      return;
+    }
+    setState(() => _transcripts.add(_LogEntry(text, fromUser: false)));
+    _scrollLogToEnd();
+  }
+
+  void _scrollLogToEnd() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_logScroll.hasClients) {
         _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
@@ -217,6 +239,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     final state = ref.watch(voiceConversationStateProvider);
     ref.listen(voiceConversationStateProvider, (_, next) {
       _appendTranscript(next);
+      _appendAssistantReply(next);
     });
 
     final scheme = Theme.of(context).colorScheme;
@@ -716,6 +739,14 @@ class _WaveformState extends State<_Waveform>
 
 /// Scrollable conversation log: recognised user utterances as right-aligned
 /// bubbles and a live left-aligned bubble while the AI is speaking.
+/// One transcript-log entry: who said it and what.
+class _LogEntry {
+  const _LogEntry(this.text, {required this.fromUser});
+
+  final String text;
+  final bool fromUser;
+}
+
 class _MessageLog extends StatelessWidget {
   const _MessageLog({
     required this.controller,
@@ -725,7 +756,7 @@ class _MessageLog extends StatelessWidget {
   });
 
   final ScrollController controller;
-  final List<String> entries;
+  final List<_LogEntry> entries;
   final bool aiSpeaking;
   final bool connected;
 
@@ -752,7 +783,10 @@ class _MessageLog extends StatelessWidget {
         if (index >= entries.length) {
           return const _AssistantSpeakingBubble();
         }
-        return _UserBubble(text: entries[index]);
+        final entry = entries[index];
+        return entry.fromUser
+            ? _UserBubble(text: entry.text)
+            : _AssistantBubble(text: entry.text);
       },
     );
   }
@@ -782,6 +816,38 @@ class _UserBubble extends StatelessWidget {
           ),
         ),
         child: Text(text, style: TextStyle(color: scheme.onPrimaryContainer)),
+      ),
+    );
+  }
+}
+
+/// Left-aligned transcript bubble styled as an assistant message.
+class _AssistantBubble extends StatelessWidget {
+  const _AssistantBubble({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(4),
+            bottomRight: Radius.circular(16),
+          ),
+        ),
+        child: Text(
+          text,
+          style: TextStyle(color: scheme.onSurfaceVariant),
+        ),
       ),
     );
   }
