@@ -277,6 +277,39 @@ if [ -n "${FLUTTER_ARGS:-}" ]; then
 fi
 
 echo "Running flutter on '$FLUTTER_DEVICE' against host '$HOST_FQDN' (dev http)…"
+
+# Self-heal wireless adb after a phone reboot: `adb tcpip` does not survive
+# reboots without root. When the configured device is an adb TCP target that
+# is no longer connected and a USB device IS attached, flip the USB device
+# back into TCP mode and reconnect it at the configured address.
+resolve_adb() {
+  if [ -n "${ADB:-}" ] && [ -x "$ADB" ]; then echo "$ADB"; return; fi
+  if command -v adb >/dev/null 2>&1; then command -v adb; return; fi
+  local sdk
+  sdk="$(grep -E '^sdk\.dir=' "$ROOT_DIR/android/local.properties" 2>/dev/null | cut -d= -f2-)"
+  if [ -n "$sdk" ] && [ -x "$sdk/platform-tools/adb" ]; then
+    echo "$sdk/platform-tools/adb"
+  fi
+}
+ADB_BIN="$(resolve_adb)"
+case "$FLUTTER_DEVICE" in
+  *.*:[0-9]*)
+    if [ -n "$ADB_BIN" ] && ! "$ADB_BIN" devices 2>/dev/null | grep -q "^$FLUTTER_DEVICE[[:space:]]"; then
+      USB_SERIAL="$("$ADB_BIN" devices -l 2>/dev/null | awk '/usb:/ && $2=="device" {print $1; exit}')"
+      if [ -n "$USB_SERIAL" ]; then
+        echo "Wireless adb target $FLUTTER_DEVICE not connected; re-enabling TCP mode on USB device $USB_SERIAL…"
+        "$ADB_BIN" -s "$USB_SERIAL" tcpip "${FLUTTER_DEVICE##*:}" >/dev/null
+        sleep 2
+        "$ADB_BIN" connect "$FLUTTER_DEVICE" || true
+      else
+        echo "warning: wireless adb target $FLUTTER_DEVICE is not connected and no USB device is attached."
+        echo "         After a phone reboot, plug in USB once — this script will re-enable TCP mode."
+        echo "         Or re-enable Wireless debugging on the phone and update FLUTTER_DEVICE."
+      fi
+    fi
+    ;;
+esac
+
 "$FLUTTER_BIN" run \
   -d "$FLUTTER_DEVICE" \
   --dart-define=HOST_FQDN="$HOST_FQDN" \
