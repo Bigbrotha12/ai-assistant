@@ -55,7 +55,7 @@ the ledger needs migrating.
 | ------------------- | -------- | ---------------------- | ------------------------------------------------------------------------------ |
 | `BETTER_AUTH_SECRET`| yes      | —                      | HMAC/verification secret, **≥ 32 chars**. `openssl rand -base64 32`.           |
 | `BETTER_AUTH_URL`   | yes      | —                      | Public base URL of the gateway, e.g. `http://localhost:17600`.                   |
-| `INFERENCE_URL`     | yes      | —                      | Base URL of the OpenAI-compatible engine. Must NOT equal this gateway's port.   |
+| `INFERENCE_URL`     | yes      | `http://localhost:9090` | Base URL of the OpenAI-compatible engine (llama.cpp proxy; 9090 = Qwen3-14B, see `~/Documents/homelab/podman/queues`). Must NOT equal this gateway's port. Edit in `server/.env` to override. |
 | `PORT`              | no       | `17600`                | Gateway port (the Flutter app derives this as its backend base).                |
 | `DB_PATH`           | no       | `./data/gateway.db`    | SQLite file for better-auth (dev only).                          |
 | `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |

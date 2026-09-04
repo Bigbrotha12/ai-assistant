@@ -110,6 +110,9 @@ fi
 
 # 3) Ensure the dev defaults for BETTER_AUTH_URL / INFERENCE_URL when missing
 #    or blank (the gateway refuses to boot on a missing/blank URL).
+#    INFERENCE_URL targets the llama.cpp inference proxy (port 9090 = Qwen3-14B);
+#    see ~/Documents/homelab/podman/queues. --dart-define overrides are applied
+#    to flutter run below; a custom INFERENCE_URL may be set in server/.env.
 ensure_env_default() {
   local key="$1" default="$2"
   if ! grep -q "^${key}=.*[^[:space:]]" .env; then
@@ -123,7 +126,7 @@ ensure_env_default() {
   fi
 }
 ensure_env_default "BETTER_AUTH_URL" "http://localhost:17600"
-ensure_env_default "INFERENCE_URL" "http://localhost:11434"
+ensure_env_default "INFERENCE_URL" "http://localhost:9090"
 
 # 4) npm install (only if node_modules is missing).
 if [ ! -d node_modules ]; then
@@ -175,9 +178,22 @@ fi
 echo "Gateway is healthy: $(curl -fsS "$HEALTH_URL")"
 
 # Note if the inference engine is unreachable (needed for chat, not auth).
-if ! curl -fsS "http://localhost:11434" >/dev/null 2>&1; then
-  echo "warning: Ollama (http://localhost:11434) is not reachable."
+# INFERENCE_URL is read from server/.env (the editable source of truth; default
+# is the llama.cpp proxy port 9090 = Qwen3-14B, see ~/Documents/homelab/podman/
+# queues). The proxy binds its port only when the podman queues stack is running.
+# We probe the TCP port: the proxy routes every path to llama, so an HTTP GET
+# would block waiting on inference — a bare port check is the safe, non-blocking
+# signal.
+INFERENCE_URL="${INFERENCE_URL:-$(grep -E '^INFERENCE_URL=' ".env" | head -n1 | cut -d= -f2-)}"
+INFERENCE_URL="${INFERENCE_URL:-http://localhost:9090}"
+INFERENCE_PORT="$(printf '%s' "$INFERENCE_URL" | sed -E 's#^https?://[^:/]+:?([0-9]*).*#\1#')"
+INFERENCE_PORT="${INFERENCE_PORT:-9090}"
+if ! (exec 3<>"/dev/tcp/localhost/$INFERENCE_PORT") 2>/dev/null; then
+  echo "warning: inference proxy ($INFERENCE_URL) is not reachable."
+  echo "         Start it with: cd ~/Documents/homelab/podman/queues && podman-compose up -d --build"
   echo "         Auth / sign-up still work; chat will fail until it is up."
+else
+  exec 3>&- 2>/dev/null
 fi
 
 # ---------------------------------------------------------------------------
