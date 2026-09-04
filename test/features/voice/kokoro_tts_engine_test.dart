@@ -348,12 +348,6 @@ class FakeSession implements KokoroOnnxSession {
   Float32List? _speed;
 
   @override
-  List<String> get inputNames => const ['input_ids', 'style', 'speed'];
-
-  @override
-  List<String> get outputNames => const ['audio'];
-
-  @override
   Future<List<double>> run({
     required List<int> inputIds,
     required Float32List style,
@@ -372,10 +366,6 @@ class FakeSession implements KokoroOnnxSession {
 }
 
 class FailingSession implements KokoroOnnxSession {
-  @override
-  List<String> get inputNames => const ['input_ids', 'style', 'speed'];
-  @override
-  List<String> get outputNames => const ['audio'];
   @override
   Future<List<double>> run({
     required List<int> inputIds,

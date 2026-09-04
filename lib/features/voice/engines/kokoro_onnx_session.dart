@@ -1,27 +1,19 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
-import 'package:onnxruntime/onnxruntime.dart';
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 
 import '../engine_errors.dart';
 
-/// A thin, testable seam over the onnxruntime session used for Kokoro
+/// A thin, testable seam over the ONNX Runtime session used for Kokoro
 /// synthesis.
 ///
 /// [KokoroTtsEngine] depends on this abstraction (constructed via an injectable
 /// [KokoroSessionFactory]) so unit tests can exercise the synthesis pipeline
 /// with a fake backend instead of a real ~92 MB `.onnx` file.
 abstract interface class KokoroOnnxSession {
-  /// Input node names as reported by the loaded graph.
-  ///
-  /// Used to resolve the actual ONNX io node names generically (e.g. the
-  /// `onnx-community` export names them `input_ids`, `style`, `speed`).
-  List<String> get inputNames;
-
-  /// Output node names as reported by the loaded graph.
-  List<String> get outputNames;
-
   /// Runs inference and returns raw mono float audio at the model's native
   /// sample rate (24 kHz for Kokoro).
   Future<List<double>> run({
@@ -30,81 +22,48 @@ abstract interface class KokoroOnnxSession {
     required Float32List speed,
   });
 
-  /// Releases native/FFI resources held by the session.
+  /// Releases native resources held by the session.
   void release();
 }
 
-/// Returns a [KokoroOnnxSession] backed by the real onnxruntime plugin.
+/// Returns a [KokoroOnnxSession] backed by the real ONNX Runtime plugin.
 ///
 /// This is the production factory; tests inject their own.
 typedef KokoroSessionFactory = KokoroOnnxSession Function(File modelFile);
 
-/// Default production session factory backed by onnxruntime.
+/// Default production session factory backed by ONNX Runtime.
 KokoroOnnxSession createKokoroOnnxSession(File modelFile) =>
     KokoroOnnxSessionImpl(modelFile);
 
-/// Real onnxruntime-backed [KokoroOnnxSession].
+/// Real ONNX Runtime-backed [KokoroOnnxSession].
 ///
-/// Wraps an [OrtSession] created from [modelFile], resolves the io node names
-/// generically from `session.inputNames` / `session.outputNames`, feeds the
-/// typed tensors (with the correct dtypes — see critical notes below) and
-/// flattens the float audio output.
+/// Wraps an `OrtSession` created from [modelFile] via `flutter_onnxruntime`
+/// (ONNX Runtime 1.23 native runtime behind a platform channel), resolves the
+/// io node names generically from `session.inputNames` / `session.outputNames`,
+/// feeds the typed tensors (with the correct dtypes — see critical notes
+/// below) and flattens the float audio output.
 ///
 /// ## ONNX dtype gotcha
 ///
-/// `OrtValueTensor.createTensorWithDataList` infers the ONNX dtype from the
-/// Dart element type: a plain `List<int>` maps to **int64** (correct for
-/// `input_ids`), but a plain `List<double>` maps to **float64** (wrong for
-/// the `style`/`speed` float32 inputs). Those must be passed as `Float32List`.
+/// `OrtValue.fromList` maps the Dart element type onto the ONNX dtype:
+/// `Int64List` → **int64** (required for `input_ids`), `Float32List` →
+/// **float32** (required for the `style`/`speed` inputs), while a plain
+/// `List<num>` is auto-sniffed (float32/int32/int64) and must be avoided for
+/// inputs whose dtype the graph fixes.
 ///
 /// ## Resource lifecycle
 ///
-/// Every allocated `OrtValue` (inputs + outputs) and the `OrtRunOptions` are
-/// released after the run so FFI buffers are not leaked.
+/// Every allocated `OrtValue` (inputs + outputs) is disposed after the run so
+/// native buffers are not leaked. `release()` closes the session; it is called
+/// by the engine after each utterance (session-per-utterance lifecycle).
 class KokoroOnnxSessionImpl implements KokoroOnnxSession {
   KokoroOnnxSessionImpl(this._modelFile);
 
   final File _modelFile;
 
   OrtSession? _session;
+  Future<OrtSession>? _loading;
   bool _released = false;
-
-  @override
-  List<String> get inputNames {
-    final s = _ensureSession();
-    return s.inputNames;
-  }
-
-  @override
-  List<String> get outputNames {
-    final s = _ensureSession();
-    return s.outputNames;
-  }
-
-  OrtSession _ensureSession() {
-    if (_session != null) return _session!;
-    if (_released) {
-      throw const EngineModelLoadError('Session was already released');
-    }
-    try {
-      final options = OrtSessionOptions();
-      try {
-        // On-device: CPU provider is always available; a single intra-op
-        // thread keeps memory small and avoids oversubscription of the
-        // device's cores during a single utterance.
-        options.appendCPUProvider(CPUFlags.useNone);
-        options.setIntraOpNumThreads(1);
-        _session = OrtSession.fromFile(_modelFile, options);
-      } finally {
-        options.release();
-      }
-      return _session!;
-    } on EngineError {
-      rethrow;
-    } on Exception catch (e) {
-      throw EngineModelLoadError('Failed to load Kokoro ONNX model: $e');
-    }
-  }
 
   @override
   Future<List<double>> run({
@@ -112,57 +71,47 @@ class KokoroOnnxSessionImpl implements KokoroOnnxSession {
     required Float32List style,
     required Float32List speed,
   }) async {
-    final session = _ensureSession();
+    final session = await _ensureSession();
     final names = _resolveNames(session);
 
-    final inputIdsTensor = OrtValueTensor.createTensorWithDataList(
-      inputIds,
+    final inputIdsTensor = await OrtValue.fromList(
+      Int64List.fromList(inputIds),
       [1, inputIds.length],
     );
-    final styleTensor = OrtValueTensor.createTensorWithDataList(
-      style,
-      [1, style.length],
-    );
-    final speedTensor =
-        OrtValueTensor.createTensorWithDataList(speed, [speed.length]);
+    final styleTensor = await OrtValue.fromList(style, [1, style.length]);
+    final speedTensor = await OrtValue.fromList(speed, [speed.length]);
     final inputs = <String, OrtValue>{
       names.inputIds: inputIdsTensor,
       names.style: styleTensor,
       names.speed: speedTensor,
     };
 
-    final runOptions = OrtRunOptions();
-    List<OrtValue?>? outputs;
+    Map<String, OrtValue> outputs = const {};
     try {
-      final out = await session.runAsync(runOptions, inputs, [
-        names.audioOutput,
-      ]);
-      outputs = out ?? const [];
-      final audioValue = outputs.isNotEmpty ? outputs.first : null;
-      if (audioValue is! OrtValueTensor) {
+      outputs = await session.run(inputs);
+      final audioValue = outputs[names.audioOutput] ??
+          (outputs.isNotEmpty ? outputs.values.first : null);
+      if (audioValue == null) {
         throw const EngineInferenceError(
-          'Kokoro model did not return a tensor audio output',
+          'Kokoro model did not return an audio output',
         );
       }
-      final dynamic value = audioValue.value;
-      return _flattenDoubles(value);
+      final flat = await audioValue.asFlattenedList();
+      return [for (final e in flat) (e as num).toDouble()];
     } on EngineError {
       rethrow;
     } on Exception catch (e) {
       throw EngineInferenceError('Kokoro inference failed: $e');
     } finally {
-      // Release every output OrtValue returned by the run (including the
-      // audio tensor we read above) so their native/FFI buffers are freed.
-      // Failing to release these is a per-utterance native memory leak.
-      if (outputs != null) {
-        for (final v in outputs) {
-          v?.release();
-        }
+      // Dispose every output OrtValue returned by the run (including the
+      // audio tensor we read above) so their native buffers are freed.
+      // Failing to dispose these is a per-utterance native memory leak.
+      for (final v in outputs.values) {
+        await v.dispose();
       }
       for (final v in inputs.values) {
-        v.release();
+        await v.dispose();
       }
-      runOptions.release();
     }
   }
 
@@ -212,34 +161,53 @@ class KokoroOnnxSessionImpl implements KokoroOnnxSession {
     );
   }
 
-  /// Recursively flattens a nested tensor-shaped [List] of doubles into a
-  /// single flat `List<double>`.
-  static List<double> _flattenDoubles(dynamic value) {
-    final out = <double>[];
-    void walk(dynamic v) {
-      if (v is double) {
-        out.add(v);
-      } else if (v is num) {
-        out.add(v.toDouble());
-      } else if (v is List) {
-        for (final e in v) {
-          walk(e);
-        }
-      }
+  /// Loads the session once; concurrent callers share the in-flight load.
+  Future<OrtSession> _ensureSession() {
+    final existing = _session;
+    if (existing != null) return Future.value(existing);
+    if (_released) {
+      throw const EngineModelLoadError('Session was already released');
     }
+    return _loading ??= _createSession();
+  }
 
-    walk(value);
-    return out;
+  Future<OrtSession> _createSession() async {
+    try {
+      final options = OrtSessionOptions(
+        // On-device: CPU provider is always available; a single intra-op
+        // thread keeps memory small and avoids oversubscription of the
+        // device's cores during a single utterance.
+        providers: const [OrtProvider.CPU],
+        intraOpNumThreads: 1,
+      );
+      final session =
+          await OnnxRuntime().createSession(_modelFile.path, options: options);
+      if (_released) {
+        // release() raced the load; tear the fresh session back down.
+        await session.close();
+        throw const EngineModelLoadError('Session was already released');
+      }
+      return _session = session;
+    } on EngineError {
+      rethrow;
+    } on Exception catch (e) {
+      throw EngineModelLoadError('Failed to load Kokoro ONNX model: $e');
+    } finally {
+      _loading = null;
+    }
   }
 
   @override
   void release() {
     if (_released) return;
     _released = true;
-    try {
-      _session?.release();
-    } finally {
-      _session = null;
+    final session = _session;
+    _session = null;
+    _loading = null;
+    if (session != null) {
+      // Fire-and-forget teardown: the engine only releases after a run has
+      // fully settled, so the session is idle here.
+      unawaited(session.close().onError((_, _) {}));
     }
   }
 }

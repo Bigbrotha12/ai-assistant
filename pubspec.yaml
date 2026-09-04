@@ -56,13 +56,15 @@ dependencies:
   shared_preferences: ^2.5.5
 
   # Voice Conversation (Phase 4): mic capture, TTS playback,
-  # device info for capability detection, on-device STT/TTS engines.
+  # on-device STT/TTS engines.
   just_audio: ^0.10.6
-  record: ^6.2.1
+  record: ^7.1.1
   audio_session: ^0.1.25
-  device_info_plus: ^12.4.0
   whisper_kit: ^0.3.1
-  onnxruntime: ^1.4.1
+  # Actively maintained ONNX Runtime wrapper (bundles ORT 1.23.0, 16 KB page
+  # size compliant). Replaces the unmaintained `onnxruntime` plugin whose
+  # stale compileSdk 33 / ORT 1.15 binaries broke the Android build.
+  flutter_onnxruntime: ^1.8.4
   # VAD for voice activity detection during mic capture.
   # flutter_vad: ^0.1.2  # — not published on pub.dev; add when available
 
