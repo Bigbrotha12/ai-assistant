@@ -49,3 +49,6 @@ app.*.map.json
 
 # Local docs (generated, not versioned)
 /docs/
+
+# dev.sh local configuration
+dev.env

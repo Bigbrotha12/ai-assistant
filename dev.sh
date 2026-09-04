@@ -4,15 +4,23 @@
 #
 # Provisions the backend gateway (server/.env, npm install, migrate), starts
 # the gateway in the background, waits for it to become healthy, then runs the
-# Flutter app against a local dev backend. Everything is torn down on exit.
+# Flutter app against the dev backend. Everything is torn down on exit.
+#
+# The backend host baked into the app defaults to this machine's Tailscale
+# IPv4, so the same build works on the Linux desktop (local loopback) and on
+# tailnet phones (over Tailscale). Without Tailscale it falls back to
+# localhost.
 #
 # Usage:
-#   ./dev.sh                          # run flutter run -d linux with localhost backend
+#   ./dev.sh                          # run on Linux with the Tailscale host
+#   FLUTTER_DEVICE=<device-id> ./dev.sh  # run on Android (see: flutter devices)
 #   ./dev.sh -- <flutter args...>     # forward extra args to flutter run (e.g. --dart-define=...)
 #
-# Env:
-#   FLUTTER       Flutter SDK binary path (default: $HOME/Projects/mobile/flutter/bin/flutter)
-#   FLUTTER_ARGS  Extra args appended to flutter run (alternative to --)
+# Env (see dev.env.example for persistent configuration):
+#   FLUTTER_DEVICE  Device for flutter run -d (default: linux)
+#   HOST_FQDN       Backend host dart-define (default: Tailscale IP, else localhost)
+#   FLUTTER         Flutter SDK binary path (default: $HOME/Projects/mobile/flutter/bin/flutter)
+#   FLUTTER_ARGS    Extra args appended to flutter run (alternative to --)
 
 set -euo pipefail
 
@@ -21,6 +29,37 @@ SERVER_DIR="$ROOT_DIR/server"
 DATA_DIR="$SERVER_DIR/data"
 LOG_FILE="$DATA_DIR/server.log"
 HEALTH_URL="http://localhost:17600/api/auth/ok"
+
+# ---------------------------------------------------------------------------
+# Optional dev config (dev.env; KEY=VALUE lines, '#' comments). Values only
+# apply when the corresponding variable is unset — an explicitly exported env
+# var always wins. See dev.env.example.
+# ---------------------------------------------------------------------------
+
+DEV_ENV_FILE="$ROOT_DIR/dev.env"
+if [ -f "$DEV_ENV_FILE" ]; then
+  echo "Loading dev config from dev.env"
+  while IFS='=' read -r key value; do
+    key="${key//[[:space:]]/}"
+    key="${key%$'\r'}"
+    case "$key" in '' | '#'*) continue ;; esac
+    value="${value%$'\r'}"
+    # Strip one layer of surrounding quotes for convenience.
+    case "$value" in
+    '"'*)
+      value="${value#\"}"
+      value="${value%\"}"
+      ;;
+    "'"*)
+      value="${value#\'}"
+      value="${value%\'}"
+      ;;
+    esac
+    if [ -z "${!key:-}" ]; then
+      export "$key=$value"
+    fi
+  done <"$DEV_ENV_FILE"
+fi
 
 GATEWAY_PID=""
 FLUTTER_PID=""
@@ -50,6 +89,28 @@ if [ ! -x "$FLUTTER_BIN" ]; then
   exit 1
 fi
 echo "Using flutter: $FLUTTER_BIN"
+
+# Backend host for the app build: explicit HOST_FQDN (env/dev.env) wins, else
+# this machine's Tailscale IPv4 (works for the Linux desktop over loopback and
+# for tailnet phones over Tailscale), else plain localhost.
+if [ -z "${HOST_FQDN:-}" ]; then
+  if command -v tailscale >/dev/null 2>&1; then
+    HOST_FQDN="$(tailscale ip -4 2>/dev/null | head -n1)"
+  fi
+  if [ -n "${HOST_FQDN:-}" ]; then
+    echo "HOST_FQDN defaulted to this machine's Tailscale IP: $HOST_FQDN"
+  else
+    HOST_FQDN="localhost"
+    echo "note: Tailscale unavailable; HOST_FQDN defaulted to localhost."
+  fi
+fi
+
+# Target device for flutter run -d: explicit FLUTTER_DEVICE (env/dev.env) wins,
+# else the Linux desktop.
+FLUTTER_DEVICE="${FLUTTER_DEVICE:-linux}"
+if [ -z "$FLUTTER_DEVICE" ]; then
+  FLUTTER_DEVICE="linux"
+fi
 
 # ---------------------------------------------------------------------------
 # Teardown
@@ -103,7 +164,7 @@ if grep -q '^BETTER_AUTH_SECRET=replace-me-with-at-least-32-random-characters' .
     sed -i.bak "s|^BETTER_AUTH_SECRET=.*|BETTER_AUTH_SECRET=${SECRET}|" .env
     rm -f .env.bak
   else
-    printf 'BETTER_AUTH_SECRET=%s\n' "$SECRET" >> .env
+    printf 'BETTER_AUTH_SECRET=%s\n' "$SECRET" >>.env
   fi
   echo "Generated BETTER_AUTH_SECRET in server/.env."
 fi
@@ -121,11 +182,11 @@ ensure_env_default() {
       sed -i.bak "s|^${key}=.*|${key}=${default}|" .env
       rm -f .env.bak
     else
-      printf '%s=%s\n' "$key" "$default" >> .env
+      printf '%s=%s\n' "$key" "$default" >>.env
     fi
   fi
 }
-ensure_env_default "BETTER_AUTH_URL" "http://localhost:17600"
+ensure_env_default "BETTER_AUTH_URL" "http://${HOST_FQDN}:17600"
 ensure_env_default "INFERENCE_URL" "http://localhost:9090"
 
 # 4) npm install (only if node_modules is missing).
@@ -215,9 +276,10 @@ if [ -n "${FLUTTER_ARGS:-}" ]; then
   EXTRA_ARGS+=("${FLUTTER_ARGS_SPLIT[@]}")
 fi
 
-echo "Running flutter with host=localhost (dev http)…"
-"$FLUTTER_BIN" run -d linux \
-  --dart-define=HOST_FQDN=localhost \
+echo "Running flutter on '$FLUTTER_DEVICE' against host '$HOST_FQDN' (dev http)…"
+"$FLUTTER_BIN" run \
+  -d "$FLUTTER_DEVICE" \
+  --dart-define=HOST_FQDN="$HOST_FQDN" \
   "${EXTRA_ARGS[@]}" &
 FLUTTER_PID=$!
 
