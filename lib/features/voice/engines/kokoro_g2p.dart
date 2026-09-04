@@ -16,6 +16,8 @@
 ///    exercise the tokenizer + ONNX pipeline in isolation.
 library;
 
+import 'lexicon_g2p.dart';
+
 /// Converts natural-language text into an IPA phoneme string suitable for
 /// [KokoroTokenizer.encode].
 abstract interface class TextToPhonemes {
@@ -25,13 +27,19 @@ abstract interface class TextToPhonemes {
   /// greedy longest-prefix matching against the Kokoro vocabulary (see
   /// `KokoroTokenizer.fallbackVocab`).
   String convert(String text);
+
+  /// Preloads any heavy backing data. No-op by default; the engine awaits it
+  /// once before the first synthesis.
+  Future<void> ensureLoaded() async {}
 }
 
-/// Creates the [TextToPhonemes] used by [KokoroTtsEngine] by default.
-typedef G2PFactory = TextToPhonemes Function();
+/// Creates the [TextToPhonemes] used by [KokoroTtsEngine] by default: the
+/// lexicon-backed [LexiconG2P], falling back to the [KokoroG2P] letter rules
+/// per out-of-vocabulary word.
+TextToPhonemes createKokoroG2P() => LexiconG2P();
 
-/// Default production G2P factory backed by the [KokoroG2P] heuristic.
-TextToPhonemes createKokoroG2P() => KokoroG2P();
+/// Injectable G2P seam factory (tests substitute their own).
+typedef G2PFactory = TextToPhonemes Function();
 
 /// A pragmatic, well-documented **heuristic** English grapheme-to-phoneme
 /// (G2P) converter.
@@ -145,6 +153,13 @@ class KokoroG2P implements TextToPhonemes {
     }
     return phonemes.join(' ');
   }
+
+  /// Converts a single word to IPA. Public so higher-fidelity backends can
+  /// fall back to the letter rules per out-of-vocabulary word.
+  String convertWord(String rawWord) => _convertWord(rawWord);
+
+  @override
+  Future<void> ensureLoaded() async {}
 
   /// Converts a single lowercase word to an IPA string.
   String _convertWord(String word) {

@@ -15,6 +15,9 @@ import 'package:flutter_test/flutter_test.dart';
 class _PassThroughG2P implements TextToPhonemes {
   @override
   String convert(String text) => text;
+
+  @override
+  Future<void> ensureLoaded() async {}
 }
 
 void main() {
@@ -329,6 +332,9 @@ class _FixedG2P implements TextToPhonemes {
   final String phonemes;
   @override
   String convert(String text) => phonemes;
+
+  @override
+  Future<void> ensureLoaded() async {}
 }
 
 /// Records its call arguments so the engine's wiring can be asserted, and

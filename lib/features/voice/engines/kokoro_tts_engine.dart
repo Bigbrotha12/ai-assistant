@@ -117,7 +117,9 @@ class KokoroTtsEngine implements TtsEngine {
       }
     }
 
-    // 1) G2P: natural-language text → IPA phonemes.
+    // 1) G2P: natural-language text → IPA phonemes. The lexicon backend
+    // loads its dictionary once (no-op for the heuristic fallback).
+    await _g2p.ensureLoaded();
     final phonemes = _g2p.convert(text);
 
     // 2) Tokenize: IPA phonemes → padded integer ids.

@@ -95,6 +95,11 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # Bundled G2P lexicon: CMU Pronouncing Dictionary 0.7b (BSD-style licence,
+  # redistribution with attribution — the original header ships in the file).
+  assets:
+    - assets/g2p/cmudict-0.7b.gz
+
   # Design system fonts (see docs/design-system.md). Both are variable fonts;
   # each declared weight maps to the same file so the named weight is applied.
   fonts:
