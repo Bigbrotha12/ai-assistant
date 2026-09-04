@@ -85,7 +85,9 @@ void main() {
     // The exact utterance seen by the controller is flushed through.
     expect(stt.transcribed, isNotEmpty);
     expect(stt.transcribed.single, isNotEmpty);
-    expect(controller.state.onDeviceTranscript, 'recognized speech');
+    // The utterance slot is cleared when the turn begins (sendText), so by
+    // the time the turn completes it is null again.
+    expect(controller.state.onDeviceTranscript, isNull);
 
     // The recognised utterance drives the LLM reply and TTS playback.
     expect(chat.calls, hasLength(1));

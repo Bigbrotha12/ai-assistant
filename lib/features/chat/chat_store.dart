@@ -16,6 +16,17 @@ abstract interface class ChatStore {
   /// Upserts the conversation row and all of its messages.
   Future<void> saveConversation(Conversation c);
 
+  /// Ensures the conversation row exists (creating it with [title] when
+  /// absent — never overwriting an existing row's data) and appends
+  /// [firstMessage]. Unlike [saveConversation] this is not a full-message-list
+  /// overwrite, so concurrent first-turn writers on the same conversation id
+  /// (chat + voice surfaces) can never clobber each other's messages.
+  Future<void> ensureConversation(
+    String id, {
+    required String title,
+    required Message firstMessage,
+  });
+
   /// Inserts a message and bumps the conversation's updatedAt + messageCount.
   Future<void> appendMessage(String conversationId, Message m);
 
@@ -69,6 +80,33 @@ class DriftChatStore implements ChatStore {
       for (final message in c.messages) {
         await _insertOrReplaceMessage(c.id, message);
       }
+      await _enforceEviction();
+    });
+  }
+
+  @override
+  Future<void> ensureConversation(
+    String id, {
+    required String title,
+    required Message firstMessage,
+  }) {
+    return _db.transaction(() async {
+      // Create the row only when absent (INSERT OR IGNORE): a concurrent
+      // first-turn writer may have created it between the caller's
+      // loadConversation and here, and its data must never be overwritten.
+      final now = DateTime.now();
+      await _db.into(_db.conversations).insert(
+        ConversationRow(
+          id: id,
+          title: title,
+          createdAt: now,
+          updatedAt: now,
+          messageCount: 0,
+        ),
+        mode: InsertMode.insertOrIgnore,
+      );
+      await _insertOrReplaceMessage(id, firstMessage);
+      await _bumpConversation(id, incrementCount: true);
       await _enforceEviction();
     });
   }

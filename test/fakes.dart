@@ -125,18 +125,51 @@ class FakeChatStore implements ChatStore {
   }
 
   @override
+  Future<void> ensureConversation(
+    String id, {
+    required String title,
+    required Message firstMessage,
+  }) async {
+    final now = DateTime.now();
+    final existing = _conversations[id];
+    if (existing == null) {
+      _conversations[id] = Conversation(
+        id: id,
+        title: title,
+        messages: [firstMessage],
+        createdAt: now,
+        updatedAt: now,
+      );
+    } else {
+      _conversations[id] = Conversation(
+        id: existing.id,
+        title: existing.title,
+        messages: [...existing.messages, firstMessage],
+        createdAt: existing.createdAt,
+        updatedAt: now,
+      );
+    }
+    _emit();
+  }
+
+  @override
   Future<void> appendMessage(String conversationId, Message m) async {
     final conv = _conversations[conversationId];
-    if (conv != null) {
-      _conversations[conversationId] = Conversation(
-        id: conv.id,
-        title: conv.title,
-        messages: [...conv.messages, m],
-        createdAt: conv.createdAt,
-        updatedAt: DateTime.now(),
-      );
-      _emit();
+    if (conv == null) {
+      // Mirrors production: DriftChatStore's FK constraint (database.dart's
+      // `PRAGMA foreign_keys = ON`) rejects message writes against a missing
+      // conversation row. A silent no-op here would mask exactly the bugs the
+      // FK exists to catch.
+      throw StateError('conversation $conversationId not found');
     }
+    _conversations[conversationId] = Conversation(
+      id: conv.id,
+      title: conv.title,
+      messages: [...conv.messages, m],
+      createdAt: conv.createdAt,
+      updatedAt: DateTime.now(),
+    );
+    _emit();
   }
 
   @override
@@ -145,7 +178,11 @@ class FakeChatStore implements ChatStore {
       throw StateError('store unavailable');
     }
     final conv = _conversations[conversationId];
-    if (conv == null) return;
+    if (conv == null) {
+      // Mirrors production: DriftChatStore's FK constraint rejects message
+      // writes against a missing conversation row.
+      throw StateError('conversation $conversationId not found');
+    }
     var found = false;
     final messages = <Message>[];
     for (final existing in conv.messages) {

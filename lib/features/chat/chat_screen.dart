@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:uuid/uuid.dart';
 
 import '../../core/auth_client.dart';
 import '../../core/files_providers.dart';
@@ -33,8 +32,7 @@ class ChatScreen extends ConsumerStatefulWidget {
 class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _input = TextEditingController();
   final _scroll = ScrollController();
-  final _uuid = const Uuid();
-  String _conversationId = const Uuid().v4();
+  late String _conversationId;
 
   /// Files selected for the next message, cleared after a successful send.
   List<AttachmentDraft> _attachments = [];
@@ -45,6 +43,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ValueNotifier(const {});
 
   @override
+  void initState() {
+    super.initState();
+    _conversationId = ref.read(activeConversationIdProvider)!;
+  }
+
+  @override
   void dispose() {
     _input.dispose();
     _scroll.dispose();
@@ -53,8 +57,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   void _newChat() {
+    ref.read(activeConversationIdProvider.notifier).newConversation();
     setState(() {
-      _conversationId = _uuid.v4();
       _attachments.clear();
       _uploadStatus.value = const {};
     });
@@ -66,7 +70,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       MaterialPageRoute(builder: (_) => const ConversationListScreen()),
     );
     if (selected != null && mounted) {
-      setState(() => _conversationId = selected);
+      ref.read(activeConversationIdProvider.notifier).set(selected);
     }
   }
 
@@ -146,6 +150,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Track the app-wide active conversation reactively (shared with the voice
+    // feature); _newChat / _openHistory switch it via the provider.
+    final activeId = ref.watch(activeConversationIdProvider);
+    if (activeId != null && activeId != _conversationId) {
+      _conversationId = activeId;
+    }
     final stateAsync = ref.watch(conversationProvider(_conversationId));
     final state = stateAsync.value;
     final isStreaming = state?.isStreaming ?? false;

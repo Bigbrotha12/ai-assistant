@@ -71,7 +71,7 @@ void main() {
   test('save then load round-trips settings', () async {
     const settings = VoiceSettings(
       sttEngine: 'whisper_tiny',
-      ttsEngine: 'kokoro_82m',
+      ttsEngine: 'supertonic_3',
       vadSensitivity: 0.75,
       preferredLanguage: 'en',
     );
@@ -80,6 +80,27 @@ void main() {
     final loaded = await store.load();
 
     expect(loaded, settings);
+  });
+
+  test('stored kokoro_82m ttsEngine migrates to supertonic_3', () async {
+    // Simulates settings saved before the TTS engine swap.
+    await storage.write(key: 'voice_stt_engine', value: 'whisper_tiny');
+    await storage.write(key: 'voice_tts_engine', value: 'kokoro_82m');
+
+    final loaded = await store.load();
+
+    expect(loaded, isNotNull);
+    expect(loaded!.ttsEngine, 'supertonic_3');
+    expect(loaded.sttEngine, 'whisper_tiny');
+  });
+
+  test('unknown stored ttsEngine ids pass through unmigrated', () async {
+    await storage.write(key: 'voice_tts_engine', value: 'some_future_engine');
+
+    final loaded = await store.load();
+
+    expect(loaded, isNotNull);
+    expect(loaded!.ttsEngine, 'some_future_engine');
   });
 
   test('load falls back to defaults for partial saves', () async {

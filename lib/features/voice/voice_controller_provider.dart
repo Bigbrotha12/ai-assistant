@@ -1,9 +1,14 @@
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
 
 import '../../core/chat_client_provider.dart';
 import '../../core/network_banner.dart';
+import '../chat/chat_providers.dart';
+import '../chat/database_providers.dart';
+import '../chat/message_model.dart';
 import 'audio_playback_service.dart';
 import 'engine_manager_provider.dart';
 import 'mic_capture_service.dart';
@@ -42,20 +47,141 @@ final voiceControllerProvider =
 class VoiceControllerNotifier extends Notifier<VoiceController> {
   void Function()? _enginesListener;
 
+  final _uuid = const Uuid();
+
+  /// Conversation id captured at turn start ([onUserMessage]). The user
+  /// message and — seconds later — the assistant reply both persist into this
+  /// id, so switching the active conversation mid-stream can never split a
+  /// turn across two conversations (the reply always follows its user message;
+  /// a missing row in a switched-to conversation can never swallow it either).
+  /// Fall back to [ensure] when null (a text turn started before any capture).
+  String? _turnConversationId;
+
+  /// Serialises persistence writes so a first-turn row creation and the user /
+  /// reply appends can never interleave (two concurrent first turns could
+  /// clobber via a full-message-list overwrite). Each link swallows errors so
+  /// one failure never wedges the chain.
+  Future<void> _persistTail = Future.value();
+
+  /// Appends [action] onto [_persistTail], fire-and-forget. The caller must
+  /// not await it: persistence runs serially in the background.
+  void _enqueuePersist(Future<void> Function() action) {
+    _persistTail = _persistTail.then((_) => action()).catchError((_) {});
+  }
+
+  /// Persists the user message into the turn's conversation, creating the
+  /// conversation row (with a title from the first user text) when absent.
+  Future<void> _persistUserMessage(String userText) async {
+    if (!ref.mounted) return;
+    final store = ref.read(chatStoreProvider);
+    final id =
+        _turnConversationId ??
+        ref.read(activeConversationIdProvider.notifier).ensure();
+    final existing = await store.loadConversation(id);
+    if (existing == null) {
+      final now = DateTime.now();
+      final title = userText.length <= 60
+          ? userText
+          : '${userText.substring(0, 60)}…';
+      // ensureConversation (not saveConversation, a full-message-list
+      // overwrite) so a concurrent first-turn write from the chat surface on
+      // the same conversation id can never clobber this one.
+      await store.ensureConversation(
+        id,
+        title: title,
+        firstMessage: Message(
+          id: _uuid.v4(),
+          role: MessageRole.user,
+          content: userText,
+          createdAt: now,
+        ),
+      );
+    } else {
+      await store.appendMessage(id, Message(
+        id: _uuid.v4(),
+        role: MessageRole.user,
+        content: userText,
+        createdAt: DateTime.now(),
+      ));
+    }
+  }
+
+  /// Persists the assistant reply into the turn's conversation. Runs after the
+  /// user message on [_persistTail], so the conversation row always exists.
+  Future<void> _persistAssistantReply(String reply) async {
+    if (!ref.mounted) return;
+    final store = ref.read(chatStoreProvider);
+    final id =
+        _turnConversationId ??
+        ref.read(activeConversationIdProvider.notifier).ensure();
+    await store.appendMessage(id, Message(
+      id: _uuid.v4(),
+      role: MessageRole.assistant,
+      content: reply,
+      createdAt: DateTime.now(),
+    ));
+  }
+
+  /// Builds the full request message list for a turn: trimmed conversation
+  /// history (from the turn's conversation) plus the new user message.
+  Future<List<ApiMessage>> _buildRequestMessages(String userText) async {
+    if (!ref.mounted) return [ApiMessage(role: 'user', content: userText)];
+    final store = ref.read(chatStoreProvider);
+    final id =
+        _turnConversationId ??
+        ref.read(activeConversationIdProvider.notifier).ensure();
+    final conversation = await store.loadConversation(id);
+    final messages = conversation?.messages ?? const <Message>[];
+    final trimmed = ref.read(contextTrimmerProvider).trim(messages);
+    final result = [...toApiMessages(trimmed)];
+    // The user message persist can land before this builder reads the DB, so
+    // the loaded history may already end with the very message being sent —
+    // appending it again would send the user text to the LLM twice. Skip the
+    // append only when the tail already carries this exact turn's text.
+    final last = trimmed.isNotEmpty ? trimmed.last : null;
+    final alreadyPresent =
+        last != null && last.role == MessageRole.user && last.content == userText;
+    if (!alreadyPresent) {
+      result.add(ApiMessage(role: 'user', content: userText));
+    }
+    return result;
+  }
+
   @override
   VoiceController build() {
     final engineManager = ref.watch(engineManagerProvider);
     final sttEngine = engineManager.sttEngine;
     final ttsEngine = engineManager.ttsEngine;
+    // Watch the trimmer so it is part of this notifier's dependency graph; the
+    // context builder itself reads it at call time (never captured).
+    ref.watch(contextTrimmerProvider);
+    // Abort any in-flight turn when this notifier is rebuilt (re-auth /
+    // engine-landing invalidateSelf), so a stream can never complete into a
+    // disposed notifier's persistence callbacks.
+    final cancelToken = CancelToken();
     final controller = VoiceController(
       chatClient: ref.watch(chatApiClientProvider),
       micCapture: ref.read(micCaptureServiceProvider),
       playback: ref.read(audioPlaybackServiceProvider),
       sttEngine: sttEngine,
       ttsEngine: ttsEngine,
+      cancelToken: cancelToken,
       onNetworkError: () {
+        if (!ref.mounted) return;
         ref.read(networkStatusProvider.notifier).set(NetworkStatus.disconnected);
       },
+      onUserMessage: (userText) {
+        if (!ref.mounted) return;
+        _turnConversationId =
+            ref.read(activeConversationIdProvider.notifier).ensure();
+        _enqueuePersist(() => _persistUserMessage(userText));
+      },
+      onTranscript: (reply) {
+        if (!ref.mounted) return;
+        _enqueuePersist(() => _persistAssistantReply(reply));
+      },
+      contextBuilder: (userText) => _buildRequestMessages(userText),
+      systemPrompt: kSystemPrompt,
     );
 
     // Engines register asynchronously (model-dir resolution happens on a
@@ -72,6 +198,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     }
 
     ref.onDispose(() {
+      cancelToken.cancel();
       if (_enginesListener != null) {
         engineManager.removeListener(_enginesListener!);
         _enginesListener = null;

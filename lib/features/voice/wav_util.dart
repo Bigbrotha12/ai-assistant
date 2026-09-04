@@ -75,7 +75,7 @@ Uint8List pcm16ToWav(
 /// little-endian PCM bytes — the payload format of a PCM16 WAV `data` chunk.
 ///
 /// Values outside the int16 range are clamped (defensive: today's producers —
-/// mic decode, Kokoro's resampler — already deliver in-range samples, so a
+/// mic decode, the TTS resampler — already deliver in-range samples, so a
 /// future out-of-range producer degrades to clipping instead of a click).
 ///
 /// This is the inverse of the mic-side decode ([MicCaptureService]): the

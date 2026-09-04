@@ -94,7 +94,7 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
 
   List<String> _ttsOptions() {
     final registered = EngineRegistry.instance.ttsEngineIds.toList();
-    final ids = registered.isEmpty ? [EngineConfig.kokoro82mId] : registered;
+    final ids = registered.isEmpty ? [EngineConfig.supertonic3Id] : registered;
     return ids.contains(_ttsEngine) ? ids : [...ids, _ttsEngine];
   }
 
@@ -348,12 +348,12 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
               ),
             ),
             const SizedBox(width: 12),
-            if (statuses[EngineConfig.kokoro82mId] !=
+            if (statuses[EngineConfig.supertonic3Id] !=
                 VoiceEngineStatus.unavailable) ...[
               Expanded(
                 child: _ModelStatusChip(
-                  label: 'Kokoro',
-                  status: statuses[EngineConfig.kokoro82mId] ??
+                  label: 'Supertonic 3',
+                  status: statuses[EngineConfig.supertonic3Id] ??
                       VoiceEngineStatus.notStarted,
                   progress: progress,
                   onAction: _busy ? null : _downloadAll,

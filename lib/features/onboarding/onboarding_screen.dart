@@ -265,11 +265,11 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     final allowed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Download Whisper tiny?'),
+        title: const Text('Download voice models?'),
         content: const Text(
-          'Whisper tiny is about 75 MB and enables on-device '
-          'speech-to-text. You can also download it later from '
-          'Voice settings.',
+          'Whisper tiny (~75 MB) enables on-device speech-to-text and '
+          'Supertonic 3 (~145 MB) adds on-device text-to-speech. You can '
+          'also download them later from Voice settings.',
         ),
         actions: [
           TextButton(
@@ -297,22 +297,37 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     }
   }
 
+  /// Re-downloads only the Supertonic 3 model (targeted retry after a failed
+  /// attempt) — Whisper is left untouched.
+  Future<void> _retrySupertonicDownload() async {
+    if (_downloading) return;
+    if (!await _requestDownloadConsent()) return;
+    setState(() => _downloading = true);
+    try {
+      await ref
+          .read(voiceEngineStatusProvider.notifier)
+          .downloadModel(EngineConfig.supertonic3Id);
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
   Widget _buildVoiceStep() {
     final theme = Theme.of(context);
     final statuses = ref.watch(voiceEngineStatusProvider);
     final progress = ref.watch(modelDownloadProgressProvider).value;
     final stt =
         statuses[EngineConfig.whisperTinyId] ?? VoiceEngineStatus.notStarted;
-    final kokoro = EngineConfig.kokoro82mDownloadAvailable
-        ? statuses[EngineConfig.kokoro82mId] ?? VoiceEngineStatus.notStarted
+    final supertonic = EngineConfig.supertonic3DownloadAvailable
+        ? statuses[EngineConfig.supertonic3Id] ?? VoiceEngineStatus.notStarted
         : VoiceEngineStatus.unavailable;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text(
           'Chat works without models; Whisper adds on-device speech input '
-          'and Kokoro speech output. Download Whisper to recognise speech '
-          'offline.',
+          'and Supertonic speech output. Download Whisper to recognise '
+          'speech offline.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -327,8 +342,12 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         ),
         const SizedBox(height: 8),
         _ModelRow(
-          label: 'Kokoro 82M',
-          status: kokoro,
+          label: 'Supertonic 3',
+          status: supertonic,
+          progress: progress,
+          // Without a retry action a failed Supertonic download would render
+          // a permanently disabled Retry button.
+          onAction: _downloading ? null : _retrySupertonicDownload,
         ),
         const SizedBox(height: 16),
         Align(
@@ -357,10 +376,10 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       VoiceEngineStatus.unavailable => 'unavailable',
       VoiceEngineStatus.notStarted => 'not downloaded',
     };
-    final kokoro = EngineConfig.kokoro82mDownloadAvailable
+    final supertonic = EngineConfig.supertonic3DownloadAvailable
         ? 'available'
         : 'unavailable';
-    return 'Whisper tiny: $sttLabel · Kokoro: $kokoro';
+    return 'Whisper tiny: $sttLabel · Supertonic: $supertonic';
   }
 
   Future<void> _getStarted() async {

@@ -62,7 +62,7 @@ class ModelDownloader {
 
   static Future<Directory> _loadModelDirectory() async {
     final base = await getApplicationDocumentsDirectory();
-    return Directory('${base.path}${EngineConfig.modelStorageDir}');
+    return Directory('${base.path}/${EngineConfig.modelStorageDir}');
   }
 
   final StreamController<ModelDownloadProgress> _progressController =
@@ -82,8 +82,9 @@ class ModelDownloader {
   ///
   /// [fileName] optionally overrides the output file name. When omitted the
   /// legacy `ggml<modelType>.bin` convention is used; when provided the bytes
-  /// land directly at `$dir/$fileName` (used by Kokoro's secondary artifacts —
-  /// the voices and tokenizer — whose names differ from their model type).
+  /// land directly at `$dir/$fileName` (used by the per-file TTS model
+  /// artifacts — e.g. Supertonic's seven files — whose names differ from
+  /// their model type; subdirectories inside [fileName] are created).
   Future<void> downloadModel({
     required String modelType,
     required String url,

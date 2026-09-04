@@ -21,6 +21,8 @@ import 'database_providers.dart';
 import 'message_model.dart';
 import 'tool_executor.dart';
 
+export 'active_conversation_provider.dart';
+
 /// Snapshot of a single conversation's chat state, consumed by the UI.
 class ConversationState {
   final List<Message> messages;
@@ -212,6 +214,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
 
     // Brand-new conversations need their row created first (the message row's
     // FK references it), with a title derived from the first user message.
+    // ensureConversation (rather than saveConversation, a full-message-list
+    // overwrite) so a concurrent first-turn write from the voice surface on
+    // the same conversation id can never clobber this one.
     final existing = await _store!.loadConversation(conversationId);
     if (!ref.mounted) return;
 
@@ -219,13 +224,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       final title = trimmed.length <= 60
           ? trimmed
           : '${trimmed.substring(0, 60)}…';
-      await _store!.saveConversation(Conversation(
-        id: conversationId,
+      await _store!.ensureConversation(
+        conversationId,
         title: title,
-        messages: [userMsg],
-        createdAt: userMsg.createdAt ?? DateTime.now(),
-        updatedAt: DateTime.now(),
-      ));
+        firstMessage: userMsg,
+      );
     } else {
       await _store!.appendMessage(conversationId, userMsg);
     }

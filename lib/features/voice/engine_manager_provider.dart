@@ -55,6 +55,15 @@ class VoiceEngineStatusNotifier
     // Snapshot final statuses.
     state = manager.allStatuses;
   }
+
+  /// Triggers a download of only the model identified by [modelId] (targeted
+  /// retry — e.g. re-downloading Supertonic after a failed attempt without
+  /// re-touching Whisper) and snapshots the status map afterwards.
+  Future<void> downloadModel(String modelId) async {
+    final manager = ref.read(engineManagerProvider);
+    await manager.downloadModel(modelId);
+    state = manager.allStatuses;
+  }
 }
 
 /// Progress events for the currently-active model download (if any).
@@ -78,12 +87,12 @@ final sttEngineProvider = FutureProvider<SttEngine?>((ref) async {
   return EngineRegistry.instance.getSttEngine(EngineConfig.whisperTinyId);
 });
 
-/// The registered TTS engine (Kokoro), or `null` if not registered yet.
+/// The registered TTS engine (Supertonic 3), or `null` if not registered yet.
 ///
 /// Awaits [EngineManager.initialize] so consumers never read an unregistered
 /// engine during the asynchronous model-dir resolution.
 final ttsEngineProvider = FutureProvider<TtsEngine?>((ref) async {
   final manager = ref.watch(engineManagerProvider);
   await manager.initialize();
-  return EngineRegistry.instance.getTtsEngine(EngineConfig.kokoro82mId);
+  return EngineRegistry.instance.getTtsEngine(EngineConfig.supertonic3Id);
 });

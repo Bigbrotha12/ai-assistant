@@ -128,6 +128,30 @@ void main() {
     await sub.cancel();
   });
 
+  test('ensureConversation creates the row once and never overwrites existing '
+      'messages (concurrent first-turn safety)', () async {
+    await store.ensureConversation(
+      'c1',
+      title: 'First turn',
+      firstMessage: userMessage('m1', 'hello'),
+    );
+    // A concurrent second first-turn writer on the same id: the row already
+    // exists, so only its message is appended — the title and existing
+    // messages are preserved.
+    await store.ensureConversation(
+      'c1',
+      title: 'ignored',
+      firstMessage: userMessage('m2', 'world'),
+    );
+
+    final loaded = await store.loadConversation('c1');
+    expect(loaded, isNotNull);
+    expect(loaded!.title, 'First turn');
+    expect(loaded.messages, hasLength(2));
+    expect(loaded.messages[0].content, 'hello');
+    expect(loaded.messages[1].content, 'world');
+  });
+
   test('updateMessage replaces content (streaming partial)', () async {
     await store.saveConversation(conversation(messages: [
       userMessage('m1', 'partial'),

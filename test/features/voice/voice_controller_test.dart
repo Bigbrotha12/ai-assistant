@@ -36,6 +36,41 @@ void main() {
     await playback.dispose();
   });
 
+  test('startConversation and endConversation clear stale turn fields', () async {
+    final chat = FakeChatClient(
+      results: [
+        ChatResult(content: 'hi', toolCalls: const [], finishReason: 'stop'),
+      ],
+    );
+    final mic = FakeMicCaptureService();
+    final playback = FakeAudioPlayback();
+
+    final controller = VoiceController(
+      chatClient: chat,
+      micCapture: mic,
+      playback: playback,
+    );
+
+    await controller.startConversation();
+    await controller.sendText('hello', speakReply: false);
+    // The completed turn leaves lastReply set.
+    expect(controller.state.lastReply, 'hi');
+
+    // endConversation clears per-turn fields.
+    await controller.endConversation();
+    expect(controller.state.lastReply, isNull);
+    expect(controller.state.onDeviceTranscript, isNull);
+
+    // A restarted session starts with clean per-turn fields.
+    await controller.startConversation();
+    expect(controller.state.lastReply, isNull);
+    expect(controller.state.onDeviceTranscript, isNull);
+
+    await controller.dispose();
+    await mic.dispose();
+    await playback.dispose();
+  });
+
   test('flushTranscriptionBuffer clears the buffer immediately', () async {
     final chat = FakeChatClient(
       results: [
@@ -406,6 +441,77 @@ void main() {
       // The final reply is exposed exactly once per completed turn (cleared
       // at the start of the next), so per-turn listeners fire reliably.
       expect(controller.state.lastReply, 'hi there');
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('onDeviceTranscript is set per utterance and cleared at turn start',
+        () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Hello', ' there', '!'],
+        ],
+        results: [
+          ChatResult(
+              content: 'Hello there!',
+              toolCalls: const [],
+              finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine(transcript: 'hello world');
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+        // Back-to-back turns at test speed would otherwise be swallowed by
+        // the echo refractory window.
+        echoGateDuration: Duration.zero,
+      );
+
+      final emissions = <VoiceConversationState>[];
+      controller.stateStream.listen(emissions.add);
+      int transcriptEmits(String text) => emissions.fold(
+            0,
+            (n, s) => n + (s.onDeviceTranscript == text ? 1 : 0),
+          );
+
+      await controller.startConversation();
+
+      // Turn 1: a full STT → LLM (streamed deltas) → TTS turn.
+      mic.emitChunk([1, 2, 3]);
+      await pumpEventQueue();
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      await pumpEventQueue();
+
+      // (a) The slot is cleared once the turn begins, so it is null after
+      // the turn completes (streaming deltas and playback flips must not
+      // keep re-carrying the stale utterance).
+      expect(controller.state.onDeviceTranscript, isNull);
+      // (b) The recognised transcript appeared exactly twice per utterance:
+      // once from flushTranscriptionBuffer and once from sendText (the UI
+      // dedupes the consecutive identical values).
+      expect(transcriptEmits('hello world'), 2);
+
+      // Turn 2: the SAME text in a new turn must still produce fresh
+      // non-null emissions, since the slot was null between turns.
+      mic.emitChunk([4, 5, 6]);
+      await pumpEventQueue();
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      await pumpEventQueue();
+
+      expect(controller.state.onDeviceTranscript, isNull);
+      expect(transcriptEmits('hello world'), 4);
 
       await controller.dispose();
       await mic.dispose();

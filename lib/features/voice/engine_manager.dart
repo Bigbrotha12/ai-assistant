@@ -5,7 +5,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'engine_config.dart';
 import 'engine_registry.dart';
-import 'engines/kokoro_tts_engine.dart';
+import 'engines/supertonic_tts_engine.dart';
 import 'engines/whisper_stt_engine.dart';
 import 'model_downloader.dart';
 import 'stt_engine.dart';
@@ -51,6 +51,10 @@ class EngineManager extends ChangeNotifier {
   final ModelDownloader _downloader = ModelDownloader();
   final Map<String, VoiceEngineStatus> _statuses = {};
 
+  /// The registered TTS engine, kept so [dispose] can release its native
+  /// resources.
+  SupertonicTtsEngine? _ttsEngine;
+
   /// Lazily resolved absolute path to the model directory.
   String? _resolvedModelDir;
 
@@ -87,8 +91,10 @@ class EngineManager extends ChangeNotifier {
       WhisperSttEngine(modelPath: '$dir/ggml-tiny.bin'),
     );
     _ensureTtsEngineRegistered(
-      EngineConfig.kokoro82mId,
-      KokoroTtsEngine(modelPath: '$dir/kokoro_82m.onnx'),
+      EngineConfig.supertonic3Id,
+      _ttsEngine = SupertonicTtsEngine(
+        modelDir: '$dir/${EngineConfig.supertonic3ModelDir}',
+      ),
     );
 
     _refreshStatuses();
@@ -103,12 +109,13 @@ class EngineManager extends ChangeNotifier {
   ///
   /// [progress] is invoked with the model ID each time a download starts so
   /// the UI can display per-model progress. Models whose URL is not configured
-  /// (e.g. an unavailable Kokoro) are skipped and marked [unavailable] rather
-  /// than attempted — a failing download would permanently poison the status.
+  /// (e.g. an unavailable Supertonic) are skipped and marked [unavailable]
+  /// rather than attempted — a failing download would permanently poison the
+  /// status.
   ///
-  /// A "model" may consist of several artifacts (e.g. Kokoro's ONNX graph plus
-  /// its voices and tokenizer). All artifacts are downloaded to their canonical
-  /// file names before the model is reported [ready].
+  /// A "model" may consist of several artifacts (e.g. Supertonic's seven
+  /// model files). All artifacts are downloaded to their canonical file names
+  /// before the model is reported [ready].
   ///
   /// Returns `true` when every usable model is available.
   Future<bool> ensureModelsDownloaded({
@@ -136,24 +143,7 @@ class EngineManager extends ChangeNotifier {
       progress(id);
 
       try {
-        // Download the primary artifact first, then the secondary artifacts.
-        // Each lands at its canonical file name (the downloader's optional
-        // `fileName` bypasses the legacy `ggml<type>.bin` notation), so no
-        // post-download rename is required.
-        await _downloader.downloadModel(
-          modelType: config.downloaderType,
-          url: config.url,
-          destinationPath: dir,
-          fileName: config.fileName,
-        );
-        for (final artifact in config.artifacts) {
-          await _downloader.downloadModel(
-            modelType: artifact.downloaderType,
-            url: artifact.url,
-            destinationPath: dir,
-            fileName: artifact.fileName,
-          );
-        }
+        await _downloadArtifacts(config, dir);
         // Only mark ready if every artifact actually landed.
         _statuses[id] = allTargets.every((t) => File(t.path).existsSync())
             ? VoiceEngineStatus.ready
@@ -168,6 +158,59 @@ class EngineManager extends ChangeNotifier {
 
     _notify();
     return areModelsReady();
+  }
+
+  /// Downloads all missing artifacts of a single model (e.g. a targeted
+  /// Supertonic retry after a failed attempt) without touching other models.
+  ///
+  /// Returns `true` when the model ended up [VoiceEngineStatus.ready].
+  Future<bool> downloadModel(String modelId) async {
+    final dir = await _resolveModelDir();
+    final config = _modelConfig[modelId];
+    if (config == null || !config.downloadable) {
+      _statuses[modelId] = VoiceEngineStatus.unavailable;
+      _notify();
+      return false;
+    }
+
+    _statuses[modelId] = VoiceEngineStatus.downloading;
+    _notify();
+    try {
+      await _downloadArtifacts(config, dir);
+      _statuses[modelId] =
+          config.allTargets(dir).every((t) => File(t.path).existsSync())
+              ? VoiceEngineStatus.ready
+              : VoiceEngineStatus.failed;
+    } catch (e) {
+      _statuses[modelId] = VoiceEngineStatus.failed;
+      if (kDebugMode) {
+        debugPrint('EngineManager: model "$modelId" download failed: $e');
+      }
+    }
+    _notify();
+    return getStatus(modelId) == VoiceEngineStatus.ready;
+  }
+
+  /// Downloads every artifact of [config] into [dir] (primary file first,
+  /// then the secondary artifacts). Callers own the status bookkeeping.
+  Future<void> _downloadArtifacts(_ModelConfig config, String dir) async {
+    // Each artifact lands at its canonical file name (the downloader's
+    // optional `fileName` bypasses the legacy `ggml<type>.bin` notation),
+    // so no post-download rename is required.
+    await _downloader.downloadModel(
+      modelType: config.downloaderType,
+      url: config.url,
+      destinationPath: dir,
+      fileName: config.fileName,
+    );
+    for (final artifact in config.artifacts) {
+      await _downloader.downloadModel(
+        modelType: artifact.downloaderType,
+        url: artifact.url,
+        destinationPath: dir,
+        fileName: artifact.fileName,
+      );
+    }
   }
 
   /// Whether every usable configured model exists on disk.
@@ -208,12 +251,14 @@ class EngineManager extends ChangeNotifier {
   /// Registered asynchronously by [initialize]; await [initialized] first if
   /// a non-null engine is required.
   TtsEngine? get ttsEngine =>
-      EngineRegistry.instance.getTtsEngine(EngineConfig.kokoro82mId);
+      EngineRegistry.instance.getTtsEngine(EngineConfig.supertonic3Id);
 
-  /// Releases the model downloader resources.
+  /// Releases the model downloader resources and the TTS engine's native
+  /// backend (if it was created).
   @override
   void dispose() {
     _disposed = true;
+    _ttsEngine?.dispose();
     _downloader.dispose();
     super.dispose();
   }
@@ -229,21 +274,55 @@ class EngineManager extends ChangeNotifier {
       url: EngineConfig.whisperTinyUrl,
       downloadable: true,
     ),
-    EngineConfig.kokoro82mId: _ModelConfig(
-      fileName: 'kokoro_82m.onnx',
-      downloaderType: EngineConfig.kokoro82mId,
-      url: EngineConfig.kokoro82mUrl,
-      downloadable: EngineConfig.kokoro82mDownloadAvailable,
+    EngineConfig.supertonic3Id: _ModelConfig(
+      fileName:
+          '${EngineConfig.supertonic3ModelDir}/'
+          '${EngineConfig.supertonic3TextEncoderFile}',
+      downloaderType: EngineConfig.supertonic3TextEncoderId,
+      url: EngineConfig.supertonic3TextEncoderUrl,
+      downloadable: EngineConfig.supertonic3DownloadAvailable,
       artifacts: [
         _ArtifactConfig(
-          fileName: EngineConfig.kokoro82mVoicesFileName,
-          downloaderType: EngineConfig.kokoro82mVoicesId,
-          url: EngineConfig.kokoro82mVoicesUrl,
+          fileName:
+              '${EngineConfig.supertonic3ModelDir}/'
+              '${EngineConfig.supertonic3DurationPredictorFile}',
+          downloaderType: EngineConfig.supertonic3DurationPredictorId,
+          url: EngineConfig.supertonic3DurationPredictorUrl,
         ),
         _ArtifactConfig(
-          fileName: EngineConfig.kokoro82mTokenizerFileName,
-          downloaderType: EngineConfig.kokoro82mTokenizerId,
-          url: EngineConfig.kokoro82mTokenizerUrl,
+          fileName:
+              '${EngineConfig.supertonic3ModelDir}/'
+              '${EngineConfig.supertonic3VectorEstimatorFile}',
+          downloaderType: EngineConfig.supertonic3VectorEstimatorId,
+          url: EngineConfig.supertonic3VectorEstimatorUrl,
+        ),
+        _ArtifactConfig(
+          fileName:
+              '${EngineConfig.supertonic3ModelDir}/'
+              '${EngineConfig.supertonic3VocoderFile}',
+          downloaderType: EngineConfig.supertonic3VocoderId,
+          url: EngineConfig.supertonic3VocoderUrl,
+        ),
+        _ArtifactConfig(
+          fileName:
+              '${EngineConfig.supertonic3ModelDir}/'
+              '${EngineConfig.supertonic3TtsJsonFile}',
+          downloaderType: EngineConfig.supertonic3TtsJsonId,
+          url: EngineConfig.supertonic3TtsJsonUrl,
+        ),
+        _ArtifactConfig(
+          fileName:
+              '${EngineConfig.supertonic3ModelDir}/'
+              '${EngineConfig.supertonic3UnicodeIndexerFile}',
+          downloaderType: EngineConfig.supertonic3UnicodeIndexerId,
+          url: EngineConfig.supertonic3UnicodeIndexerUrl,
+        ),
+        _ArtifactConfig(
+          fileName:
+              '${EngineConfig.supertonic3ModelDir}/'
+              '${EngineConfig.supertonic3VoiceFile}',
+          downloaderType: EngineConfig.supertonic3VoiceId,
+          url: EngineConfig.supertonic3VoiceUrl,
         ),
       ],
     ),
@@ -317,8 +396,8 @@ class _ModelConfig {
   final String url;
 
   /// Secondary artifacts (additional files) that make up this model, e.g.
-  /// Kokoro's voices and tokenizer. Downloaded alongside the primary file and
-  /// all must exist before the model is reported [ready].
+  /// Supertonic's six non-primary model files. Downloaded alongside the
+  /// primary file and all must exist before the model is reported [ready].
   final List<_ArtifactConfig> artifacts;
 
   /// False when the model has no usable download URL on this build — the

@@ -4,80 +4,84 @@ class EngineConfig {
 
   static const String whisperTinyId = 'whisper_tiny';
   static const String whisperTinyUrl =
-      'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin';
+      'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin';
 
   // ---------------------------------------------------------------------------
-  // Kokoro 82M (on-device TTS)
+  // Supertonic 3 (on-device TTS, sherpa-onnx)
   // ---------------------------------------------------------------------------
 
-  static const String kokoro82mId = 'kokoro_82m';
+  static const String supertonic3Id = 'supertonic_3';
 
-  /// Downloader/state keys for Kokoro's secondary (non-primary) artifacts.
-  static const String kokoro82mVoicesId = 'kokoro_82m_voices';
-  static const String kokoro82mTokenizerId = 'kokoro_82m_tokenizer';
+  /// Subdirectory of [modelStorageDir] holding the seven Supertonic 3
+  /// artifacts (`<appDocs>/.voice_models/supertonic_3/`).
+  static const String supertonic3ModelDir = 'supertonic_3';
 
-  /// Primary ONNX graph URL for the Kokoro 82M synthesis model.
+  /// Base URL of the sherpa-onnx Supertonic 3 int8 model repository.
   ///
-  /// We use the **int8-quantized** export (`model_quantized.onnx`, ~92 MB)
-  /// rather than the full fp32 `model.onnx` (~300 MB): Kokoro is intended to
-  /// run on-device, and the quantized graph is far smaller with only a small
-  /// quality trade-off (io node names are identical). Both the quantized and
-  /// full exports live in the `onnx-community/Kokoro-82M-v1.0-ONNX` repo.
-  ///
-  /// Inputs are `input_ids` (int64), `style` (float32, `[1, 256]`), `speed`
-  /// (float32, `[1]`); the output tensor is `audio` (float32, ~24 kHz mono).
-  /// The engine maps io names generically via `session.inputNames` /
-  /// `session.outputNames`, so this tolerates the model naming shown above.
-  static const String kokoro82mUrl =
-      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/'
-      'resolve/main/onnx/model_quantized.onnx';
+  /// The repo mirrors the official `sherpa-onnx-supertonic-3-tts-int8-2026-05-11`
+  /// release (Supertone/supertonic-3 quantized by k2-fsa). Each artifact is
+  /// downloaded per-file via [ModelDownloader] (single-file API), so the 7
+  /// URLs below must all resolve.
+  static const String supertonic3UrlBase =
+      'https://huggingface.co/csukuangfj2/sherpa-onnx-supertonic-3-tts-int8-2026-05-11'
+      '/resolve/main';
 
-  /// Voice/style embedding artifact.
-  ///
-  /// The packed `voices/af.bin` file is a flat `float32` array holding one
-  /// 256-dim style vector per valid token-count, reshaped row-major as
-  /// `[n_vectors, 1, 256]` (e.g. `af.bin` is 524288 bytes = 512 rows). The
-  /// style vector for a phoneme sequence is `voices[tokens.length]`.
-  static const String kokoro82mVoicesUrl =
-      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/'
-      'resolve/main/voices/af.bin';
+  // Per-artifact constants: downloader/state key, on-disk file name and URL.
+  // Together the 7 artifacts total ~145 MB (~139 MB of model weights plus
+  // the bundled README/LICENSE).
 
-  /// Phoneme → token-id vocabulary (`tokenizer.json`).
-  ///
-  /// This downloadable file is the canonical, data-driven source for the
-  /// IPA→integer mapping (see `KokoroTokenizer`). It matches the
-  /// `hexgrad/Kokoro-82M` `config.json` vocab at the pinned commit
-  /// `785407d1adfa7ae8fbef8ffd85f34ca127da3039`. A built-in fallback copy of
-  /// the same map is shipped in the tokenizer so the engine degrades
-  /// gracefully if this artifact is missing.
-  static const String kokoro82mTokenizerUrl =
-      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/'
-      'resolve/main/tokenizer.json';
+  static const String supertonic3TextEncoderId = 'supertonic_3_text_encoder';
+  static const String supertonic3TextEncoderFile = 'text_encoder.int8.onnx';
+  static const String supertonic3TextEncoderUrl =
+      '$supertonic3UrlBase/$supertonic3TextEncoderFile';
 
-  /// Fallback local file name of the voices artifact on disk (must match
-  /// [kokoro82mVoicesUrl]'s landing name used by [EngineManager]).
-  static const String kokoro82mVoicesFileName = 'kokoro_82m_voices.bin';
-  static const String kokoro82mTokenizerFileName = 'kokoro_82m_tokenizer.json';
+  static const String supertonic3VectorEstimatorId =
+      'supertonic_3_vector_estimator';
+  static const String supertonic3VectorEstimatorFile =
+      'vector_estimator.int8.onnx';
+  static const String supertonic3VectorEstimatorUrl =
+      '$supertonic3UrlBase/$supertonic3VectorEstimatorFile';
+
+  static const String supertonic3VocoderId = 'supertonic_3_vocoder';
+  static const String supertonic3VocoderFile = 'vocoder.int8.onnx';
+  static const String supertonic3VocoderUrl =
+      '$supertonic3UrlBase/$supertonic3VocoderFile';
+
+  static const String supertonic3DurationPredictorId =
+      'supertonic_3_duration_predictor';
+  static const String supertonic3DurationPredictorFile =
+      'duration_predictor.int8.onnx';
+  static const String supertonic3DurationPredictorUrl =
+      '$supertonic3UrlBase/$supertonic3DurationPredictorFile';
+
+  static const String supertonic3TtsJsonId = 'supertonic_3_tts_json';
+  static const String supertonic3TtsJsonFile = 'tts.json';
+  static const String supertonic3TtsJsonUrl =
+      '$supertonic3UrlBase/$supertonic3TtsJsonFile';
+
+  static const String supertonic3UnicodeIndexerId =
+      'supertonic_3_unicode_indexer';
+  static const String supertonic3UnicodeIndexerFile = 'unicode_indexer.bin';
+  static const String supertonic3UnicodeIndexerUrl =
+      '$supertonic3UrlBase/$supertonic3UnicodeIndexerFile';
+
+  static const String supertonic3VoiceId = 'supertonic_3_voice';
+  static const String supertonic3VoiceFile = 'voice.bin';
+  static const String supertonic3VoiceUrl =
+      '$supertonic3UrlBase/$supertonic3VoiceFile';
 
   static const int defaultSampleRate = 16000;
   static const String modelStorageDir = '.voice_models';
 
-  /// Whether a real, downloadable Kokoro artifact set is configured.
+  /// Whether a real, downloadable Supertonic 3 artifact set is configured.
   ///
-  /// All three URLs above point to files verified to exist in the
-  /// `onnx-community/Kokoro-82M-v1.0-ONNX` repo: the quantized ONNX graph,
-  /// the packed `af.bin` voices, and the `tokenizer.json` vocab. The engine's
-  /// synthesis pipeline is real (phoneme tokenizer → ONNX → PCM), so the
-  /// download UI may offer the model.
+  /// All URLs above were verified against the
+  /// `csukuangfj2/sherpa-onnx-supertonic-3-tts-int8-2026-05-11` repo
+  /// (HTTP 200, exact byte sizes). The engine's synthesis pipeline is real
+  /// (sherpa-onnx OfflineTts in a worker isolate → PCM), so the download UI
+  /// may offer the model.
   ///
-  /// Keep this `false` ONLY if an artifact cannot be downloaded or the
-  /// pipeline is known-broken on-device. On-device validation is still
-  /// strongly recommended (see the M0b report notes) before shipping; if
-  /// synthesis turns out to produce no audible audio, flip this back to
-  /// `false` to hide the broken download.
-  static bool get kokoro82mDownloadAvailable =>
-      kokoro82mUrl.isNotEmpty &&
-      kokoro82mUrl != 'PLACEHOLDER_URL' &&
-      kokoro82mVoicesUrl.isNotEmpty &&
-      kokoro82mTokenizerUrl.isNotEmpty;
+  /// Flip to `false` ONLY if an artifact cannot be downloaded or the
+  /// pipeline is known-broken on-device.
+  static const bool supertonic3DownloadAvailable = true;
 }

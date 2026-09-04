@@ -366,10 +366,10 @@ void main() {
       await pumpOnboarding(tester, engine: engine);
       await completeFlowToVoice(tester);
 
-      // Kokoro is now a real, downloadable model on this build (verified
-      // URLs are configured), so it renders as a not-yet-downloaded model
-      // rather than "unavailable".
-      expect(find.text('Kokoro 82M').hitTestable(), findsOneWidget);
+      // Supertonic 3 is now a real, downloadable model on this build
+      // (verified URLs are configured), so it renders as a not-yet-downloaded
+      // model rather than "unavailable".
+      expect(find.text('Supertonic 3').hitTestable(), findsOneWidget);
       expect(find.text('not downloaded').hitTestable(), findsOneWidget);
 
       await tester.tap(find.text('Do it later').hitTestable());

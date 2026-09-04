@@ -5,7 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../chat/chat_screen.dart';
+import '../chat/chat_providers.dart';
+import '../chat/conversation_list.dart';
+import '../chat/database_providers.dart';
+import '../chat/message_model.dart';
 import '../settings/settings_screen.dart';
 import '../../core/app_startup.dart';
 import '../../core/auth_credentials_providers.dart';
@@ -47,6 +50,36 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   /// Transcript log: user utterances and assistant replies, in order.
   final _transcripts = <_LogEntry>[];
 
+  /// Number of [_transcripts] entries seeded from the active conversation's
+  /// persisted history (see [_seedFromConversation]). Live appends must never
+  /// dedupe against this seeded prefix — the user may legitimately repeat the
+  /// exact text of their last stored message.
+  int _seededCount = 0;
+
+  /// Bumped on every re-seed request so a slow store load for a stale
+  /// conversation can never clobber a newer one (e.g. rapid history switches).
+  int _seedEpoch = 0;
+
+  /// True while [_seedFromConversation] has cleared the panel but not yet
+  /// landed the loaded history. Live appends landing in that window are
+  /// queued into [_pendingLive] instead of being appended, so they can never
+  /// scramble the seeded order or duplicate a message the seed then re-imports.
+  bool _seeding = false;
+
+  /// Live transcript entries received while [_seeding]; replayed after the
+  /// seed lands (in arrival order, after the seeded prefix).
+  final _pendingLive = <_LogEntry>[];
+
+  /// Composer input; voice hold-to-talk when false, text composer when true.
+  bool _textInputMode = false;
+
+  final _textInput = TextEditingController();
+
+  /// True while a text-mode turn is streaming. The controller serialises turns
+  /// internally, but the UI disables the SpeakButton and composer while it is
+  /// set so the in-flight turn is never stacked visually.
+  bool _turnInFlight = false;
+
   bool _micBusy = false;
 
   /// The in-flight [_holdStart], so a very quick release can wait for it.
@@ -67,8 +100,18 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   String? _localError;
 
   @override
+  void initState() {
+    super.initState();
+    // The active conversation may already exist (set by an earlier chat/voice
+    // session); ensure one exists, then seed the transcript from its history.
+    final id = ref.read(activeConversationIdProvider.notifier).ensure();
+    _seedFromConversation(id);
+  }
+
+  @override
   void dispose() {
     _logScroll.dispose();
+    _textInput.dispose();
     // The voice providers own their teardown: `VoiceCapturePipelineNotifier`
     // and `VoiceControllerNotifier` dispose the pipeline (stopping any active
     // recording) and the controller (ending the conversation) via their
@@ -78,32 +121,112 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     super.dispose();
   }
 
+  /// Loads [id]'s messages from the store and seeds `_transcripts` with them.
+  ///
+  /// Clears the panel immediately (switching conversations must never show
+  /// stale bubbles) and resets `_seededCount` so the whole list is treated as
+  /// seeded history by the live-append dedupe. A store load must not race an
+  /// unopened database, so [databaseReadyProvider] is awaited first.
+  Future<void> _seedFromConversation(String id) async {
+    final epoch = ++_seedEpoch;
+    // A shared controller carries per-turn state across conversations; clear
+    // its fields so a stale lastReply / onDeviceTranscript from the previous
+    // conversation can never re-emit into this one as a phantom bubble.
+    ref.read(voiceControllerProvider).clearTurnFields();
+    _seeding = true;
+    _pendingLive.clear();
+    if (_transcripts.isNotEmpty || _seededCount != 0) {
+      setState(() {
+        _transcripts.clear();
+        _seededCount = 0;
+      });
+    }
+    await ref.read(databaseReadyProvider);
+    if (!mounted || epoch != _seedEpoch) {
+      if (mounted) setState(() => _seeding = false);
+      return;
+    }
+    final conversation = await ref.read(chatStoreProvider).loadConversation(id);
+    if (!mounted || epoch != _seedEpoch) {
+      if (mounted) setState(() => _seeding = false);
+      return;
+    }
+    final entries = <_LogEntry>[];
+    for (final message in conversation?.messages ?? const <Message>[]) {
+      switch (message.role) {
+        case MessageRole.user:
+          entries.add(_LogEntry(message.content, fromUser: true));
+        case MessageRole.assistant:
+          entries.add(_LogEntry(message.content, fromUser: false));
+        // Tool/system rows are internal plumbing, never surfaced.
+        case MessageRole.tool || MessageRole.system:
+          break;
+      }
+    }
+    setState(() {
+      _transcripts.addAll(entries);
+      _seededCount = _transcripts.length;
+      // Replay any live appends that landed while the seed was loading, in
+      // order, after the seeded prefix. They were accepted (deduped) at
+      // arrival time, so replaying them keeps order without duplication.
+      if (_pendingLive.isNotEmpty) {
+        _transcripts.addAll(_pendingLive);
+        _pendingLive.clear();
+      }
+      _seeding = false;
+    });
+    _scrollLogToEnd();
+  }
+
   /// Appends a freshly recognised user utterance to the log. Empty text is
-  /// ignored so the list stays stable across unrelated state updates.
+  /// ignored so the list stays stable across unrelated state updates. The
+  /// consecutive-identical dedupe only applies to LIVE appends: once the
+  /// transcript has grown past [_seededCount] the last entry is known to be
+  /// live, so a repeated utterance (same value re-emitted across state flips)
+  /// is dropped — but it never collapses a live utterance into the seeded
+  /// history.
   void _appendTranscript(VoiceConversationState state) {
     final text = state.onDeviceTranscript;
     if (text == null || text.trim().isEmpty) return;
-    if (_transcripts.isNotEmpty &&
+    if (_transcripts.length > _seededCount &&
+        _transcripts.isNotEmpty &&
         _transcripts.last.fromUser &&
         _transcripts.last.text == text) {
       return;
     }
-    setState(() => _transcripts.add(_LogEntry(text, fromUser: true)));
+    final entry = _LogEntry(text, fromUser: true);
+    if (_seeding) {
+      // The seed will re-import this utterance if it has been persisted; queue
+      // it so it is replayed in order after the seed lands (never scrambled
+      // ahead of the loaded history).
+      _pendingLive.add(entry);
+      return;
+    }
+    setState(() => _transcripts.add(entry));
     _scrollLogToEnd();
   }
 
   /// Appends the assistant's final reply to the log. [lastReply] is cleared
   /// at the start of each turn and set once at its end, so this fires exactly
-  /// once per completed turn (even for identical reply text).
+  /// once per completed turn (even for identical reply text). Like
+  /// [_appendTranscript], the dedupe is skipped while the log is still inside
+  /// the seeded prefix.
   void _appendAssistantReply(VoiceConversationState state) {
     final text = state.lastReply;
     if (text == null || text.trim().isEmpty) return;
-    if (_transcripts.isNotEmpty &&
+    if (_transcripts.length > _seededCount &&
+        _transcripts.isNotEmpty &&
         !_transcripts.last.fromUser &&
         _transcripts.last.text == text) {
       return;
     }
-    setState(() => _transcripts.add(_LogEntry(text, fromUser: false)));
+    final entry = _LogEntry(text, fromUser: false);
+    if (_seeding) {
+      // Queue as with [_appendTranscript]; replayed after the seed lands.
+      _pendingLive.add(entry);
+      return;
+    }
+    setState(() => _transcripts.add(entry));
     _scrollLogToEnd();
   }
 
@@ -230,9 +353,60 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
   void _openBackendSettings() => _push(const SettingsScreen());
 
-  void _openChat() => _push(const ChatScreen());
-
   void _openVoiceSettings() => _push(const VoiceSettingsScreen());
+
+  /// Switches the active conversation to a fresh, empty one.
+  void _newConversation() {
+    ref.read(activeConversationIdProvider.notifier).newConversation();
+    _seedFromConversation(ref.read(activeConversationIdProvider.notifier).ensure());
+  }
+
+  /// Opens the session history; selecting a conversation switches the active
+  /// id and re-seeds the transcript from that conversation's messages.
+  Future<void> _openHistory() async {
+    final selected = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const ConversationListScreen()),
+    );
+    if (selected != null && mounted) {
+      ref.read(activeConversationIdProvider.notifier).set(selected);
+      _seedFromConversation(selected);
+    }
+  }
+
+  /// Sends the composer text as a text-mode turn: starts the conversation
+  /// session when needed, then hands off to the controller with `speakReply:
+  /// false` so TTS never runs for a typed message. The field is cleared only
+  /// once the message has actually been accepted by the controller.
+  Future<void> _sendText() async {
+    final text = _textInput.text.trim();
+    if (text.isEmpty || _turnInFlight || _micBusy) return;
+    final controller = ref.read(voiceControllerProvider);
+    setState(() {
+      _turnInFlight = true;
+      _localError = null;
+    });
+    try {
+      if (!controller.state.isConnected) {
+        await controller.startConversation();
+      }
+      if (!controller.state.isConnected) {
+        return; // Session error already surfaced through the state.
+      }
+      await controller.sendText(text, speakReply: false);
+      _textInput.clear();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _localError = e.toString());
+      }
+    } finally {
+      if (mounted) setState(() => _turnInFlight = false);
+    }
+  }
+
+  void _setTextInputMode(bool value) {
+    if (value == _textInputMode) return;
+    setState(() => _textInputMode = value);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -240,6 +414,13 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     ref.listen(voiceConversationStateProvider, (_, next) {
       _appendTranscript(next);
       _appendAssistantReply(next);
+    });
+    // Re-seed whenever the app-wide active conversation changes while this
+    // screen is mounted (e.g. a history pick in another surface).
+    ref.listen<String?>(activeConversationIdProvider, (previous, next) {
+      if (next != null && next != previous) {
+        _seedFromConversation(next);
+      }
     });
 
     final scheme = Theme.of(context).colorScheme;
@@ -261,9 +442,16 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
         title: const Text('AI Assistant'),
         actions: [
           IconButton(
-            tooltip: 'Chat',
-            icon: const Icon(Icons.chat_bubble_outline),
-            onPressed: _openChat,
+            key: const Key('new-conversation'),
+            tooltip: 'New Conversation',
+            icon: const Icon(Icons.add_comment_outlined),
+            onPressed: _newConversation,
+          ),
+          IconButton(
+            key: const Key('history'),
+            tooltip: 'History',
+            icon: const Icon(Icons.history),
+            onPressed: _openHistory,
           ),
           PopupMenuButton<String>(
             onSelected: (value) {
@@ -359,27 +547,50 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                                     ),
                             ),
                             const SizedBox(height: 20),
-                            SpeakButton(
-                              recording: recording,
-                              aiSpeaking: state.isAiSpeaking,
-                              busy: _micBusy,
-                              onHoldStart: _holdStart,
-                              onHoldEnd: _holdEnd,
-                            ),
-                            const SizedBox(height: 18),
-                            Text(
-                              'PRESS AND HOLD TO TALK',
-                              style: Theme.of(context).textTheme.labelSmall
-                                  ?.copyWith(
-                                    letterSpacing: 1.4,
-                                    color: tier.premium
-                                        ? AppColors.goldDark
-                                        : scheme.onSurfaceVariant,
-                                  ),
-                            ),
+                            if (_textInputMode) ...[
+                              _Composer(
+                                controller: _textInput,
+                                enabled: !_turnInFlight && !_micBusy,
+                                canSend: !_turnInFlight &&
+                                    !_micBusy &&
+                                    _textInput.text.trim().isNotEmpty,
+                                onSend: _sendText,
+                                onChanged: () => setState(() {}),
+                              ),
+                            ] else ...[
+                              SpeakButton(
+                                recording: recording,
+                                aiSpeaking: state.isAiSpeaking,
+                                busy: _micBusy || _turnInFlight,
+                                onHoldStart: _holdStart,
+                                onHoldEnd: _holdEnd,
+                              ),
+                              const SizedBox(height: 18),
+                              Text(
+                                'PRESS AND HOLD TO TALK',
+                                style: Theme.of(context).textTheme.labelSmall
+                                    ?.copyWith(
+                                      letterSpacing: 1.4,
+                                      color: tier.premium
+                                          ? AppColors.goldDark
+                                          : scheme.onSurfaceVariant,
+                                    ),
+                              ),
+                            ],
                           ],
                         ),
                       ),
+                    ),
+                  ),
+                  // Input mode toggle lives below the scrollable hero area so
+                  // it is never clipped by the viewport or overlapped by the
+                  // transcript panel.
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8, bottom: 8),
+                    child: _InputModeToggle(
+                      value: _textInputMode,
+                      enabled: !_turnInFlight && !recording,
+                      onChanged: _setTextInputMode,
                     ),
                   ),
                   // Transcript panel: expands upward from the pill, so the
@@ -469,6 +680,106 @@ class _HeroStatus extends StatelessWidget {
   }
 }
 
+/// Compact text composer replacing the SpeakButton in text mode. Sends via the
+/// keyboard action or the trailing send button; no attachments/tool chips yet.
+class _Composer extends StatelessWidget {
+  const _Composer({
+    required this.controller,
+    required this.enabled,
+    required this.canSend,
+    required this.onSend,
+    required this.onChanged,
+  });
+
+  final TextEditingController controller;
+  final bool enabled;
+  final bool canSend;
+  final VoidCallback onSend;
+  final VoidCallback onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(AppRadii.lg),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                key: const Key('voice-composer-field'),
+                controller: controller,
+                enabled: enabled,
+                textInputAction: TextInputAction.send,
+                onSubmitted: (_) {
+                  if (canSend) onSend();
+                },
+                onChanged: (_) => onChanged(),
+                decoration: const InputDecoration(
+                  hintText: 'Message the assistant…',
+                  border: InputBorder.none,
+                  isDense: true,
+                ),
+              ),
+            ),
+            IconButton(
+              key: const Key('voice-composer-send'),
+              icon: const Icon(Icons.send),
+              tooltip: 'Send',
+              color: scheme.primary,
+              onPressed: canSend ? onSend : null,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Small segmented voice / text mode switch shown under the input area.
+class _InputModeToggle extends StatelessWidget {
+  const _InputModeToggle({
+    required this.value,
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  final bool value;
+  final bool enabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return SegmentedButton<bool>(
+      key: const Key('voice-input-mode-toggle'),
+      segments: const [
+        ButtonSegment(
+          value: false,
+          icon: Icon(Icons.mic_none, size: 18),
+          label: Text('Voice'),
+        ),
+        ButtonSegment(
+          value: true,
+          icon: Icon(Icons.keyboard_outlined, size: 18),
+          label: Text('Text'),
+        ),
+      ],
+      selected: {value},
+      onSelectionChanged: enabled ? (selection) => onChanged(selection.single) : null,
+      showSelectedIcon: false,
+      style: ButtonStyle(
+        visualDensity: VisualDensity.compact,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        textStyle: WidgetStatePropertyAll(
+          Theme.of(context).textTheme.labelMedium,
+        ),
+      ),
+    );
+  }
+}
+
 /// Banner shown when a voice session error is active: microphone permission
 /// and backend configuration get dedicated actions, connection errors get a
 /// retry action, everything else is shown as-is.
@@ -500,8 +811,8 @@ class _ErrorBanner extends StatelessWidget {
 
   String get _message {
     if (error is EngineModelNotFoundError) {
-      return 'Local speech-to-text model is missing. Download it below to '
-          'enable on-device recognition.';
+      return 'An on-device voice model is missing. Download it below to '
+          'enable offline speech recognition and voice replies.';
     }
     if (error is EngineInferenceError) {
       return 'On-device sound processing failed. Offline speech and voice '
@@ -611,7 +922,7 @@ class _FallbackBanner extends ConsumerWidget {
     final statuses = ref.watch(voiceEngineStatusProvider);
     final (stt, tts) = (
       statuses[EngineConfig.whisperTinyId] ?? VoiceEngineStatus.notStarted,
-      statuses[EngineConfig.kokoro82mId] ?? VoiceEngineStatus.notStarted,
+      statuses[EngineConfig.supertonic3Id] ?? VoiceEngineStatus.notStarted,
     );
     // Engines surfaced as `unavailable` are intentionally off (e.g. TTS is
     // gated until its model/tokenizer lands) — they should neither show a
@@ -931,14 +1242,14 @@ class _EngineStatusBar extends ConsumerWidget {
                   // Engines surfaced as `unavailable` are intentionally off —
                   // hide their chip entirely instead of offering a download
                   // that can never succeed.
-                  if (statuses[EngineConfig.kokoro82mId] !=
+                  if (statuses[EngineConfig.supertonic3Id] !=
                       VoiceEngineStatus.unavailable) ...[
                     const SizedBox(width: 12),
                     Expanded(
                       child: _EngineStatusChip(
-                        label: 'Kokoro',
+                        label: 'Supertonic 3',
                         status:
-                            statuses[EngineConfig.kokoro82mId] ??
+                            statuses[EngineConfig.supertonic3Id] ??
                             VoiceEngineStatus.notStarted,
                         progress: progress,
                         onAction: downloading ? null : onDownload,

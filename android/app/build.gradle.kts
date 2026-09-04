@@ -27,6 +27,15 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // The sherpa-onnx platform plugin ships ~27 MB of native libs per ABI
+        // (sherpa-onnx + onnxruntime). Only arm64 devices are supported, so
+        // packaging a single ABI keeps the APK ~50 MB smaller. NOTE: the
+        // Flutter gradle plugin presets all 3 platform ABIs into this set at
+        // plugin-apply time, so clear it before pinning.
+        ndk {
+            abiFilters.clear()
+            abiFilters.add("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -34,8 +43,9 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
-            // Keeps the ONNX Runtime Java classes the flutter_onnxruntime
-            // plugin reaches via JNI; R8 would strip them during minification.
+            // sherpa-onnx is loaded via dart:ffi straight from its bundled
+            // .so libraries (no Java API surface), so no extra keep rules
+            // are required; the file stays wired for future rules.
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

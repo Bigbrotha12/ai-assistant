@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
 import '../../core/chat_client.dart';
@@ -61,9 +62,9 @@ class VoiceConversationState {
   /// assistant's message exactly once.
   final String? lastReply;
 
-  /// Transcript produced by the on-device STT engine for the last recognised
-  /// user utterance (null when no local engine is active or nothing has been
-  /// transcribed yet).
+  /// Holds the latest recognised user utterance from the on-device STT
+  /// engine. Cleared when that utterance's turn begins ([sendText]), so state
+  /// emissions carry it for exactly one append opportunity per utterance.
   final String? onDeviceTranscript;
 
   VoiceConversationState copyWith({
@@ -148,8 +149,12 @@ final class VoiceController {
     this.ttsEngine,
     this.onTranscript,
     this.onDeviceTranscript,
+    this.onUserMessage,
     this.onError,
     this.onNetworkError,
+    this.contextBuilder,
+    this.systemPrompt,
+    this.cancelToken,
     Duration? echoGateDuration,
   }) : _echoGateDuration =
            echoGateDuration ?? const Duration(milliseconds: 300) {
@@ -184,8 +189,8 @@ final class VoiceController {
   /// buffered during recording and transcribed locally on [flushTranscriptionBuffer].
   final SttEngine? sttEngine;
 
-  /// Optional on-device TTS engine (Kokoro). When provided, [synthesizeOnDevice]
-  /// can generate speech from text without the server.
+  /// Optional on-device TTS engine (Supertonic). When provided,
+  /// [synthesizeOnDevice] can generate speech from text without the server.
   final TtsEngine? ttsEngine;
 
   /// Reports the assistant's reply back to the app whenever a turn completes.
@@ -195,12 +200,33 @@ final class VoiceController {
   /// recognised utterance).
   void Function(String transcript)? onDeviceTranscript;
 
+  /// Fired exactly once per turn with the trimmed user text, right at the
+  /// start of [sendText] (before streaming). This is the persistence seam for
+  /// the user's message and fires for both voice and text turns (voice turns
+  /// already reach it via [flushTranscriptionBuffer]).
+  void Function(String userText)? onUserMessage;
+
   /// Reports failures encountered by the session.
   void Function(Object error)? onError;
 
   /// Called when a network-level error is detected. Null when the caller
   /// does not need network status notifications.
   final void Function()? onNetworkError;
+
+  /// Builds the full request message list (history + new user message) for a
+  /// turn. When set, [sendText] uses its result instead of a bare user
+  /// message.
+  final Future<List<ApiMessage>> Function(String userText)? contextBuilder;
+
+  /// System prompt passed to the chat client for every turn when set (matches
+  /// the chat feature's `kSystemPrompt` usage).
+  final String? systemPrompt;
+
+  /// Optional [CancelToken] forwarded to every [ChatClient.streamCompletions]
+  /// call. Lets the owner (the controller's notifier) abort an in-flight turn
+  /// at teardown so a stale stream can never complete into a disposed
+  /// notifier's persistence callbacks.
+  final CancelToken? cancelToken;
 
   late final StreamSubscription<List<int>> _micSubscription;
   late final StreamSubscription<bool> _isPlayingSubscription;
@@ -241,7 +267,10 @@ final class VoiceController {
   /// handshake — conversation happens over the [ChatClient]'s text path.
   Future<void> startConversation() async {
     // A stale paused flag from an interruption that hit while idle must not
-    // mute a fresh session (synthesize gates on isPaused).
+    // mute a fresh session (synthesize gates on isPaused). Per-turn fields
+    // from the previous session must not leak into the new one either — a
+    // stale onDeviceTranscript / lastReply would re-emit as phantom bubbles.
+    clearTurnFields();
     _update(_state.copyWith(isConnected: true, isPaused: false, error: null));
   }
 
@@ -259,6 +288,9 @@ final class VoiceController {
       // Best-effort stop.
     }
     _micAudioBuffer.clear();
+    // Drop per-turn fields so a later restarted session cannot re-emit the
+    // previous session's utterance/reply as phantom bubbles.
+    clearTurnFields();
     _update(_state.copyWith(isConnected: false, isAiSpeaking: false));
   }
 
@@ -383,7 +415,11 @@ final class VoiceController {
   ///
   /// No-op for empty/whitespace input. Failures are surfaced through
   /// [state.error] / [onError].
-  Future<void> sendText(String text) async {
+  ///
+  /// When [speakReply] is false the reply is NOT synthesised or played (the
+  /// text-mode path; also avoids the [StateError] thrown when no [ttsEngine]
+  /// is configured) — [onTranscript] and the state updates still fire.
+  Future<void> sendText(String text, {bool speakReply = true}) async {
     final trimmed = text.trim();
     if (trimmed.isEmpty) return;
     // A turn queued ahead of a teardown must not hit the network.
@@ -391,13 +427,37 @@ final class VoiceController {
     if (kDebugMode) {
       debugPrint('VoiceController: sendText "${trimmed.substring(0, trimmed.length.clamp(0, 60))}"');
     }
+    // The user's utterance surfaces in the UI transcript for this turn. Voice
+    // turns already set it in flushTranscriptionBuffer (the UI dedupes the
+    // consecutive identical value); text-mode turns rely on this so the user's
+    // text appears in the transcript. Persistence of the user message goes
+    // through onUserMessage ONLY (otherwise voice turns would persist twice).
+    _update(_state.copyWith(onDeviceTranscript: trimmed));
+    onDeviceTranscript?.call(trimmed);
+    onUserMessage?.call(trimmed);
     try {
-      // Clearing lastReply too: consecutive identical replies must still
-      // flip the field so per-turn listeners fire.
-      _update(_state.copyWith(lastTranscript: null, lastReply: null, error: null));
+      // Clearing lastReply and onDeviceTranscript too: consecutive identical
+      // replies must still flip the field so per-turn listeners fire, and the
+      // recognised utterance must not be re-emitted by later state changes
+      // (streaming deltas, playback flips) into a duplicated transcript
+      // entry.
+      _update(
+        _state.copyWith(
+          lastTranscript: null,
+          lastReply: null,
+          error: null,
+          onDeviceTranscript: null,
+        ),
+      );
+      final builder = contextBuilder;
+      final messages = builder != null
+          ? await builder(trimmed)
+          : [ApiMessage(role: 'user', content: trimmed)];
       final buffer = StringBuffer();
       final result = await chatClient.streamCompletions(
-        messages: [ApiMessage(role: 'user', content: trimmed)],
+        messages: messages,
+        systemPrompt: systemPrompt,
+        cancelToken: cancelToken,
         onContent: (delta) {
           buffer.write(delta);
           _update(_state.copyWith(lastTranscript: buffer.toString()));
@@ -410,7 +470,9 @@ final class VoiceController {
       if (reply.isNotEmpty) {
         _update(_state.copyWith(lastTranscript: reply, lastReply: reply));
         onTranscript?.call(reply);
-        await synthesizeOnDevice(reply);
+        if (speakReply) {
+          await synthesizeOnDevice(reply);
+        }
       }
     } catch (e) {
       _reportError(e);
@@ -491,6 +553,15 @@ final class VoiceController {
   void clearError() {
     if (_state.error == null) return;
     _update(_state.copyWith(error: null));
+  }
+
+  /// Clears the per-turn fields ([lastReply], [onDeviceTranscript]) without
+  /// touching the connection/recording state. Called when a conversation is
+  /// switched or a session restarts so stale turn data from the previous
+  /// conversation/session can never re-emit as phantom transcript bubbles.
+  void clearTurnFields() {
+    if (_state.lastReply == null && _state.onDeviceTranscript == null) return;
+    _update(_state.copyWith(lastReply: null, onDeviceTranscript: null));
   }
 
   // ---- wiring -----------------------------------------------------------

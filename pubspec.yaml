@@ -61,10 +61,10 @@ dependencies:
   record: ^7.1.1
   audio_session: ^0.1.25
   whisper_kit: ^0.3.1
-  # Actively maintained ONNX Runtime wrapper (bundles ORT 1.23.0, 16 KB page
-  # size compliant). Replaces the unmaintained `onnxruntime` plugin whose
-  # stale compileSdk 33 / ORT 1.15 binaries broke the Android build.
-  flutter_onnxruntime: ^1.8.4
+  # On-device TTS runtime (Supertonic 3 int8). Bundles the sherpa-onnx C API
+  # and onnxruntime native libs per platform. Pinned to ^1.13.7: the
+  # Supertonic vocoder requires onnxruntime >= 1.21, first bundled by 1.13.7.
+  sherpa_onnx: ^1.13.7
   # VAD for voice activity detection during mic capture.
   # flutter_vad: ^0.1.2  # — not published on pub.dev; add when available
 
@@ -91,14 +91,9 @@ dev_dependencies:
 flutter:
 
   # The following line ensures that the Material Icons font is
-  # included with your application, so that you can use the icons in
+  # included with your application, so that it uses the icons in
   # the material Icons class.
   uses-material-design: true
-
-  # Bundled G2P lexicon: CMU Pronouncing Dictionary 0.7b (BSD-style licence,
-  # redistribution with attribution — the original header ships in the file).
-  assets:
-    - assets/g2p/cmudict-0.7b.gz
 
   # Design system fonts (see docs/design-system.md). Both are variable fonts;
   # each declared weight maps to the same file so the named weight is applied.

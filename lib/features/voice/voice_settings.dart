@@ -5,7 +5,7 @@
 class VoiceSettings {
   const VoiceSettings({
     this.sttEngine = 'whisper_tiny',
-    this.ttsEngine = 'kokoro_82m',
+    this.ttsEngine = 'supertonic_3',
     this.vadSensitivity = 0.5,
     this.preferredLanguage = 'en',
     this.minTurnSeconds = 0.5,

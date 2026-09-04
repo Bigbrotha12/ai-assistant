@@ -39,6 +39,13 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
   static const _kMinTurnSeconds = 'voice_min_turn_seconds';
   static const _kVisionEnabled = 'voice_vision_enabled';
 
+  /// Migrations for persisted engine ids that no longer exist: the TTS engine
+  /// was swapped from the custom Kokoro-82M pipeline to sherpa-onnx +
+  /// Supertonic 3, so stored `'kokoro_82m'` selections are remapped on load.
+  static const _kLegacyTtsEngineIds = <String, String>{
+    'kokoro_82m': 'supertonic_3',
+  };
+
   final FlutterSecureStorage _storage;
 
   @override
@@ -56,7 +63,9 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
 
     return VoiceSettings(
       sttEngine: sttEngine ?? VoiceSettings().sttEngine,
-      ttsEngine: ttsEngine ?? VoiceSettings().ttsEngine,
+      ttsEngine: ttsEngine != null
+          ? _kLegacyTtsEngineIds[ttsEngine] ?? ttsEngine
+          : VoiceSettings().ttsEngine,
       vadSensitivity: vadStr != null
           ? double.tryParse(vadStr) ?? VoiceSettings().vadSensitivity
           : VoiceSettings().vadSensitivity,
