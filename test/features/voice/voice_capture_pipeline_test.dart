@@ -37,6 +37,9 @@ void main() {
       playback: playback,
       sttEngine: stt,
       ttsEngine: tts,
+      // This test asserts back-to-back utterances; the echo refractory would
+      // (correctly) swallow the second one at test speed.
+      echoGateDuration: Duration.zero,
     );
     pipeline = VoiceCapturePipeline(
       micCapture: mic,

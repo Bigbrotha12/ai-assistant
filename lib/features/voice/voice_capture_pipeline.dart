@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
@@ -56,19 +57,14 @@ class VoiceCapturePipeline {
   /// TTS).
   Future<void> startRecording() async {
     if (_isRecording) return;
+    if (kDebugMode) {
+      debugPrint('VoicePipeline: startRecording (focus → mic → VAD)');
+    }
 
     await audioSession.requestAudioFocus();
     await micCapture.start();
 
-    _micSubscription = micCapture.audioStream.listen(
-      _onMicAudio,
-      onError: (Object e) {
-        if (kDebugMode) {
-          debugPrint('VoiceCapturePipeline: mic stream error: $e');
-        }
-        voiceController.reportError(e);
-      },
-    );
+    _listenMic();
     _vadSubscription = vad.stateChanges.listen(_onVadStateChange);
 
     _isRecording = true;
@@ -78,12 +74,57 @@ class VoiceCapturePipeline {
     await voiceController.startRecording();
   }
 
+  /// Subscribes to the mic stream. Shared by [startRecording] and the
+  /// interruption-resume path so error/done handling can never drift apart.
+  void _listenMic() {
+    var chunkCount = 0;
+    _micSubscription = micCapture.audioStream.listen(
+      (chunk) {
+        chunkCount++;
+        if (kDebugMode) {
+          if (chunkCount == 1) {
+            debugPrint('VoicePipeline: first mic chunk ${chunk.length} samples');
+          } else if (chunkCount % 50 == 0) {
+            // ~1s heartbeat at 20 ms frames; RMS approximates the mic level.
+            debugPrint(
+              'VoicePipeline: chunks=$chunkCount rms=${_chunkRmsDb(chunk).toStringAsFixed(1)}dBFS',
+            );
+          }
+        }
+        _onMicAudio(chunk);
+      },
+      onError: (Object e) {
+        if (kDebugMode) {
+          debugPrint('VoicePipeline: mic stream error: $e');
+        }
+        voiceController.reportError(e);
+      },
+      onDone: () {
+        // The recorder died mid-session; reflect it so the UI unsticks and
+        // no "recording" state is held against a dead stream.
+        if (kDebugMode) {
+          debugPrint('VoicePipeline: mic stream ended');
+        }
+        if (_isRecording) {
+          _isRecording = false;
+          unawaited(voiceController.stopRecording());
+        }
+      },
+    );
+  }
+
   void _onMicAudio(List<int> chunk) {
-    if (_isPaused) return;
+    // No capture while paused (interruption) or while the assistant's own
+    // TTS is playing through the speaker — the mic would otherwise feed the
+    // assistant's voice back through VAD/STT as a phantom user turn.
+    if (_isPaused || voiceController.state.isAiSpeaking) return;
     vad.processChunk(chunk);
   }
 
   void _onVadStateChange(VadState state) {
+    if (kDebugMode) {
+      debugPrint('VoicePipeline: VAD → $state');
+    }
     switch (state) {
       case VadState.speechStarted:
         break;
@@ -99,10 +140,24 @@ class VoiceCapturePipeline {
     }
   }
 
+  /// Root-mean-square level of a PCM16 chunk in dBFS (max 0, silence ≈ -96).
+  double _chunkRmsDb(List<int> chunk) {
+    if (chunk.isEmpty) return -96;
+    var sumSq = 0.0;
+    for (final sample in chunk) {
+      sumSq += sample * sample;
+    }
+    final rms = sqrt(sumSq / chunk.length) / 32768.0;
+    return rms <= 0 ? -96 : 20 * log(rms) / ln10;
+  }
+
   /// Stop capturing microphone audio and tear down the pipeline.
   Future<void> stopRecording() async {
     if (!_isRecording) return;
     _isRecording = false;
+    if (kDebugMode) {
+      debugPrint('VoicePipeline: stopRecording');
+    }
 
     await _vadSubscription?.cancel();
     _vadSubscription = null;
@@ -118,41 +173,57 @@ class VoiceCapturePipeline {
       }
     }
 
-    await audioSession.abandonAudioFocus();
+    // Hold focus while the assistant's reply is still playing: releasing it
+    // now would leave playback without interruption coverage. The focus is
+    // abandoned when the conversation ends (or the next stop after playback).
+    if (!voiceController.state.isAiSpeaking) {
+      await audioSession.abandonAudioFocus();
+    }
 
     // Sync VoiceController state.
     await voiceController.stopRecording();
   }
 
+  /// Bumped on every interruption transition; pause/resume coroutines bail
+  /// when their epoch is stale, so a begin→end flip-flop can never leave the
+  /// new mic subscription cancelled by an old pause coroutine.
+  int _interruptionEpoch = 0;
+
   void _handleInterruption(bool isInterrupted) {
+    _interruptionEpoch++;
     if (isInterrupted) {
       _isPaused = true;
-      unawaited(_pauseForInterruption());
+      final epoch = _interruptionEpoch;
+      unawaited(_pauseForInterruption(epoch));
     } else {
-      unawaited(_resumeAfterInterruption());
+      final epoch = _interruptionEpoch;
+      unawaited(_resumeAfterInterruption(epoch));
     }
   }
 
-  Future<void> _pauseForInterruption() async {
+  Future<void> _pauseForInterruption(int epoch) async {
     await _micSubscription?.cancel();
+    if (epoch != _interruptionEpoch) return;
     _micSubscription = null;
     try {
       await micCapture.stop();
     } catch (_) {
       // Best-effort stop.
     }
+    if (epoch != _interruptionEpoch) return;
     // Pause any in-flight TTS playback and mark the session paused.
     await voiceController.pauseForInterruption();
   }
 
-  Future<void> _resumeAfterInterruption() async {
+  Future<void> _resumeAfterInterruption(int epoch) async {
     _isPaused = false;
     // Clear the paused flag regardless of whether mic restart succeeds.
     await voiceController.resumeAfterInterruption();
-    if (!_isRecording) return;
+    if (epoch != _interruptionEpoch || !_isRecording) return;
     try {
       await micCapture.start();
-      _micSubscription = micCapture.audioStream.listen(_onMicAudio);
+      if (epoch != _interruptionEpoch) return;
+      _listenMic();
     } catch (e) {
       if (kDebugMode) {
         debugPrint(
@@ -171,6 +242,9 @@ class VoiceCapturePipeline {
     if (_isRecording) {
       await stopRecording();
     }
+    // stopRecording may have kept focus (reply still playing); the pipeline
+    // is going away, so focus ownership ends here unconditionally.
+    await audioSession.abandonAudioFocus();
     audioSession.onInterruption = null;
   }
 }

@@ -69,4 +69,35 @@ void main() {
       expect(ByteData.view(wav.buffer, 44).getInt16(4, Endian.little), -1);
     });
   });
+
+  group('pcm16SamplesToLeBytes', () {
+    test('packs signed samples as little-endian byte pairs', () {
+      final bytes = pcm16SamplesToLeBytes(const [0, 1, -1, 32767, -32768]);
+      expect(bytes, [0, 0, 1, 0, 0xFF, 0xFF, 0xFF, 0x7F, 0x00, 0x80]);
+    });
+
+    test('round-trips through signed 16-bit reads', () {
+      const samples = [0, 1, -1, 256, -256, 32767, -32768, 12345, -12345];
+      final bytes = pcm16SamplesToLeBytes(samples);
+      final view = ByteData.view(bytes.buffer);
+      for (var i = 0; i < samples.length; i++) {
+        expect(view.getInt16(i * 2, Endian.little), samples[i]);
+      }
+    });
+
+    test('payload matches pcm16ToWav data chunk size for the same samples', () {
+      const samples = [100, -100, 1234];
+      expect(
+        pcm16SamplesToLeBytes(samples).length,
+        // PCM payload length for the same samples (2 bytes per sample).
+        pcm16ToWav(samples, sampleRate: 16000).length - 44,
+      );
+    });
+
+    test('does not truncate negative samples to their low byte', () {
+      // Regression guard: Uint8List.fromList(samples) would turn -1 into 255.
+      final bytes = pcm16SamplesToLeBytes(const [-1]);
+      expect(bytes, [0xFF, 0xFF]);
+    });
+  });
 }

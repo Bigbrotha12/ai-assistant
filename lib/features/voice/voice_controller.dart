@@ -6,6 +6,7 @@ import '../../core/chat_client.dart';
 import '../chat/message_model.dart';
 import 'audio_playback_service.dart';
 import 'mic_capture_service.dart';
+import 'speech_text_filter.dart';
 import 'stt_engine.dart';
 import 'tts_engine.dart';
 
@@ -135,11 +136,25 @@ final class VoiceController {
     this.onDeviceTranscript,
     this.onError,
     this.onNetworkError,
-  }) {
-    // Mic frames → local buffer for on-device STT.
-    _micSubscription = micCapture.audioStream.listen(_onMicAudio);
+    Duration? echoGateDuration,
+  }) : _echoGateDuration =
+           echoGateDuration ?? const Duration(milliseconds: 300) {
+    // Mic frames → local buffer for on-device STT. The capture pipeline is
+    // the single error reporter for mic streams (it routes into
+    // [reportError]); this listener only logs so a broadcast error can never
+    // be unhandled — and is never double-reported.
+    _micSubscription = micCapture.audioStream.listen(
+      _onMicAudio,
+      onError: (Object e) {
+        if (kDebugMode) {
+          debugPrint('VoiceController: mic stream error (reported by pipeline): $e');
+        }
+      },
+    );
     // Playback activity → isAiSpeaking.
     _isPlayingSubscription = playback.isPlaying.listen(_onIsPlayingChanged);
+    // Playback failures → conversation state (never silent).
+    _playbackErrorSubscription = playback.errors.listen(_reportError);
   }
 
   /// The textual LLM client used to produce assistant replies.
@@ -175,9 +190,27 @@ final class VoiceController {
 
   late final StreamSubscription<List<int>> _micSubscription;
   late final StreamSubscription<bool> _isPlayingSubscription;
+  StreamSubscription<Object>? _playbackErrorSubscription;
 
   /// Accumulates PCM audio chunks for on-device STT when [sttEngine] is set.
   final List<int> _micAudioBuffer = [];
+
+  /// Serialisation tail: turns (STT → LLM → TTS) run one at a time so a VAD
+  /// flush racing the release-flush can never interleave two chat streams or
+  /// cut one utterance's audio with the next.
+  Future<void> _turnTail = Future.value();
+
+  /// Bumped on teardown ([endConversation] / [dispose]); queued turns check
+  /// their captured epoch at each stage and bail when it moved on.
+  int _turnEpoch = 0;
+
+  /// Chunks are ignored this long after playback ends — the speaker's tail
+  /// and room echo would otherwise land in the STT buffer as a phantom
+  /// utterance (the assistant transcribing itself).
+  final Duration _echoGateDuration;
+
+  /// Until this instant, mic chunks are not buffered (echo gate).
+  DateTime _echoGateUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
   VoiceConversationState _state = VoiceConversationState.initial();
   final StreamController<VoiceConversationState> _stateController =
@@ -193,11 +226,16 @@ final class VoiceController {
   /// active so [startRecording] is allowed. There is no room, JWT or signaling
   /// handshake — conversation happens over the [ChatClient]'s text path.
   Future<void> startConversation() async {
-    _update(_state.copyWith(isConnected: true, error: null));
+    // A stale paused flag from an interruption that hit while idle must not
+    // mute a fresh session (synthesize gates on isPaused).
+    _update(_state.copyWith(isConnected: true, isPaused: false, error: null));
   }
 
   /// Ends the current conversation session and deactivates the mic.
   Future<void> endConversation() async {
+    // Invalidate any queued or in-flight turn: nothing may transcribe, hit
+    // the network, or start playback after the session is gone.
+    _turnEpoch++;
     if (_state.isRecording) {
       await stopRecording();
     }
@@ -206,6 +244,7 @@ final class VoiceController {
     } catch (_) {
       // Best-effort stop.
     }
+    _micAudioBuffer.clear();
     _update(_state.copyWith(isConnected: false, isAiSpeaking: false));
   }
 
@@ -218,6 +257,9 @@ final class VoiceController {
     }
     if (_state.isRecording) return;
     try {
+      // Stale audio (e.g. a released hold before speech) must never leak
+      // into the next utterance's transcription.
+      _micAudioBuffer.clear();
       // 16 kHz mono matches the buffer format for the on-device STT engine.
       await micCapture.start(sampleRate: kPlaybackSampleRate);
       _update(_state.copyWith(isRecording: true, error: null));
@@ -240,32 +282,85 @@ final class VoiceController {
 
   /// Flushes the accumulated mic audio buffer to the on-device STT engine.
   ///
-  /// Intended to be called when VAD detects end-of-utterance. If the engine
-  /// yields a non-empty transcript, the utterance is sent through [sendText]
-  /// to produce and speak the assistant reply. If no [sttEngine] is
-  /// configured the buffer is simply cleared.
+  /// Intended to be called when VAD detects end-of-utterance or when a
+  /// hold-to-talk press is released. If the engine yields a non-empty
+  /// transcript, the utterance is sent through [sendText] to produce and
+  /// speak the assistant reply. If no [sttEngine] is configured the buffer is
+  /// simply cleared.
+  ///
+  /// The buffer copy/clear happens synchronously before the first await, so
+  /// a new utterance cannot interleave with the transcript being produced;
+  /// the turn itself (STT → LLM → TTS) is serialised onto [_turnTail] so two
+  /// flushes can never run concurrently.
   Future<void> flushTranscriptionBuffer() async {
     final engine = sttEngine;
     final buffer = List<int>.from(_micAudioBuffer);
     _micAudioBuffer.clear();
 
+    if (kDebugMode) {
+      debugPrint(
+        'VoiceController: flush (${buffer.length} samples, engine=${engine?.name ?? 'none'})',
+      );
+    }
     if (engine == null || buffer.isEmpty) return;
 
-    try {
-      final transcript = await engine.transcribe(
-        buffer,
-        sampleRate: kPlaybackSampleRate,
-      );
-      // Whitespace-only transcripts mean "no speech recognised"; treat them
-      // as empty so they neither update state nor fire callbacks.
-      if (transcript.trim().isNotEmpty) {
-        _update(_state.copyWith(onDeviceTranscript: transcript));
-        onDeviceTranscript?.call(transcript);
-        await sendText(transcript);
-      }
-    } catch (e) {
-      _reportError(e);
-    }
+    final epoch = _turnEpoch;
+    unawaited(
+      _runSerialized(() async {
+        // The session may have ended while this turn sat queued.
+        if (epoch != _turnEpoch) return;
+        try {
+          final raw = await engine.transcribe(
+            buffer,
+            sampleRate: kPlaybackSampleRate,
+          );
+          // Whisper hallucinates stage-direction tags on silence/noise
+          // ("[BLANK_AUDIO]", "(humming)", "Thanks for watching!"); strip
+          // them and drop hallucination-only utterances so they never
+          // become a turn.
+          final transcript = SpeechTextFilter.stripNonSpeechTags(raw).trim();
+          final hallucinated =
+              SpeechTextFilter.isLikelySilenceHallucination(raw);
+          if (kDebugMode) {
+            debugPrint(
+              'VoiceController: transcript="${transcript.isEmpty ? raw.trim() : transcript}"'
+              '${hallucinated ? ' (dropped: silence hallucination)' : ''}',
+            );
+          }
+          if (epoch != _turnEpoch) return;
+          // Whitespace-only transcripts mean "no speech recognised"; treat
+          // them as empty so they neither update state nor fire callbacks.
+          if (transcript.isNotEmpty && !hallucinated) {
+            _update(_state.copyWith(onDeviceTranscript: transcript));
+            onDeviceTranscript?.call(transcript);
+            await sendText(transcript);
+            // A turn ends when its audio finishes, not when play is merely
+            // kicked off — otherwise the next turn truncates this one and
+            // briefly re-opens the echo gate around its tail.
+            if (_state.isAiSpeaking) {
+              await playback.isPlaying
+                  .firstWhere((playing) => !playing)
+                  .timeout(const Duration(minutes: 2));
+            }
+          }
+        } on TimeoutException {
+          // Abnormally long playback; never wedge the turn queue on it.
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint('VoiceController: STT failed: $e');
+          }
+          _reportError(e);
+        }
+      }),
+    );
+  }
+
+  /// Serialises [action] onto [_turnTail] so concurrent turns queue.
+  Future<T> _runSerialized<T>(Future<T> Function() action) {
+    final result = _turnTail.then((_) => action());
+    // Swallow errors on the tail so one failed turn never wedges the chain.
+    _turnTail = result.then((_) {}, onError: (_) {});
+    return result;
   }
 
   /// Sends [text] (a recognised user utterance) to the [ChatClient], streams
@@ -277,6 +372,11 @@ final class VoiceController {
   Future<void> sendText(String text) async {
     final trimmed = text.trim();
     if (trimmed.isEmpty) return;
+    // A turn queued ahead of a teardown must not hit the network.
+    if (!_state.isConnected) return;
+    if (kDebugMode) {
+      debugPrint('VoiceController: sendText "${trimmed.substring(0, trimmed.length.clamp(0, 60))}"');
+    }
     try {
       _update(_state.copyWith(lastTranscript: null, error: null));
       final buffer = StringBuffer();
@@ -311,16 +411,36 @@ final class VoiceController {
     if (engine == null) {
       throw StateError('No on-device TTS engine configured');
     }
+    // Never push audio at the user mid-interruption (e.g. during a call) or
+    // after the session ended.
+    if (_state.isPaused || !_state.isConnected) return const [];
     try {
+      // LLM replies can carry stage directions ("(humming)",
+      // "[BLANK_AUDIO]"); the TTS engine must speak only real text.
+      final speakable = SpeechTextFilter.stripNonSpeechTags(text).trim();
+      if (speakable.isEmpty) {
+        if (kDebugMode) {
+          debugPrint('VoiceController: TTS skipped (nothing speakable)');
+        }
+        return const [];
+      }
       final pcm = await engine.synthesize(
-        text,
+        speakable,
         sampleRate: kPlaybackSampleRate,
       );
-      if (pcm.isNotEmpty) {
+      if (kDebugMode) {
+        debugPrint('VoiceController: TTS produced ${pcm.length} samples');
+      }
+      // Synthesis takes seconds; the session or an interruption may have
+      // started while it ran. Check again before any audio leaves the app.
+      if (pcm.isNotEmpty && !_state.isPaused && _state.isConnected) {
         await playback.playAudio(pcm);
       }
       return pcm;
     } catch (e) {
+      if (kDebugMode) {
+        debugPrint('VoiceController: TTS failed: $e');
+      }
       _reportError(e);
       return const [];
     }
@@ -335,6 +455,8 @@ final class VoiceController {
     } catch (_) {
       // Best-effort stop; the interruption takes precedence over playback.
     }
+    // Buffered speech spanning the interruption is stale; starting fresh.
+    _micAudioBuffer.clear();
     _update(_state.copyWith(isPaused: true, isAiSpeaking: false));
   }
 
@@ -358,6 +480,14 @@ final class VoiceController {
   // ---- wiring -----------------------------------------------------------
 
   void _onMicAudio(List<int> chunk) {
+    // Echo gate: while the assistant is speaking — and for a short tail
+    // after it stops (speaker decay + room echo) — mic chunks must not enter
+    // the STT buffer, or the assistant transcribes its own voice into a
+    // phantom turn. (The capture pipeline gates VAD separately; this gate
+    // protects the STT buffer the pipeline cannot see.)
+    if (_state.isAiSpeaking || DateTime.now().isBefore(_echoGateUntil)) {
+      return;
+    }
     // Buffer for on-device STT when the engine is configured.
     if (sttEngine != null) {
       _micAudioBuffer.addAll(chunk);
@@ -365,6 +495,10 @@ final class VoiceController {
   }
 
   void _onIsPlayingChanged(bool playing) {
+    if (!playing && _state.isAiSpeaking) {
+      // Playback just ended: hold the echo gate through the speaker tail.
+      _echoGateUntil = DateTime.now().add(_echoGateDuration);
+    }
     _update(_state.copyWith(isAiSpeaking: playing));
   }
 
@@ -408,8 +542,11 @@ final class VoiceController {
   /// Tears down this controller. The underlying services remain owned by
   /// their providers and stay usable.
   Future<void> dispose() async {
+    // Invalidate queued turns — nothing may run against a disposed controller.
+    _turnEpoch++;
     await _micSubscription.cancel();
     await _isPlayingSubscription.cancel();
+    await _playbackErrorSubscription?.cancel();
     await _stateController.close();
     await playback.stop();
   }

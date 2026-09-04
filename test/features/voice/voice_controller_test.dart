@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/core/chat_client.dart';
@@ -255,5 +256,181 @@ void main() {
     await controller.dispose();
     await mic.dispose();
     await playback.dispose();
+  });
+
+  group('echo gate', () {
+    test('mic chunks during and shortly after playback are not buffered',
+        () async {
+      final chat = FakeChatClient(
+        results: [
+          ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+      );
+
+      await controller.startConversation();
+      await controller.startRecording();
+      await controller.synthesizeOnDevice('reply');
+      // FakeAudioPlayback emitted isPlaying true → false (completion); the
+      // echo gate now covers the speaker tail. Chunks right after playback
+      // must not reach the STT buffer.
+      expect(controller.state.isAiSpeaking, isFalse);
+      mic.emitChunk(List.filled(160, 5));
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await Future<void>.delayed(Duration.zero);
+      expect(stt.transcribed, isEmpty);
+
+      // After the refractory window, capture resumes.
+      await Future<void>.delayed(const Duration(milliseconds: 320));
+      mic.emitChunk(List.filled(160, 7));
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await Future<void>.delayed(Duration.zero);
+      expect(stt.transcribed, hasLength(1));
+      expect(stt.transcribed.single, everyElement(7));
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+  });
+
+  group('turn lifecycle', () {
+    test('endConversation cancels queued turns (no network or audio after)',
+        () async {
+      final chat = FakeChatClient(
+        results: [
+          ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+      );
+
+      await controller.startConversation();
+      await controller.startRecording();
+
+      // Turn 1 in flight (STT held open), turn 2 queued behind it.
+      stt.gate = Completer<void>();
+      mic.emitChunk(List.filled(40, 1));
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await Future<void>.delayed(Duration.zero);
+      mic.emitChunk(List.filled(40, 2));
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      expect(stt.transcribed, hasLength(1));
+
+      // Teardown while turn 1 is mid-flight.
+      await controller.endConversation();
+
+      // Release the gate: turn 1 must abort after STT, turn 2 never start —
+      // no network call and no audio after the session is gone.
+      stt.gate!.complete();
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(chat.calls, isEmpty);
+      expect(playback.playedChunks, isEmpty);
+      expect(controller.state.isConnected, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('concurrent flushes serialize into ordered turns', () async {
+      final chat = FakeChatClient(
+        results: [
+          ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+      );
+
+      await controller.startConversation();
+      await controller.startRecording();
+
+      stt.gate = Completer<void>();
+      mic.emitChunk(List.filled(40, 1));
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await Future<void>.delayed(Duration.zero);
+      mic.emitChunk(List.filled(40, 2));
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      // Both buffers copied; only turn 1 has reached STT so far.
+      expect(stt.transcribed, hasLength(1));
+
+      stt.gate!.complete();
+      // Let turn 1 finish and turn 2 run.
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(stt.transcribed, hasLength(2));
+      expect(stt.transcribed[0], everyElement(1));
+      expect(stt.transcribed[1], everyElement(2));
+      expect(chat.callCount, 2);
+      expect(playback.playedChunks, hasLength(2));
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('mic stream errors are tolerated, not unhandled', () async {
+      final chat = FakeChatClient();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: FakeSttEngine(),
+        ttsEngine: FakeTtsEngine(),
+      );
+
+      await controller.startConversation();
+      // The capture pipeline is the single mic-error reporter; the
+      // controller's own listener must merely survive it.
+      mic.emitError(StateError('dead object'));
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.state.error, isNull);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
   });
 }

@@ -1,8 +1,8 @@
 // ignore_for_file: experimental_member_use, prefer_initializing_formals
 
 import 'dart:async';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 
 import 'audio_session_manager.dart';
@@ -20,26 +20,29 @@ abstract interface class AudioPlayback {
   /// Whether audio is currently playing.
   Stream<bool> get isPlaying;
 
-  /// Queues one PCM16 chunk (16 kHz mono) for gapless playback.
-  Future<void> playAudio(List<int> pcm16bit);
+  /// Playback failures (player and source errors), so orchestrators can
+  /// surface them in the conversation state instead of failing silently.
+  Stream<Object> get errors;
 
-  /// Stops playback, discards any buffered chunks, and releases audio focus.
+  /// Plays one utterance of PCM16 samples (16 kHz mono), replacing any
+  /// currently playing audio.
+  Future<void> playAudio(List<int> pcm16Samples);
+
+  /// Stops playback.
   Future<void> stop();
 }
 
-/// Plays back AI TTS audio delivered as raw PCM16 chunks.
+/// Plays back AI TTS audio delivered as PCM16 sample utterances.
 ///
-/// Chunks are queued onto a live [StreamAudioSource] wrapped in a WAV
-/// container so the platform decoders can consume them, keeping playback
-/// gapless across chunk boundaries. The audio session is owned and configured
-/// by the shared [AudioSessionManager], which is also responsible for
-/// acquiring/releasing audio focus on interruptions.
+/// Each utterance is wrapped in a finite WAV container ([_BytesAudioSource])
+/// that the platform decoders consume with byte-range support. The audio
+/// session is owned and configured by the shared [AudioSessionManager].
 class AudioPlaybackService implements AudioPlayback {
   AudioPlaybackService({
     int sampleRate = kPlaybackSampleRate,
     AudioSessionManager? audioSession,
-  }) : _sampleRate = sampleRate,
-       _audioSession = audioSession {
+  }) : _audioSession = audioSession,
+       _source = _BytesAudioSource(sampleRate: sampleRate) {
     _isPlayingSubscription = _player.playerStateStream
         .map(
           (state) =>
@@ -52,69 +55,94 @@ class AudioPlaybackService implements AudioPlayback {
           if (_isPlayingController.isClosed) return;
           _isPlayingController.add(playing);
         });
+    // Always subscribed: a playback failure must be observable by callers
+    // (routed into the conversation state), not just in debug logs.
+    _errorSubscription = _player.errorStream.listen((e) {
+      final error = '(${e.code}) ${e.message}';
+      if (_errorsController.isClosed) return;
+      _errorsController.add(error);
+      if (kDebugMode) {
+        debugPrint('AudioPlayback: player error $error');
+      }
+    });
   }
-
-  final int _sampleRate;
 
   /// Optionally shares the session manager configured by the caller/scaffold.
   /// When null, focus is not driven by this service (the session manager or a
   /// capture pipeline owns focus acquisition).
   final AudioSessionManager? _audioSession;
-  final AudioPlayer _player = AudioPlayer();
+
+  /// Interruption handling is fully owned by [AudioSessionManager] + the
+  /// capture pipeline. just_audio's built-in handlers are disabled: they
+  /// auto-resume playback on pause-type interruption ends (racing the app's
+  /// own pause), activate the audio session on every `play()` (a third focus
+  /// owner), and ignore duck semantics the app treats as a full pause.
+  final AudioPlayer _player = AudioPlayer(
+    handleInterruptions: false,
+    handleAudioSessionActivation: false,
+  );
   final StreamController<bool> _isPlayingController =
       StreamController<bool>.broadcast();
+  final StreamController<Object> _errorsController =
+      StreamController<Object>.broadcast();
   StreamSubscription<bool>? _isPlayingSubscription;
+  StreamSubscription<PlayerException>? _errorSubscription;
 
-  /// Controller feeding PCM chunks into the currently-loaded [_LivePcmSource].
-  StreamController<Uint8List>? _sourceController;
+  /// Reused source: just_audio's proxy registers a handler per source id and
+  /// never removes it, so a fresh source per utterance would pin every WAV in
+  /// memory for the app's lifetime. One instance with swapped bytes keeps the
+  /// proxy map at a single entry.
+  final _BytesAudioSource _source;
 
   /// Whether audio is currently playing.
   @override
   Stream<bool> get isPlaying => _isPlayingController.stream;
 
-  /// Queues one PCM16 chunk (16 kHz mono) for gapless playback.
-  ///
-  /// The first call starts the player; subsequent calls are appended to the
-  /// same continuous stream until [stop] is called.
+  /// Playback failures surfaced for orchestrators.
   @override
-  Future<void> playAudio(List<int> pcm16bit) async {
-    final chunk = pcm16bit is Uint8List
-        ? pcm16bit
-        : Uint8List.fromList(pcm16bit);
-    final controller = _sourceController;
-    if (controller == null) {
-      await _startPlayback(chunk);
-    } else {
-      controller.add(chunk);
-    }
-  }
+  Stream<Object> get errors => _errorsController.stream;
 
-  Future<void> _startPlayback(Uint8List firstChunk) async {
+  /// Plays one utterance of PCM16 samples (16 kHz mono).
+  ///
+  /// Each call replaces the current audio. Chunks arrive complete (the on-device
+  /// TTS engine synthesises a whole reply before handing it over), so serving
+  /// a finite WAV is both simpler and robust: just_audio's proxy requires a
+  /// known `contentLength` whenever a response carries an `offset`, and an
+  /// unknown-length live stream makes the platform player reopen the source
+  /// mid-playback (the source of hard-to-diagnose "Source error" failures).
+  @override
+  Future<void> playAudio(List<int> pcm16Samples) async {
     // Ensure the shared session holds audio focus so the platform routes
-    // playback through the voice-communication channel.
+    // playback to the configured output (media stream → speaker).
     await _audioSession?.requestAudioFocus();
 
-    final controller = StreamController<Uint8List>();
-    final source = _LivePcmSource(_sampleRate, controller.stream);
-    _sourceController = controller;
-    controller.add(firstChunk);
-
-    await _player.setAudioSource(source);
+    _source.updateWav(pcm16SamplesToLeBytes(pcm16Samples));
+    try {
+      await _player.setAudioSource(_source);
+    } catch (e) {
+      // The errorStream listener is the single failure reporter (it also
+      // fires for this failure); rethrowing would report twice.
+      if (kDebugMode) {
+        debugPrint('AudioPlayback: setAudioSource failed: $e');
+      }
+      return;
+    }
     if (!_player.playing) {
-      unawaited(_player.play());
+      unawaited(
+        _player.play().catchError((Object e) {
+          if (kDebugMode) {
+            debugPrint('AudioPlayback: play() failed: $e');
+          }
+        }),
+      );
     }
   }
 
-  /// Stops playback, discards any buffered chunks, and releases audio focus
-  /// previously acquired through the shared [AudioSessionManager].
+  /// Stops playback. Audio focus is owned by the shared [AudioSessionManager]
+  /// (acquired/released by the capture pipeline and playback owners), so this
+  /// only halts the player.
   @override
   Future<void> stop() async {
-    final controller = _sourceController;
-    _sourceController = null;
-    if (controller != null && !controller.isClosed) {
-      // Signals end-of-stream to the player.
-      await controller.close();
-    }
     try {
       if (_player.processingState != ProcessingState.idle) {
         await _player.stop();
@@ -126,50 +154,71 @@ class AudioPlaybackService implements AudioPlayback {
 
   /// Releases all resources held by this service.
   Future<void> dispose() async {
+    await _errorSubscription?.cancel();
+    _errorSubscription = null;
     await _isPlayingSubscription?.cancel();
     _isPlayingSubscription = null;
     await stop();
+    await _errorsController.close();
     await _isPlayingController.close();
     await _player.dispose();
   }
 }
 
-/// A [StreamAudioSource] that wraps a live PCM16 stream in a WAV container.
+/// A [StreamAudioSource] serving a complete PCM16 payload as a finite WAV.
 ///
-/// Every request emits a minimal WAV header (16 kHz mono 16-bit PCM) followed
-/// by the PCM bytes as they arrive from the controller, keeping the input
-/// stream untouched until [stop] closes its controller.
-class _LivePcmSource extends StreamAudioSource {
-  _LivePcmSource(this._sampleRate, this._pcm);
+/// One instance is reused for every utterance ([updateWav] swaps the payload
+/// before each `setAudioSource`): just_audio's proxy keys handlers by source
+/// id with no removal API, so fresh sources per utterance would pin every
+/// WAV in memory.
+///
+/// The response honours byte-range requests with a known `contentLength` —
+/// just_audio's proxy builds the 206 `Content-Range` from `offset` and
+/// `contentLength`, so `offset` is always reported (the 206 branch only
+/// engages when the player actually sent a Range header; a plain open gets a
+/// correct 200).
+class _BytesAudioSource extends StreamAudioSource {
+  _BytesAudioSource({required int sampleRate})
+    : _sampleRate = sampleRate,
+      _wav = Uint8List(0);
 
   final int _sampleRate;
-  final Stream<List<int>> _pcm;
+
+  /// Complete WAV file (44-byte header + PCM payload).
+  Uint8List _wav;
+
+  /// Replaces the payload for the next playback. Must be called before the
+  /// player loads the source; a response already streaming reads the byte
+  /// list it snapshotted at request time.
+  void updateWav(Uint8List pcm) {
+    _wav = Uint8List.fromList([
+      ...wavHeaderForPcm16(
+        sampleRate: _sampleRate,
+        numChannels: 1,
+        bitsPerSample: 16,
+        dataLength: pcm.length,
+      ),
+      ...pcm,
+    ]);
+  }
 
   @override
   Future<StreamAudioResponse> request([int? start, int? end]) async {
-    if (start != null) {
-      // Live, non-seekable stream.
-      throw StateError('Seeking is not supported by the live PCM source');
-    }
+    final offset = (start ?? 0).clamp(0, _wav.length);
+    final endExclusive = (end ?? _wav.length).clamp(offset, _wav.length);
+    final length = endExclusive - offset;
+
     return StreamAudioResponse(
-      contentLength: null,
+      contentLength: length,
       contentType: 'audio/wav',
-      offset: null,
-      rangeRequestsSupported: false,
-      sourceLength: null,
-      stream: () async* {
-        // Streaming WAV: payload length unknown up front, so RIFF/data sizes
-        // are written as unknown.
-        yield wavHeaderForPcm16(
-          sampleRate: _sampleRate,
-          numChannels: 1,
-          bitsPerSample: 16,
-          dataLength: -1,
-        );
-        await for (final chunk in _pcm) {
-          yield chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
-        }
-      }(),
+      offset: offset,
+      rangeRequestsSupported: true,
+      sourceLength: _wav.length,
+      stream: Stream<List<int>>.value(
+        length == _wav.length
+            ? _wav
+            : Uint8List.sublistView(_wav, offset, endExclusive),
+      ),
     );
   }
 }

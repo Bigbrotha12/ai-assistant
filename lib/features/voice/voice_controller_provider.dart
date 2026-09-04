@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/chat_client_provider.dart';
@@ -10,7 +9,6 @@ import 'engine_manager_provider.dart';
 import 'mic_capture_service.dart';
 import 'voice_capture_providers.dart';
 import 'voice_controller.dart';
-import 'voice_lifecycle_observer.dart';
 
 /// Microphone capture streaming raw PCM16 chunks.
 final micCaptureServiceProvider = Provider<MicCaptureService>((ref) {
@@ -42,7 +40,6 @@ final voiceControllerProvider =
     );
 
 class VoiceControllerNotifier extends Notifier<VoiceController> {
-  VoiceLifecycleObserver? _lifecycleObserver;
   void Function()? _enginesListener;
 
   @override
@@ -74,46 +71,14 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
       engineManager.addListener(_enginesListener!);
     }
 
-    // Register a lifecycle observer so entering the background tears the
-    // conversation down cleanly (even when the VoiceScreen is not visible).
-    final previousObserver = _lifecycleObserver;
-    _lifecycleObserver = VoiceLifecycleObserver(
-      onBackground: _handleBackground,
-      onForeground: _handleForeground,
-    );
-    WidgetsBinding.instance.addObserver(_lifecycleObserver!);
-    previousObserver?.dispose();
-
     ref.onDispose(() {
       if (_enginesListener != null) {
         engineManager.removeListener(_enginesListener!);
         _enginesListener = null;
       }
-      _lifecycleObserver?.dispose();
-      _lifecycleObserver = null;
       unawaited(controller.dispose());
     });
     return controller;
-  }
-
-  /// Tears down recording and playback and ends the text conversation when
-  /// the app moves to the background. Voice calls are short-lived; dropping
-  /// the session on background is the conservative, audio-safe choice.
-  Future<void> _handleBackground() async {
-    final pipeline = ref.read(voiceCapturePipelineProvider);
-    if (pipeline.isRecording) {
-      await pipeline.stopRecording();
-    }
-    await ref.read(voiceControllerProvider).endConversation();
-  }
-
-  /// Resets the session to idle on foreground. Deliberately does not
-  /// auto-reconnect — the user re-taps the mic to rejoin.
-  Future<void> _handleForeground() async {
-    final controller = ref.read(voiceControllerProvider);
-    if (controller.state.isPaused) {
-      await controller.resumeAfterInterruption();
-    }
   }
 }
 

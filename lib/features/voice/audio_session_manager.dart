@@ -34,6 +34,7 @@ class AudioSessionManagerImpl implements AudioSessionManager {
   AudioSession? _session;
   StreamSubscription<AudioInterruptionEvent>? _interruptionSubscription;
   bool _initialized = false;
+  bool _disposed = false;
 
   /// Callback invoked when an interruption begins or ends.
   @override
@@ -43,7 +44,11 @@ class AudioSessionManagerImpl implements AudioSessionManager {
   Future<void> initialize() async {
     if (_initialized) return;
     try {
-      _session = await AudioSession.instance;
+      final session = await AudioSession.instance;
+      // dispose() may have run while the platform lookup was in flight; do
+      // not configure/subscribe on a torn-down manager.
+      if (_disposed) return;
+      _session = session;
       await _session!.configure(
         AudioSessionConfiguration(
           avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
@@ -53,7 +58,12 @@ class AudioSessionManagerImpl implements AudioSessionManager {
               AVAudioSessionCategoryOptions.duckOthers,
           androidAudioAttributes: const AndroidAudioAttributes(
             contentType: AndroidAudioContentType.speech,
-            usage: AndroidAudioUsage.voiceCommunication,
+            // USAGE_MEDIA, not voiceCommunication: the session is half-duplex
+            // (hold-to-talk), so TTS belongs on the media stream — media
+            // volume, speaker routing. voiceCommunication routes to the
+            // earpiece with STREAM_VOICE_CALL volume, which reads as "TTS
+            // produced samples but silence" when call volume is low/zero.
+            usage: AndroidAudioUsage.media,
           ),
         ),
       );
@@ -113,6 +123,7 @@ class AudioSessionManagerImpl implements AudioSessionManager {
 
   @override
   Future<void> dispose() async {
+    _disposed = true;
     _interruptionSubscription?.cancel();
     _interruptionSubscription = null;
     if (_hasAudioFocus) {

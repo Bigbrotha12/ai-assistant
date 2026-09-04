@@ -1,9 +1,11 @@
+import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'audio_session_manager.dart';
 import 'vad_processor.dart';
 import 'voice_capture_pipeline.dart';
 import 'voice_controller_provider.dart';
+import 'voice_lifecycle_observer.dart';
 import 'voice_settings_providers.dart';
 
 /// Voice activity detection processor.
@@ -49,6 +51,49 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
       voiceController: ref.watch(voiceControllerProvider),
     );
     ref.onDispose(pipeline.dispose);
+
+    // Register a lifecycle observer here rather than in
+    // VoiceControllerNotifier: the pipeline provider depends on the
+    // controller, so a lifecycle read of the pipeline from the controller's
+    // ref closed a dependency circle (Riverpod CircularDependencyError on
+    // every background transition). The pipeline owns the recording state
+    // this teardown needs anyway. Re-registration pairs with the notifier
+    // rebuilds (onDispose removes the previous observer).
+    final observer = VoiceLifecycleObserver(
+      onBackground: _handleBackground,
+      onForeground: _handleForeground,
+    );
+    WidgetsBinding.instance.addObserver(observer);
+    ref.onDispose(observer.dispose);
+
     return pipeline;
+  }
+
+  /// Tears down recording and playback and ends the text conversation when
+  /// the app moves to the background. Voice calls are short-lived; dropping
+  /// the session on background is the conservative, audio-safe choice.
+  Future<void> _handleBackground() async {
+    // Capture references before the first await: the notifier may be
+    // rebuilt/disposed while the teardown is in flight, which would leave
+    // this ref dead mid-await.
+    final pipeline = state;
+    final controller = ref.read(voiceControllerProvider);
+    final session = ref.read(audioSessionManagerProvider);
+    if (pipeline.isRecording) {
+      await pipeline.stopRecording();
+    }
+    await controller.endConversation();
+    // endConversation stops playback but owns no focus; a reply playing at
+    // this moment would otherwise leak the audio focus for the app session.
+    await session.abandonAudioFocus();
+  }
+
+  /// Resets the session to idle on foreground. Deliberately does not
+  /// auto-reconnect — the user re-taps the mic to rejoin.
+  Future<void> _handleForeground() async {
+    final controller = ref.read(voiceControllerProvider);
+    if (controller.state.isPaused) {
+      await controller.resumeAfterInterruption();
+    }
   }
 }

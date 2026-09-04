@@ -91,12 +91,16 @@ class FakeMicCaptureService implements MicCaptureService {
   /// Injects one PCM16 chunk into `audioStream`.
   void emitChunk(List<int> chunk) => _audioStream.add(chunk);
 
+  /// Injects an error into `audioStream` (e.g. a dead-object read failure).
+  void emitError(Object error) => _audioStream.addError(error);
+
   Future<void> dispose() async => _audioStream.close();
 }
 
 /// In-memory [AudioPlayback] double. Inspect [playedChunks].
 class FakeAudioPlayback implements AudioPlayback {
   final _isPlayingController = StreamController<bool>.broadcast();
+  final _errorsController = StreamController<Object>.broadcast();
 
   final List<List<int>> playedChunks = [];
 
@@ -104,13 +108,22 @@ class FakeAudioPlayback implements AudioPlayback {
   Stream<bool> get isPlaying => _isPlayingController.stream;
 
   @override
-  Future<void> playAudio(List<int> pcm16bit) async {
-    playedChunks.add(pcm16bit);
+  Stream<Object> get errors => _errorsController.stream;
+
+  @override
+  Future<void> playAudio(List<int> pcm16Samples) async {
+    playedChunks.add(pcm16Samples);
     // Emit asynchronously so the controller's subscription settles the same
     // way it would with a real player.
     await Future<void>.delayed(Duration.zero);
     if (!_isPlayingController.isClosed) {
       _isPlayingController.add(true);
+    }
+    // Natural completion: the real player flips isPlaying false when the
+    // track finishes (ProcessingState.completed). Callers (turn serialization,
+    // the echo gate) await this transition.
+    if (!_isPlayingController.isClosed) {
+      _isPlayingController.add(false);
     }
   }
 
@@ -121,7 +134,10 @@ class FakeAudioPlayback implements AudioPlayback {
     }
   }
 
-  Future<void> dispose() async => _isPlayingController.close();
+  Future<void> dispose() async {
+    await _isPlayingController.close();
+    await _errorsController.close();
+  }
 }
 
 /// In-memory [AudioSessionManager] double for pipeline tests.
@@ -222,12 +238,20 @@ class FakeSttEngine implements SttEngine {
   /// Non-null makes [transcribe] throw.
   Object? error;
 
+  /// When set, [transcribe] awaits this before returning, letting tests hold
+  /// a turn in flight (for serialization / cancellation scenarios).
+  Completer<void>? gate;
+
   @override
   Future<String> transcribe(List<int> pcm16bit, {required int sampleRate}) async {
     final err = error;
     if (err != null) throw err;
     transcribed.add(List<int>.from(pcm16bit));
     sampleRates.add(sampleRate);
+    final g = gate;
+    if (g != null) {
+      await g.future;
+    }
     return transcript;
   }
 }

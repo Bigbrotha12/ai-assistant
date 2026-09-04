@@ -71,6 +71,26 @@ Uint8List pcm16ToWav(
   return wav;
 }
 
+/// Packs [samples] (16-bit signed PCM, one element per sample) into raw
+/// little-endian PCM bytes — the payload format of a PCM16 WAV `data` chunk.
+///
+/// Values outside the int16 range are clamped (defensive: today's producers —
+/// mic decode, Kokoro's resampler — already deliver in-range samples, so a
+/// future out-of-range producer degrades to clipping instead of a click).
+///
+/// This is the inverse of the mic-side decode ([MicCaptureService]): the
+/// voice pipeline's unit of exchange is int16 samples, and this packing is
+/// the single place samples become bytes. Packing with `Uint8List.fromList`
+/// instead silently truncates every sample to its low 8 bits.
+Uint8List pcm16SamplesToLeBytes(List<int> samples) {
+  final bytes = Uint8List(samples.length * 2);
+  final view = ByteData.view(bytes.buffer);
+  for (var i = 0; i < samples.length; i++) {
+    view.setInt16(i * 2, samples[i].clamp(-32768, 32767), Endian.little);
+  }
+  return bytes;
+}
+
 void _writeAscii(ByteData view, int offset, String value) {
   for (var i = 0; i < value.length; i++) {
     view.setUint8(offset + i, value.codeUnitAt(i));

@@ -48,6 +48,9 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
   bool _micBusy = false;
 
+  /// The in-flight [_holdStart], so a very quick release can wait for it.
+  Future<void>? _pendingStart;
+
   /// Mirrors [VoiceCapturePipeline.isRecording] for states where the server
   /// connection is down but local capture is still active.
   bool _localRecording = false;
@@ -104,32 +107,43 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       _micBusy = true;
       _localError = null;
     });
-    try {
-      if (!controller.state.isConnected) {
-        await controller.startConversation();
+    final started = () async {
+      try {
+        if (!controller.state.isConnected) {
+          await controller.startConversation();
+        }
+        if (!controller.state.isConnected) {
+          return; // Session error is already surfaced through the state.
+        }
+        await pipeline.startRecording();
+        if (mounted) {
+          setState(() => _localRecording = true);
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() => _localError = e.toString());
+        }
+      } finally {
+        if (mounted) setState(() => _micBusy = false);
       }
-      if (!controller.state.isConnected) {
-        return; // Session error is already surfaced through the state.
-      }
-      await pipeline.startRecording();
-      if (mounted) {
-        setState(() => _localRecording = true);
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _localError = e.toString());
-      }
-    } finally {
-      if (mounted) setState(() => _micBusy = false);
-    }
+    }();
+    // Recorded so a very quick release (_holdEnd) waits for the start to
+    // settle instead of early-returning and leaving the mic live.
+    _pendingStart = started;
+    await started;
   }
 
   /// Stops the hold-to-talk recording on release.
   Future<void> _holdEnd() async {
+    await _pendingStart;
     final pipeline = ref.read(voiceCapturePipelineProvider);
     if (!pipeline.isRecording) return;
     try {
       await pipeline.stopRecording();
+      // Hold-to-talk turn boundary: the VAD only flushes after its silence
+      // window elapses *while still recording*, which a quick release never
+      // satisfies — the buffered utterance must be flushed explicitly here.
+      await ref.read(voiceControllerProvider).flushTranscriptionBuffer();
       if (mounted) {
         setState(() => _localRecording = false);
       }

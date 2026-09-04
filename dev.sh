@@ -264,6 +264,13 @@ fi
 cd "$ROOT_DIR"
 
 # Argv after "--" (or FLUTTER_ARGS) forwards to flutter run.
+GATEWAY_ONLY=0
+if [ "${1:-}" = "--gateway-only" ]; then
+  # Run only the backend (provision + health-check + keep serving), no
+  # flutter. For standalone phone/tablet builds that talk to this host.
+  GATEWAY_ONLY=1
+  shift
+fi
 if [ "${1:-}" = "--" ]; then
   shift
   EXTRA_ARGS=("$@")
@@ -274,6 +281,13 @@ if [ -n "${FLUTTER_ARGS:-}" ]; then
   # Word-split FLUTTER_ARGS so multiple args survive as separate elements.
   read -r -a FLUTTER_ARGS_SPLIT <<<"$FLUTTER_ARGS"
   EXTRA_ARGS+=("${FLUTTER_ARGS_SPLIT[@]}")
+fi
+
+if [ "$GATEWAY_ONLY" = "1" ]; then
+  echo "Gateway-only mode: backend is up at http://${HOST_FQDN}:17600 (health: $HEALTH_URL)."
+  echo "Ctrl-C to stop. The phone app can now reach the gateway."
+  wait "$GATEWAY_PID"
+  exit 0
 fi
 
 echo "Running flutter on '$FLUTTER_DEVICE' against host '$HOST_FQDN' (dev http)…"
