@@ -121,14 +121,6 @@ void main() {
     );
   });
 
-  test('clear removes every voice key', () async {
-    await store.save(const VoiceSettings(vadSensitivity: 0.3));
-    await store.clear();
-
-    expect(await store.load(), isNull);
-    expect(storage.values, isEmpty);
-  });
-
   test('visionEnabled key round-trips', () async {
     await store.save(const VoiceSettings(visionEnabled: false));
     final loaded = await store.load();

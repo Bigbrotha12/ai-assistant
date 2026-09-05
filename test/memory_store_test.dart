@@ -233,23 +233,6 @@ void main() {
     expect(await store.searchMemories('fox'), isEmpty);
   });
 
-  test('searchMemories returns nothing after deleteMemory', () async {
-    await store.saveMemory(memory(id: 'm1', content: 'fox hunt'));
-    await store.deleteMemory('m1');
-
-    expect(await store.searchMemories('fox'), isEmpty);
-  });
-
-  test('searchMemories returns nothing after deleteAllMemories', () async {
-    await store.saveMemory(memory(id: 'm1', content: 'fox hunt'));
-    await store.saveMemory(memory(id: 'm2', content: 'dog walk'));
-
-    await store.deleteAllMemories();
-
-    expect(await store.searchMemories('fox'), isEmpty);
-    expect(await store.searchMemories('dog'), isEmpty);
-  });
-
   test('compact removes memories older than the threshold', () async {
     await store.saveMemory(
       memory(
@@ -304,20 +287,23 @@ void main() {
   });
 
   test('deleteMemory removes the row', () async {
-    await store.saveMemory(memory());
+    await store.saveMemory(memory(id: 'm1', content: 'fox hunt'));
     await store.deleteMemory('m1');
 
     expect(await store.getMemory('m1'), isNull);
+    expect(await store.searchMemories('fox'), isEmpty);
   });
 
   test('deleteAllMemories clears everything', () async {
-    await store.saveMemory(memory(id: 'm1'));
-    await store.saveMemory(memory(id: 'm2'));
+    await store.saveMemory(memory(id: 'm1', content: 'fox hunt'));
+    await store.saveMemory(memory(id: 'm2', content: 'dog walk'));
 
     await store.deleteAllMemories();
 
     expect(await store.countMemories(), 0);
     expect(await store.listMemories(), isEmpty);
+    expect(await store.searchMemories('fox'), isEmpty);
+    expect(await store.searchMemories('dog'), isEmpty);
   });
 
   test('countMemories reflects stored rows', () async {

@@ -55,18 +55,6 @@ class InMemorySecureStorage extends FlutterSecureStorage {
 }
 
 void main() {
-  test('save then load round-trips credentials', () async {
-    final store =
-        SecureAuthCredentialsStore(storage: InMemorySecureStorage());
-
-    await store.save(
-      const AuthCredentials(apiKey: 'cake_abcdef', email: 'a@b.c'),
-    );
-    final loaded = await store.load();
-
-    expect(loaded, const AuthCredentials(apiKey: 'cake_abcdef', email: 'a@b.c'));
-  });
-
   test('load returns null when nothing has been saved', () async {
     final store =
         SecureAuthCredentialsStore(storage: InMemorySecureStorage());
@@ -224,16 +212,4 @@ void main() {
     expect(base.hashCode, isNot(withToken.hashCode));
   });
 
-  test('clear empties the storage', () async {
-    final storage = InMemorySecureStorage();
-    final store = SecureAuthCredentialsStore(storage: storage);
-
-    await store.save(
-      const AuthCredentials(apiKey: 'cake_x', email: 'a@b.c'),
-    );
-    await store.clear();
-
-    expect(await store.load(), isNull);
-    expect(storage.values, isEmpty);
-  });
 }

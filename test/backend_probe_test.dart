@@ -149,16 +149,6 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       );
     });
 
-    test('returns noCredentials when no API key is stored', () async {
-      final (dio, adapter) = makeDio();
-      registerAllOk(adapter);
-
-      final status = await probe(dio, apiKeyReader: _noKey).probe(_settings);
-
-      final result = status.resultFor(BackendCheck.auth)!;
-      expect(result.status, ProbeStatus.noCredentials);
-      expect(result.detail, contains('no API key'));
-    });
   });
 
   group('inference', () {
@@ -232,15 +222,6 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       );
     });
 
-    test('returns noCredentials when no API key is stored', () async {
-      final (dio, adapter) = makeDio();
-      registerAllOk(adapter);
-
-      final status = await probe(dio, apiKeyReader: _noKey).probe(_settings);
-
-      final result = status.resultFor(BackendCheck.inference)!;
-      expect(result.status, ProbeStatus.noCredentials);
-    });
   });
 
   group('vision', () {
@@ -322,18 +303,23 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       );
     });
 
-    test('returns noCredentials when no API key is stored', () async {
+  });
+
+  group('aggregation', () {
+    test('a missing API key yields noCredentials on every check', () async {
       final (dio, adapter) = makeDio();
       registerAllOk(adapter);
 
       final status = await probe(dio, apiKeyReader: _noKey).probe(_settings);
 
-      final result = status.resultFor(BackendCheck.vision)!;
-      expect(result.status, ProbeStatus.noCredentials);
+      for (final check in BackendCheck.values) {
+        expect(status.resultFor(check)!.status, ProbeStatus.noCredentials,
+            reason: '$check');
+      }
+      expect(
+          status.resultFor(BackendCheck.auth)!.detail, contains('no API key'));
     });
-  });
 
-  group('aggregation', () {
     test('probe returns checks in the documented order', () async {
       final (dio, adapter) = makeDio();
       registerAllOk(adapter);

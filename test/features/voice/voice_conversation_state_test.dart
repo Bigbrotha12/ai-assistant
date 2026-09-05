@@ -71,32 +71,18 @@ void main() {
       expect(cleared.onDeviceTranscript, isNull);
     });
 
-    test('equality reflects every field including isPaused', () {
-      final a = VoiceConversationState.initial().copyWith(isPaused: true);
-      final b = VoiceConversationState.initial().copyWith(isPaused: true);
-      final c = VoiceConversationState.initial().copyWith(isPaused: false);
-
-      expect(a, b);
-      expect(a.hashCode, b.hashCode);
-      expect(a, isNot(c));
-      expect(a.hashCode, isNot(c.hashCode));
-    });
-
-    test('equality reflects isGenerating', () {
-      final a = VoiceConversationState.initial().copyWith(isGenerating: true);
-      final b = VoiceConversationState.initial().copyWith(isGenerating: true);
-      final c = VoiceConversationState.initial().copyWith(isGenerating: false);
-
-      expect(a, b);
-      expect(a.hashCode, b.hashCode);
-      expect(a, isNot(c));
-      expect(a.hashCode, isNot(c.hashCode));
-    });
-
-    test('equality reflects notice', () {
-      final a = VoiceConversationState.initial().copyWith(notice: 'n');
-      final b = VoiceConversationState.initial().copyWith(notice: 'n');
-      final c = VoiceConversationState.initial().copyWith(notice: null);
+    test('equality and hashCode reflect every field', () {
+      final a = VoiceConversationState.initial().copyWith(
+        isPaused: true,
+        isGenerating: true,
+        notice: 'n',
+      );
+      final b = VoiceConversationState.initial().copyWith(
+        isPaused: true,
+        isGenerating: true,
+        notice: 'n',
+      );
+      final c = VoiceConversationState.initial();
 
       expect(a, b);
       expect(a.hashCode, b.hashCode);

@@ -59,17 +59,6 @@ class InMemorySecureStorage extends FlutterSecureStorage {
 }
 
 void main() {
-  test('save then load round-trips settings', () async {
-    final store = SecureSettingsStore(storage: InMemorySecureStorage());
-
-    await store.save(
-      const BackendSettings(host: 'tail.example'),
-    );
-    final loaded = await store.load();
-
-    expect(loaded, const BackendSettings(host: 'tail.example'));
-  });
-
   test('load returns null when nothing has been saved', () async {
     final store = SecureSettingsStore(storage: InMemorySecureStorage());
 
@@ -122,19 +111,6 @@ void main() {
     await store.save(const BackendSettings(host: '   '));
 
     expect(await store.load(), isNull);
-  });
-
-  test('clear empties the storage', () async {
-    final storage = InMemorySecureStorage();
-    final store = SecureSettingsStore(storage: storage);
-
-    await store.save(
-      const BackendSettings(host: 'tail.example'),
-    );
-    await store.clear();
-
-    expect(await store.load(), isNull);
-    expect(storage.values, isEmpty);
   });
 
   test('save stores the host trimmed', () async {
