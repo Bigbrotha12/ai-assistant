@@ -253,12 +253,23 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       _localError = null;
     });
     final started = () async {
-      try {
-        if (!controller.state.isConnected) {
-          await controller.startConversation();
-        }
+try {
+      // A typed turn while the AI is speaking stops it first (barge-in), so
+      // the new reply is not spoken over the tail of the previous one.
+      if (controller.state.isAiSpeaking) {
+        await controller.interrupt();
+      }
+      if (!controller.state.isConnected) {
+        await controller.startConversation();
+      }
         if (!controller.state.isConnected) {
           return; // Session error is already surfaced through the state.
+        }
+        // Barge-in: holding the talk button while the AI is replying stops it
+        // immediately so the user's utterance is captured instead of being
+        // discarded by the mic gates.
+        if (controller.state.isAiSpeaking) {
+          await controller.interrupt();
         }
         await pipeline.startRecording();
         if (mounted) {
@@ -282,18 +293,21 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   Future<void> _holdEnd() async {
     await _pendingStart;
     final pipeline = ref.read(voiceCapturePipelineProvider);
-    if (!pipeline.isRecording) return;
     try {
-      await pipeline.stopRecording();
-      // Hold-to-talk turn boundary: the VAD only flushes after its silence
-      // window elapses *while still recording*, which a quick release never
-      // satisfies — the buffered utterance must be flushed explicitly here.
-      await ref.read(voiceControllerProvider).flushTranscriptionBuffer();
-      if (mounted) {
-        setState(() => _localRecording = false);
+      if (pipeline.isRecording) {
+        await pipeline.stopRecording();
+        // Hold-to-talk turn boundary: the VAD only flushes after its silence
+        // window elapses *while still recording*, which a quick release never
+        // satisfies — the buffered utterance must be flushed explicitly here.
+        await ref.read(voiceControllerProvider).flushTranscriptionBuffer();
       }
     } catch (_) {
       // Failures surface through the conversation state; never crash.
+    } finally {
+      // Always clear the local flag: if the pipeline was torn down under us
+      // (provider rebuild), an early return here would wedge the UI in
+      // "listening" mode until the next press.
+      if (mounted) setState(() => _localRecording = false);
     }
   }
 
@@ -386,6 +400,12 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       _localError = null;
     });
     try {
+      // A typed turn while the AI is speaking stops it first (barge-in), so
+      // the new reply is not spoken over the tail of the previous one and the
+      // typed turn can never be silently dropped by a later voice barge-in.
+      if (controller.state.isAiSpeaking) {
+        await controller.interrupt();
+      }
       if (!controller.state.isConnected) {
         await controller.startConversation();
       }
@@ -512,10 +532,24 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                             _HeroStatus(
                               recording: recording,
                               aiSpeaking: state.isAiSpeaking,
+                              generating: state.isGenerating,
                               connected: state.isConnected,
                               paused: state.isPaused,
                               premium: tier.premium,
                             ),
+                            if (state.notice != null) ...[
+                              const SizedBox(height: 6),
+                              Text(
+                                state.notice!,
+                                textAlign: TextAlign.center,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .labelSmall
+                                    ?.copyWith(
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                              ),
+                            ],
                             if (tier.premium) ...[
                               const SizedBox(height: 10),
                               Text(
@@ -584,13 +618,34 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                   ),
                   // Input mode toggle lives below the scrollable hero area so
                   // it is never clipped by the viewport or overlapped by the
-                  // transcript panel.
+                  // transcript panel. The Stop control (barge-in) sits beside
+                  // it while the AI is speaking, clear of the SpeakButton's
+                  // hit area.
                   Padding(
                     padding: const EdgeInsets.only(top: 8, bottom: 8),
-                    child: _InputModeToggle(
-                      value: _textInputMode,
-                      enabled: !_turnInFlight && !recording,
-                      onChanged: _setTextInputMode,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _InputModeToggle(
+                          value: _textInputMode,
+                          enabled: !_turnInFlight && !recording,
+                          onChanged: _setTextInputMode,
+                        ),
+                        if (state.isAiSpeaking) ...[
+                          const SizedBox(width: 12),
+                          IconButton(
+                            key: const Key('voice-stop-speaking'),
+                            tooltip: 'Stop speaking',
+                            icon: const Icon(Icons.stop_circle_outlined),
+                            color: scheme.primary,
+                            onPressed: () {
+                              unawaited(
+                                ref.read(voiceControllerProvider).interrupt(),
+                              );
+                            },
+                          ),
+                        ],
+                      ],
                     ),
                   ),
                   // Transcript panel: expands upward from the pill, so the
@@ -635,11 +690,12 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 }
 
 /// Quiet status line above the speak button (§3.4): idle copy, or the live
-/// state (recording / AI speaking / paused / connected).
+/// state (recording / generating / AI speaking / paused / connected).
 class _HeroStatus extends StatelessWidget {
   const _HeroStatus({
     required this.recording,
     required this.aiSpeaking,
+    required this.generating,
     required this.connected,
     required this.paused,
     required this.premium,
@@ -647,6 +703,7 @@ class _HeroStatus extends StatelessWidget {
 
   final bool recording;
   final bool aiSpeaking;
+  final bool generating;
   final bool connected;
   final bool paused;
   final bool premium;
@@ -662,9 +719,15 @@ class _HeroStatus extends StatelessWidget {
             ? (Icons.mic, premium ? AppColors.goldDark : scheme.error, 'Listening…')
             : aiSpeaking
                 ? (Icons.volume_up, premium ? AppColors.goldBase : scheme.primary, 'AI is speaking…')
-                : connected
-                    ? (Icons.check_circle, premium ? AppColors.goldBase : scheme.primary, 'Connected')
-                    : (Icons.mic_none, scheme.onSurfaceVariant, 'Press and hold to talk');
+                : generating
+                    ? (
+                        Icons.hourglass_top,
+                        scheme.onSurfaceVariant,
+                        'Working…',
+                      )
+                    : connected
+                        ? (Icons.check_circle, premium ? AppColors.goldBase : scheme.primary, 'Connected')
+                        : (Icons.mic_none, scheme.onSurfaceVariant, 'Press and hold to talk');
 
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,

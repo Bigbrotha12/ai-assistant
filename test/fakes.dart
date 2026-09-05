@@ -279,6 +279,13 @@ class FakeChatClient implements ChatClient {
         onToolCallDelta,
     CancelToken? cancelToken,
   }) async {
+    // Mirror the Dio-backed client (chat_client.dart's DioExceptionType.cancel
+    // handling): a request dispatched against an already-cancelled token
+    // errors immediately as ChatNetworkError('cancelled') instead of
+    // streaming. Nothing is recorded — the request never went out.
+    if (cancelToken?.isCancelled ?? false) {
+      throw const ChatNetworkError('cancelled');
+    }
     calls.add(messages);
     lastSystemPrompt = systemPrompt;
     lastTools = tools;

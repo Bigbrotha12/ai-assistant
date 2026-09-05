@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
@@ -155,17 +154,14 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     // Watch the trimmer so it is part of this notifier's dependency graph; the
     // context builder itself reads it at call time (never captured).
     ref.watch(contextTrimmerProvider);
-    // Abort any in-flight turn when this notifier is rebuilt (re-auth /
-    // engine-landing invalidateSelf), so a stream can never complete into a
-    // disposed notifier's persistence callbacks.
-    final cancelToken = CancelToken();
+    // The controller owns its per-turn cancel token (interrupt() cancels and
+    // replaces it) and cancels it in dispose(); nothing to abort here.
     final controller = VoiceController(
       chatClient: ref.watch(chatApiClientProvider),
       micCapture: ref.read(micCaptureServiceProvider),
       playback: ref.read(audioPlaybackServiceProvider),
       sttEngine: sttEngine,
       ttsEngine: ttsEngine,
-      cancelToken: cancelToken,
       onNetworkError: () {
         if (!ref.mounted) return;
         ref.read(networkStatusProvider.notifier).set(NetworkStatus.disconnected);
@@ -186,19 +182,20 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
 
     // Engines register asynchronously (model-dir resolution happens on a
     // background task). If they haven't landed by the time the controller is
-    // built, rebuild once they do — otherwise the controller would be stuck
-    // without its on-device engines for the rest of the session.
+    // built, inject them into the live controller once they do. Rebuilding
+    // here (invalidateSelf) instead would cascade into the capture pipeline
+    // and tear down an in-flight hold-to-talk mid-session, dropping the
+    // buffered utterance and wedging the UI in "listening" state.
     if (sttEngine == null || ttsEngine == null) {
       _enginesListener = () {
         final manager = ref.read(engineManagerProvider);
-        if (manager.sttEngine == null && manager.ttsEngine == null) return;
-        ref.invalidateSelf();
+        controller.sttEngine ??= manager.sttEngine;
+        controller.ttsEngine ??= manager.ttsEngine;
       };
       engineManager.addListener(_enginesListener!);
     }
 
     ref.onDispose(() {
-      cancelToken.cancel();
       if (_enginesListener != null) {
         engineManager.removeListener(_enginesListener!);
         _enginesListener = null;

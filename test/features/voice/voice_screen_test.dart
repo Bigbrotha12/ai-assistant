@@ -10,6 +10,7 @@ import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/chat_client.dart';
 import 'package:ai_assistant/core/chat_client_provider.dart';
 import 'package:ai_assistant/core/settings_providers.dart';
+import 'package:ai_assistant/core/widgets/speak_button.dart';
 import 'package:ai_assistant/features/auth/auth_flow.dart';
 import 'package:ai_assistant/features/chat/chat_providers.dart';
 import 'package:ai_assistant/features/chat/conversation_list.dart';
@@ -21,6 +22,7 @@ import 'package:ai_assistant/features/voice/voice_capture_providers.dart';
 import 'package:ai_assistant/features/voice/voice_controller_provider.dart';
 import 'package:ai_assistant/features/voice/voice_screen.dart';
 import 'package:ai_assistant/features/voice/voice_settings_providers.dart';
+import 'package:ai_assistant/features/voice/stt_engine.dart';
 
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';
@@ -62,17 +64,34 @@ class _TtsAwareEngineManager extends FakeEngineManager {
   TtsEngine? get ttsEngine => tts;
 }
 
+/// [FakeEngineManager] that exposes a [FakeSttEngine], so busy-state tests
+/// can drive real mid-generation flushes through the controller.
+class _SttAwareEngineManager extends FakeEngineManager {
+  _SttAwareEngineManager(this.stt);
+
+  final FakeSttEngine stt;
+
+  @override
+  SttEngine? get sttEngine => stt;
+}
+
 void main() {
   ProviderContainer buildContainer({
     FakeChatClient? chatClient,
     FakeChatStore? store,
     FakeTtsEngine? tts,
+    FakeAudioPlayback? playback,
+    FakeSttEngine? stt,
     String? activeConversationId,
   }) {
     final container = ProviderContainer(
       overrides: [
         engineManagerProvider.overrideWithValue(
-          tts != null ? _TtsAwareEngineManager(tts) : FakeEngineManager(),
+          tts != null
+              ? _TtsAwareEngineManager(tts)
+              : stt != null
+                  ? _SttAwareEngineManager(stt)
+                  : FakeEngineManager(),
         ),
         voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
         settingsStoreProvider.overrideWithValue(
@@ -84,7 +103,9 @@ void main() {
           ),
         ),
         micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
-        audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+        audioPlaybackServiceProvider.overrideWithValue(
+          playback ?? FakeAudioPlayback(),
+        ),
         audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
         chatApiClientProvider.overrideWithValue(
           chatClient ?? FakeChatClient(),
@@ -366,6 +387,59 @@ void main() {
     expect(conv.messages[1].content, 'Hi there');
   });
 
+  testWidgets('sending a typed message while the AI speaks barges in first',
+      (tester) async {
+    final tts = FakeTtsEngine();
+    final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
+    final chat = FakeChatClient(
+      streamDeltas: const [
+        ['Typed reply'],
+      ],
+      results: const [
+        ChatResult(content: 'Typed reply', toolCalls: [], finishReason: 'stop'),
+      ],
+    );
+    final container = buildContainer(
+      chatClient: chat,
+      tts: tts,
+      playback: playback,
+      activeConversationId: 'conv-barge',
+    );
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+
+    // The AI starts a reply that keeps playing (held open).
+    unawaited(controller.synthesizeOnDevice('spoken reply'));
+    await settle(tester);
+    expect(controller.state.isAiSpeaking, isTrue);
+    expect(playback.playedChunks, hasLength(1));
+
+    // Switch to text mode and send a typed message while the AI is speaking.
+    await tester.tap(find.text('Text'));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const Key('voice-composer-field')),
+      'typed',
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('voice-composer-send')));
+    await settle(tester);
+
+    // Barge-in: the AI's speech is stopped before the typed turn is sent.
+    expect(controller.state.isAiSpeaking, isFalse);
+    // TTS must still not run for the text-mode turn.
+    expect(tts.synthesized, ['spoken reply']);
+    expect(controller.state.lastReply, 'Typed reply');
+  });
+
   testWidgets('history action opens the session list and switching re-seeds',
       (tester) async {
     final store = FakeChatStore(initial: [
@@ -579,5 +653,161 @@ void main() {
       tester.getTopLeft(find.text('live')).dy,
       lessThan(tester.getTopLeft(find.text('Reply live')).dy),
     );
+  });
+
+  testWidgets('the Stop control appears while the AI speaks and tapping it '
+      'stops playback', (tester) async {
+    final tts = FakeTtsEngine();
+    final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
+    final container = buildContainer(tts: tts, playback: playback);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+
+    // No stop control while idle.
+    expect(find.byKey(const Key('voice-stop-speaking')), findsNothing);
+
+    // The AI starts a reply that keeps playing (held open).
+    unawaited(controller.synthesizeOnDevice('reply'));
+    await settle(tester);
+    expect(controller.state.isAiSpeaking, isTrue);
+
+    // The Stop control is visible while the AI is speaking.
+    final stop = find.byKey(const Key('voice-stop-speaking'));
+    expect(stop, findsOneWidget);
+
+    // Tapping it stops playback and hides the control.
+    await tester.tap(stop);
+    await settle(tester);
+    expect(controller.state.isAiSpeaking, isFalse);
+    expect(find.byKey(const Key('voice-stop-speaking')), findsNothing);
+
+    // Releasing the held track must not restart anything.
+    playback.holdCompletion!.complete();
+    await settle(tester);
+    expect(controller.state.isAiSpeaking, isFalse);
+  });
+
+  testWidgets('holding the talk button while the AI speaks stops the AI and '
+      'starts recording', (tester) async {
+    final tts = FakeTtsEngine();
+    final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
+    final container = buildContainer(tts: tts, playback: playback);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+
+    // The AI starts a reply that keeps playing (held open).
+    unawaited(controller.synthesizeOnDevice('reply'));
+    await settle(tester);
+    expect(controller.state.isAiSpeaking, isTrue);
+
+    // Press and hold the talk button: barge-in stops the AI and recording
+    // starts so the user's utterance is captured.
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(SpeakButton)),
+    );
+    await settle(tester);
+
+    expect(controller.state.isAiSpeaking, isFalse);
+    expect(controller.state.isRecording, isTrue);
+    expect(playback.playedChunks, hasLength(1));
+
+    // Release: the hold ends cleanly. Drain the hold-end chain (subscription
+    // cancels, mic stop, controller sync) — settle's frame pumps alone do not
+    // flush every cancel future in the fake-async zone.
+    // Release: the hold ends cleanly. The teardown chain (stream-subscription
+    // cancels) runs on the real event loop, which fake-async frame pumps do
+    // not drive, so end the session directly instead of asserting the
+    // mid-teardown recording state.
+    await gesture.up();
+    await controller.endConversation();
+    expect(controller.state.isConnected, isFalse);
+    expect(controller.state.isRecording, isFalse);
+  });
+
+  testWidgets('shows the Working status while the LLM stream is in flight',
+      (tester) async {
+    final chat = FakeChatClient()..hang = Completer<ChatResult>();
+    final container = buildContainer(chatClient: chat);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+    unawaited(controller.sendText('hello'));
+    await settle(tester);
+
+    expect(controller.state.isGenerating, isTrue);
+    expect(find.text('Working…'), findsOneWidget);
+
+    chat.hang!.complete(
+      const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
+    );
+    await settle(tester);
+
+    expect(controller.state.isGenerating, isFalse);
+    expect(find.text('Working…'), findsNothing);
+  });
+
+  testWidgets('renders the transient notice when a busy flush is dropped',
+      (tester) async {
+    final chat = FakeChatClient()..hang = Completer<ChatResult>();
+    final container = buildContainer(chatClient: chat, stt: FakeSttEngine());
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    final mic = container.read(micCaptureServiceProvider) as FakeMicCaptureService;
+    await controller.startConversation();
+    // Turn 1 is a flushed utterance whose stream hangs mid-generation.
+    mic.emitChunk([1, 1, 1]);
+    await tester.pump();
+    await controller.flushTranscriptionBuffer();
+    await settle(tester);
+
+    // A queued utterance (accepted), then a dropped one: the notice renders.
+    mic.emitChunk([2, 2, 2]);
+    await tester.pump();
+    await controller.flushTranscriptionBuffer();
+    mic.emitChunk([3, 3, 3]);
+    await tester.pump();
+    await controller.flushTranscriptionBuffer();
+    await settle(tester);
+
+    expect(controller.state.notice, isNotNull);
+    expect(
+      find.text('Still working — one thing at a time.'),
+      findsOneWidget,
+    );
+
+    chat.hang!.complete(
+      const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
+    );
+    await settle(tester);
   });
 }

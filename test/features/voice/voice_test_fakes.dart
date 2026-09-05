@@ -104,6 +104,10 @@ class FakeAudioPlayback implements AudioPlayback {
 
   final List<List<int>> playedChunks = [];
 
+  /// When set, [playAudio] holds `isPlaying` true until this completes,
+  /// simulating a long-running track (for interrupt / barge-in scenarios).
+  Completer<void>? holdCompletion;
+
   @override
   Stream<bool> get isPlaying => _isPlayingController.stream;
 
@@ -118,6 +122,23 @@ class FakeAudioPlayback implements AudioPlayback {
     await Future<void>.delayed(Duration.zero);
     if (!_isPlayingController.isClosed) {
       _isPlayingController.add(true);
+    }
+    final hold = holdCompletion;
+    if (hold != null) {
+      // Mirrors production fire-and-forget playback (the real service returns
+      // immediately and just_audio keeps playing): playAudio returns while
+      // the track is still playing, and the completion (isPlaying false) is
+      // emitted only when the held track finishes. This keeps callers parked
+      // in the flush turn's `firstWhere(!playing)` wait during the hold, the
+      // same timeline the real service produces.
+      unawaited(
+        hold.future.then((_) {
+          if (!_isPlayingController.isClosed) {
+            _isPlayingController.add(false);
+          }
+        }),
+      );
+      return;
     }
     // Natural completion: the real player flips isPlaying false when the
     // track finishes (ProcessingState.completed). Callers (turn serialization,
@@ -258,16 +279,40 @@ class FakeSttEngine implements SttEngine {
 
 /// [TtsEngine] double returning a canned PCM sequence.
 class FakeTtsEngine implements TtsEngine {
-  FakeTtsEngine({this.samples = const [1, 2, 3], this.name = 'fake_tts'});
+  FakeTtsEngine({
+    this.samples = const [1, 2, 3],
+    this.sampleVariants = const [],
+    this.name = 'fake_tts',
+  });
 
   final List<int> samples;
+
+  /// Per-call PCM overrides, indexed by call order: lets tests tie a played
+  /// chunk to the utterance that produced it (ordering assertions). Falls
+  /// back to [samples] when empty or exhausted.
+  final List<List<int>> sampleVariants;
+
   @override
   final String name;
   final List<String> synthesized = [];
 
+  /// When set, [synthesize] awaits this before returning, letting tests hold
+  /// synthesis in flight (for interrupt / barge-in scenarios).
+  Completer<void>? gate;
+
   @override
   Future<List<int>> synthesize(String text, {required int sampleRate}) async {
+    final index = synthesized.length;
     synthesized.add(text);
+    final g = gate;
+    if (g != null) {
+      await g.future;
+    }
+    if (sampleVariants.isNotEmpty) {
+      final clamped =
+          index >= sampleVariants.length ? sampleVariants.length - 1 : index;
+      return sampleVariants[clamped];
+    }
     return samples;
   }
 }

@@ -11,15 +11,17 @@ import 'voice_settings_providers.dart';
 /// Voice activity detection processor.
 ///
 /// Sensitivity and minimum silence duration are sourced from persisted
-/// [VoiceSettings]. The provider rebuilds (creating a fresh processor)
-/// when settings change, ensuring the new processor starts with the
-/// correct values.
+/// [VoiceSettings]. Settings are read (not watched) at build time: the
+/// async settings load (loading → data) must not rebuild this provider at
+/// startup — a rebuild cascades into the capture pipeline and tears down
+/// an in-flight hold-to-talk. Live settings changes are applied to the
+/// running processor in place by [VoiceCapturePipelineNotifier].
 final vadProcessorProvider = Provider<VadProcessor>((ref) {
-  final settingsAsync = ref.watch(voiceSettingsProvider);
-  final sensitivity = settingsAsync.value?.vadSensitivity ?? 0.5;
-  final minSilence = settingsAsync.value?.minTurnSeconds ?? 0.5;
-  final processor =
-      EnergyBasedVadProcessor(sensitivity: sensitivity, minSilenceSeconds: minSilence);
+  final settings = ref.read(voiceSettingsProvider).value;
+  final processor = EnergyBasedVadProcessor(
+    sensitivity: settings?.vadSensitivity ?? 0.5,
+    minSilenceSeconds: settings?.minTurnSeconds ?? 0.5,
+  );
   ref.onDispose(processor.dispose);
   return processor;
 });
@@ -50,7 +52,23 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
       audioSession: ref.watch(audioSessionManagerProvider),
       voiceController: ref.watch(voiceControllerProvider),
     );
-    ref.onDispose(pipeline.dispose);
+
+    // Apply voice-settings changes to the running VAD in place instead of
+    // rebuilding the processor (and thereby this pipeline): a rebuild while
+    // a hold is active stops the mic mid-utterance and drops the buffered
+    // audio. Fires once at startup with the loaded settings, so the first
+    // frame of a session already carries the persisted values.
+    final vadSettingsSub = ref.listen(
+      voiceSettingsProvider,
+      (_, next) {
+        pipeline.vad.setSensitivity(next.value?.vadSensitivity ?? 0.5);
+        pipeline.vad.setMinSilenceSeconds(next.value?.minTurnSeconds ?? 0.5);
+      },
+    );
+    ref.onDispose(() {
+      vadSettingsSub.close();
+      pipeline.dispose();
+    });
 
     // Register a lifecycle observer here rather than in
     // VoiceControllerNotifier: the pipeline provider depends on the

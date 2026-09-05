@@ -500,11 +500,14 @@ Future<void> _isolateMain(SendPort mainPort) async {
           //   sid 0-9   — voice.bin ships 10 speakers; sid 0 is the default
           //   numSteps  — flow-matching steps (8 = release default)
           //   lang 'en' — text language carried via the extra payload
+          //   speed     — duration-predictor scale; <1.0 restores the tail that
+          //               the predictor under-estimates for symbol-heavy text
           final audio = engine.generateWithConfig(
             text: text,
             config: const sherpa_onnx.OfflineTtsGenerationConfig(
               sid: 0,
               numSteps: 8,
+              speed: 0.9,
               extra: {'lang': 'en'},
             ),
           );
