@@ -243,6 +243,7 @@ void main() {
     });
 
     test('unknown, empty, or malformed URIs map to null', () {
+      expect(targetForUri(null), isNull);
       expect(targetForUri('aiassistant://bogus'), isNull);
       expect(targetForUri('https://example.com'), isNull);
       expect(targetForUri(''), isNull);

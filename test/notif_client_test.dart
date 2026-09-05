@@ -1,7 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/notifications/notif_client.dart';
-import 'package:ai_assistant/features/widgets/launcher_shortcuts.dart';
 
 void main() {
   group('parseNtfyEvent', () {
@@ -42,20 +41,6 @@ void main() {
           '{"id":"x","event":"message","message":"Hi","title":"T"}');
       expect(message, isNotNull);
       expect(message!.topic, '');
-    });
-  });
-
-  group('launcher shortcut resolution', () {
-    test('maps chat and voice URIs to targets', () {
-      expect(targetForUri('aiassistant://open_chat'), LauncherShortcutTarget.chat);
-      expect(targetForUri('aiassistant://open_voice'), LauncherShortcutTarget.voice);
-    });
-
-    test('returns null for unknown, malformed, or absent URIs', () {
-      expect(targetForUri(null), isNull);
-      expect(targetForUri('aiassistant://unknown'), isNull);
-      expect(targetForUri('https://example.com'), isNull);
-      expect(targetForUri(''), isNull);
     });
   });
 }

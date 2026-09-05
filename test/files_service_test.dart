@@ -238,6 +238,20 @@ void main() {
         throwsA(isA<FilesValidationError>()),
       );
     });
+
+    test('rejects IDs with angle brackets or spaces', () async {
+      final dio = _makeDio().$1;
+      final client = _client(dio);
+
+      expect(
+        () => client.fetchFile('a<123'),
+        throwsA(isA<FilesValidationError>()),
+      );
+      expect(
+        () => client.fetchFile('my file'),
+        throwsA(isA<FilesValidationError>()),
+      );
+    });
   });
 
   group('deleteFile', () {
