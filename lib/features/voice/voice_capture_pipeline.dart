@@ -44,6 +44,14 @@ class VoiceCapturePipeline {
   bool _isRecording = false;
   bool _isPaused = false;
 
+  /// Grace before a hold-to-talk recording self-heals after an interruption
+  /// that never resolved. An interruption-begin that is never followed by an
+  /// end (spurious focus churn from the app's own playback stop/start) must
+  /// not permanently kill the user's hold — after this delay the mic is
+  /// restarted while the hold is still active.
+  static const _selfHealDelay = Duration(milliseconds: 1200);
+  Timer? _selfHealTimer;
+
   /// Whether the pipeline is actively capturing audio.
   bool get isRecording => _isRecording;
 
@@ -74,8 +82,9 @@ class VoiceCapturePipeline {
     await voiceController.startRecording();
   }
 
-  /// Subscribes to the mic stream. Shared by [startRecording] and the
-  /// interruption-resume path so error/done handling can never drift apart.
+  /// Subscribes to the mic stream. Shared by [startRecording], the
+  /// interruption-resume path and the self-heal path so error/done handling
+  /// can never drift apart.
   void _listenMic() {
     var chunkCount = 0;
     _micSubscription = micCapture.audioStream.listen(
@@ -97,20 +106,43 @@ class VoiceCapturePipeline {
         if (kDebugMode) {
           debugPrint('VoicePipeline: mic stream error: $e');
         }
-        voiceController.reportError(e);
+        // A recorder that died mid-hold (e.g. ERROR_DEAD_OBJECT from audio
+        // focus churn on repeated start/stop) must not end the user's
+        // utterance. Restart the mic; a persistent failure surfaces through
+        // the restart instead of an error banner that lies about a recovered
+        // hold.
+        unawaited(_restartMic());
       },
       onDone: () {
-        // The recorder died mid-session; reflect it so the UI unsticks and
-        // no "recording" state is held against a dead stream.
+        // The recorder died mid-hold (or the service is being torn down). If
+        // the hold is still active, restart the mic so the utterance survives.
         if (kDebugMode) {
           debugPrint('VoicePipeline: mic stream ended');
         }
-        if (_isRecording) {
-          _isRecording = false;
-          unawaited(voiceController.stopRecording());
-        }
+        unawaited(_restartMic());
       },
     );
+  }
+
+  /// Restarts the mic capture and re-subscribes, preserving the buffered STT
+  /// audio (unlike [startRecording], which clears it). A no-op when the hold
+  /// is over or the session is paused (a real interruption still owns the
+  /// speaker). Failures are surfaced through [voiceController.reportError].
+  Future<void> _restartMic() async {
+    if (!_isRecording || _isPaused) return;
+    if (kDebugMode) {
+      debugPrint('VoicePipeline: restarting mic (self-heal)');
+    }
+    try {
+      await micCapture.start();
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('VoicePipeline: mic restart failed: $e');
+      }
+      voiceController.reportError(e);
+      return;
+    }
+    _listenMic();
   }
 
   void _onMicAudio(List<int> chunk) {
@@ -129,6 +161,14 @@ class VoiceCapturePipeline {
       case VadState.speechStarted:
         break;
       case VadState.speechStopped:
+        // Mid-hold silence is NOT end-of-utterance: the user is still
+        // holding and may resume speaking. The hold's release flush owns
+        // that turn boundary — flushing here races it, and under the
+        // one-pending busy-state cap one of the two utterances gets dropped
+        // with a notice (observed as phantom "dropped" notices on device).
+        // The pipeline's own flag is set synchronously at startRecording,
+        // before the controller's async flag catches up.
+        if (voiceController.state.isRecording || _isRecording) break;
         // End-of-utterance: flush the buffered mic audio through the
         // controller's text turn (on-device STT → LLM → TTS).
         // flushTranscriptionBuffer copies and clears the buffer
@@ -155,6 +195,8 @@ class VoiceCapturePipeline {
   Future<void> stopRecording() async {
     if (!_isRecording) return;
     _isRecording = false;
+    _selfHealTimer?.cancel();
+    _selfHealTimer = null;
     if (kDebugMode) {
       debugPrint('VoicePipeline: stopRecording');
     }
@@ -213,9 +255,31 @@ class VoiceCapturePipeline {
     if (epoch != _interruptionEpoch) return;
     // Pause any in-flight TTS playback and mark the session paused.
     await voiceController.pauseForInterruption();
+    // A hold-to-talk must not be killed by a transient interruption that
+    // never resolves (spurious focus churn from the app's own playback
+    // stop/start). If the user is still holding when the grace elapses and
+    // no interruption-end has arrived, restart the mic.
+    _armSelfHeal(epoch);
+  }
+
+  /// Arms the self-heal fallback for a paused hold: after [_selfHealDelay],
+  /// if the hold is still active and no newer interruption event has
+  /// superseded [epoch], resume the mic exactly as an interruption-end would.
+  void _armSelfHeal(int epoch) {
+    _selfHealTimer?.cancel();
+    _selfHealTimer = Timer(_selfHealDelay, () {
+      _selfHealTimer = null;
+      if (!_isRecording || epoch != _interruptionEpoch) return;
+      if (kDebugMode) {
+        debugPrint('VoicePipeline: interruption unresolved — self-healing mic');
+      }
+      unawaited(_resumeAfterInterruption(epoch));
+    });
   }
 
   Future<void> _resumeAfterInterruption(int epoch) async {
+    _selfHealTimer?.cancel();
+    _selfHealTimer = null;
     _isPaused = false;
     // Clear the paused flag regardless of whether mic restart succeeds.
     await voiceController.resumeAfterInterruption();
@@ -239,6 +303,8 @@ class VoiceCapturePipeline {
 
   /// Release all resources.
   Future<void> dispose() async {
+    _selfHealTimer?.cancel();
+    _selfHealTimer = null;
     if (_isRecording) {
       await stopRecording();
     }

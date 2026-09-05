@@ -65,6 +65,9 @@ class FakeMicCaptureService implements MicCaptureService {
   bool permissionGranted = true;
   int? startSampleRate;
 
+  /// Number of [start] calls — lets tests observe mic restarts (self-heal).
+  int startCount = 0;
+
   @override
   bool get isRecording => _recording;
 
@@ -76,10 +79,12 @@ class FakeMicCaptureService implements MicCaptureService {
 
   @override
   Future<void> start({int sampleRate = 16000}) async {
+    if (_recording) return;
     if (!permissionGranted) {
       throw StateError('Microphone permission denied');
     }
     _recording = true;
+    startCount++;
     startSampleRate = sampleRate;
   }
 
@@ -92,7 +97,12 @@ class FakeMicCaptureService implements MicCaptureService {
   void emitChunk(List<int> chunk) => _audioStream.add(chunk);
 
   /// Injects an error into `audioStream` (e.g. a dead-object read failure).
-  void emitError(Object error) => _audioStream.addError(error);
+  /// Marks the recorder stopped, mirroring the real service where the
+  /// underlying stream finishing ends the recording.
+  void emitError(Object error) {
+    _recording = false;
+    _audioStream.addError(error);
+  }
 
   Future<void> dispose() async => _audioStream.close();
 }
@@ -107,6 +117,11 @@ class FakeAudioPlayback implements AudioPlayback {
   /// When set, [playAudio] holds `isPlaying` true until this completes,
   /// simulating a long-running track (for interrupt / barge-in scenarios).
   Completer<void>? holdCompletion;
+
+  /// When set, [stop] awaits this before emitting `isPlaying` false,
+  /// simulating a slow/hung playback stop (for barge-in robustness
+  /// scenarios — recording must start regardless of the stop's latency).
+  Completer<void>? stopGate;
 
   @override
   Stream<bool> get isPlaying => _isPlayingController.stream;
@@ -150,6 +165,10 @@ class FakeAudioPlayback implements AudioPlayback {
 
   @override
   Future<void> stop() async {
+    final gate = stopGate;
+    if (gate != null) {
+      await gate.future;
+    }
     if (!_isPlayingController.isClosed) {
       _isPlayingController.add(false);
     }
@@ -297,15 +316,21 @@ class FakeTtsEngine implements TtsEngine {
   final List<String> synthesized = [];
 
   /// When set, [synthesize] awaits this before returning, letting tests hold
-  /// synthesis in flight (for interrupt / barge-in scenarios).
+  /// synthesis in flight (for interrupt / barge-in scenarios). Applies to
+  /// every call unless [gateCallLimit] bounds it to the first N calls.
   Completer<void>? gate;
+
+  /// When non-null, [gate] only holds the first N synthesis calls — later
+  /// calls return immediately (e.g. hold the reply's first sentence while a
+  /// later acknowledgement synthesizes freely).
+  int? gateCallLimit;
 
   @override
   Future<List<int>> synthesize(String text, {required int sampleRate}) async {
     final index = synthesized.length;
     synthesized.add(text);
     final g = gate;
-    if (g != null) {
+    if (g != null && (gateCallLimit == null || index < gateCallLimit!)) {
       await g.future;
     }
     if (sampleVariants.isNotEmpty) {

@@ -631,6 +631,45 @@ void main() {
       await playback.dispose();
     });
 
+    test('interrupt re-opens the mic gates synchronously even while the '
+        'playback stop is held open', () async {
+      final chat = FakeChatClient();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback()
+        ..holdCompletion = Completer<void>()
+        ..stopGate = Completer<void>();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      unawaited(controller.synthesizeOnDevice('hello'));
+      await pumpEventQueue();
+      expect(controller.state.isAiSpeaking, isTrue);
+
+      // The stop is held open, yet the gates must reopen before it resolves:
+      // a barge-in recording that starts now must not be blocked on it.
+      final interruptFuture = controller.interrupt();
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      // The stop resolves; interrupt completes and the flag stays cleared.
+      playback.stopGate!.complete();
+      await interruptFuture;
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      playback.holdCompletion!.complete();
+      await pumpEventQueue();
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
     test('interrupt before the LLM call surfaces a real cancellation that '
         'sendText swallows', () async {
       final chat = FakeChatClient();
@@ -806,6 +845,75 @@ void main() {
       expect(controller.state.lastReply, 'hi');
       expect(tts.synthesized, ['hi']);
       expect(playback.playedChunks, hasLength(1));
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('barge-in mid-reply then a follow-up utterance still completes its '
+        'turn (user-observed pipeline stall)', () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Alpha. Beta.'],
+        ],
+        results: [
+          const ChatResult(
+            content: 'Alpha. Beta.',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
+      final tts = FakeTtsEngine();
+      final stt = FakeSttEngine(transcript: 'follow up');
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+      );
+      await controller.startConversation();
+
+      // Turn 1 (user speaks, releases, the AI starts replying).
+      mic.emitChunk([1, 1, 1]);
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(chat.callCount, 1);
+      expect(stt.transcribed, hasLength(1));
+      // Alpha is playing (held open).
+      expect(playback.playedChunks, hasLength(1));
+      expect(controller.state.isAiSpeaking, isTrue);
+
+      // Barge-in mid-reply: the user presses the talk button.
+      await controller.interrupt();
+      // Release the interrupted track: the drain must exit cleanly.
+      playback.holdCompletion!.complete();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      // The follow-up utterance: hold → speak → release → flush.
+      mic.emitChunk([2, 2, 2]);
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      await pumpEventQueue();
+
+      // Turn 2 MUST complete: STT ran, the stream started, a reply spoke.
+      // (Turn 1 spoke Alpha; turn 2's reply "Alpha. Beta." speaks two
+      // sentences — the follow-up survived the interrupt intact.)
+      expect(stt.transcribed, hasLength(2));
+      expect(chat.callCount, 2);
+      expect(playback.playedChunks, hasLength(3));
+      expect(controller.state.isAiSpeaking, isFalse);
 
       await controller.dispose();
       await mic.dispose();
@@ -1509,66 +1617,129 @@ void main() {
     });
   });
 
-  group('interim speech (W1.3)', () {
-    test('fires after the delay when the stream produces nothing', () async {
-      final chat = FakeChatClient()..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-        interimDelay: const Duration(milliseconds: 20),
-      );
-      await controller.startConversation();
-
-      final send = controller.sendText('hello');
-      await pumpEventQueue();
-      expect(controller.state.isGenerating, isTrue);
-
-      // Nothing streamed for one interim delay: the canned line speaks.
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await pumpEventQueue();
-
-      expect(tts.synthesized, [VoiceController.kInterimSpeechLine]);
-      expect(playback.playedChunks, hasLength(1));
-
-      // Releasing the stream: empty reply → no further audio.
-      chat.hang!.complete(
-        const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
-      );
-      await send;
-      await pumpEventQueue();
-
-      expect(playback.playedChunks, hasLength(1));
-      expect(controller.state.isGenerating, isFalse);
-
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
-
-    test('does not fire when a reply sentence is already enqueued',
-        () async {
+  group('review fixes (post-commit 0995545)', () {
+    test('a hung synthesis times out, drops that sentence, and the queue '
+        'continues (C1)', () async {
       final chat = FakeChatClient(
         streamDeltas: [
-          // The trailing capital closes the first boundary mid-stream, so the
-          // sentence is enqueued while the stream is still held.
-          ['First sentence. Second'],
+          ['First sentence. Second sentence.'],
         ],
         results: [
           const ChatResult(
-            content: 'First sentence. Second',
+            content: 'First sentence. Second sentence.',
             toolCalls: [],
             finishReason: 'stop',
           ),
         ],
-      )..hang = Completer<ChatResult>();
+      );
       final mic = FakeMicCaptureService();
       final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine()..gate = Completer<void>();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+        synthesisTimeout: const Duration(milliseconds: 30),
+      );
+      await controller.startConversation();
+
+      final send = controller.sendText('hello');
+      await pumpEventQueue();
+
+      // Sentence 1's synthesis hangs past the timeout: it is dropped and
+      // reported, and the drain moves on to sentence 2 (the remainder),
+      // whose synthesis is now also hanging on the same gate.
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      await pumpEventQueue();
+      expect(controller.state.error, isNotNull);
+      expect(playback.playedChunks, isEmpty);
+
+      // Release before sentence 2's own timeout (started at ~30ms): it
+      // synthesizes and plays — the queue survived the timed-out sentence.
+      tts.gate!.complete();
+      await send;
+      await pumpEventQueue();
+
+      // Sentence 2 survived and played. (The fake records the synthesis
+      // request before its gate, so both calls appear in the record; only
+      // sentence 2 produced audio.)
+      expect(tts.synthesized, containsAll(['First sentence.', 'Second sentence.']));
+      expect(playback.playedChunks, hasLength(1));
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('interrupt during a held synthesis does not swallow the next '
+        'turn\'s first sentence (M1)', () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Alpha.'],
+        ],
+        results: [
+          const ChatResult(
+            content: 'Alpha.',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine()..gate = Completer<void>();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+      );
+      await controller.startConversation();
+
+      // Turn 1 enqueues Alpha; its synthesis hangs.
+      final send1 = controller.sendText('hi');
+      await pumpEventQueue();
+      expect(tts.synthesized, ['Alpha.']);
+
+      // Barge-in while the synthesis is still in flight, then let the stale
+      // synthesis return.
+      await controller.interrupt();
+      tts.gate!.complete();
+      await send1;
+
+      // Turn 2 must get a FRESH drain: its Alpha is synthesized and played.
+      final send2 = controller.sendText('hi again');
+      await send2;
+
+      expect(tts.synthesized, ['Alpha.', 'Alpha.']);
+      expect(playback.playedChunks, hasLength(1));
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('a playback stream closed mid-drain drops the queue instead of '
+        'stranding it (M3)', () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Alpha. Beta.'],
+        ],
+        results: [
+          const ChatResult(
+            content: 'Alpha. Beta.',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
         chatClient: chat,
@@ -1576,38 +1747,26 @@ void main() {
         playback: playback,
         ttsEngine: tts,
         echoGateDuration: Duration.zero,
-        interimDelay: const Duration(milliseconds: 20),
       );
       await controller.startConversation();
 
       final send = controller.sendText('hello');
       await pumpEventQueue();
-
-      // The sentence is enqueued and synthesizing long before the delay
-      // elapses: first audio is already in flight, no acknowledgement. The
-      // timer was cancelled at first playback; by the time the delay has
-      // elapsed, even a completed first sentence must not resurrect it.
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await pumpEventQueue();
-
-      expect(tts.synthesized, ['First sentence.']);
       expect(playback.playedChunks, hasLength(1));
 
-      chat.hang!.complete(
-        const ChatResult(
-          content: 'First sentence. Second',
-          toolCalls: [],
-          finishReason: 'stop',
-        ),
-      );
+      // The player is torn down while Alpha is "playing": its end-wait
+      // throws StateError — the drain must complete, drop the rest, and
+      // return instead of hanging the turn.
+      await playback.dispose();
       await send;
+
+      expect(controller.state.isAiSpeaking, isFalse);
 
       await controller.dispose();
       await mic.dispose();
-      await playback.dispose();
     });
 
-    test('a queued utterance re-arms the acknowledgement', () async {
+    test('interrupt clears a stale drop notice (m6)', () async {
       final chat = FakeChatClient()..hang = Completer<ChatResult>();
       final mic = FakeMicCaptureService();
       final playback = FakeAudioPlayback();
@@ -1620,129 +1779,63 @@ void main() {
         sttEngine: stt,
         ttsEngine: tts,
         echoGateDuration: Duration.zero,
-        interimDelay: const Duration(milliseconds: 20),
       );
       await controller.startConversation();
 
-      final send = controller.sendText('hello');
-      await pumpEventQueue();
-
-      // First acknowledgement for the silent turn.
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await pumpEventQueue();
-      expect(playback.playedChunks, hasLength(1));
-
-      // A queued utterance re-arms: a second line speaks for it — from the
-      // cache, without a second synthesis.
       mic.emitChunk([1, 1, 1]);
       await Future<void>.delayed(Duration.zero);
       await controller.flushTranscriptionBuffer();
-      await Future<void>.delayed(const Duration(milliseconds: 50));
       await pumpEventQueue();
-
-      expect(playback.playedChunks, hasLength(2));
-      expect(tts.synthesized, [VoiceController.kInterimSpeechLine]);
-
-      chat.hang!.complete(
-        const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
-      );
-      await send;
-
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
-
-    test('does not fire on an errored turn', () async {
-      final chat = FakeChatClient()..error = ChatServerError('boom');
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-        interimDelay: const Duration(milliseconds: 20),
-      );
-      await controller.startConversation();
-
-      await controller.sendText('hello');
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      // Queued, then dropped with a notice.
+      mic.emitChunk([2, 2, 2]);
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      mic.emitChunk([3, 3, 3]);
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
       await pumpEventQueue();
+      expect(controller.state.notice, isNotNull);
 
-      expect(playback.playedChunks, isEmpty);
-      expect(controller.state.error, isNotNull);
-
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
-
-    test('never fires for a text-mode turn (speakReply: false)', () async {
-      final chat = FakeChatClient()..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-        interimDelay: const Duration(milliseconds: 20),
-      );
-      await controller.startConversation();
-
-      final send = controller.sendText('hello', speakReply: false);
-      await pumpEventQueue();
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await pumpEventQueue();
-
-      expect(tts.synthesized, isEmpty);
-      expect(playback.playedChunks, isEmpty);
-
-      chat.hang!.complete(
-        const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
-      );
-      await send;
-
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
-
-    test('interrupt cancels the pending acknowledgement', () async {
-      final chat = FakeChatClient()..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-        interimDelay: const Duration(milliseconds: 20),
-      );
-      await controller.startConversation();
-
-      final send = controller.sendText('hello');
-      await pumpEventQueue();
       await controller.interrupt();
-
-      // Far past the delay: nothing may fire into an interrupted turn.
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-      await pumpEventQueue();
-
-      expect(tts.synthesized, isEmpty);
-      expect(playback.playedChunks, isEmpty);
+      expect(controller.state.notice, isNull);
 
       chat.hang!.complete(
         const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
       );
-      await send;
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('onDeviceTranscript callback fires exactly once per utterance (m5)',
+        () async {
+      final chat = FakeChatClient(
+        results: [
+          const ChatResult(content: 'hi', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+      final stt = FakeSttEngine();
+      final transcripts = <String>[];
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+        onDeviceTranscript: transcripts.add,
+      );
+      await controller.startConversation();
+
+      mic.emitChunk([1, 1, 1]);
+      await Future<void>.delayed(Duration.zero);
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+
+      expect(transcripts, ['hello']);
 
       await controller.dispose();
       await mic.dispose();

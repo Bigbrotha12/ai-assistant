@@ -94,6 +94,10 @@ class AudioPlaybackService implements AudioPlayback {
   /// proxy map at a single entry.
   final _BytesAudioSource _source;
 
+  /// Bumped on every [stop]; a play whose source load spans a [stop] must
+  /// not start playing the "cancelled" utterance once the load completes.
+  int _generation = 0;
+
   /// Whether audio is currently playing.
   @override
   Stream<bool> get isPlaying => _isPlayingController.stream;
@@ -116,14 +120,25 @@ class AudioPlaybackService implements AudioPlayback {
     // playback to the configured output (media stream → speaker).
     await _audioSession?.requestAudioFocus();
 
+    final generation = _generation;
     _source.updateWav(pcm16SamplesToLeBytes(pcm16Samples));
     try {
       await _player.setAudioSource(_source);
     } catch (e) {
       // The errorStream listener is the single failure reporter (it also
-      // fires for this failure); rethrowing would report twice.
-      if (kDebugMode) {
-        debugPrint('AudioPlayback: setAudioSource failed: $e');
+      // fires for this failure); rethrowing would report twice. Emit a false
+      // so a caller awaiting the playback-end edge is not stranded until its
+      // timeout — no true was ever emitted for this utterance.
+      if (!_isPlayingController.isClosed) {
+        _isPlayingController.add(false);
+      }
+      return;
+    }
+    // A stop() during the load window invalidated this utterance: the user
+    // cancelled it before it became audible — do not start it now.
+    if (generation != _generation) {
+      if (!_isPlayingController.isClosed) {
+        _isPlayingController.add(false);
       }
       return;
     }
@@ -140,9 +155,10 @@ class AudioPlaybackService implements AudioPlayback {
 
   /// Stops playback. Audio focus is owned by the shared [AudioSessionManager]
   /// (acquired/released by the capture pipeline and playback owners), so this
-  /// only halts the player.
+  /// only halts the player — and invalidates any load still in flight.
   @override
   Future<void> stop() async {
+    _generation++;
     try {
       if (_player.processingState != ProcessingState.idle) {
         await _player.stop();

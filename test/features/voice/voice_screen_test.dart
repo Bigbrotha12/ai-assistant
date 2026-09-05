@@ -740,6 +740,109 @@ void main() {
     expect(controller.state.isRecording, isFalse);
   });
 
+  testWidgets('holding the talk button while the AI is still generating '
+      '(no audio yet) interrupts the turn and starts recording',
+      (tester) async {
+    // The reply streams but the turn hangs mid-generation, so isGenerating is
+    // true while isAiSpeaking is still false ("Working…" status).
+    final chat = FakeChatClient()..hang = Completer<ChatResult>();
+    final tts = FakeTtsEngine();
+    final container = buildContainer(chatClient: chat, tts: tts);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+    // The turn never produces audio while the stream is held.
+    unawaited(controller.sendText('hello'));
+    await settle(tester);
+    expect(controller.state.isGenerating, isTrue);
+    expect(controller.state.isAiSpeaking, isFalse);
+    expect(controller.state.isRecording, isFalse);
+
+    // Press and hold: recording starts AND the generating turn is interrupted.
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(SpeakButton)),
+    );
+    await settle(tester);
+
+    expect(controller.state.isRecording, isTrue);
+    expect(controller.state.isGenerating, isTrue); // stream still held
+
+    // Releasing the interrupted stream must abandon the turn — no TTS may
+    // speak the interrupted reply over the user's recording.
+    chat.hang!.complete(
+      const ChatResult(
+        content: 'Would have spoken',
+        toolCalls: [],
+        finishReason: 'stop',
+      ),
+    );
+    await pumpFrames(tester);
+    expect(controller.state.isGenerating, isFalse);
+    expect(controller.state.isAiSpeaking, isFalse);
+    expect(tts.synthesized, isEmpty);
+    expect(controller.state.isRecording, isTrue);
+
+    await gesture.up();
+    await controller.endConversation();
+  });
+
+  testWidgets('holding the talk button while the AI speaks starts recording '
+      'even when the playback stop is slow', (tester) async {
+    final tts = FakeTtsEngine();
+    final playback = FakeAudioPlayback()
+      ..holdCompletion = Completer<void>()
+      ..stopGate = Completer<void>();
+    final container = buildContainer(tts: tts, playback: playback);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+
+    // The AI is audibly speaking (playback held open).
+    unawaited(controller.synthesizeOnDevice('reply'));
+    await settle(tester);
+    expect(controller.state.isAiSpeaking, isTrue);
+
+    // Press and hold: the barge-in awaits a bounded interrupt, so a slow
+    // playback stop delays recording only up to the bound — it must never
+    // wedge the hold. The stop is held open here.
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(SpeakButton)),
+    );
+    await settle(tester);
+
+    // The stop is still held open: within the bound, the mic has not opened
+    // yet, but the barge-in already re-opened the mic gates synchronously.
+    expect(controller.state.isAiSpeaking, isFalse);
+    expect(controller.state.isRecording, isFalse);
+
+    // Past the interrupt bound: the mic opens even though the stop hangs.
+    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(controller.state.isRecording, isTrue);
+
+    // The stop completes; the hold ends cleanly.
+    playback.stopGate!.complete();
+    playback.holdCompletion!.complete();
+    await gesture.up();
+    await controller.endConversation();
+    expect(controller.state.isConnected, isFalse);
+    expect(controller.state.isRecording, isFalse);
+  });
+
   testWidgets('shows the Working status while the LLM stream is in flight',
       (tester) async {
     final chat = FakeChatClient()..hang = Completer<ChatResult>();
@@ -801,7 +904,7 @@ void main() {
 
     expect(controller.state.notice, isNotNull);
     expect(
-      find.text('Still working — one thing at a time.'),
+      find.text('Dropped — one utterance at a time.'),
       findsOneWidget,
     );
 

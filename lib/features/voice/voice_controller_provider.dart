@@ -191,6 +191,12 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
         final manager = ref.read(engineManagerProvider);
         controller.sttEngine ??= manager.sttEngine;
         controller.ttsEngine ??= manager.ttsEngine;
+        // Both engines landed: nothing left to inject, so stop listening —
+        // a standing no-op listener per session would otherwise pile up.
+        if (controller.sttEngine != null && controller.ttsEngine != null) {
+          engineManager.removeListener(_enginesListener!);
+          _enginesListener = null;
+        }
       };
       engineManager.addListener(_enginesListener!);
     }

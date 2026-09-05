@@ -100,18 +100,43 @@ void main() {
       expect(accumulator.takeRemainder(), 'Fine.');
     });
 
-    test('numbered markdown list markers split per the conservative rule', () {
-      // Accepted Wave 1 behaviour: "1." is followed by a capital, so the
-      // marker period qualifies as a boundary; the newline closes "First
-      // item" unconditionally.
+    test('numbered markdown list items stay whole (digit-guard + newlines)',
+        () {
+      // A '.' preceded by a digit is decimal/numeric, never a boundary — so
+      // the "1." marker no longer splits from its item text. The newline
+      // still closes each line as one sentence (natural TTS pause per item);
+      // the last line has no trailing newline and pends for the remainder.
       final accumulator = SentenceAccumulator();
       accumulator.add('1. First item\n2. Second item');
+      expect(accumulator.takeCompleteSentences(), <String>['1. First item']);
+      expect(accumulator.takeRemainder(), '2. Second item');
+    });
+
+    test('capitalized abbreviations and titles do not split', () {
+      final accumulator = SentenceAccumulator();
+      accumulator.add('Dr. Smith met Mr. Lee at Mt. Everest. Then left.');
       expect(accumulator.takeCompleteSentences(), <String>[
-        '1.',
-        'First item',
-        '2.',
+        'Dr. Smith met Mr. Lee at Mt. Everest.',
       ]);
-      expect(accumulator.takeRemainder(), 'Second item');
+      expect(accumulator.takeRemainder(), 'Then left.');
+    });
+
+    test('lowercase answer "no." still splits despite the No allowlist', () {
+      final accumulator = SentenceAccumulator();
+      accumulator.add('The answer is no. We left.');
+      expect(accumulator.takeCompleteSentences(), <String>[
+        'The answer is no.',
+      ]);
+      expect(accumulator.takeRemainder(), 'We left.');
+    });
+
+    test('decimals followed by a capital stay whole', () {
+      final accumulator = SentenceAccumulator();
+      accumulator.add('It cost 3.14 Dollars. Nothing split early.');
+      expect(accumulator.takeCompleteSentences(), <String>[
+        'It cost 3.14 Dollars.',
+      ]);
+      expect(accumulator.takeRemainder(), 'Nothing split early.');
     });
   });
 }

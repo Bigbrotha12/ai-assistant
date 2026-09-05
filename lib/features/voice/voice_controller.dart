@@ -14,7 +14,7 @@ import 'tts_engine.dart';
 
 /// One queued utterance awaiting synthesis + playback. Exactly one of [text]
 /// / [pcm] is set: text is synthesised inside the drain loop, pre-built PCM
-/// (e.g. a cached interim line) plays as-is.
+/// plays as-is.
 class _SpeakItem {
   _SpeakItem.forText(String this.text)
       : pcm = null,
@@ -212,10 +212,10 @@ final class VoiceController {
     this.contextBuilder,
     this.systemPrompt,
     Duration? echoGateDuration,
-    Duration? interimDelay,
+    Duration? synthesisTimeout,
   }) : _echoGateDuration =
            echoGateDuration ?? const Duration(milliseconds: 300),
-       _interimDelay = interimDelay ?? const Duration(seconds: 2) {
+       _synthesisTimeout = synthesisTimeout ?? const Duration(seconds: 60) {
     // Mic frames → local buffer for on-device STT. The capture pipeline is
     // the single error reporter for mic streams (it routes into
     // [reportError]); this listener only logs so a broadcast error can never
@@ -318,30 +318,13 @@ final class VoiceController {
   /// Until this instant, mic chunks are not buffered (echo gate).
   DateTime _echoGateUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// How long the LLM may stay silent before the interim acknowledgement
-  /// line ([kInterimSpeechLine]) fills the dead air. Injectable for tests;
-  /// 2s in production so the acknowledgement lands within the ~2s
-  /// interactive budget.
-  final Duration _interimDelay;
-
-  /// The one-shot timer arming the interim acknowledgement for the current
-  /// turn. Cancelled when the first playback starts, when the turn ends, on
-  /// interrupt/teardown — and re-armed when an utterance queues behind a
-  /// busy turn, so the user gets a fresh acknowledgement for it.
-  Timer? _interimTimer;
-
-  /// Cached PCM for [kInterimSpeechLine]: synthesized once on first use so
-  /// later acknowledgements play instantly at the 2s mark instead of
-  /// serializing behind synthesis.
-  List<int>? _interimPcm;
-
   /// Utterances currently queued behind the in-flight turn (busy state).
   /// Decremented when a queued turn starts running. Capped at one: a further
   /// flush is dropped with a [notice].
   int _pendingTurns = 0;
 
   /// FIFO of utterances awaiting synthesis + sequential playback: the
-  /// completed sentences of the streaming reply (interim speech later).
+  /// completed sentences of the streaming reply.
   /// The drain ([_drainSpeakQueue]) synthesises strictly sequentially —
   /// never two syntheses in flight — and starts the next playback as soon
   /// as the previous one ends, so first audio lands while the LLM is still
@@ -351,6 +334,21 @@ final class VoiceController {
   /// The running queue drain; null while the queue is idle. [_enqueue]
   /// starts one; never more than one at a time.
   Future<void>? _drainFuture;
+
+  /// The epoch the running drain was started for. A drain outlives an
+  /// interrupt while a synthesis is in flight, so [_enqueue] uses this to
+  /// start a fresh drain for the new epoch instead of appending the next
+  /// turn's sentences to the stale one (which would drop them on wake).
+  int? _drainEpoch;
+
+  /// Bound on a single sentence's synthesis. Without it, one hung
+  /// synthesis (dead isolate, stalled backend) would wedge the drain, the
+  /// turn tail, and every future flush. Injectable for tests.
+  final Duration _synthesisTimeout;
+
+  /// Set by [dispose]; a disposed controller never speaks again — the
+  /// state's isConnected stays true after dispose, so guards need this.
+  bool _disposed = false;
 
   /// When the current turn started, for the time-to-first-audio measurement.
   DateTime? _turnStartedAt;
@@ -382,8 +380,10 @@ final class VoiceController {
     // Invalidate any queued or in-flight turn: nothing may transcribe, hit
     // the network, or start playback after the session is gone.
     _turnEpoch++;
-    // No acknowledgement may fire into a session that is going away.
-    _cancelInterimTimer();
+    // Drop this session's queued sentences synchronously — a drain that is
+    // mid-synthesis will wake to the epoch change and leave the queue (now
+    // possibly holding a fresh session's items) alone.
+    _dropPendingSpeakItems();
     // Abort the active LLM stream and mint a fresh token (mirroring
     // interrupt): a stream still in flight when the session ends must not
     // keep mutating lastTranscript or fire onTranscript on completion.
@@ -466,7 +466,7 @@ final class VoiceController {
     // becomes a concurrent turn.
     if (_pendingTurns >= 1) {
       _update(
-        _state.copyWith(notice: 'Still working — one thing at a time.'),
+        _state.copyWith(notice: 'Dropped — one utterance at a time.'),
       );
       if (kDebugMode) {
         debugPrint('VoiceController: flush dropped (a turn is already queued)');
@@ -484,12 +484,6 @@ final class VoiceController {
         await _runUtteranceTurn(engine, buffer, epoch);
       }),
     );
-    // Interim-speech re-arm (W1.3): an utterance successfully queued behind
-    // a busy turn earns its own acknowledgement — re-arm the 2s timer so the
-    // user hears a fresh line for it while it waits.
-    if (_state.isGenerating) {
-      _armInterimTimer();
-    }
   }
 
   /// The serialised body of one flushed utterance: transcribe [buffer] with
@@ -503,12 +497,24 @@ final class VoiceController {
     int epoch,
   ) async {
     // The session may have ended while this turn sat queued.
-    if (epoch != _turnEpoch) return;
+    if (epoch != _turnEpoch) {
+      if (kDebugMode) {
+        debugPrint('VoiceController: turn skipped (epoch $epoch)');
+      }
+      return;
+    }
+    if (kDebugMode) {
+      debugPrint('VoiceController: turn start (epoch $epoch)');
+    }
     try {
-      final raw = await engine.transcribe(
-        buffer,
-        sampleRate: kPlaybackSampleRate,
-      );
+      // Bounded: one hung transcription must cost one utterance, never the
+      // turn tail (an unbounded await here would wedge every future flush).
+      final raw = await engine
+          .transcribe(buffer, sampleRate: kPlaybackSampleRate)
+          .timeout(const Duration(minutes: 2));
+      if (kDebugMode) {
+        debugPrint('VoiceController: turn transcribed');
+      }
       // Whisper hallucinates stage-direction tags on silence/noise
       // ("[BLANK_AUDIO]", "(humming)", "Thanks for watching!"); strip
       // them and drop hallucination-only utterances so they never
@@ -525,18 +531,18 @@ final class VoiceController {
       // Whitespace-only transcripts mean "no speech recognised"; treat
       // them as empty so they neither update state nor fire callbacks.
       if (transcript.isNotEmpty && !hallucinated) {
+        // State only: the callback fires exactly once per utterance, in
+        // [sendText] (this utterance's turn) — firing it here too would
+        // double-report to any consumer.
         _update(_state.copyWith(onDeviceTranscript: transcript));
-        onDeviceTranscript?.call(transcript);
+        // The turn's audio is fully serialised inside sendText: it returns
+        // only after the speak queue has drained and the last playback
+        // finished (_waitQueueDrained). No extra playback wait here — it was
+        // a belt-and-braces guard from before the drain wait existed, and
+        // under the turn-level isAiSpeaking semantics its condition is
+        // unreliable (the flag is held across streaming gaps), which could
+        // hang on a stale isPlaying stream and wedge the whole turn tail.
         await sendText(transcript);
-        // A turn ends when its audio finishes, not when play is merely
-        // kicked off — otherwise the next turn truncates this one and
-        // briefly re-opens the echo gate around its tail. The speak queue
-        // drain already serialises this; the wait below is belt-and-braces.
-        if (_state.isAiSpeaking) {
-          await playback.isPlaying
-              .firstWhere((playing) => !playing)
-              .timeout(const Duration(minutes: 2));
-        }
       }
     } on TimeoutException {
       // Abnormally long playback; never wedge the turn queue on it.
@@ -545,6 +551,9 @@ final class VoiceController {
         debugPrint('VoiceController: STT failed: $e');
       }
       _reportError(e);
+    }
+    if (kDebugMode) {
+      debugPrint('VoiceController: turn done (epoch $epoch)');
     }
   }
 
@@ -579,7 +588,7 @@ final class VoiceController {
     // A turn queued ahead of a teardown must not hit the network.
     if (!_state.isConnected) return;
     if (kDebugMode) {
-      debugPrint('VoiceController: sendText "${trimmed.substring(0, trimmed.length.clamp(0, 60))}"');
+      debugPrint('VoiceController: sendText "${_debugTruncate(trimmed)}"');
     }
     // The user's utterance surfaces in the UI transcript for this turn. Voice
     // turns already set it in flushTranscriptionBuffer (the UI dedupes the
@@ -591,8 +600,10 @@ final class VoiceController {
     onUserMessage?.call(trimmed);
     // Snapshot the active token: interrupt() cancels and replaces it, so a
     // turn that started before an interrupt must still abort, while turns
-    // started after it pick up the fresh token.
+    // started after it pick up the fresh token. The epoch snapshot scopes
+    // the drain wait the same way.
     final cancelToken = _activeTurnToken;
+    final epoch = _turnEpoch;
     // Sentence-buffered streaming only applies when this turn may speak and
     // an on-device TTS engine is configured.
     final speak = speakReply && ttsEngine != null;
@@ -624,12 +635,6 @@ final class VoiceController {
       // abandon return, and both error paths via the catch below — so a
       // stream that dies mid-flight can never leave it stuck true.
       _update(_state.copyWith(isGenerating: true));
-      // Dead-air guard (W1.3): if the reply produces no audio within
-      // [_interimDelay], the cached interim line speaks. Only when this turn
-      // can speak — a text-mode turn never acknowledges out loud.
-      if (speak) {
-        _armInterimTimer();
-      }
       final ChatResult result;
       try {
         result = await chatClient.streamCompletions(
@@ -679,8 +684,16 @@ final class VoiceController {
             }
           }
           // A turn ends when its audio finishes: wait for the whole queue —
-          // earlier sentences may already be playing mid-stream.
-          await _waitQueueDrained();
+          // earlier sentences may already be playing mid-stream. Scoped to
+          // this turn's epoch: a newer drain (post-interrupt) is not ours.
+          await _waitQueueDrained(epoch);
+          // The drain held the speaking flag through any streaming gap (the
+          // queue is momentarily empty between sentences while the LLM
+          // catches up); the turn is over — hand the speaker back. Epoch-
+          // guarded: interrupt() owns the false update after a barge-in.
+          if (epoch == _turnEpoch && _state.isAiSpeaking) {
+            _update(_state.copyWith(isAiSpeaking: false));
+          }
         }
       }
     } catch (e) {
@@ -694,99 +707,28 @@ final class VoiceController {
         return;
       }
       _reportError(e);
-    } finally {
-      // The turn is over (or abandoned): no acknowledgement may fire into a
-      // finished turn. Runs after the drain await above, so this can never
-      // cancel a live acknowledgement mid-turn.
-      _cancelInterimTimer();
-    }
-  }
-
-  // ---- interim speech ----------------------------------------------------
-
-  /// The canned acknowledgement filling dead air while the LLM generates
-  /// (W1.3). Canned on-device copy — never the heavy model mid-prefill.
-  static const String kInterimSpeechLine = 'Working on it.';
-
-  /// Arms (or re-arms) the one-shot interim timer. Called when the LLM
-  /// stream starts and when an utterance queues behind a busy turn; fires
-  /// [_speakInterimLine] after [_interimDelay] unless cancelled first.
-  void _armInterimTimer() {
-    _cancelInterimTimer();
-    _interimTimer = Timer(_interimDelay, () {
-      unawaited(_speakInterimLine());
-    });
-  }
-
-  void _cancelInterimTimer() {
-    _interimTimer?.cancel();
-    _interimTimer = null;
-  }
-
-  /// Fires the interim acknowledgement. A no-op when the first audio is
-  /// already in flight (queue non-empty or playback started), when the
-  /// session is gone, or when the cached line cannot be synthesized — the
-  /// acknowledgement exists to fill silence, never to pile on speech.
-  Future<void> _speakInterimLine() async {
-    _interimTimer = null;
-    if (!_maySpeakInterim()) return;
-    final pcm = await _ensureInterimPcm();
-    if (pcm == null || pcm.isEmpty) return;
-    // Synthesis ran outside the timer callback; re-verify before speaking.
-    if (!_maySpeakInterim()) return;
-    if (kDebugMode) {
-      debugPrint('VoiceController: interim line');
-    }
-    _enqueuePcm(pcm);
-  }
-
-  /// Whether the interim line may speak right now: live session, not paused,
-  /// no playback started, and no drain running — the drain may hold a
-  /// sentence already removed from the queue (synthesis in flight), which is
-  /// exactly "first audio on the way".
-  bool _maySpeakInterim() =>
-      _state.isConnected &&
-      !_state.isPaused &&
-      !_state.isAiSpeaking &&
-      _drainFuture == null &&
-      _speakQueue.isEmpty;
-
-  /// Returns the cached interim PCM, synthesizing it once on first use (the
-  /// very first acknowledgement pays one synthesis; every later one plays
-  /// the cached PCM instantly). Failures never surface as session errors —
-  /// a missing acknowledgement is better than an error banner; the reply's
-  /// own sentences report real TTS failures.
-  Future<List<int>?> _ensureInterimPcm() async {
-    final cached = _interimPcm;
-    if (cached != null) return cached;
-    final engine = ttsEngine;
-    if (engine == null) return null;
-    try {
-      final pcm = await engine.synthesize(
-        kInterimSpeechLine,
-        sampleRate: kPlaybackSampleRate,
-      );
-      _interimPcm = pcm;
-      return pcm;
-    } catch (e) {
-      if (kDebugMode) {
-        debugPrint('VoiceController: interim synthesis failed: $e');
-      }
-      return null;
     }
   }
 
   // ---- speak queue ------------------------------------------------------
 
-  /// Appends an utterance to the speak queue and starts the sequential drain
-  /// if none is running.
+  /// Appends an utterance to the speak queue and ensures a drain of the
+  /// CURRENT epoch is running: a drain still alive from an earlier epoch
+  /// (an interrupt landed mid-synthesis) no longer owns the speaker, so the
+  /// next turn gets a fresh drain instead of being appended to the stale
+  /// one — the stale drain would drop the new sentences when it woke.
   void _enqueue(_SpeakItem item) {
     _speakQueue.add(item);
-    _drainFuture ??= _drainSpeakQueue();
+    if (_drainFuture == null || _drainEpoch != _turnEpoch) {
+      _drainEpoch = _turnEpoch;
+      _drainFuture = _drainSpeakQueue();
+    }
   }
 
-  /// Appends pre-synthesised PCM (the cached interim line) straight to the
-  /// queue, bypassing synthesis.
+  /// Appends pre-synthesised PCM straight to the queue, bypassing synthesis.
+  /// Currently unused — kept for future priority/overlay sources — but the PCM
+  /// path stays for future priority/overlay sources.
+  // ignore: unused_element
   void _enqueuePcm(List<int> pcm) {
     _enqueue(_SpeakItem.forPcm(pcm));
   }
@@ -806,12 +748,17 @@ final class VoiceController {
     _enqueue(_SpeakItem.forText(speakable));
   }
 
-  /// Waits until the speak queue has fully drained and the last playback
-  /// finished, so a turn cannot return — and release the next serialised
-  /// turn — while its audio is still going.
-  Future<void> _waitQueueDrained() async {
-    while (_drainFuture != null) {
+  /// Waits until this turn's speak queue has fully drained and the last
+  /// playback finished, so a turn cannot return — and release the next
+  /// serialised turn — while its audio is still going. Scoped to [epoch]: a
+  /// drain started by a NEWER turn (after an interrupt) is not this turn's
+  /// business.
+  Future<void> _waitQueueDrained(int epoch) async {
+    while (_drainFuture != null && _drainEpoch == epoch) {
       await _drainFuture;
+    }
+    if (kDebugMode) {
+      debugPrint('VoiceController: queue drained (epoch $epoch)');
     }
   }
 
@@ -825,10 +772,13 @@ final class VoiceController {
   }
 
   /// Plays the speak queue sequentially: synthesise (text items), play,
-  /// await the playback end, next item. Runs until the queue is empty; an
-  /// [_turnEpoch] change (interrupt / teardown) makes the loop drop
-  /// everything still queued — and never override [interrupt]'s own
-  /// isAiSpeaking update.
+  /// await the playback end, next item. Runs until the queue is empty.
+  ///
+  /// Epoch ownership: this drain owns speaker for the epoch it captured. An
+  /// interrupt / teardown bumps the epoch and synchronously drops this
+  /// turn's queued items; when this drain wakes to a changed epoch it exits
+  /// WITHOUT touching the queue — anything in it by then belongs to a newer
+  /// drain. It also never overrides [interrupt]'s own isAiSpeaking update.
   ///
   /// [VoiceConversationState.isAiSpeaking] is turn-level here: it flips true
   /// when the first playback starts and stays true across inter-sentence
@@ -846,9 +796,17 @@ final class VoiceController {
     // synchronously (e.g. a queue of skippable items) would otherwise leave
     // a stale completed future behind and block [_waitQueueDrained] forever.
     await Future<void>.value();
+    if (kDebugMode) {
+      debugPrint('VoiceController: drain start (epoch $epoch)');
+    }
     var played = false;
     try {
       while (_speakQueue.isNotEmpty) {
+        // Interrupted / torn down mid-queue: this drain no longer owns the
+        // speaker. interrupt()/endConversation() already dropped this turn's
+        // items synchronously; anything here belongs to a newer turn and is
+        // the newer drain's business.
+        if (epoch != _turnEpoch) break;
         // An OS interruption halts the queue WITHOUT consuming it: the rest
         // of the reply resumes after [resumeAfterInterruption] instead of
         // being lost.
@@ -858,23 +816,27 @@ final class VoiceController {
                 .firstWhere((s) => !s.isPaused || !s.isConnected)
                 .timeout(const Duration(minutes: 2));
           } on TimeoutException {
+            // Abnormally long OS interruption: never wedge the queue on it.
+            // The epoch still matches (an interrupt would have exited
+            // above), so these items are stale the moment the interruption
+            // is over — drop them rather than surprise-play them later.
+            _dropPendingSpeakItems();
             break;
           } on StateError {
-            // State stream closed (dispose).
+            // State stream closed (dispose): nothing may play afterwards.
+            _dropPendingSpeakItems();
             break;
           }
           if (_state.isPaused) {
             // Woke for a teardown, not a resume: the queued reply belongs to
-            // a dead turn and must not leak into a fresh session.
-            _dropPendingSpeakItems();
+            // a dead turn and must not leak into a fresh session. (A wake
+            // with a matching epoch and isConnected false is only possible
+            // via endConversation, which bumped the epoch — this branch is
+            // belt-and-braces for any state shape that violates that.)
+            if (epoch == _turnEpoch) _dropPendingSpeakItems();
             break;
           }
           continue;
-        }
-        // Interrupted / torn down mid-queue: drop everything still queued.
-        if (epoch != _turnEpoch) {
-          _dropPendingSpeakItems();
-          break;
         }
         final item = _speakQueue.removeAt(0);
         final text = item.text;
@@ -887,10 +849,21 @@ final class VoiceController {
             if (engine == null) {
               throw StateError('No on-device TTS engine configured');
             }
-            synthesized = await engine.synthesize(
-              text,
-              sampleRate: kPlaybackSampleRate,
+            // Bounded: one hung synthesis must cost one sentence, never the
+            // whole loop (an unbounded await here would wedge the drain, the
+            // turn tail, and every future flush until the app restarts).
+            synthesized = await engine
+                .synthesize(text, sampleRate: kPlaybackSampleRate)
+                .timeout(_synthesisTimeout);
+          } on TimeoutException {
+            if (kDebugMode) {
+              debugPrint('VoiceController: sentence TTS timed out');
+            }
+            _reportError(
+              TimeoutException('TTS synthesis timed out', _synthesisTimeout),
             );
+            item.result?.complete(const []);
+            continue;
           } catch (e) {
             if (kDebugMode) {
               debugPrint('VoiceController: sentence TTS failed: $e');
@@ -903,14 +876,15 @@ final class VoiceController {
             debugPrint(
               'VoiceController: sentence synthesis '
               '${DateTime.now().difference(synthStartedAt).inMilliseconds}ms '
-              '(${synthesized.length} samples)',
+              '(${synthesized.length} samples) "${_debugTruncate(text)}"',
             );
           }
           // Synthesis takes seconds; the turn may have been interrupted
-          // while it ran. Drop the fresh audio — and the rest of the queue.
+          // while it ran. Drop the fresh audio — but NOT the queue: items
+          // enqueued after the interrupt belong to a newer turn and a newer
+          // drain.
           if (epoch != _turnEpoch) {
             item.result?.complete(const []);
-            _dropPendingSpeakItems();
             break;
           }
           pcm = synthesized;
@@ -927,9 +901,6 @@ final class VoiceController {
         }
         if (!played) {
           played = true;
-          // First audio of the turn is out: the dead-air acknowledgement has
-          // nothing left to fill and must not fire on top of the reply.
-          _cancelInterimTimer();
           final startedAt = _turnStartedAt;
           if (kDebugMode) {
             final ms = startedAt == null
@@ -947,7 +918,9 @@ final class VoiceController {
             .firstWhere((playing) => !playing)
             .timeout(const Duration(minutes: 2));
         try {
-          await playback.playAudio(pcm);
+          // Bounded: one hung source load must cost one sentence, never the
+          // whole loop.
+          await playback.playAudio(pcm).timeout(const Duration(minutes: 2));
         } catch (e) {
           if (kDebugMode) {
             debugPrint('VoiceController: playback failed: $e');
@@ -959,24 +932,50 @@ final class VoiceController {
         try {
           await ended;
         } on TimeoutException {
-          // Abnormally long playback; never wedge the queue on it.
+          // Abnormally long playback; never wedge the queue on it. The
+          // stranded utterance is abandoned unplayed rather than played out
+          // of context later.
+          _dropPendingSpeakItems();
+          break;
         } on StateError {
-          // The playback stream closed (player torn down). Complete the
-          // current item so a [synthesizeOnDevice] caller is never left
-          // waiting, then stop draining.
+          // The playback stream closed (player torn down): nothing may play
+          // afterwards. Complete the current item so a [synthesizeOnDevice]
+          // caller is never left waiting, then clear the rest.
+          item.result?.complete(const []);
+          _dropPendingSpeakItems();
+          break;
+        }
+        // An interrupt mid-playback stops the player: the utterance was
+        // cancelled, not played — report it as such (the generation counter
+        // in the service makes the stop authoritative).
+        if (epoch != _turnEpoch) {
           item.result?.complete(const []);
           break;
         }
         item.result?.complete(pcm);
       }
       // Queue drained, last playback finished: close the turn-level speaking
-      // flag. Never after an interrupt — interrupt() already set it false
-      // and must stay authoritative.
-      if (played && epoch == _turnEpoch) {
+      // flag — but NOT while the turn is still streaming: the LLM is slower
+      // than playback in the normal case, and the queue is momentarily empty
+      // between sentences. Clearing here would flicker isAiSpeaking false
+      // (re-opening the mic gates mid-turn) and flip the UI to "Working…"
+      // between sentences. A turn still generating holds the flag; [sendText]
+      // clears it when the stream ends with nothing left to speak. Never
+      // after an interrupt — interrupt() already set it false and must stay
+      // authoritative.
+      if (played && epoch == _turnEpoch && !_state.isGenerating) {
         _update(_state.copyWith(isAiSpeaking: false));
       }
     } finally {
-      _drainFuture = null;
+      // Release the handle only if this drain still owns it: a newer-epoch
+      // drain may have started while this one was finishing.
+      if (_drainEpoch == epoch) {
+        _drainFuture = null;
+        _drainEpoch = null;
+      }
+      if (kDebugMode) {
+        debugPrint('VoiceController: drain end (epoch $epoch)');
+      }
     }
   }
 
@@ -990,23 +989,36 @@ final class VoiceController {
     // Invalidate any queued/in-flight turn: nothing may continue after the
     // interrupt.
     _turnEpoch++;
-    // The interrupted turn's acknowledgement has nothing left to fill.
-    _cancelInterimTimer();
+    // Drop THIS turn's queued sentences synchronously (completing their
+    // result completers): a drain mid-synthesis stays alive until the
+    // synthesis returns, and sentences enqueued afterwards belong to the
+    // NEXT turn — a later drain wake must not swallow them.
+    _dropPendingSpeakItems();
     // Abort the active LLM stream and mint a fresh token so the NEXT turn is
     // never pre-cancelled.
     _activeTurnToken.cancel();
     _activeTurnToken = CancelToken();
-    try {
-      await playback.stop();
-    } catch (_) {
-      // Best-effort stop.
-    }
+    // Reopen the mic gates and arm the echo gate NOW, synchronously, BEFORE
+    // the (potentially slow) playback stop: a barge-in recording that starts
+    // while this runs must not be blocked on the stop completing, or the
+    // hold silently captures nothing. The echo gate still covers the speaker
+    // tail from the press moment; it is re-armed below from the actual stop.
+    _echoGateUntil = DateTime.now().add(_echoGateDuration);
     // Stale audio from the interrupted utterance must never leak into the
     // next one's transcription.
     _micAudioBuffer.clear();
-    // Reopen the mic gates: both the controller's own _onMicAudio and the
-    // capture pipeline gate on isAiSpeaking.
-    _update(_state.copyWith(isAiSpeaking: false));
+    _update(_state.copyWith(isAiSpeaking: false, notice: null));
+    try {
+      // Bounded: one hung stop must never wedge the mic gates shut for a
+      // barge-in hold.
+      await playback.stop().timeout(const Duration(seconds: 1));
+    } catch (_) {
+      // Best-effort stop; the gates are already open.
+    }
+    // The speaker's tail can bleed into the mic right after a Stop. If the
+    // stop was slow, the gate armed above may have expired while the tail was
+    // still decaying — re-arm it from the actual stop so the tail is covered.
+    _echoGateUntil = DateTime.now().add(_echoGateDuration);
   }
 
   /// Synthesises [text] locally using the on-device TTS engine via the speak
@@ -1020,9 +1032,10 @@ final class VoiceController {
     if (engine == null) {
       throw StateError('No on-device TTS engine configured');
     }
-    // Never push audio at the user mid-interruption (e.g. during a call) or
-    // after the session ended.
-    if (_state.isPaused || !_state.isConnected) return const [];
+    // Never push audio at the user mid-interruption (e.g. during a call),
+    // after the session ended, or from a disposed controller (isConnected
+    // stays true after dispose — the flag is the only reliable guard).
+    if (_disposed || _state.isPaused || !_state.isConnected) return const [];
     try {
       // LLM replies can carry stage directions ("(humming)",
       // "[BLANK_AUDIO]"); the TTS engine must speak only real text.
@@ -1033,7 +1046,12 @@ final class VoiceController {
         }
         return const [];
       }
-      _turnStartedAt = DateTime.now();
+      // Direct speaks outside a turn get their own measurement window; a
+      // mid-turn interjection must not clobber the turn's time-to-first-
+      // audio reference.
+      if (!_state.isGenerating) {
+        _turnStartedAt = DateTime.now();
+      }
       final item = _SpeakItem.forText(speakable);
       _enqueue(item);
       // Resolves when the item finished playing — with an empty list when
@@ -1062,6 +1080,10 @@ final class VoiceController {
     } catch (_) {
       // Best-effort stop; the interruption takes precedence over playback.
     }
+    // The speaker's tail after the stop can bleed into the mic; the
+    // playback-end listener may arm the gate after the isAiSpeaking update
+    // above (missing its window) — arm it unconditionally.
+    _echoGateUntil = DateTime.now().add(_echoGateDuration);
     // Buffered speech spanning the interruption is stale; starting fresh.
     _micAudioBuffer.clear();
   }
@@ -1158,12 +1180,25 @@ final class VoiceController {
         msg.contains('ioexception');
   }
 
+  /// Debug-log-safe truncation: never splits a UTF-16 surrogate pair, so
+  /// emoji/CJK replies cannot produce malformed log lines.
+  static String _debugTruncate(String text, [int max = 60]) {
+    if (text.length <= max) return text;
+    var end = max;
+    final last = text.codeUnitAt(end - 1);
+    if (last >= 0xD800 && last <= 0xDBFF) end--;
+    return '${text.substring(0, end)}…';
+  }
+
   /// Tears down this controller. The underlying services remain owned by
   /// their providers and stay usable.
   Future<void> dispose() async {
     // Invalidate queued turns — nothing may run against a disposed controller.
+    _disposed = true;
     _turnEpoch++;
-    _cancelInterimTimer();
+    // Complete any queued result completers so no [synthesizeOnDevice]
+    // caller hangs on a controller that can never speak again.
+    _dropPendingSpeakItems();
     // Abort any in-flight LLM stream so it can never complete into a disposed
     // notifier's persistence callbacks.
     _activeTurnToken.cancel();

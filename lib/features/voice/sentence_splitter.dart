@@ -24,24 +24,30 @@
 /// A sentence ends at `.`, `!`, or `?` — or at a newline — followed by
 /// whitespace and then an uppercase letter or an opening quote
 /// (`"`, `'`, `(`, `[`). A closing quote or bracket glued to the terminator
-/// (`"Go!"`) joins the boundary cluster. The lookahead keeps abbreviations
-/// ("e.g."), ordinals ("No. 5"), decimals ("3.14"), and ellipses ("...")
-/// from splitting mid-sentence.
+/// (`"Go!"`) joins the boundary cluster. The lookahead keeps lowercase
+/// follow-ups ("e.g. math"), ordinals ("No. 5"), and ellipses ("...")
+/// from splitting mid-sentence; a small case-sensitive abbreviation
+/// allowlist additionally guards capitalized follow-ups ("e.g. Python",
+/// "Dr. Smith"), and a `.` preceded by a digit is treated as decimal
+/// ("3.14 Files" stays whole).
 ///
 /// Newlines close the current sentence unconditionally — even without
 /// terminal punctuation — so markdown line breaks become natural TTS pauses.
 ///
-/// Consequences of the conservative rule (accepted for Wave 1): numbered
-/// markdown list markers ("1. First item") split before the item text
-/// because the marker period is followed by a capital, and a sentence whose
-/// terminator is followed by lowercase text stays pending until a later
-/// qualifying boundary (or the end-of-stream remainder) closes it.
+/// Consequences of the conservative rule (accepted for Wave 1): a sentence
+/// whose terminator is followed by lowercase text stays pending until a
+/// later qualifying boundary (or the end-of-stream remainder) closes it.
 final class SentenceAccumulator {
   /// Creates an empty accumulator; use one per streaming reply.
   SentenceAccumulator();
 
   /// Streamed text that has not yet been dispatched as a complete sentence.
   String _pending = '';
+
+  /// Index into [_pending] where the next [takeCompleteSentences] resumes
+  /// scanning. Everything before it is confirmed terminator-free, so a
+  /// long unterminated tail is not rescanned on every streamed delta.
+  int _scan = 0;
 
   /// Punctuation that can terminate a sentence.
   static const String _terminators = '.!?';
@@ -53,6 +59,14 @@ final class SentenceAccumulator {
   /// Closing quotes/brackets that glue onto a terminator ("Go!") and stay
   /// with the sentence they close.
   static const String _closers = '"\')]';
+
+  /// Tokens that may directly precede a sentence-ending `.` without
+  /// terminating the sentence, even when the lookahead qualifies
+  /// (capitalized follow-up). Case-sensitive on purpose: lowercase "no."
+  /// ("the answer is no. We left.") must still split.
+  static const Set<String> _abbreviations = {
+    'e.g', 'i.e', 'etc', 'vs', 'Dr', 'Mr', 'Mrs', 'Ms', 'St', 'Mt', 'No',
+  };
 
   /// Appends a streamed [delta] to the pending buffer.
   ///
@@ -71,12 +85,15 @@ final class SentenceAccumulator {
   /// punctuation (plus any glued closing quote). Whitespace-only fragments
   /// never produce results. A terminator whose lookahead has not arrived yet
   /// stays pending until a later [add] confirms or refutes it.
+  ///
+  /// Scanning resumes at the cursor left by the previous call, so the cost
+  /// is O(new text) per delta, not O(pending tail).
   List<String> takeCompleteSentences() {
     final sentences = <String>[];
     final buffer = _pending;
     final length = buffer.length;
     var start = _skipWhitespace(buffer, 0);
-    var i = start;
+    var i = _scan > start ? _scan : start;
     while (i < length) {
       final char = buffer[i];
 
@@ -88,6 +105,20 @@ final class SentenceAccumulator {
       }
 
       if (!_isTerminator(buffer, i)) {
+        i++;
+        continue;
+      }
+
+      // A '.' directly preceded by a digit is decimal/numeric ("3.14"),
+      // never a sentence boundary.
+      if (char == '.' && i > 0 && _isDigit(buffer[i - 1])) {
+        i++;
+        continue;
+      }
+
+      // Known non-sentence-ending tokens ("Dr. Smith") never split, even
+      // when the lookahead would otherwise qualify.
+      if (char == '.' && _isAbbreviation(buffer, i)) {
         i++;
         continue;
       }
@@ -109,7 +140,7 @@ final class SentenceAccumulator {
       if (next >= length) break; // boundary not yet confirmed
 
       if (!_isUppercase(buffer[next]) && !_openers.contains(buffer[next])) {
-        i++; // lookahead failed; not a boundary (e.g. "e.g.", "No. 5")
+        i++; // lookahead failed; not a boundary (e.g. "e.g. math")
         continue;
       }
 
@@ -117,6 +148,9 @@ final class SentenceAccumulator {
       start = i = next;
     }
     _pending = start < length ? buffer.substring(start) : '';
+    // The cursor is absolute in the pre-slice buffer; rebase it onto the
+    // pending tail. Unconfirmed terminators are re-examined next call.
+    _scan = i - start;
     return sentences;
   }
 
@@ -127,7 +161,28 @@ final class SentenceAccumulator {
   String? takeRemainder() {
     final remainder = _pending.trim();
     _pending = '';
+    _scan = 0;
     return remainder.isEmpty ? null : remainder;
+  }
+
+  /// Whether the token ending at the terminator [i] is a known
+  /// non-sentence-ending abbreviation. The token may itself contain dots
+  /// ("e.g"), so the back-scan spans letters and dots.
+  bool _isAbbreviation(String buffer, int i) {
+    var wordStart = i;
+    while (wordStart > 0) {
+      final c = buffer[wordStart - 1];
+      final isLetter = c.toUpperCase() != c.toLowerCase();
+      if (!isLetter && c != '.') break;
+      wordStart--;
+    }
+    return _abbreviations.contains(buffer.substring(wordStart, i));
+  }
+
+  /// Whether [char] is an ASCII digit.
+  bool _isDigit(String char) {
+    final code = char.codeUnitAt(0);
+    return code >= 0x30 && code <= 0x39;
   }
 
   /// Adds the trimmed slice [buffer.substring(start, end)] to [out] when it

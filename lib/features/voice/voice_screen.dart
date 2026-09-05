@@ -253,23 +253,27 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       _localError = null;
     });
     final started = () async {
-try {
-      // A typed turn while the AI is speaking stops it first (barge-in), so
-      // the new reply is not spoken over the tail of the previous one.
-      if (controller.state.isAiSpeaking) {
-        await controller.interrupt();
-      }
-      if (!controller.state.isConnected) {
-        await controller.startConversation();
-      }
+      try {
+        if (!controller.state.isConnected) {
+          await controller.startConversation();
+        }
         if (!controller.state.isConnected) {
           return; // Session error is already surfaced through the state.
         }
-        // Barge-in: holding the talk button while the AI is replying stops it
-        // immediately so the user's utterance is captured instead of being
-        // discarded by the mic gates.
-        if (controller.state.isAiSpeaking) {
-          await controller.interrupt();
+        // Barge-in BEFORE the mic opens: interrupt()'s playback stop must
+        // never run against a live microphone — on device that tears the
+        // capture session down mid-hold (recording starts, then stops). The
+        // await is bounded so a slow/hung stop still cannot wedge the hold:
+        // past the bound the mic opens regardless, with the gates already
+        // re-opened and the echo gate armed by interrupt()'s synchronous part.
+        if (controller.state.isAiSpeaking || controller.state.isGenerating) {
+          try {
+            await controller.interrupt().timeout(
+              const Duration(milliseconds: 500),
+            );
+          } on TimeoutException {
+            // The stop is still winding down; open the mic anyway.
+          }
         }
         await pipeline.startRecording();
         if (mounted) {
@@ -403,7 +407,9 @@ try {
       // A typed turn while the AI is speaking stops it first (barge-in), so
       // the new reply is not spoken over the tail of the previous one and the
       // typed turn can never be silently dropped by a later voice barge-in.
-      if (controller.state.isAiSpeaking) {
+      // The union gate covers the whole turn span: generating (no audio yet)
+      // as well as audibly speaking (after the stream ended).
+      if (controller.state.isAiSpeaking || controller.state.isGenerating) {
         await controller.interrupt();
       }
       if (!controller.state.isConnected) {
@@ -715,19 +721,33 @@ class _HeroStatus extends StatelessWidget {
 
     final (icon, color, label) = paused
         ? (Icons.pause_circle_outline, scheme.onSurfaceVariant, 'Paused')
-        : recording
-            ? (Icons.mic, premium ? AppColors.goldDark : scheme.error, 'Listening…')
-            : aiSpeaking
-                ? (Icons.volume_up, premium ? AppColors.goldBase : scheme.primary, 'AI is speaking…')
-                : generating
-                    ? (
-                        Icons.hourglass_top,
-                        scheme.onSurfaceVariant,
-                        'Working…',
-                      )
-                    : connected
-                        ? (Icons.check_circle, premium ? AppColors.goldBase : scheme.primary, 'Connected')
-                        : (Icons.mic_none, scheme.onSurfaceVariant, 'Press and hold to talk');
+        : switch ((recording, aiSpeaking, generating, connected)) {
+            (true, _, _, _) => (
+              Icons.mic,
+              premium ? AppColors.goldDark : scheme.error,
+              'Listening…',
+            ),
+            (false, true, _, _) => (
+              Icons.volume_up,
+              premium ? AppColors.goldBase : scheme.primary,
+              'AI is speaking…',
+            ),
+            (false, false, true, _) => (
+              Icons.hourglass_top,
+              scheme.onSurfaceVariant,
+              'Working…',
+            ),
+            (false, false, false, true) => (
+              Icons.check_circle,
+              premium ? AppColors.goldBase : scheme.primary,
+              'Connected',
+            ),
+            _ => (
+              Icons.mic_none,
+              scheme.onSurfaceVariant,
+              'Press and hold to talk',
+            ),
+          };
 
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,

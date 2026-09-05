@@ -79,6 +79,16 @@ void main() {
     await pumpEventQueue();
     vad.emitState(VadState.speechStopped);
     await pumpEventQueue();
+
+    // Mid-hold silence is NOT end-of-utterance: the user is still holding,
+    // and the VAD must not split the utterance (the hold's release flush
+    // owns the turn boundary — a mid-hold flush races it and, under the
+    // one-pending cap, drops one of the two halves).
+    expect(stt.transcribed, isEmpty);
+
+    // The hold is released: the release flush carries the whole utterance.
+    await controller.flushTranscriptionBuffer();
+    await pumpEventQueue();
     await pumpEventQueue();
     await pumpEventQueue();
 
@@ -104,11 +114,13 @@ void main() {
     await controller.startConversation();
     await pipeline.startRecording();
 
-    // Utterance 1.
+    // Utterance 1 (mid-hold VAD silence does not flush; release does).
     mic.emitChunk(List<int>.filled(50, 1));
     vad.emitState(VadState.speechStarted);
     await pumpEventQueue();
     vad.emitState(VadState.speechStopped);
+    await pumpEventQueue();
+    await controller.flushTranscriptionBuffer();
     await pumpEventQueue();
     await pumpEventQueue();
 
@@ -118,11 +130,80 @@ void main() {
     await pumpEventQueue();
     vad.emitState(VadState.speechStopped);
     await pumpEventQueue();
+    await controller.flushTranscriptionBuffer();
+    await pumpEventQueue();
     await pumpEventQueue();
 
     expect(stt.transcribed, hasLength(2));
     expect(stt.transcribed[0], hasLength(50));
     expect(stt.transcribed[1], hasLength(30));
     expect(stt.transcribed[1], isNot(contains(1)));
+  });
+
+  test('a mic stream error mid-hold restarts the mic instead of ending the '
+      'recording', () async {
+    await controller.startConversation();
+    await pipeline.startRecording();
+    expect(mic.startCount, 1);
+
+    // The recorder dies mid-hold (e.g. ERROR_DEAD_OBJECT from focus churn).
+    mic.emitError(Exception('ERROR_DEAD_OBJECT'));
+    await pumpEventQueue();
+    await pumpEventQueue();
+
+    // The hold survives: the mic was restarted and recording is still active.
+    expect(mic.startCount, 2);
+    expect(controller.state.isRecording, isTrue);
+    expect(controller.state.error, isNull);
+
+    // Buffered audio is preserved across the restart.
+    mic.emitChunk(List<int>.filled(10, 7));
+    await pumpEventQueue();
+    await controller.flushTranscriptionBuffer();
+    await pumpEventQueue();
+    await pumpEventQueue();
+    expect(stt.transcribed, isNotEmpty);
+  });
+
+  test('an interruption-begin that never resolves self-heals the mic while '
+      'the hold is active', () async {
+    await controller.startConversation();
+    await pipeline.startRecording();
+    expect(mic.startCount, 1);
+
+    // A spurious interruption fires and its end never arrives.
+    audioSession.handleInterruption(isInterrupted: true);
+    await pumpEventQueue();
+    expect(mic.isRecording, isFalse);
+
+    // Past the self-heal grace the mic restarts, keeping the hold alive.
+    await Future<void>.delayed(
+      const Duration(milliseconds: 1400),
+    );
+    await pumpEventQueue();
+    await pumpEventQueue();
+
+    expect(mic.startCount, 2);
+    expect(controller.state.isRecording, isTrue);
+    expect(controller.state.isPaused, isFalse);
+  });
+
+  test('a real interruption end resumes the mic before the self-heal grace',
+      () async {
+    await controller.startConversation();
+    await pipeline.startRecording();
+
+    audioSession.handleInterruption(isInterrupted: true);
+    await pumpEventQueue();
+    expect(mic.isRecording, isFalse);
+
+    // The interruption resolves immediately: the mic resumes without waiting
+    // for the grace timer.
+    audioSession.handleInterruption(isInterrupted: false);
+    await pumpEventQueue();
+    await pumpEventQueue();
+
+    expect(mic.isRecording, isTrue);
+    expect(controller.state.isPaused, isFalse);
   });
 }
