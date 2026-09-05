@@ -49,22 +49,13 @@ void main() {
 
     test('keeps the newest user message even when it exceeds the budget', () {
       final messages = [
+        _assistant('a1', 'A' * 4000), // ~1000 tokens
         _user('u1', 'old'),
         _user('u2', 'X' * 10000), // ~2500 tokens, way over budget
       ];
       final trimmer = ContextTrimmer(maxTokens: 100);
       final result = trimmer.trim(messages);
       expect(result.map((m) => m.id), ['u2']);
-    });
-
-    test('keeps a single newest user over budget as last resort', () {
-      final messages = [
-        _assistant('a1', 'A' * 4000), // ~1000 tokens
-        _user('u1', 'B' * 4000), // ~1000 tokens, newest user
-      ];
-      final trimmer = ContextTrimmer(maxTokens: 100);
-      final result = trimmer.trim(messages);
-      expect(result.map((m) => m.id), ['u1']);
     });
 
     test('keeps tool-call pair together when it fits', () {
