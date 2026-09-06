@@ -2,8 +2,9 @@
 
 Flutter frontend to the self-hosted voice/LLM stack over Tailscale.
 
-**Read [PLAN.md](PLAN.md) first** - backend surface map, architecture,
-and the phase-by-phase build order.
+Planning docs live in the gitignored `docs/` directory (local only). Start
+with `docs/PLAN.md` - backend surface map, architecture, and the
+phase-by-phase build order.
 
 ## Local dev
 
