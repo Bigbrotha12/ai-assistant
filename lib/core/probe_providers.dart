@@ -1,6 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'auth_credentials_providers.dart';
+import '../features/auth/data/auth_credentials_providers.dart';
 import 'backend_probe.dart';
 
 /// Provides the concrete [BackendProbe] used to verify connectivity to the

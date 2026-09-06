@@ -1,9 +1,9 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:ai_assistant/features/voice/engine_errors.dart';
-import 'package:ai_assistant/features/voice/engines/supertonic_tts_engine.dart';
-import 'package:ai_assistant/features/voice/pcm_resample.dart';
+import 'package:ai_assistant/features/voice/data/engine_errors.dart';
+import 'package:ai_assistant/features/voice/data/engines/supertonic_tts_engine.dart';
+import 'package:ai_assistant/features/voice/data/pcm_resample.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Canned-samples [SupertonicSynthesizer] double. Never touches FFI: the

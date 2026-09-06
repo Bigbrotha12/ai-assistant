@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:ai_assistant/features/voice/model_downloader.dart';
+import 'package:ai_assistant/features/voice/data/model_downloader.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';

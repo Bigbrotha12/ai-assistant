@@ -2,7 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/voice/wav_util.dart';
+import 'package:ai_assistant/features/voice/data/wav_util.dart';
 
 void main() {
   group('wavHeaderForPcm16', () {

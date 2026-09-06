@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'core/onboarding_gate.dart';
-import 'core/theme.dart';
-import 'core/theme_providers.dart';
-import 'core/widgets/gold_band.dart';
+import './app/onboarding_gate.dart';
+import './app/theme.dart';
+import './app/theme_providers.dart';
+import './app/widgets/gold_band.dart';
 
 void main() => runApp(const ProviderScope(child: AiAssistantApp()));
 

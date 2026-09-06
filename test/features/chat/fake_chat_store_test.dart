@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/chat/message_model.dart';
+import 'package:ai_assistant/features/chat/data/message_model.dart';
 
 import '../../fakes.dart';
 

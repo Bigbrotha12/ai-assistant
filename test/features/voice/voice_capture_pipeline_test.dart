@@ -1,9 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/core/chat_client.dart';
-import 'package:ai_assistant/features/voice/voice_capture_pipeline.dart';
-import 'package:ai_assistant/features/voice/voice_controller.dart';
-import 'package:ai_assistant/features/voice/vad_processor.dart';
+import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/voice/data/voice_capture_pipeline.dart';
+import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
+import 'package:ai_assistant/features/voice/data/vad_processor.dart';
 
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';

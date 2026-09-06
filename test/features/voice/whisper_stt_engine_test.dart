@@ -1,8 +1,8 @@
 import 'dart:io';
 
-import 'package:ai_assistant/features/voice/engine_errors.dart';
-import 'package:ai_assistant/features/voice/engine_config.dart';
-import 'package:ai_assistant/features/voice/engines/whisper_stt_engine.dart';
+import 'package:ai_assistant/features/voice/data/engine_errors.dart';
+import 'package:ai_assistant/features/voice/data/engine_config.dart';
+import 'package:ai_assistant/features/voice/data/engines/whisper_stt_engine.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Fake [WhisperTranscriber] that never touches the native model.

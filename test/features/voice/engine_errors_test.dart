@@ -1,4 +1,4 @@
-import 'package:ai_assistant/features/voice/engine_errors.dart';
+import 'package:ai_assistant/features/voice/data/engine_errors.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Covers the sealed [EngineError] hierarchy: construction, message passing,

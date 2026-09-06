@@ -1,15 +1,15 @@
 import 'dart:async';
 
-import 'package:ai_assistant/features/voice/audio_playback_service.dart';
-import 'package:ai_assistant/features/voice/audio_session_manager.dart';
-import 'package:ai_assistant/features/voice/engine_manager.dart';
-import 'package:ai_assistant/features/voice/mic_capture_service.dart';
-import 'package:ai_assistant/features/voice/model_downloader.dart';
-import 'package:ai_assistant/features/voice/stt_engine.dart';
-import 'package:ai_assistant/features/voice/tts_engine.dart';
-import 'package:ai_assistant/features/voice/vad_processor.dart';
-import 'package:ai_assistant/features/voice/voice_settings.dart';
-import 'package:ai_assistant/features/voice/voice_settings_store.dart';
+import 'package:ai_assistant/features/voice/data/audio_playback_service.dart';
+import 'package:ai_assistant/features/voice/data/audio_session_manager.dart';
+import 'package:ai_assistant/features/voice/data/engine_manager.dart';
+import 'package:ai_assistant/features/voice/data/mic_capture_service.dart';
+import 'package:ai_assistant/features/voice/data/model_downloader.dart';
+import 'package:ai_assistant/features/voice/data/stt_engine.dart';
+import 'package:ai_assistant/features/voice/data/tts_engine.dart';
+import 'package:ai_assistant/features/voice/data/vad_processor.dart';
+import 'package:ai_assistant/features/voice/ui/voice_settings.dart';
+import 'package:ai_assistant/features/voice/ui/voice_settings_store.dart';
 
 /// In-memory [EngineManager] double for widget tests.
 ///

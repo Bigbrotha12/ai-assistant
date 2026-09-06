@@ -1,4 +1,4 @@
-import 'package:ai_assistant/features/voice/vad_processor.dart';
+import 'package:ai_assistant/features/voice/data/vad_processor.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Builds a PCM16 buffer of [count] samples at the given [amplitude]

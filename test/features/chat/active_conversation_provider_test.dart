@@ -1,7 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/chat/active_conversation_provider.dart';
+import 'package:ai_assistant/features/chat/ui/active_conversation_provider.dart';
 
 void main() {
   test('ensure creates and stores an id on first call', () {

@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/voice/sentence_splitter.dart';
+import 'package:ai_assistant/features/voice/data/sentence_splitter.dart';
 
 void main() {
   group('SentenceAccumulator', () {

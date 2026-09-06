@@ -3,19 +3,19 @@ import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
-import 'package:ai_assistant/core/auth_client.dart';
-import 'package:ai_assistant/core/auth_credentials_store.dart';
+import 'package:ai_assistant/features/auth/data/auth_client.dart';
+import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
-import 'package:ai_assistant/core/chat_client.dart';
-import 'package:ai_assistant/core/files_service.dart';
-import 'package:ai_assistant/core/prefs_store.dart';
-import 'package:ai_assistant/core/settings_store.dart';
-import 'package:ai_assistant/core/theme_providers.dart';
-import 'package:ai_assistant/features/attachments/file_model.dart';
-import 'package:ai_assistant/features/attachments/file_store.dart';
-import 'package:ai_assistant/features/chat/chat_store.dart';
-import 'package:ai_assistant/features/chat/message_model.dart';
+import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/attachments/data/files_service.dart';
+import 'package:ai_assistant/features/settings/data/prefs_store.dart';
+import 'package:ai_assistant/features/settings/data/settings_store.dart';
+import 'package:ai_assistant/app/theme_providers.dart';
+import 'package:ai_assistant/features/attachments/data/file_model.dart';
+import 'package:ai_assistant/features/attachments/data/file_store.dart';
+import 'package:ai_assistant/features/chat/data/chat_store.dart';
+import 'package:ai_assistant/features/chat/data/message_model.dart';
 
 /// In-memory [AppTierStore] for widget tests.
 class FakeAppTierStore implements AppTierStore {

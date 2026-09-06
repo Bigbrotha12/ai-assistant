@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/voice/speech_text_filter.dart';
+import 'package:ai_assistant/features/voice/data/speech_text_filter.dart';
 
 void main() {
   group('stripNonSpeechTags', () {

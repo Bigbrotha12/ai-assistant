@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/core/chat_client.dart';
-import 'package:ai_assistant/features/chat/message_model.dart';
-import 'package:ai_assistant/features/voice/engine_errors.dart';
-import 'package:ai_assistant/features/voice/voice_controller.dart';
+import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/voice/data/engine_errors.dart';
+import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
 
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';

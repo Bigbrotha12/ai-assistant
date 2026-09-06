@@ -1,8 +1,8 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/voice/voice_settings.dart';
-import 'package:ai_assistant/features/voice/voice_settings_store.dart';
+import 'package:ai_assistant/features/voice/ui/voice_settings.dart';
+import 'package:ai_assistant/features/voice/ui/voice_settings_store.dart';
 
 /// In-memory [FlutterSecureStorage] double (see settings_store_test.dart for
 /// the same pattern) so the store never touches a platform channel.

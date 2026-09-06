@@ -2,16 +2,16 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/core/chat_client.dart';
-import 'package:ai_assistant/core/chat_client_provider.dart';
-import 'package:ai_assistant/features/chat/chat_providers.dart';
-import 'package:ai_assistant/features/chat/database_providers.dart';
-import 'package:ai_assistant/features/chat/message_model.dart';
-import 'package:ai_assistant/features/voice/engine_manager_provider.dart';
-import 'package:ai_assistant/features/voice/stt_engine.dart';
-import 'package:ai_assistant/features/voice/tts_engine.dart';
-import 'package:ai_assistant/features/voice/voice_capture_providers.dart';
-import 'package:ai_assistant/features/voice/voice_controller_provider.dart';
+import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
+import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
+import 'package:ai_assistant/features/chat/data/database_providers.dart';
+import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/data/stt_engine.dart';
+import 'package:ai_assistant/features/voice/data/tts_engine.dart';
+import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
+import 'package:ai_assistant/features/voice/ui/voice_controller_provider.dart';
 
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';
