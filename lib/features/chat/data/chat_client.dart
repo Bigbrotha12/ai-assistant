@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 
 import './message_model.dart';
-import '../../../core/network_errors.dart';
+import '../../../core/http/dio_errors.dart';
 import './sse.dart';
 
 /// Structured event from the LLM stream.
@@ -88,6 +88,9 @@ class _ToolAccumulator {
 abstract interface class ChatClient {
   /// Streams a chat completion, calling [onContent] for each content delta and
   /// [onToolCallDelta] for each tool-call fragment. Returns the full result.
+  ///
+  /// [onReceived] fires exactly once when the backend accepts the request
+  /// (HTTP 2xx), before any SSE frames are iterated.
   Future<ChatResult> streamCompletions({
     required List<ApiMessage> messages,
     String? systemPrompt,
@@ -98,9 +101,13 @@ abstract interface class ChatClient {
     void Function(String text)? onContent,
     void Function(int index, String name, String argsFragment)? onToolCallDelta,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   });
 
   /// Non-streaming chat completion (fallback when streamed tool args fail).
+  ///
+  /// [onReceived] fires exactly once when the backend accepts the request
+  /// (HTTP 2xx), before parsing the response body.
   Future<ChatResult> completions({
     required List<ApiMessage> messages,
     String? systemPrompt,
@@ -109,11 +116,13 @@ abstract interface class ChatClient {
     List<Map<String, Object?>>? tools,
     bool enableThinking,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   });
 }
 
-/// OpenAI-compatible chat completions client for the gateway LLM proxy
-/// (`POST $baseUrl/v1/chat/completions`).
+/// OpenAI-compatible chat completions client. Targets either the gateway LLM
+/// proxy or an external OpenAI-compatible API (e.g. a LibreChat agents
+/// endpoint); both serve `POST $baseUrl/chat/completions` SSE streams.
 class ChatApiClient implements ChatClient {
   ChatApiClient({
     required this.baseUrl,
@@ -122,23 +131,28 @@ class ChatApiClient implements ChatClient {
     this.apiKey,
   }) : _dio = dio ?? Dio();
 
-  /// llmProxy(host), e.g. http://192.168.1.5:17600. No trailing slash.
+  /// OpenAI-compatible API base root including the `/v1` prefix, e.g.
+  /// `http://192.168.1.5:17600/v1` (gateway) or
+  /// `https://librechat.../api/agents/v1`. No trailing slash.
   final String baseUrl;
 
   final String model;
 
-  /// Gateway bearer API key sent as `Authorization: Bearer <apiKey>` on every
-  /// request. Null when no key is available; requests then go out
+  /// Gateway or external API bearer key sent as `Authorization: Bearer <apiKey>`
+  /// on every request. Null when no key is available; requests then go out
   /// unauthenticated (and the gateway 401s them).
   final String? apiKey;
 
   final Dio _dio;
 
   static const Duration _connectTimeout = Duration(seconds: 8);
-  static const Duration _receiveTimeout = Duration(seconds: 60);
+  // 180s: the LibreChat agents backend cold-starts Qwen3-14B on an idle
+  // llama.cpp, and the first chunk can arrive ~90-120s after TTFB. A 60s
+  // window made the very first call after a pause fail as a network error.
+  static const Duration _receiveTimeout = Duration(seconds: 180);
   static const Duration _retryBackoff = Duration(seconds: 1);
 
-  String get _endpoint => '$baseUrl/v1/chat/completions';
+  String get _endpoint => '$baseUrl/chat/completions';
 
   /// Builds the per-request [Options]. The bearer API key (when set) is
   /// attached to every request so the gateway never 401s a chat call. The
@@ -174,7 +188,16 @@ class ChatApiClient implements ChatClient {
     void Function(int index, String name, String argsFragment)?
         onToolCallDelta,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   }) async {
+    var ackFired = false;
+    void onReceivedAck() {
+      if (!ackFired) {
+        ackFired = true;
+        onReceived?.call();
+      }
+    }
+
     for (var attempt = 0; attempt < 2; attempt++) {
       try {
         return await _streamOnce(
@@ -187,6 +210,7 @@ class ChatApiClient implements ChatClient {
           onContent: onContent,
           onToolCallDelta: onToolCallDelta,
           cancelToken: cancelToken,
+          onReceived: onReceivedAck,
         );
       } on _ConnectionFailure catch (e) {
         if (attempt == 1) {
@@ -208,6 +232,7 @@ class ChatApiClient implements ChatClient {
     List<Map<String, Object?>>? tools,
     bool enableThinking = false,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   }) async {
     final body = _buildBody(
       messages: messages,
@@ -235,6 +260,8 @@ class ChatApiClient implements ChatClient {
     if (status == null || status < 200 || status >= 300) {
       throw ChatServerError('HTTP $status', statusCode: status);
     }
+
+    onReceived?.call();
 
     final data = response.data;
     final choices = data?['choices'];
@@ -287,6 +314,7 @@ class ChatApiClient implements ChatClient {
     void Function(int index, String name, String argsFragment)?
         onToolCallDelta,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   }) async {
     final body = _buildBody(
       messages: messages,
@@ -314,6 +342,8 @@ class ChatApiClient implements ChatClient {
     if (responseBody == null) {
       throw ChatStreamError('empty stream response');
     }
+
+    onReceived?.call();
 
     final content = StringBuffer();
     final toolAccums = <int, _ToolAccumulator>{};
@@ -353,9 +383,9 @@ class ChatApiClient implements ChatClient {
         throw ChatNetworkError('cancelled');
       }
       if (!bytesReceived) {
-        throw _ConnectionFailure(describeDioError(e));
+        throw _ConnectionFailure(describeDioException(e));
       }
-      throw ChatNetworkError(describeDioError(e));
+      throw ChatNetworkError(describeDioException(e));
     } catch (e) {
       if (!bytesReceived) {
         throw _ConnectionFailure('connection failed before any data: $e');
@@ -377,6 +407,7 @@ class ChatApiClient implements ChatClient {
             tools: tools,
             enableThinking: enableThinking,
             cancelToken: cancelToken,
+            onReceived: onReceived,
           );
         }
         toolCalls.add(
@@ -432,23 +463,18 @@ class ChatApiClient implements ChatClient {
   }
 
   Never _mapRequestError(DioException e) {
-    switch (e.type) {
-      case DioExceptionType.cancel:
+    switch (classifyDioException(e)) {
+      case DioErrorCategory.cancelled:
         throw ChatNetworkError('cancelled');
-      case DioExceptionType.badResponse:
+      case DioErrorCategory.badResponse:
         throw ChatServerError(
-          describeDioError(e),
+          describeDioException(e),
           statusCode: e.response?.statusCode,
         );
-      case DioExceptionType.connectionTimeout:
-      case DioExceptionType.receiveTimeout:
-      case DioExceptionType.sendTimeout:
-      case DioExceptionType.connectionError:
-        throw _ConnectionFailure(describeDioError(e));
-      case DioExceptionType.badCertificate:
-      case DioExceptionType.unknown:
-      case DioExceptionType.transformTimeout:
-        throw ChatNetworkError(describeDioError(e));
+      case DioErrorCategory.timeoutNetwork:
+        throw _ConnectionFailure(describeDioException(e));
+      case DioErrorCategory.other:
+        throw ChatNetworkError(describeDioException(e));
     }
   }
 

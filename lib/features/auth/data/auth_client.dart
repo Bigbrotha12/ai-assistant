@@ -1,6 +1,6 @@
 import 'package:dio/dio.dart';
 
-import '../../../core/network_errors.dart';
+import '../../../core/http/dio_errors.dart';
 
 /// A successful email sign-up/sign-in result from the backend.
 class AuthSession {
@@ -234,30 +234,29 @@ class BetterAuthClient implements AuthClient {
   }
 
   Never _mapDioError(DioException e) {
-    if (isNetworkError(e)) {
-      throw AuthNetworkError(describeDioError(e));
+    final message = describeDioException(e);
+    switch (classifyDioException(e)) {
+      case DioErrorCategory.cancelled:
+        throw const AuthNetworkError('cancelled');
+      case DioErrorCategory.badResponse:
+        final status = e.response?.statusCode;
+        switch (status) {
+          case 401:
+            throw AuthUnauthorized(message, statusCode: status);
+          case 409:
+            throw AuthEmailTaken(message, statusCode: status);
+          case 400:
+            // better-auth returns 422 for most validation / credential errors;
+            // 400 covers the remaining malformed-request family.
+            throw AuthInvalidCredentials(message, statusCode: status);
+          case 422:
+            throw AuthInvalidCredentials(message, statusCode: status);
+          default:
+            throw AuthServerError(message, statusCode: status);
+        }
+      case DioErrorCategory.timeoutNetwork:
+      case DioErrorCategory.other:
+        throw AuthNetworkError(message);
     }
-    if (e.type == DioExceptionType.badResponse) {
-      final status = e.response?.statusCode;
-      final message = describeDioError(e);
-      switch (status) {
-        case 401:
-          throw AuthUnauthorized(message, statusCode: status);
-        case 409:
-          throw AuthEmailTaken(message, statusCode: status);
-        case 400:
-          // better-auth returns 422 for most validation / credential errors;
-          // 400 covers the remaining malformed-request family.
-          throw AuthInvalidCredentials(message, statusCode: status);
-        case 422:
-          throw AuthInvalidCredentials(message, statusCode: status);
-        default:
-          throw AuthServerError(message, statusCode: status);
-      }
-    }
-    if (e.type == DioExceptionType.cancel) {
-      throw const AuthNetworkError('cancelled');
-    }
-    throw AuthNetworkError(describeDioError(e));
   }
 }

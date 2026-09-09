@@ -6,7 +6,7 @@ import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/engine_registry.dart';
 import '../data/model_downloader.dart';
-import './voice_settings.dart';
+import '../data/voice_settings.dart';
 import './voice_settings_providers.dart';
 
 /// Configuration screen for the voice conversation feature: engine selection,
@@ -47,7 +47,7 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
   }
 
   void _applyDefaults() {
-    final defaults = const VoiceSettings();
+    final defaults = VoiceSettings.defaults;
     _sttEngine = defaults.sttEngine;
     _ttsEngine = defaults.ttsEngine;
     _vadSensitivity = defaults.vadSensitivity;

@@ -1,7 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/config.dart';
-import '../../attachments/data/files_providers.dart';
+import '../../../core/http/dio_provider.dart';
 import './notif_client.dart';
 
 /// The notifier server URL, from compile-time env. Empty (default) disables

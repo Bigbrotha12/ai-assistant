@@ -7,7 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../app/app_startup.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../../core/config.dart';
-import '../../attachments/data/files_providers.dart';
+import '../../../core/http/dio_provider.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../voice/ui/voice_settings_providers.dart';
 import './vram_gate.dart';
@@ -67,7 +67,7 @@ class VisionClientNotifier extends AsyncNotifier<VisionClient> {
       return const NoOpVisionClient();
     }
 
-    return VisionApiClient(baseUrl: baseUrl, apiKey: apiKey);
+    return VisionApiClient(baseUrl: baseUrl, dio: ref.read(dioProvider), apiKey: apiKey);
   }
 
   /// Queries the backend's /v1/models to check for [kVisionModelRoute].

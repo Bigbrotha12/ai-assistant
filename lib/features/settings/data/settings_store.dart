@@ -1,6 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../../../core/backend_settings.dart';
+import '../../../core/secure_storage.dart';
 
 /// Persistence for runtime backend settings.
 abstract interface class SettingsStore {
@@ -21,19 +22,16 @@ class SecureSettingsStore implements SettingsStore {
   /// is used whose iOS keychain items are scoped to this device
   /// (`first_unlock_this_device`) so they never sync across devices.
   SecureSettingsStore({FlutterSecureStorage? storage})
-      : _storage = storage ??
-            const FlutterSecureStorage(
-              aOptions: AndroidOptions(),
-              iOptions: IOSOptions(
-                accessibility: KeychainAccessibility.first_unlock_this_device,
-              ),
-            );
+      : _storage = storage ?? defaultSecureStorage();
 
   static const _kHost = 'backend_host';
   static const _kEnvironment = 'backend_environment';
   static const _kMcpSecret = 'backend_mcp_secret';
   static const _kFilesSecret = 'backend_files_secret';
   static const _kStorageUrl = 'backend_storage_url';
+  static const _kLlmBaseUrl = 'backend_llm_base_url';
+  static const _kLlmModel = 'backend_llm_model';
+  static const _kLlmApiKey = 'backend_llm_api_key';
 
   final FlutterSecureStorage _storage;
 
@@ -50,6 +48,9 @@ class SecureSettingsStore implements SettingsStore {
     final mcpSecret = await _storage.read(key: _kMcpSecret);
     final filesSecret = await _storage.read(key: _kFilesSecret);
     final storageUrl = await _storage.read(key: _kStorageUrl);
+    final llmBaseUrl = await _storage.read(key: _kLlmBaseUrl);
+    final llmModel = await _storage.read(key: _kLlmModel);
+    final llmApiKey = await _storage.read(key: _kLlmApiKey);
     return BackendSettings(
       host: host,
       environment: environment,
@@ -59,6 +60,11 @@ class SecureSettingsStore implements SettingsStore {
           filesSecret == null || filesSecret.trim().isEmpty ? null : filesSecret,
       storageUrl:
           storageUrl == null || storageUrl.trim().isEmpty ? null : storageUrl,
+      llmBaseUrl:
+          llmBaseUrl == null || llmBaseUrl.trim().isEmpty ? null : llmBaseUrl,
+      llmModel: llmModel == null || llmModel.trim().isEmpty ? null : llmModel,
+      llmApiKey:
+          llmApiKey == null || llmApiKey.trim().isEmpty ? null : llmApiKey,
     );
   }
 
@@ -89,6 +95,24 @@ class SecureSettingsStore implements SettingsStore {
     } else {
       await _storage.delete(key: _kStorageUrl);
     }
+    final llmBaseUrl = settings.trimmedLlmBaseUrl;
+    if (llmBaseUrl != null) {
+      await _storage.write(key: _kLlmBaseUrl, value: llmBaseUrl);
+    } else {
+      await _storage.delete(key: _kLlmBaseUrl);
+    }
+    final llmModel = settings.trimmedLlmModel;
+    if (llmModel != null) {
+      await _storage.write(key: _kLlmModel, value: llmModel);
+    } else {
+      await _storage.delete(key: _kLlmModel);
+    }
+    final llmApiKey = settings.trimmedLlmApiKey;
+    if (llmApiKey != null) {
+      await _storage.write(key: _kLlmApiKey, value: llmApiKey);
+    } else {
+      await _storage.delete(key: _kLlmApiKey);
+    }
   }
 
   @override
@@ -98,5 +122,8 @@ class SecureSettingsStore implements SettingsStore {
     await _storage.delete(key: _kMcpSecret);
     await _storage.delete(key: _kFilesSecret);
     await _storage.delete(key: _kStorageUrl);
+    await _storage.delete(key: _kLlmBaseUrl);
+    await _storage.delete(key: _kLlmModel);
+    await _storage.delete(key: _kLlmApiKey);
   }
 }

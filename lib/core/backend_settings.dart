@@ -6,6 +6,9 @@ class BackendSettings {
     this.mcpSecret,
     this.filesSecret,
     this.storageUrl,
+    this.llmBaseUrl,
+    this.llmModel,
+    this.llmApiKey,
   });
 
   final String host;
@@ -23,6 +26,19 @@ class BackendSettings {
 
   /// Optional storage service URL. When null/blank derived from host:17603.
   final String? storageUrl;
+
+  /// Optional external OpenAI-compatible LLM API base root (e.g. a LibreChat
+  /// agents endpoint `https://<host>/api/agents/v1`, including the `/v1`
+  /// prefix). When null/blank the gateway LLM proxy is used.
+  final String? llmBaseUrl;
+
+  /// Optional inference model (e.g. a LibreChat agent id). When null/blank the
+  /// gateway's default model applies.
+  final String? llmModel;
+
+  /// Optional inference bearer key (e.g. a LibreChat API key). When null/blank
+  /// the gateway's better-auth key applies.
+  final String? llmApiKey;
 
   /// True when the host is non-blank. The MCP and files tokens are optional
   /// and not required for validity.
@@ -45,12 +61,33 @@ class BackendSettings {
   String? get trimmedStorageUrl =>
       storageUrl?.trim().isEmpty ?? true ? null : storageUrl?.trim();
 
+  /// The LLM base URL with surrounding whitespace and a trailing slash
+  /// removed; an empty (or blank) value is normalised to null.
+  String? get trimmedLlmBaseUrl {
+    final value = llmBaseUrl?.trim();
+    if (value == null || value.isEmpty) return null;
+    return value.endsWith('/') ? value.substring(0, value.length - 1) : value;
+  }
+
+  /// The LLM model with surrounding whitespace removed; an empty (or blank)
+  /// value is normalised to null.
+  String? get trimmedLlmModel =>
+      llmModel?.trim().isEmpty ?? true ? null : llmModel?.trim();
+
+  /// The LLM API key with surrounding whitespace removed; an empty (or blank)
+  /// value is normalised to null.
+  String? get trimmedLlmApiKey =>
+      llmApiKey?.trim().isEmpty ?? true ? null : llmApiKey?.trim();
+
   BackendSettings copyWith({
     String? host,
     BackendEnvironment? environment,
     String? mcpSecret,
     String? filesSecret,
     String? storageUrl,
+    String? llmBaseUrl,
+    String? llmModel,
+    String? llmApiKey,
   }) =>
       BackendSettings(
         host: host ?? this.host,
@@ -58,6 +95,9 @@ class BackendSettings {
         mcpSecret: mcpSecret ?? this.mcpSecret,
         filesSecret: filesSecret ?? this.filesSecret,
         storageUrl: storageUrl ?? this.storageUrl,
+        llmBaseUrl: llmBaseUrl ?? this.llmBaseUrl,
+        llmModel: llmModel ?? this.llmModel,
+        llmApiKey: llmApiKey ?? this.llmApiKey,
       );
 
   @override
@@ -67,11 +107,14 @@ class BackendSettings {
       other.environment == environment &&
       other.mcpSecret == mcpSecret &&
       other.filesSecret == filesSecret &&
-      other.storageUrl == storageUrl;
+      other.storageUrl == storageUrl &&
+      other.llmBaseUrl == llmBaseUrl &&
+      other.llmModel == llmModel &&
+      other.llmApiKey == llmApiKey;
 
   @override
-  int get hashCode =>
-      Object.hash(host, environment, mcpSecret, filesSecret, storageUrl);
+  int get hashCode => Object.hash(host, environment, mcpSecret, filesSecret,
+      storageUrl, llmBaseUrl, llmModel, llmApiKey);
 }
 
 /// Deployment environment; selects the URI scheme for backend endpoints.

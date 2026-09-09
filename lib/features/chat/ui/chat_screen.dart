@@ -14,7 +14,6 @@ import '../../attachments/data/file_model.dart';
 import '../../auth/ui/auth_flow.dart';
 import '../../settings/ui/settings_screen.dart';
 import '../../voice/ui/voice_screen.dart';
-import '../../voice/ui/voice_settings_screen.dart';
 import './chat_providers.dart';
 import './conversation_list.dart';
 import './message_list.dart';
@@ -194,33 +193,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          key: const Key('new-conversation'),
+          tooltip: 'New Chat',
+          icon: const Icon(Icons.add_comment_outlined),
+          onPressed: _newChat,
+        ),
         title: const Text('AI Assistant'),
         actions: [
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              switch (value) {
-                case 'new':
-                  _newChat();
-                case 'history':
-                  _openHistory();
-                case 'voice':
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => const VoiceSettingsScreen(),
-                    ),
-                  );
-                case 'settings':
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const SettingsScreen()),
-                  );
-              }
-            },
-            itemBuilder: (context) => const [
-              PopupMenuItem(value: 'new', child: Text('New Chat')),
-              PopupMenuItem(value: 'history', child: Text('History')),
-              PopupMenuItem(value: 'voice', child: Text('Voice')),
-              PopupMenuItem(value: 'settings', child: Text('Settings')),
-            ],
+          IconButton(
+            key: const Key('history'),
+            tooltip: 'History',
+            icon: const Icon(Icons.history),
+            onPressed: _openHistory,
           ),
         ],
       ),

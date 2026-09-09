@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:url_launcher/url_launcher.dart';
 
@@ -33,7 +33,7 @@ class MarkdownRenderer extends StatelessWidget {
       extensionSet: md.ExtensionSet.gitHubFlavored,
       // Images disabled: rendering nothing prevents SSRF into tailnet-internal
       // services via Image.network.
-      sizedImageBuilder: (config) => const SizedBox.shrink(),
+      imageBuilder: (uri, title, alt) => const SizedBox.shrink(),
       onTapLink: (text, href, title) => _openLink(href),
     );
   }

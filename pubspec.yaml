@@ -31,17 +31,12 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
   flutter_riverpod: ^3.4.2
   dio: ^5.11.0
   flutter_secure_storage: ^9.2.2
   drift: ^2.34.3
   drift_flutter: ^0.3.1
-  # flutter_markdown is deprecated on pub.dev; flutter_markdown_plus is the
-  # community-maintained replacement. Migrate in Phase 5 polish.
-  flutter_markdown: ^0.7.7+1
+  flutter_markdown_plus: ^1.0.12
   markdown: ^7.3.1
   url_launcher: ^6.3.2
   uuid: ^4.6.0
@@ -67,6 +62,10 @@ dependencies:
   sherpa_onnx: ^1.13.7
   # VAD for voice activity detection during mic capture.
   # flutter_vad: ^0.1.2  # — not published on pub.dev; add when available
+  # Keep the screen awake while an active voice conversation is running so a
+  # long LLM wait / TTS reply does not let the screen fall asleep (the app has
+  # no background-audio permission to finish speaking unseen).
+  wakelock_plus: ^1.2.10
 
 dev_dependencies:
   flutter_test:

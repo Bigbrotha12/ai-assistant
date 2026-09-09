@@ -9,7 +9,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
-import 'package:ai_assistant/features/attachments/data/files_providers.dart';
+import 'package:ai_assistant/core/http/dio_provider.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/features/vision/data/vision_client.dart';
 import 'package:ai_assistant/features/vision/data/vision_config.dart';

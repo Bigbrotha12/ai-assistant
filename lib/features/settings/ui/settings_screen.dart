@@ -17,8 +17,9 @@ import '../../../core/probe_providers.dart';
 import '../data/settings_providers.dart';
 import '../../../app/theme_providers.dart';
 import '../../../app/widgets/probe_status_row.dart';
-import '../../voice/ui/voice_settings.dart';
+import '../../voice/data/voice_settings.dart';
 import '../../voice/ui/voice_settings_providers.dart';
+import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
 import '../../auth/ui/auth_flow.dart';
 
@@ -459,6 +460,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 _buildGeneral(context),
                 const SizedBox(height: 32),
                 _buildAccount(context),
+                const SizedBox(height: 32),
+                _buildVoice(context),
               ],
             ),
           ),
@@ -665,7 +668,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Widget _buildGeneral(BuildContext context) {
     final theme = Theme.of(context);
     final voice =
-        ref.watch(voiceSettingsProvider).value ?? const VoiceSettings();
+         ref.watch(voiceSettingsProvider).value ?? VoiceSettings.defaults;
     final prefs = ref.watch(appPrefsProvider).value ?? const AppPrefs();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -799,6 +802,32 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           AuthFlow(onSuccess: _onAuthSuccess),
         ],
+      ],
+    );
+  }
+
+  /// "Voice" section: entry point to the voice conversation settings screen
+  /// (the voice/chat home screens no longer carry settings in their top
+  /// bars). Appended at the end of the list so the text-field indices used
+  /// by the settings tests stay stable.
+  Widget _buildVoice(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Voice', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        ListTile(
+          key: const Key('settings-voice'),
+          contentPadding: const EdgeInsets.symmetric(vertical: 4),
+          leading: const Icon(Icons.mic),
+          title: const Text('Voice conversation settings'),
+          subtitle: const Text('Engines, VAD sensitivity, language'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const VoiceSettingsScreen()),
+          ),
+        ),
       ],
     );
   }

@@ -240,6 +240,8 @@ class FakeChatClient implements ChatClient {
     List<ChatResult>? results,
     this.error,
     this.streamDeltas = const [],
+    this.toolCallDeltas = const [],
+    this.fireOnReceived = false,
   }) : results = results ?? [];
 
   /// Results consumed in order; the last one repeats once exhausted.
@@ -251,9 +253,19 @@ class FakeChatClient implements ChatClient {
   /// Per-call streamed content deltas delivered via [onContent].
   List<List<String>> streamDeltas = const [];
 
+  /// Per-call tool-call deltas delivered via [onToolCallDelta].
+  /// Each entry is one call's worth of `(index, name, argsFragment)` tuples.
+  List<List<(int index, String name, String argsFragment)>> toolCallDeltas =
+      const [];
+
   /// When set, [streamCompletions] awaits this before returning, letting tests
   /// pause mid-stream (for stop / dispose scenarios).
   Completer<ChatResult>? hang;
+
+  /// When true, [streamCompletions] calls [onReceived] immediately so new
+  /// tests can exercise the ack path. Defaults to false to avoid breaking
+  /// existing scripted tests that don't expect the ack interjection.
+  bool fireOnReceived;
 
   /// The `messages` argument of each [streamCompletions] call.
   final List<List<ApiMessage>> calls = [];
@@ -278,6 +290,7 @@ class FakeChatClient implements ChatClient {
     void Function(int index, String name, String argsFragment)?
         onToolCallDelta,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   }) async {
     // Mirror the Dio-backed client (chat_client.dart's DioExceptionType.cancel
     // handling): a request dispatched against an already-cancelled token
@@ -289,8 +302,14 @@ class FakeChatClient implements ChatClient {
     calls.add(messages);
     lastSystemPrompt = systemPrompt;
     lastTools = tools;
+    if (fireOnReceived) onReceived?.call();
     final index = callCount < results.length ? callCount : results.length - 1;
     callCount++;
+    if (index >= 0 && index < toolCallDeltas.length) {
+      for (final delta in toolCallDeltas[index]) {
+        onToolCallDelta?.call(delta.$1, delta.$2, delta.$3);
+      }
+    }
     if (index >= 0 && index < streamDeltas.length) {
       for (final delta in streamDeltas[index]) {
         onContent?.call(delta);
@@ -316,6 +335,7 @@ class FakeChatClient implements ChatClient {
     List<Map<String, Object?>>? tools,
     bool enableThinking = false,
     CancelToken? cancelToken,
+    void Function()? onReceived,
   }) {
     throw UnimplementedError();
   }

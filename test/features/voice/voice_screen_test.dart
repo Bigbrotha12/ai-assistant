@@ -7,6 +7,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
+import 'package:ai_assistant/core/probe_providers.dart';
+import 'package:ai_assistant/app/theme_providers.dart';
+import 'package:ai_assistant/features/settings/data/prefs_providers.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
@@ -17,12 +20,14 @@ import 'package:ai_assistant/features/chat/ui/conversation_list.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
 import 'package:ai_assistant/features/voice/data/tts_engine.dart';
 import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller_provider.dart';
 import 'package:ai_assistant/features/voice/ui/voice_screen.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
 import 'package:ai_assistant/features/voice/data/stt_engine.dart';
+import 'package:ai_assistant/main.dart';
 
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';
@@ -107,6 +112,7 @@ void main() {
           playback ?? FakeAudioPlayback(),
         ),
         audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
+        screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
         chatApiClientProvider.overrideWithValue(
           chatClient ?? FakeChatClient(),
         ),
@@ -264,7 +270,8 @@ void main() {
     );
     await settle(tester);
 
-    await tester.tap(find.text('Transcript'));
+    // The transcript panel only renders in text mode.
+    await tester.tap(find.text('Text'));
     await pumpFrames(tester);
 
     expect(find.text('Where is the moon?'), findsOneWidget);
@@ -308,7 +315,7 @@ void main() {
       ),
     );
     await settle(tester);
-    await tester.tap(find.text('Transcript'));
+    await tester.tap(find.text('Text'));
     await pumpFrames(tester);
 
     // A new (voice) turn with the exact text of the seeded last message must
@@ -370,7 +377,7 @@ void main() {
     expect(playback.playedChunks, isEmpty);
 
     // The user bubble appears immediately and the reply after it streams.
-    await tester.tap(find.text('Transcript'));
+    // (The transcript panel is expanded by default in text mode.)
     await pumpFrames(tester);
     expect(find.text('hello'), findsOneWidget);
     expect(find.text('Hi there'), findsOneWidget);
@@ -477,7 +484,7 @@ void main() {
     await settle(tester);
 
     // Conversation A's history is seeded.
-    await tester.tap(find.text('Transcript'));
+    await tester.tap(find.text('Text'));
     await pumpFrames(tester);
     expect(find.text('Hello A'), findsOneWidget);
     expect(find.text('Hello B'), findsNothing);
@@ -561,7 +568,7 @@ void main() {
     await tester.tap(find.text('Conversation B'));
     await pumpFrames(tester, 25);
 
-    await tester.tap(find.text('Transcript'));
+    await tester.tap(find.text('Text'));
     await pumpFrames(tester);
 
     // B's seeded history shows; A's reply must NOT appear as a phantom bubble.
@@ -614,7 +621,7 @@ void main() {
       ),
     );
     await settle(tester);
-    await tester.tap(find.text('Transcript'));
+    await tester.tap(find.text('Text'));
     await pumpFrames(tester);
     expect(find.text('Hello A'), findsOneWidget);
 
@@ -912,5 +919,106 @@ void main() {
       const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
     );
     await settle(tester);
+  });
+
+  /// Boots the real [AiAssistantApp] with a fully faked provider graph. The
+  /// onboarding gate lands on the voice home when a valid host is stored, so
+  /// the voice provider graph must be resolvable too.
+  Widget app({
+    FakeSettingsStore? store,
+    required FakeProbe probe,
+    required FakeChatStore chatStore,
+    required FakeChatClient client,
+  }) {
+    final settingsStore =
+        store ?? FakeSettingsStore(stored: const BackendSettings(host: 'myhost'));
+    return ProviderScope(
+      overrides: [
+        settingsStoreProvider.overrideWithValue(settingsStore),
+        // The app home is the onboarding gate, which also reads the auth and
+        // prefs stores before routing to the voice home.
+        authCredentialsStoreProvider.overrideWithValue(
+          FakeAuthCredentialsStore(
+            stored: const AuthCredentials(apiKey: 'test-key'),
+          ),
+        ),
+        appPrefsStoreProvider.overrideWithValue(FakePrefsStore()),
+        backendProbeProvider.overrideWithValue(probe),
+        chatStoreProvider.overrideWithValue(chatStore),
+        chatApiClientProvider.overrideWithValue(client),
+        // The voice home boots the real audio stack (record, just_audio,
+        // secure storage, path_provider); none of that exists in widget
+        // tests, so every voice service is faked.
+        engineManagerProvider.overrideWithValue(FakeEngineManager()),
+        micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
+        audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+        audioSessionManagerProvider
+            .overrideWithValue(FakeAudioSessionManager()),
+        screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+        vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
+        voiceSettingsStoreProvider
+            .overrideWithValue(FakeVoiceSettingsStore()),
+        appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
+      ],
+      child: const AiAssistantApp(),
+    );
+  }
+
+  /// Bounded pump: the voice home keeps idle animations running (the speak
+  /// button's breathing pulse + ring repeat forever), so `pumpAndSettle`
+  /// would time out. Fixed-duration pumps settle providers and route
+  /// transitions without waiting for an idle frame.
+  Future<void> pumpBounded(WidgetTester tester) async {
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+  }
+
+  group('full-app boot', () {
+    testWidgets('app boots to VoiceScreen with valid settings',
+        (tester) async {
+      final store = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      await tester.pumpWidget(app(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: FakeChatClient(),
+      ));
+      await pumpBounded(tester);
+
+      expect(find.text('AI Assistant'), findsOneWidget);
+      expect(find.byType(SpeakButton), findsOneWidget);
+      expect(find.text('PRESS AND HOLD TO TALK'), findsOneWidget);
+      // The voice/text toggle pill renders in both modes.
+      expect(
+        find.byKey(const Key('voice-input-mode-toggle')),
+        findsOneWidget,
+      );
+      expect(find.text('Backend not configured'), findsNothing);
+    });
+
+    testWidgets('Settings screen opens from the engine status bar',
+        (tester) async {
+      final store = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      await tester.pumpWidget(app(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: FakeChatClient(),
+      ));
+      await pumpBounded(tester);
+
+      // The settings gear in the engine status bar opens the settings screen.
+      await tester.tap(find.byKey(const Key('engine-bar-settings')));
+      await pumpBounded(tester);
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(find.text('Backend host'), findsOneWidget);
+      expect(find.text('MCP token (optional)'), findsOneWidget);
+    });
   });
 }

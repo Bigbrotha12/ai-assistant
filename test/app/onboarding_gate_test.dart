@@ -221,6 +221,9 @@ void main() {
       expect(find.byType(OnboardingScreen), findsOneWidget);
       expect(find.text('Account'), findsOneWidget);
       expect(find.byType(SpeakButton), findsNothing);
+      // The unconfigured banner only renders on the voice/chat homes, never
+      // on the onboarding screen.
+      expect(find.text('Backend not configured'), findsNothing);
     });
   });
 

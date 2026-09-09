@@ -3,6 +3,44 @@ import 'package:flutter/material.dart';
 import '../theme.dart';
 import './gold_band.dart';
 
+/// Shared pill chrome (§3.2): core tier is a quiet `surfaceContainer` stadium
+/// with an outline; premium tier is a paper fill with a 1.5px **metallic gold
+/// gradient border** — gold stays accent-only (never a gold fill).
+///
+/// Used by [GoldenPill] and by the voice screen's mode toggle so both share
+/// the exact same visual style.
+class PillChrome extends StatelessWidget {
+  const PillChrome({
+    super.key,
+    required this.child,
+  });
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
+
+    if (!tier.premium) {
+      return Material(
+        color: scheme.surfaceContainer,
+        shape: StadiumBorder(
+          side: BorderSide(color: scheme.outline),
+        ),
+        child: child,
+      );
+    }
+
+    return GoldEdge(
+      bandWidth: GoldBand.hairline,
+      radius: AppRadii.pill,
+      fill: AppColors.paperRaised,
+      child: child,
+    );
+  }
+}
+
 /// The signature "golden border" pill (§3.2) used for the Transcript toggle.
 ///
 /// Core tier: a quiet `surfaceTint` pill. Premium tier: ivory/paper fill with
@@ -41,8 +79,7 @@ class GoldenPill extends StatelessWidget {
     final tier = theme.extension<TierTheme>() ?? const TierTheme(premium: false);
     final chevron = open ? Icons.keyboard_arrow_down : Icons.expand_less;
 
-    final pill = Material(
-      color: Colors.transparent,
+    return PillChrome(
       child: InkWell(
         onTap: enabled ? onTap : null,
         borderRadius: BorderRadius.circular(AppRadii.pill),
@@ -77,23 +114,6 @@ class GoldenPill extends StatelessWidget {
           ),
         ),
       ),
-    );
-
-    if (!tier.premium) {
-      return Material(
-        color: scheme.surfaceContainer,
-        shape: StadiumBorder(
-          side: BorderSide(color: scheme.outline),
-        ),
-        child: pill,
-      );
-    }
-
-    return GoldEdge(
-      bandWidth: GoldBand.hairline,
-      radius: AppRadii.pill,
-      fill: AppColors.paperRaised,
-      child: pill,
     );
   }
 }

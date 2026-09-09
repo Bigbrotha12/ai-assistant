@@ -110,6 +110,35 @@ class BackendConfig {
       llmProxy(host, environment: environment)
           .replace(path: '/v1/chat/completions');
 
+  /// The OpenAI-compatible LLM API base root derived from the gateway proxy:
+  /// `host:17600` plus the `/v1` prefix the chat client appends
+  /// `chat/completions` to. Used when no inference override is configured.
+  static Uri llmApiBase(String host, {BackendEnvironment? environment}) =>
+      llmProxy(host, environment: environment).replace(path: '/v1');
+
+  /// Gateway llama.cpp model used when no inference override is configured.
+  static const String gatewayLlmModel = 'Qwen3-8B-Q4_K_M.gguf';
+
+  /// Optional inference base URL dart-define pointing at an external
+  /// OpenAI-compatible API (e.g. a LibreChat agents endpoint
+  /// `https://<host>/api/agents/v1`). Blank falls back to the gateway.
+  static const String defaultLlmBaseUrl = String.fromEnvironment(
+    'LLM_BASE_URL',
+  );
+
+  /// Optional inference model dart-define (e.g. a LibreChat agent id). Blank
+  /// falls back to [gatewayLlmModel].
+  static const String defaultLlmModel = String.fromEnvironment(
+    'LLM_MODEL',
+    defaultValue: gatewayLlmModel,
+  );
+
+  /// Optional inference bearer key dart-define (e.g. a LibreChat API key).
+  /// Blank falls back to the gateway's better-auth key.
+  static const String defaultLlmApiKey = String.fromEnvironment(
+    'LLM_API_KEY',
+  );
+
   /// voice-mcp: tool bridge (bearer-gated).
   static Uri mcp(String host, {BackendEnvironment? environment}) =>
       Uri(scheme: _scheme(environment), host: host, port: 17601);

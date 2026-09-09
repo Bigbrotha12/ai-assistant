@@ -3,7 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../app/app_startup.dart';
 import './auth_client.dart';
 import '../../../core/config.dart';
-import '../../attachments/data/files_providers.dart';
+import '../../../core/http/dio_provider.dart';
 import '../../settings/data/settings_providers.dart';
 
 /// Provides the [AuthClient] wired to the configured backend host. Reuses the

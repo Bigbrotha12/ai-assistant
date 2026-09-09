@@ -18,7 +18,7 @@ import '../../voice/data/engine_config.dart';
 import '../../voice/data/engine_manager.dart';
 import '../../voice/data/engine_manager_provider.dart';
 import '../../voice/data/model_downloader.dart';
-import '../../voice/ui/voice_settings.dart';
+import '../../voice/data/voice_settings.dart';
 import '../../voice/ui/voice_settings_providers.dart';
 
 /// Onboarding flow (plan §3.5): a themed vertical [Stepper] that walks the
@@ -391,7 +391,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     try {
       // 1) Voice settings first (language is stored here, never in prefs).
       final current =
-          ref.read(voiceSettingsProvider).value ?? const VoiceSettings();
+          ref.read(voiceSettingsProvider).value ?? VoiceSettings.defaults;
       await ref
           .read(voiceSettingsProvider.notifier)
           .save(current.copyWith(preferredLanguage: _language));

@@ -141,7 +141,7 @@ class _ScriptedAdapter implements HttpClientAdapter {
 
 ChatApiClient _client(_ScriptedAdapter adapter, {String? apiKey}) =>
     ChatApiClient(
-      baseUrl: 'http://192.168.1.5:17600',
+      baseUrl: 'http://192.168.1.5:17600/v1',
       dio: Dio()..httpClientAdapter = adapter,
       apiKey: apiKey,
     );
@@ -538,6 +538,67 @@ void main() {
       for (final req in adapter.requests) {
         expect(req.headers['Authorization'], 'Bearer sk-test123');
       }
+    });
+  });
+
+  group('onReceived', () {
+    test('fires exactly once on a 2xx streamed response', () async {
+      final adapter = _ScriptedAdapter([
+        _StreamAction([
+          frame(chunk(content: 'hi')),
+          frame(chunk(finishReason: 'stop')),
+        ]),
+      ]);
+      final client = _client(adapter);
+
+      var receivedCount = 0;
+      await client.streamCompletions(
+        messages: messages,
+        onReceived: () => receivedCount++,
+      );
+
+      expect(receivedCount, 1);
+    });
+
+    test('does NOT fire on 401 and throws ChatServerError', () async {
+      final adapter = _ScriptedAdapter([
+        _ErrorAction(401, body: 'Unauthorized'),
+      ]);
+      final client = _client(adapter);
+
+      var receivedCount = 0;
+      await expectLater(
+        client.streamCompletions(
+          messages: messages,
+          onReceived: () => receivedCount++,
+        ),
+        throwsA(
+          isA<ChatServerError>()
+              .having((e) => e.statusCode, 'statusCode', 401),
+        ),
+      );
+      expect(receivedCount, 0);
+    });
+
+    test('fires exactly once across a connection-failure retry', () async {
+      final adapter = _ScriptedAdapter([
+        _NetworkErrorAction(DioExceptionType.connectionTimeout),
+        _StreamAction([
+          frame(chunk(content: 'recovered')),
+          frame(chunk(finishReason: 'stop')),
+        ]),
+      ]);
+      final client = _client(adapter);
+
+      var receivedCount = 0;
+      final result = await client.streamCompletions(
+        messages: messages,
+        onReceived: () => receivedCount++,
+      );
+
+      expect(result.content, 'recovered');
+      expect(receivedCount, 1);
+      expect(adapter.callCount, 2);
     });
   });
 }

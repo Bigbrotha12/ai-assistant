@@ -24,9 +24,8 @@ import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/model_downloader.dart';
 import '../data/voice_capture_providers.dart';
-import './voice_controller.dart';
+import './voice_conversation_state.dart';
 import './voice_controller_provider.dart';
-import './voice_settings_screen.dart';
 
 /// Voice-first home screen: a single large hold-to-talk [SpeakButton], a
 /// quiet status line, and a Transcript [GoldenPill] whose panel expands
@@ -90,10 +89,6 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   bool _localRecording = false;
 
   bool _engineBusy = false;
-
-  /// Whether the live transcript panel is expanded (docs: chevron points up
-  /// because the panel rises from the bottom).
-  bool _transcriptOpen = false;
 
   /// Errors raised outside the controller (e.g. mic permission before the
   /// pipeline starts) so they surface in the same banner as state errors.
@@ -371,8 +366,6 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
   void _openBackendSettings() => _push(const SettingsScreen());
 
-  void _openVoiceSettings() => _push(const VoiceSettingsScreen());
-
   /// Switches the active conversation to a fresh, empty one.
   void _newConversation() {
     ref.read(activeConversationIdProvider.notifier).newConversation();
@@ -465,33 +458,19 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          key: const Key('new-conversation'),
+          tooltip: 'New Conversation',
+          icon: const Icon(Icons.add_comment_outlined),
+          onPressed: _newConversation,
+        ),
         title: const Text('AI Assistant'),
         actions: [
-          IconButton(
-            key: const Key('new-conversation'),
-            tooltip: 'New Conversation',
-            icon: const Icon(Icons.add_comment_outlined),
-            onPressed: _newConversation,
-          ),
           IconButton(
             key: const Key('history'),
             tooltip: 'History',
             icon: const Icon(Icons.history),
             onPressed: _openHistory,
-          ),
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              switch (value) {
-                case 'voice-settings':
-                  _openVoiceSettings();
-                case 'settings':
-                  _openBackendSettings();
-              }
-            },
-            itemBuilder: (context) => const [
-              PopupMenuItem(value: 'voice-settings', child: Text('Voice Settings')),
-              PopupMenuItem(value: 'settings', child: Text('Settings')),
-            ],
           ),
         ],
       ),
@@ -525,79 +504,107 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
             Expanded(
               child: Column(
                 children: [
-                  Expanded(
-                    child: Center(
-                      child: SingleChildScrollView(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 24,
-                          vertical: 12,
-                        ),
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            _HeroStatus(
-                              recording: recording,
-                              aiSpeaking: state.isAiSpeaking,
-                              generating: state.isGenerating,
-                              connected: state.isConnected,
-                              paused: state.isPaused,
-                              premium: tier.premium,
-                            ),
-                            if (state.notice != null) ...[
-                              const SizedBox(height: 6),
-                              Text(
-                                state.notice!,
-                                textAlign: TextAlign.center,
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .labelSmall
-                                    ?.copyWith(
-                                      color: scheme.onSurfaceVariant,
-                                    ),
+                  if (_textInputMode) ...[
+                    // Text mode: a compact hero (status line only) so the
+                    // message view takes most of the vertical space, with the
+                    // composer underneath the history.
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                      child: Column(
+                        children: [
+                          _HeroStatus(
+                            recording: recording,
+                            aiSpeaking: state.isAiSpeaking,
+                            generating: state.isGenerating,
+                            connected: state.isConnected,
+                            paused: state.isPaused,
+                            premium: tier.premium,
+                          ),
+                          _TurnStatusLine(
+                            status: state.status,
+                            notice: state.notice,
+                          ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      child: _MessageLog(
+                        controller: _logScroll,
+                        entries: _transcripts,
+                        aiSpeaking: state.isAiSpeaking,
+                        connected: state.isConnected,
+                        inTextMode: true,
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                      child: _Composer(
+                        controller: _textInput,
+                        enabled: !_turnInFlight && !_micBusy,
+                        canSend: !_turnInFlight &&
+                            !_micBusy &&
+                            _textInput.text.trim().isNotEmpty,
+                        onSend: _sendText,
+                        onChanged: () => setState(() {}),
+                      ),
+                    ),
+                  ] else ...[
+                    // Voice mode: the centered scrollable hero with the
+                    // SpeakButton. No transcript panel in voice mode — the
+                    // message view only appears in text mode.
+                    Expanded(
+                      child: Center(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 24,
+                            vertical: 12,
+                          ),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                               _HeroStatus(
+                                recording: recording,
+                                aiSpeaking: state.isAiSpeaking,
+                                generating: state.isGenerating,
+                                connected: state.isConnected,
+                                paused: state.isPaused,
+                                premium: tier.premium,
                               ),
-                            ],
-                            if (tier.premium) ...[
-                              const SizedBox(height: 10),
-                              Text(
-                                'Speak',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .displaySmall
-                                    ?.copyWith(
-                                      color: scheme.onSurface,
-                                    ),
+                              _TurnStatusLine(
+                                status: state.status,
+                                notice: state.notice,
                               ),
-                            ],
-                            AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 200),
-                              child: recording || state.isAiSpeaking
-                                  ? Padding(
-                                      key: const ValueKey('waveform'),
-                                      padding: const EdgeInsets.only(top: 16),
-                                      child: _Waveform(
-                                        active: recording,
-                                        color: tier.premium
-                                            ? AppColors.goldBase
-                                            : scheme.primary,
+                              if (tier.premium) ...[
+                                const SizedBox(height: 10),
+                                Text(
+                                  'Speak',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .displaySmall
+                                      ?.copyWith(
+                                        color: scheme.onSurface,
                                       ),
-                                    )
-                                  : const SizedBox(
-                                      key: ValueKey('waveform-idle'),
-                                      height: 22,
-                                    ),
-                            ),
-                            const SizedBox(height: 20),
-                            if (_textInputMode) ...[
-                              _Composer(
-                                controller: _textInput,
-                                enabled: !_turnInFlight && !_micBusy,
-                                canSend: !_turnInFlight &&
-                                    !_micBusy &&
-                                    _textInput.text.trim().isNotEmpty,
-                                onSend: _sendText,
-                                onChanged: () => setState(() {}),
+                                ),
+                              ],
+                              AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 200),
+                                child: recording || state.isAiSpeaking
+                                    ? Padding(
+                                        key: const ValueKey('waveform'),
+                                        padding: const EdgeInsets.only(top: 16),
+                                        child: _Waveform(
+                                          active: recording,
+                                          color: tier.premium
+                                              ? AppColors.goldBase
+                                              : scheme.primary,
+                                        ),
+                                      )
+                                    : const SizedBox(
+                                        key: ValueKey('waveform-idle'),
+                                        height: 22,
+                                      ),
                               ),
-                            ] else ...[
+                              const SizedBox(height: 20),
                               SpeakButton(
                                 recording: recording,
                                 aiSpeaking: state.isAiSpeaking,
@@ -617,22 +624,21 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                                     ),
                               ),
                             ],
-                          ],
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  // Input mode toggle lives below the scrollable hero area so
-                  // it is never clipped by the viewport or overlapped by the
-                  // transcript panel. The Stop control (barge-in) sits beside
-                  // it while the AI is speaking, clear of the SpeakButton's
-                  // hit area.
+                  ],
+                  // Input mode toggle lives below the content area so it is
+                  // never clipped by the viewport. The Stop control (barge-in)
+                  // sits beside it while the AI is speaking, clear of the
+                  // SpeakButton's hit area.
                   Padding(
                     padding: const EdgeInsets.only(top: 8, bottom: 8),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        _InputModeToggle(
+                        _PillModeToggle(
                           value: _textInputMode,
                           enabled: !_turnInFlight && !recording,
                           onChanged: _setTextInputMode,
@@ -654,43 +660,58 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                       ],
                     ),
                   ),
-                  // Transcript panel: expands upward from the pill, so the
-                  // pill's chevron points UP when closed and DOWN when open.
-                  AnimatedSize(
-                    duration: const Duration(milliseconds: 220),
-                    curve: Curves.easeOutCubic,
-                    alignment: Alignment.topCenter,
-                    child: _transcriptOpen
-                        ? SizedBox(
-                            height: 176,
-                            child: _MessageLog(
-                              controller: _logScroll,
-                              entries: _transcripts,
-                              aiSpeaking: state.isAiSpeaking,
-                              connected: state.isConnected,
-                            ),
-                          )
-                        : const SizedBox(width: double.infinity),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 14, top: 8),
-                    child: GoldenPill(
-                      label: 'Transcript',
-                      trailing: _transcripts.isEmpty ? null : '${_transcripts.length}',
-                      open: _transcriptOpen,
-                      onTap: () => setState(() => _transcriptOpen = !_transcriptOpen),
-                    ),
-                  ),
                 ],
               ),
             ),
             _EngineStatusBar(
               downloading: _engineBusy,
               onDownload: _downloadModels,
+              onOpenSettings: _openBackendSettings,
             ),
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Status interjection line shown below the hero: displays the live per-turn
+/// status (e.g. 'Thinking…', 'Working — …') and any transient notice (e.g.
+/// 'Dropped — one utterance at a time.'). Shared by voice and text modes.
+class _TurnStatusLine extends StatelessWidget {
+  const _TurnStatusLine({this.status, this.notice});
+
+  final String? status;
+  final String? notice;
+
+  @override
+  Widget build(BuildContext context) {
+    if (status == null && notice == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        if (status != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            status!,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  fontStyle: FontStyle.italic,
+                  color: scheme.onSurfaceVariant,
+                ),
+          ),
+        ],
+        if (notice != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            notice!,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+          ),
+        ],
+      ],
     );
   }
 }
@@ -821,9 +842,10 @@ class _Composer extends StatelessWidget {
   }
 }
 
-/// Small segmented voice / text mode switch shown under the input area.
-class _InputModeToggle extends StatelessWidget {
-  const _InputModeToggle({
+/// Voice / text mode switch rendered in the shared pill chrome ([PillChrome]),
+/// the same visual style as [GoldenPill] minus the chevron.
+class _PillModeToggle extends StatelessWidget {
+  const _PillModeToggle({
     required this.value,
     required this.enabled,
     required this.onChanged,
@@ -833,31 +855,73 @@ class _InputModeToggle extends StatelessWidget {
   final bool enabled;
   final ValueChanged<bool> onChanged;
 
+  Widget _segment(
+    BuildContext context, {
+    required bool selected,
+    required IconData icon,
+    required String label,
+    required bool segmentValue,
+  }) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final tier = theme.extension<TierTheme>() ?? const TierTheme(premium: false);
+    final color = !enabled
+        ? scheme.onSurfaceVariant
+        : selected
+            ? (tier.premium ? AppColors.goldDark : scheme.onSurface)
+            : scheme.onSurfaceVariant;
+    return InkWell(
+      onTap: enabled ? () => onChanged(segmentValue) : null,
+      borderRadius: BorderRadius.circular(AppRadii.pill),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 16, color: color),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: color,
+                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return SegmentedButton<bool>(
+    final theme = Theme.of(context);
+    final tier = theme.extension<TierTheme>() ?? const TierTheme(premium: false);
+    return PillChrome(
       key: const Key('voice-input-mode-toggle'),
-      segments: const [
-        ButtonSegment(
-          value: false,
-          icon: Icon(Icons.mic_none, size: 18),
-          label: Text('Voice'),
-        ),
-        ButtonSegment(
-          value: true,
-          icon: Icon(Icons.keyboard_outlined, size: 18),
-          label: Text('Text'),
-        ),
-      ],
-      selected: {value},
-      onSelectionChanged: enabled ? (selection) => onChanged(selection.single) : null,
-      showSelectedIcon: false,
-      style: ButtonStyle(
-        visualDensity: VisualDensity.compact,
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        textStyle: WidgetStatePropertyAll(
-          Theme.of(context).textTheme.labelMedium,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _segment(
+            context,
+            selected: !value,
+            icon: Icons.mic_none,
+            label: 'Voice',
+            segmentValue: false,
+          ),
+          Container(
+            height: 20,
+            width: 1,
+            color: tier.premium ? AppColors.goldBase : theme.colorScheme.outline,
+          ),
+          _segment(
+            context,
+            selected: value,
+            icon: Icons.keyboard_outlined,
+            label: 'Text',
+            segmentValue: true,
+          ),
+        ],
       ),
     );
   }
@@ -1147,6 +1211,7 @@ class _MessageLog extends StatelessWidget {
     required this.entries,
     required this.aiSpeaking,
     required this.connected,
+    this.inTextMode = false,
   });
 
   final ScrollController controller;
@@ -1154,15 +1219,23 @@ class _MessageLog extends StatelessWidget {
   final bool aiSpeaking;
   final bool connected;
 
+  /// Selects the empty-state copy: voice mode invites talking, text mode
+  /// invites typing.
+  final bool inTextMode;
+
   @override
   Widget build(BuildContext context) {
     final itemCount = entries.length + (aiSpeaking ? 1 : 0);
     if (itemCount == 0) {
       return Center(
         child: Text(
-          connected
-              ? 'Nothing yet — start speaking'
-              : 'Hold the button to start a conversation',
+          inTextMode
+              ? (connected
+                  ? 'Nothing yet — type a message'
+                  : 'Type a message to start a conversation')
+              : (connected
+                  ? 'Nothing yet — start speaking'
+                  : 'Hold the button to start a conversation'),
           style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
@@ -1288,13 +1361,19 @@ class _AssistantSpeakingBubble extends StatelessWidget {
   }
 }
 
-/// Bottom bar with per-engine readiness chips (STT/TTS) and model download
-/// progress / retry actions.
+/// Bottom bar with per-engine readiness chips (STT/TTS), model download
+/// progress / retry actions, and the settings entry point (the top bar no
+/// longer carries settings).
 class _EngineStatusBar extends ConsumerWidget {
-  const _EngineStatusBar({required this.downloading, required this.onDownload});
+  const _EngineStatusBar({
+    required this.downloading,
+    required this.onDownload,
+    required this.onOpenSettings,
+  });
 
   final bool downloading;
   final Future<void> Function() onDownload;
+  final VoidCallback onOpenSettings;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -1325,22 +1404,29 @@ class _EngineStatusBar extends ConsumerWidget {
                   // Engines surfaced as `unavailable` are intentionally off —
                   // hide their chip entirely instead of offering a download
                   // that can never succeed.
-                  if (statuses[EngineConfig.supertonic3Id] !=
-                      VoiceEngineStatus.unavailable) ...[
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _EngineStatusChip(
-                        label: 'Supertonic 3',
-                        status:
-                            statuses[EngineConfig.supertonic3Id] ??
-                            VoiceEngineStatus.notStarted,
-                        progress: progress,
-                        onAction: downloading ? null : onDownload,
+                    if (statuses[EngineConfig.supertonic3Id] !=
+                        VoiceEngineStatus.unavailable) ...[
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _EngineStatusChip(
+                          label: 'Supertonic 3',
+                          status:
+                              statuses[EngineConfig.supertonic3Id] ??
+                              VoiceEngineStatus.notStarted,
+                          progress: progress,
+                          onAction: downloading ? null : onDownload,
+                        ),
                       ),
+                    ],
+                    const SizedBox(width: 4),
+                    IconButton(
+                      key: const Key('engine-bar-settings'),
+                      tooltip: 'Settings',
+                      icon: const Icon(Icons.settings_outlined),
+                      onPressed: onOpenSettings,
                     ),
                   ],
-                ],
-              ),
+                ),
               if (downloading) ...[
                 const SizedBox(height: 8),
                 const LinearProgressIndicator(minHeight: 2),

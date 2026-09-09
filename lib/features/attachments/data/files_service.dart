@@ -3,7 +3,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 
 import './file_model.dart';
-import '../../../core/network_errors.dart';
+import '../../../core/http/dio_errors.dart';
 
 // The constructor assigns public params to private fields (per the shared
 // contract), which trips prefer_initializing_formals.
@@ -205,22 +205,17 @@ class FilesClientImpl implements FilesClient {
   }
 
   Never _mapError(DioException e) {
-    switch (e.type) {
-      case DioExceptionType.cancel:
+    switch (classifyDioException(e)) {
+      case DioErrorCategory.cancelled:
         throw FilesCancelledError('cancelled');
-      case DioExceptionType.badResponse:
+      case DioErrorCategory.badResponse:
         throw FilesServerError(
-          describeDioError(e),
+          describeDioException(e),
           statusCode: e.response?.statusCode,
         );
-      case DioExceptionType.connectionTimeout:
-      case DioExceptionType.sendTimeout:
-      case DioExceptionType.receiveTimeout:
-      case DioExceptionType.connectionError:
-      case DioExceptionType.badCertificate:
-      case DioExceptionType.unknown:
-      case DioExceptionType.transformTimeout:
-        throw FilesNetworkError(describeDioError(e));
+      case DioErrorCategory.timeoutNetwork:
+      case DioErrorCategory.other:
+        throw FilesNetworkError(describeDioException(e));
     }
   }
 }

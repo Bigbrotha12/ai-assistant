@@ -1,6 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import './voice_settings.dart';
+import '../data/voice_settings.dart';
 import './voice_settings_store.dart';
 
 /// Provides the runtime [VoiceSettingsStore] used for voice settings.
@@ -33,7 +33,7 @@ class VoiceSettingsNotifier extends AsyncNotifier<VoiceSettings?> {
 
   /// Resets to the default voice settings.
   Future<void> reset() async {
-    final defaults = VoiceSettings();
+    final defaults = VoiceSettings.defaults;
     try {
       await ref.read(voiceSettingsStoreProvider).save(defaults);
       state = AsyncData(defaults);

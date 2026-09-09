@@ -1,4 +1,4 @@
-import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
+import 'package:ai_assistant/features/voice/ui/voice_conversation_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -26,6 +26,7 @@ void main() {
         isGenerating: true,
         error: 'boom',
         notice: 'heads up',
+        status: 'Thinking…',
         lastTranscript: 'hello',
         onDeviceTranscript: 'hello',
       );
@@ -37,6 +38,7 @@ void main() {
       expect(next.isGenerating, isTrue);
       expect(next.error, 'boom');
       expect(next.notice, 'heads up');
+      expect(next.status, 'Thinking…');
       expect(next.lastTranscript, 'hello');
       expect(next.onDeviceTranscript, 'hello');
     });
@@ -56,17 +58,20 @@ void main() {
       final s = VoiceConversationState.initial().copyWith(
         error: 'boom',
         notice: 'heads up',
+        status: 'Thinking…',
         lastTranscript: 't',
         onDeviceTranscript: 'd',
       );
       final cleared = s.copyWith(
         error: null,
         notice: null,
+        status: null,
         lastTranscript: null,
         onDeviceTranscript: null,
       );
       expect(cleared.error, isNull);
       expect(cleared.notice, isNull);
+      expect(cleared.status, isNull);
       expect(cleared.lastTranscript, isNull);
       expect(cleared.onDeviceTranscript, isNull);
     });
@@ -76,11 +81,13 @@ void main() {
         isPaused: true,
         isGenerating: true,
         notice: 'n',
+        status: 'Thinking…',
       );
       final b = VoiceConversationState.initial().copyWith(
         isPaused: true,
         isGenerating: true,
         notice: 'n',
+        status: 'Thinking…',
       );
       final c = VoiceConversationState.initial();
 
@@ -100,6 +107,7 @@ void main() {
         base.copyWith(isGenerating: true),
         base.copyWith(error: 'x'),
         base.copyWith(notice: 'x'),
+        base.copyWith(status: 'Thinking…'),
         base.copyWith(lastTranscript: 'x'),
         base.copyWith(onDeviceTranscript: 'x'),
       ];

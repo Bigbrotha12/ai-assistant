@@ -12,6 +12,9 @@ class VoiceSettings {
     this.visionEnabled = true,
   });
 
+  /// The in-code defaults used when nothing has been persisted yet.
+  static const VoiceSettings defaults = VoiceSettings();
+
   final String sttEngine;
   final String ttsEngine;
   final double vadSensitivity;

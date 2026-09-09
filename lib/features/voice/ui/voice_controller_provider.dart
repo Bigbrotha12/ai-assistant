@@ -11,7 +11,9 @@ import '../../chat/data/message_model.dart';
 import '../data/audio_playback_service.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/mic_capture_service.dart';
+import '../data/screen_wake_lock.dart';
 import '../data/voice_capture_providers.dart';
+import './voice_conversation_state.dart';
 import './voice_controller.dart';
 
 /// Microphone capture streaming raw PCM16 chunks.
@@ -42,6 +44,13 @@ final voiceControllerProvider =
     NotifierProvider<VoiceControllerNotifier, VoiceController>(
       VoiceControllerNotifier.new,
     );
+
+/// Keeps the screen awake for the lifetime of a connected voice conversation.
+final screenWakeLockProvider = Provider<ScreenWakeLock>((ref) {
+  final lock = PlatformScreenWakeLock();
+  ref.onDispose(() => unawaited(lock.disable()));
+  return lock;
+});
 
 class VoiceControllerNotifier extends Notifier<VoiceController> {
   void Function()? _enginesListener;
@@ -160,6 +169,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
       chatClient: ref.watch(chatApiClientProvider),
       micCapture: ref.read(micCaptureServiceProvider),
       playback: ref.read(audioPlaybackServiceProvider),
+      screenWakeLock: ref.watch(screenWakeLockProvider),
       sttEngine: sttEngine,
       ttsEngine: ttsEngine,
       onNetworkError: () {

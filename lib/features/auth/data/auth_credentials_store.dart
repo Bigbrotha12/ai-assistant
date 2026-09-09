@@ -1,5 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import '../../../core/secure_storage.dart';
+
 /// Persisted authentication credentials for the app.
 ///
 /// The API key is long-lived and cannot be read back from the server after it
@@ -61,13 +63,7 @@ class SecureAuthCredentialsStore implements AuthCredentialsStore {
   /// is used whose iOS keychain items are scoped to this device
   /// (`first_unlock_this_device`) so they never sync across devices.
   SecureAuthCredentialsStore({FlutterSecureStorage? storage})
-      : _storage = storage ??
-            const FlutterSecureStorage(
-              aOptions: AndroidOptions(),
-              iOptions: IOSOptions(
-                accessibility: KeychainAccessibility.first_unlock_this_device,
-              ),
-            );
+      : _storage = storage ?? defaultSecureStorage();
 
   static const _kApiKey = 'auth_api_key';
   static const _kEmail = 'auth_email';

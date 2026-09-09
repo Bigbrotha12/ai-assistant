@@ -8,7 +8,7 @@ import 'package:ai_assistant/features/voice/data/model_downloader.dart';
 import 'package:ai_assistant/features/voice/data/stt_engine.dart';
 import 'package:ai_assistant/features/voice/data/tts_engine.dart';
 import 'package:ai_assistant/features/voice/data/vad_processor.dart';
-import 'package:ai_assistant/features/voice/ui/voice_settings.dart';
+import 'package:ai_assistant/features/voice/data/voice_settings.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_store.dart';
 
 /// In-memory [EngineManager] double for widget tests.
@@ -43,7 +43,7 @@ class FakeEngineManager extends EngineManager {
 
 /// In-memory [VoiceSettingsStore] double returning default settings.
 class FakeVoiceSettingsStore implements VoiceSettingsStore {
-  FakeVoiceSettingsStore([this.saved = const VoiceSettings()]);
+  FakeVoiceSettingsStore([this.saved = VoiceSettings.defaults]);
 
   VoiceSettings? saved;
 
@@ -325,12 +325,19 @@ class FakeTtsEngine implements TtsEngine {
   /// later acknowledgement synthesizes freely).
   int? gateCallLimit;
 
+  /// When non-null, [gate] only holds synthesis calls at index >= this value —
+  /// earlier calls return immediately (e.g. hold the prefetched second
+  /// sentence while the first synthesizes freely).
+  int? gateStartIndex;
+
   @override
   Future<List<int>> synthesize(String text, {required int sampleRate}) async {
     final index = synthesized.length;
     synthesized.add(text);
     final g = gate;
-    if (g != null && (gateCallLimit == null || index < gateCallLimit!)) {
+    if (g != null &&
+        (gateCallLimit == null || index < gateCallLimit!) &&
+        (gateStartIndex == null || index >= gateStartIndex!)) {
       await g.future;
     }
     if (sampleVariants.isNotEmpty) {

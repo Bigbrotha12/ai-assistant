@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 
 import './vision_config.dart';
-import '../../../core/network_errors.dart';
+import '../../../core/http/dio_errors.dart';
 
 /// Contract for the vision describe call. Testable via a fake.
 abstract interface class VisionClient {
@@ -141,19 +141,13 @@ class VisionApiClient implements VisionClient {
   }
 
   Never _mapError(DioException e) {
-    throw switch (e.type) {
-      DioExceptionType.cancel => VisionUnavailableError('cancelled'),
-      DioExceptionType.connectionTimeout ||
-      DioExceptionType.receiveTimeout ||
-      DioExceptionType.sendTimeout ||
-      DioExceptionType.connectionError =>
-          VisionNetworkError(describeDioError(e)),
-      DioExceptionType.badResponse =>
-          VisionServerError(describeDioError(e), statusCode: e.response?.statusCode),
-      DioExceptionType.badCertificate ||
-      DioExceptionType.unknown ||
-      DioExceptionType.transformTimeout =>
-          VisionNetworkError(describeDioError(e)),
+    throw switch (classifyDioException(e)) {
+      DioErrorCategory.cancelled => VisionUnavailableError('cancelled'),
+      DioErrorCategory.timeoutNetwork =>
+          VisionNetworkError(describeDioException(e)),
+      DioErrorCategory.badResponse =>
+          VisionServerError(describeDioException(e), statusCode: e.response?.statusCode),
+      DioErrorCategory.other => VisionNetworkError(describeDioException(e)),
     };
   }
 }

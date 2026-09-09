@@ -3,7 +3,10 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/chat/data/status_tracker.dart'
+    show domainPhrases;
 import 'package:ai_assistant/features/voice/data/engine_errors.dart';
+import 'package:ai_assistant/features/voice/ui/voice_conversation_state.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
 
 import '../../fakes.dart';
@@ -1310,7 +1313,13 @@ void main() {
       );
       final mic = FakeMicCaptureService();
       final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
-      final tts = FakeTtsEngine();
+      // Gate only the SECOND synthesis: with pipelining, sentence 2's
+      // synthesis starts while sentence 1 is still playing, so gating from the
+      // start would also hold sentence 1. gating index >= 1 keeps sentence 1
+      // free while the prefetched sentence 2 hangs.
+      final tts = FakeTtsEngine()
+        ..gate = Completer<void>()
+        ..gateStartIndex = 1;
       final controller = VoiceController(
         chatClient: chat,
         micCapture: mic,
@@ -1325,23 +1334,123 @@ void main() {
       // Sentence 1 is playing, held open.
       expect(controller.state.isAiSpeaking, isTrue);
       expect(playback.playedChunks, hasLength(1));
-      expect(tts.synthesized, ['First sentence.']);
+      expect(tts.synthesized, isNotEmpty);
+      expect(tts.synthesized.first, 'First sentence.');
 
-      // Sentence 1 ends; sentence 2's synthesis is held. The raw player is
-      // idle (isPlaying flipped false), but the turn must still count as
-      // speaking — the mic gates must not re-open mid-reply.
+      // Sentence 1 ends; sentence 2's prefetched synthesis is still held. The
+      // raw player is idle (isPlaying flipped false), but the turn must still
+      // count as speaking — the mic gates must not re-open mid-reply.
       playback.holdCompletion!.complete();
-      tts.gate = Completer<void>();
       await pumpEventQueue();
       expect(playback.playedChunks, hasLength(1));
       expect(controller.state.isAiSpeaking, isTrue);
 
-      // Release the synthesis: sentence 2 plays and the turn closes.
+      // Release the prefetched synthesis: sentence 2 plays and the turn
+      // closes.
       tts.gate!.complete();
       await send;
       expect(tts.synthesized, ['First sentence.', 'Second sentence.']);
       expect(playback.playedChunks, hasLength(2));
       expect(controller.state.isAiSpeaking, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('the next sentence is synthesised while the current one plays '
+        '(one-ahead pipeline)', () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['First sentence. ', 'Second sentence.'],
+        ],
+        results: [
+          ChatResult(
+            content: 'First sentence. Second sentence.',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
+      // Gate only the second synthesis so it is observably requested while
+      // sentence 1 is still playing (the prefetch) rather than after it ends.
+      final tts = FakeTtsEngine()
+        ..gate = Completer<void>()
+        ..gateStartIndex = 1;
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+      );
+      await controller.startConversation();
+
+      final send = controller.sendText('hello');
+      await pumpEventQueue();
+
+      // Sentence 1 is playing, held open — yet sentence 2's synthesis has
+      // ALREADY been requested. Playback end no longer gates the next
+      // synthesis.
+      expect(playback.playedChunks, hasLength(1));
+      expect(tts.synthesized, ['First sentence.', 'Second sentence.']);
+
+      // Let sentence 1 finish and release sentence 2's prefetched synthesis:
+      // sentence 2 then plays without a fresh synthesis in between.
+      playback.holdCompletion!.complete();
+      tts.gate!.complete();
+      await send;
+
+      expect(tts.synthesized, ['First sentence.', 'Second sentence.']);
+      expect(playback.playedChunks, hasLength(2));
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('model-baked edge silence is trimmed before playback', () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Alpha.'],
+        ],
+        results: [
+          ChatResult(
+            content: 'Alpha.',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      // A chunk with 200ms leading + 300ms trailing silence baked in.
+      final padded = <int>[
+        ...List<int>.filled(3200, 0),
+        ...List<int>.filled(8000, 16384),
+        ...List<int>.filled(4800, 0),
+      ];
+      final tts = FakeTtsEngine(samples: padded);
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+        echoGateDuration: Duration.zero,
+      );
+      await controller.startConversation();
+
+      await controller.sendText('hello');
+
+      // The played chunk is shorter than the synthesized one: the edge
+      // silence was cut (keeping a natural margin), while the speech core
+      // survives.
+      expect(playback.playedChunks, hasLength(1));
+      expect(playback.playedChunks.single.length, lessThan(padded.length));
+      expect(playback.playedChunks.single.length, greaterThan(8000));
 
       await controller.dispose();
       await mic.dispose();
@@ -1375,9 +1484,11 @@ void main() {
 
       final send = controller.sendText('hello');
       await pumpEventQueue();
-      // Alpha playing (held); Beta and Gamma queued but not yet synthesized.
+      // Alpha playing (held); Beta may already be prefetch-synthesised but
+      // not yet played.
       expect(controller.state.isAiSpeaking, isTrue);
-      expect(tts.synthesized, ['Alpha.']);
+      expect(tts.synthesized, isNotEmpty);
+      expect(tts.synthesized.first, 'Alpha.');
 
       await controller.interrupt();
       expect(controller.state.isAiSpeaking, isFalse);
@@ -1386,7 +1497,7 @@ void main() {
       playback.holdCompletion!.complete();
       await send;
 
-      expect(tts.synthesized, ['Alpha.']);
+      expect(tts.synthesized, contains('Alpha.'));
       expect(playback.playedChunks, hasLength(1));
       expect(controller.state.isAiSpeaking, isFalse);
 
@@ -1432,7 +1543,9 @@ void main() {
       await pumpEventQueue();
       expect(controller.state.isPaused, isTrue);
       expect(playback.playedChunks, hasLength(1));
-      expect(tts.synthesized, ['Alpha.']);
+      // Alpha played; Beta may already be prefetch-synthesised but its
+      // playback is suspended by the pause.
+      expect(tts.synthesized, contains('Alpha.'));
 
       // The interruption ended the held track; release the fake's hold so
       // the resumed sentence can finish.
@@ -1836,6 +1949,212 @@ void main() {
       await pumpEventQueue();
 
       expect(transcripts, ['hello']);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+  });
+
+  group('status interjections', () {
+    test('ack fires onReceived and enqueues a TTS phrase', () async {
+      final chat = FakeChatClient(
+        fireOnReceived: true,
+        results: [
+          const ChatResult(content: 'hi', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      await controller.sendText('hello');
+      await pumpEventQueue();
+
+      // The ack fires before content; at least one interjection phrase was
+      // enqueued before the reply text itself.
+      expect(tts.synthesized, isNotEmpty);
+      expect(tts.synthesized.first, isNot('hi'));
+      expect(tts.synthesized, contains('hi'));
+      // After the turn, status is cleared.
+      expect(controller.state.status, isNull);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('onToolCallDelta sets status with Working prefix and enqueues TTS',
+        () async {
+      final chat = FakeChatClient(
+        fireOnReceived: true,
+        toolCallDeltas: [
+          [(0, 'tasks_list_mcp_vikunja', '')],
+        ],
+        streamDeltas: [
+          ['done'],
+        ],
+        results: [
+          const ChatResult(content: 'done', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      final emissions = <VoiceConversationState>[];
+      controller.stateStream.listen(emissions.add);
+
+      await controller.sendText('hello');
+      await pumpEventQueue();
+
+      // The tool-call fragment (with the task tool name) drove the status
+      // interjection to 'Working — …' at some point during the stream.
+      expect(
+        emissions.any((s) => (s.status ?? '').startsWith('Working — ')),
+        isTrue,
+      );
+      // A TTS utterance from the task phrase set was enqueued via the tracker.
+      final taskPhrases = domainPhrases['task']!;
+      expect(tts.synthesized.any((s) => taskPhrases.contains(s)), isTrue);
+      // The stream then completed with content: the reply spoke and the
+      // status interjection was cleared.
+      expect(tts.synthesized, contains('done'));
+      expect(controller.state.status, isNull);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('error phrase is spoken on a non-cancelled error', () async {
+      final failure = ChatServerError('boom');
+      final chat = FakeChatClient(fireOnReceived: true)..error = failure;
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      await controller.sendText('hello');
+      await pumpEventQueue();
+
+      expect(controller.state.error, same(failure));
+      // The TTS engine received at least one error-phrase utterance.
+      expect(tts.synthesized, isNotEmpty);
+      // The error phrase must be one of the known server error phrases
+      // (the fake picks from the list deterministically or randomly).
+      final hasErrorPhrase = tts.synthesized.any(
+        (s) => s.contains('snag') ||
+            s.contains('issue') ||
+            s.contains('try again') ||
+            s.contains('server'),
+      );
+      expect(hasErrorPhrase, isTrue);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('status is cleared at turn start and on abandon', () async {
+      final chat = FakeChatClient(
+        fireOnReceived: true,
+        results: [
+          const ChatResult(content: 'hi', toolCalls: [], finishReason: 'stop'),
+        ],
+      )..hang = Completer<ChatResult>();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      // Start a turn that hangs mid-stream.
+      final send = controller.sendText('hello');
+      await pumpEventQueue();
+
+      // The ack has fired, so status should be set to 'Thinking…' or similar.
+      expect(controller.state.status, isNotNull);
+
+      // Cancel the token by interrupting.
+      await controller.interrupt();
+      chat.hang!.complete(
+        const ChatResult(content: 'hi', toolCalls: [], finishReason: 'stop'),
+      );
+      await send;
+
+      // After abandon, status is cleared.
+      expect(controller.state.status, isNull);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('ack updates the status display but does not speak when '
+        'speakReply is false', () async {
+      final chat = FakeChatClient(
+        fireOnReceived: true,
+        results: [
+          const ChatResult(content: 'hi', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      final emissions = <VoiceConversationState>[];
+      controller.stateStream.listen(emissions.add);
+
+      await controller.sendText('text mode reply', speakReply: false);
+      await pumpEventQueue();
+
+      // The ack interjection still drove the status display…
+      expect(emissions.any((s) => s.status == 'Thinking…'), isTrue);
+      // …but no utterances were enqueued for TTS or played.
+      expect(tts.synthesized, isEmpty);
+      expect(playback.playedChunks, isEmpty);
+      // The reply text still lands in the transcript state without speech.
+      expect(controller.state.lastReply, 'hi');
+      // The status interjection is cleared once the turn completes.
+      expect(controller.state.status, isNull);
 
       await controller.dispose();
       await mic.dispose();

@@ -103,7 +103,8 @@ class MessageBubble extends StatelessWidget {
 
   /// Renders assistant content as a block list: text blocks via
   /// [MarkdownRenderer] and `[file:<id>]` references via [FileAttachmentChip].
-  /// Widgets cannot be injected inside `flutter_markdown`, so refs are split
+  /// Widgets cannot be injected inside `flutter_markdown_plus`, so refs are
+  /// split
   /// out at parse time. A message with no refs yields a single text block and
   /// renders exactly as before.
   Widget _buildAssistantContent(String content) {

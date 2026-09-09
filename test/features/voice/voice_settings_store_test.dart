@@ -1,7 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/voice/ui/voice_settings.dart';
+import 'package:ai_assistant/features/voice/data/voice_settings.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_store.dart';
 
 /// In-memory [FlutterSecureStorage] double (see settings_store_test.dart for
@@ -108,7 +108,7 @@ void main() {
     await storage.write(key: 'voice_stt_engine', value: 'whisper_tiny');
 
     final loaded = await store.load();
-    final defaults = VoiceSettings();
+    final defaults = VoiceSettings.defaults;
 
     expect(
       loaded,

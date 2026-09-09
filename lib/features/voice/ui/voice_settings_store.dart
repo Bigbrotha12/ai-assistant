@@ -1,6 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-import './voice_settings.dart';
+import '../../../core/secure_storage.dart';
+import '../data/voice_settings.dart';
 
 /// Persistence for runtime voice settings.
 abstract interface class VoiceSettingsStore {
@@ -24,13 +25,7 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
   /// is used whose iOS keychain items are scoped to this device
   /// (`first_unlock_this_device`) so they never sync across devices.
   SecureVoiceSettingsStore({FlutterSecureStorage? storage})
-      : _storage = storage ??
-            const FlutterSecureStorage(
-              aOptions: AndroidOptions(),
-              iOptions: IOSOptions(
-                accessibility: KeychainAccessibility.first_unlock_this_device,
-              ),
-            );
+      : _storage = storage ?? defaultSecureStorage();
 
   static const _kVoiceSttEngine = 'voice_stt_engine';
   static const _kVoiceTtsEngine = 'voice_tts_engine';
@@ -62,20 +57,20 @@ class SecureVoiceSettingsStore implements VoiceSettingsStore {
     final visionEnabledRaw = await _storage.read(key: _kVisionEnabled);
 
     return VoiceSettings(
-      sttEngine: sttEngine ?? VoiceSettings().sttEngine,
+      sttEngine: sttEngine ?? VoiceSettings.defaults.sttEngine,
       ttsEngine: ttsEngine != null
           ? _kLegacyTtsEngineIds[ttsEngine] ?? ttsEngine
-          : VoiceSettings().ttsEngine,
+          : VoiceSettings.defaults.ttsEngine,
       vadSensitivity: vadStr != null
-          ? double.tryParse(vadStr) ?? VoiceSettings().vadSensitivity
-          : VoiceSettings().vadSensitivity,
-      preferredLanguage: language ?? VoiceSettings().preferredLanguage,
+          ? double.tryParse(vadStr) ?? VoiceSettings.defaults.vadSensitivity
+          : VoiceSettings.defaults.vadSensitivity,
+      preferredLanguage: language ?? VoiceSettings.defaults.preferredLanguage,
       minTurnSeconds: minTurnStr != null
-          ? double.tryParse(minTurnStr) ?? VoiceSettings().minTurnSeconds
-          : VoiceSettings().minTurnSeconds,
+          ? double.tryParse(minTurnStr) ?? VoiceSettings.defaults.minTurnSeconds
+          : VoiceSettings.defaults.minTurnSeconds,
       visionEnabled: visionEnabledRaw != null
           ? visionEnabledRaw == 'true'
-          : VoiceSettings().visionEnabled,
+          : VoiceSettings.defaults.visionEnabled,
     );
   }
 

@@ -14,7 +14,7 @@ import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/features/onboarding/ui/onboarding_screen.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
-import 'package:ai_assistant/features/voice/ui/voice_settings.dart';
+import 'package:ai_assistant/features/voice/data/voice_settings.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
 
 import '../../fakes.dart';

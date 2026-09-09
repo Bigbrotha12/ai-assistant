@@ -329,4 +329,112 @@ void main() {
     expect(loaded, isNotNull);
     expect(loaded!.mcpSecret, isNull);
   });
+
+  group('llm inference', () {
+    test('llmBaseUrl/llmModel/llmApiKey round-trip and are stored trimmed',
+        () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          llmBaseUrl: ' https://chat.example/api/agents/v1/ ',
+          llmModel: '  agent_123  ',
+          llmApiKey: '  sk-secret  ',
+        ),
+      );
+
+      expect(storage.values['backend_llm_base_url'],
+          'https://chat.example/api/agents/v1');
+      expect(storage.values['backend_llm_model'], 'agent_123');
+      expect(storage.values['backend_llm_api_key'], 'sk-secret');
+      final loaded = (await store.load())!;
+      expect(loaded.llmBaseUrl, 'https://chat.example/api/agents/v1');
+      expect(loaded.llmModel, 'agent_123');
+      expect(loaded.llmApiKey, 'sk-secret');
+    });
+
+    test('blank LLM fields are not written', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          llmBaseUrl: '   ',
+          llmModel: '',
+          llmApiKey: '  ',
+        ),
+      );
+
+      expect(storage.values.containsKey('backend_llm_base_url'), isFalse);
+      expect(storage.values.containsKey('backend_llm_model'), isFalse);
+      expect(storage.values.containsKey('backend_llm_api_key'), isFalse);
+      final loaded = (await store.load())!;
+      expect(loaded.llmBaseUrl, isNull);
+      expect(loaded.llmModel, isNull);
+      expect(loaded.llmApiKey, isNull);
+    });
+
+    test('saving with LLM fields cleared deletes the stored values', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          llmBaseUrl: 'https://chat.example/api/agents/v1',
+          llmModel: 'agent_123',
+          llmApiKey: 'sk-secret',
+        ),
+      );
+      expect(storage.values.containsKey('backend_llm_base_url'), isTrue);
+
+      await store.save(const BackendSettings(host: 'tail.example'));
+
+      expect(storage.values.containsKey('backend_llm_base_url'), isFalse);
+      expect(storage.values.containsKey('backend_llm_model'), isFalse);
+      expect(storage.values.containsKey('backend_llm_api_key'), isFalse);
+      final loaded = (await store.load())!;
+      expect(loaded.llmBaseUrl, isNull);
+      expect(loaded.llmModel, isNull);
+      expect(loaded.llmApiKey, isNull);
+    });
+
+    test('load returns null LLM fields when stored values are empty',
+        () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          llmApiKey: 'sk-secret',
+        ),
+      );
+      storage._values['backend_llm_base_url'] = '';
+      storage._values['backend_llm_api_key'] = '   ';
+      final loaded = (await store.load())!;
+
+      expect(loaded.llmBaseUrl, isNull);
+      expect(loaded.llmApiKey, isNull);
+    });
+
+    test('clear removes the LLM keys', () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureSettingsStore(storage: storage);
+
+      await store.save(
+        const BackendSettings(
+          host: 'tail.example',
+          llmApiKey: 'sk-secret',
+        ),
+      );
+      await store.clear();
+
+      expect(storage.values.isEmpty, isTrue);
+      expect(storage.values.containsKey('backend_llm_api_key'), isFalse);
+    });
+  });
 }

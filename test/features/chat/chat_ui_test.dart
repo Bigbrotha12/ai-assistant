@@ -364,9 +364,7 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byIcon(Icons.more_vert));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('History'));
+    await tester.tap(find.byKey(const Key('history')));
     await tester.pumpAndSettle();
 
     expect(find.text('First chat'), findsOneWidget);

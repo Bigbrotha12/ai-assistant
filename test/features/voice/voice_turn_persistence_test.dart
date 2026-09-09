@@ -8,6 +8,7 @@ import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
 import 'package:ai_assistant/features/voice/data/stt_engine.dart';
 import 'package:ai_assistant/features/voice/data/tts_engine.dart';
 import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
@@ -49,6 +50,7 @@ ProviderContainer _container({
       micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
       audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
       audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
+      screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
       chatApiClientProvider.overrideWithValue(chatClient),
       chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
     ],

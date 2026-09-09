@@ -327,6 +327,9 @@ esac
 "$FLUTTER_BIN" run \
   -d "$FLUTTER_DEVICE" \
   --dart-define=HOST_FQDN="$HOST_FQDN" \
+  ${LLM_BASE_URL:+--dart-define=LLM_BASE_URL="$LLM_BASE_URL"} \
+  ${LLM_MODEL:+--dart-define=LLM_MODEL="$LLM_MODEL"} \
+  ${LLM_API_KEY:+--dart-define=LLM_API_KEY="$LLM_API_KEY"} \
   "${EXTRA_ARGS[@]}" &
 FLUTTER_PID=$!
 
