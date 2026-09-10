@@ -135,15 +135,13 @@ class StatusTracker {
     final phrase =
         _phraseByDomain.putIfAbsent(domain, () => _pick(phrases, _rng));
 
-    if (_spokenPhrases.contains(phrase)) {
-      _toolPhraseSpoken = true;
-    } else if (_spokenCount < 4) {
-      _spokenPhrases.add(phrase);
-      _spokenCount++;
-      _toolPhraseSpoken = true;
-      _onSpeak(phrase);
-    }
     _onDisplay('Working — $phrase');
+    // One spoken interjection per turn: later tool calls (or domain flips
+    // as args stream in) only update the display, so a multi-tool response
+    // never produces a rapid burst of canned lines before the reply.
+    if (_toolPhraseSpoken) return;
+    _toolPhraseSpoken = true;
+    _speakPhrase(phrase);
 
     _stillWorkingTimer?.cancel();
     _stillWorkingTimer = null;

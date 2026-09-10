@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -22,7 +23,6 @@ import '../data/engine_config.dart';
 import '../data/engine_errors.dart';
 import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
-import '../data/model_downloader.dart';
 import '../data/voice_capture_providers.dart';
 import './voice_conversation_state.dart';
 import './voice_controller_provider.dart';
@@ -87,8 +87,6 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   /// Mirrors [VoiceCapturePipeline.isRecording] for states where the server
   /// connection is down but local capture is still active.
   bool _localRecording = false;
-
-  bool _engineBusy = false;
 
   /// Errors raised outside the controller (e.g. mic permission before the
   /// pipeline starts) so they surface in the same banner as state errors.
@@ -236,6 +234,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   /// Starts a hold-to-talk recording: stops any active recording (toggle), or
   /// starts the text conversation session then begins the capture pipeline.
   Future<void> _holdStart() async {
+    if (kDebugMode) debugPrint('UI: _holdStart');
     if (_micBusy) return;
     final pipeline = ref.read(voiceCapturePipelineProvider);
     if (pipeline.isRecording) {
@@ -290,6 +289,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
   /// Stops the hold-to-talk recording on release.
   Future<void> _holdEnd() async {
+    if (kDebugMode) debugPrint('UI: _holdEnd');
     await _pendingStart;
     final pipeline = ref.read(voiceCapturePipelineProvider);
     try {
@@ -307,15 +307,6 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       // (provider rebuild), an early return here would wedge the UI in
       // "listening" mode until the next press.
       if (mounted) setState(() => _localRecording = false);
-    }
-  }
-
-  Future<void> _downloadModels() async {
-    setState(() => _engineBusy = true);
-    try {
-      await ref.read(voiceEngineStatusProvider.notifier).downloadAllModels();
-    } finally {
-      if (mounted) setState(() => _engineBusy = false);
     }
   }
 
@@ -456,8 +447,23 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       stored: ref.watch(settingsProvider).value,
     );
 
+    // The SpeakButton is the hero stack's only flow child, so the stack sizes
+    // to it and the Center below places it at the exact vertical middle of
+    // the viewport. circleEdge is the distance from the stack's edge to the
+    // tappable circle's edge; the hero text and caption anchor to it, so
+    // appearing/disappearing text never moves the button off-center.
+    const double heroDiameter = 172.0;
+    final double heroBox =
+        heroDiameter * (tier.premium ? SpeakButton.premiumBoxFactor : 1.0);
+    final double circleEdge = heroBox / 2 + heroDiameter / 2;
+    // The phase label's visual gap to the button: the fixed waveform slot
+    // (36px) plus the 20px spacer below it. The caption mirrors this so the
+    // button reads vertically centered between the two labels.
+    const double heroLabelGap = 56.0;
+
     return Scaffold(
       appBar: AppBar(
+        centerTitle: true,
         leading: IconButton(
           key: const Key('new-conversation'),
           tooltip: 'New Conversation',
@@ -512,16 +518,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
                       child: Column(
                         children: [
-                          _HeroStatus(
-                            recording: recording,
-                            aiSpeaking: state.isAiSpeaking,
-                            generating: state.isGenerating,
-                            connected: state.isConnected,
-                            paused: state.isPaused,
-                            premium: tier.premium,
-                          ),
                           _TurnStatusLine(
-                            status: state.status,
                             notice: state.notice,
                           ),
                         ],
@@ -553,120 +550,182 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                     // SpeakButton. No transcript panel in voice mode — the
                     // message view only appears in text mode.
                     Expanded(
-                      child: Center(
-                        child: SingleChildScrollView(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 24,
-                            vertical: 12,
-                          ),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                               _HeroStatus(
-                                recording: recording,
-                                aiSpeaking: state.isAiSpeaking,
-                                generating: state.isGenerating,
-                                connected: state.isConnected,
-                                paused: state.isPaused,
-                                premium: tier.premium,
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          // The hero text keeps the full scroll-viewport width
+                          // (as in the previous centered column) while the
+                          // button itself is pinned to the exact vertical
+                          // middle of the viewport.
+                          final double heroWidth = constraints.maxWidth - 48;
+                          final double blockLeft = (heroBox - heroWidth) / 2;
+                          return Center(
+                            child: SingleChildScrollView(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 24,
+                                vertical: 12,
                               ),
-                              _TurnStatusLine(
-                                status: state.status,
-                                notice: state.notice,
-                              ),
-                              if (tier.premium) ...[
-                                const SizedBox(height: 10),
-                                Text(
-                                  'Speak',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .displaySmall
-                                      ?.copyWith(
-                                        color: scheme.onSurface,
-                                      ),
-                                ),
-                              ],
-                              AnimatedSwitcher(
-                                duration: const Duration(milliseconds: 200),
-                                child: recording || state.isAiSpeaking
-                                    ? Padding(
-                                        key: const ValueKey('waveform'),
-                                        padding: const EdgeInsets.only(top: 16),
-                                        child: _Waveform(
-                                          active: recording,
-                                          color: tier.premium
-                                              ? AppColors.goldBase
-                                              : scheme.primary,
+                              // The SpeakButton is the stack's only flow
+                              // child, so the stack sizes to it and Center
+                              // places it at the exact vertical middle of the
+                              // viewport. The hero text and caption anchor to
+                              // the tappable circle's edges, so they never
+                              // shift the button.
+                              child: Stack(
+                                // Don't clip the hero text/caption to the
+                                // button's box: they intentionally extend
+                                // above/below it while staying centered on the
+                                // button.
+                                clipBehavior: Clip.none,
+                                alignment: Alignment.center,
+                                children: [
+                                  // Hero text above the button: status line,
+                                  // phase label and the fixed-height waveform
+                                  // slot (16 top pad + 20 max bar), so the
+                                  // waveform's appearance never shifts the
+                                  // button.
+                                  Positioned(
+                                    left: blockLeft,
+                                    width: heroWidth,
+                                    bottom: circleEdge + 20,
+                                    child: Column(
+                                      children: [
+                                        _TurnStatusLine(
+                                          notice: state.notice,
                                         ),
-                                      )
-                                    : const SizedBox(
-                                        key: ValueKey('waveform-idle'),
-                                        height: 22,
-                                      ),
-                              ),
-                              const SizedBox(height: 20),
-                              SpeakButton(
-                                recording: recording,
-                                aiSpeaking: state.isAiSpeaking,
-                                busy: _micBusy || _turnInFlight,
-                                onHoldStart: _holdStart,
-                                onHoldEnd: _holdEnd,
-                              ),
-                              const SizedBox(height: 18),
-                              Text(
-                                'PRESS AND HOLD TO TALK',
-                                style: Theme.of(context).textTheme.labelSmall
-                                    ?.copyWith(
-                                      letterSpacing: 1.4,
-                                      color: tier.premium
-                                          ? AppColors.goldDark
-                                          : scheme.onSurfaceVariant,
+                                        const SizedBox(height: 10),
+                                        _PhaseLabel(
+                                          phase: recording
+                                              ? 'Listening'
+                                              : state.isGenerating
+                                                  ? 'Working'
+                                                  : state.isAiSpeaking
+                                                      ? 'Speaking'
+                                                      : 'Speak',
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .displaySmall
+                                              ?.copyWith(
+                                                color: scheme.onSurface,
+                                              ),
+                                        ),
+                                        SizedBox(
+                                          height: 36,
+                                          child: AnimatedSwitcher(
+                                            duration: const Duration(
+                                                milliseconds: 200),
+                                            child: recording ||
+                                                    state.isSpeaking
+                                                ? Padding(
+                                                    key:
+                                                        const ValueKey(
+                                                            'waveform'),
+                                                    padding:
+                                                        const EdgeInsets.only(
+                                                            top: 16),
+                                                    child: _Waveform(
+                                                      active: recording ||
+                                                          state.isSpeaking,
+                                                      color: tier.premium
+                                                          ? AppColors.goldBase
+                                                          : scheme.primary,
+                                                    ),
+                                                  )
+                                                : const SizedBox(
+                                                    key: ValueKey(
+                                                        'waveform-idle'),
+                                                    height: 1,
+                                                  ),
+                                          ),
+                                        ),
+                                      ],
                                     ),
+                                  ),
+                                  SpeakButton(
+                                    recording: recording,
+                                    aiSpeaking: state.isAiSpeaking,
+                                    generating: state.isGenerating,
+                                    busy: _micBusy,
+                                    onHoldStart: _holdStart,
+                                    onHoldEnd: _holdEnd,
+                                  ),
+                                  // Per-turn caption below the button, at the
+                                  // same distance the phase label sits above
+                                  // it.
+                                  Positioned(
+                                    left: blockLeft,
+                                    width: heroWidth,
+                                    top: circleEdge + heroLabelGap,
+                                    child: SizedBox(
+                                      height: 20,
+                                      child: Center(
+                                        child: Text(
+                                          state.status ??
+                                              'PRESS AND HOLD TO TALK',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          textAlign: TextAlign.center,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .labelSmall
+                                              ?.copyWith(
+                                                letterSpacing:
+                                                    state.status == null
+                                                        ? 1.4
+                                                        : null,
+                                                fontStyle: state.status == null
+                                                    ? null
+                                                    : FontStyle.italic,
+                                                color: state.status == null &&
+                                                        tier.premium
+                                                    ? AppColors.goldDark
+                                                    : scheme.onSurfaceVariant,
+                                              ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ],
-                          ),
-                        ),
+                            ),
+                          );
+                        },
                       ),
                     ),
                   ],
-                  // Input mode toggle lives below the content area so it is
-                  // never clipped by the viewport. The Stop control (barge-in)
-                  // sits beside it while the AI is speaking, clear of the
-                  // SpeakButton's hit area.
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8, bottom: 8),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        _PillModeToggle(
-                          value: _textInputMode,
-                          enabled: !_turnInFlight && !recording,
-                          onChanged: _setTextInputMode,
-                        ),
-                        if (state.isAiSpeaking) ...[
-                          const SizedBox(width: 12),
-                          IconButton(
-                            key: const Key('voice-stop-speaking'),
-                            tooltip: 'Stop speaking',
-                            icon: const Icon(Icons.stop_circle_outlined),
-                            color: scheme.primary,
-                            onPressed: () {
-                              unawaited(
-                                ref.read(voiceControllerProvider).interrupt(),
-                              );
-                            },
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
                 ],
               ),
             ),
-            _EngineStatusBar(
-              downloading: _engineBusy,
-              onDownload: _downloadModels,
-              onOpenSettings: _openBackendSettings,
+            // Bottom bar: centered mode toggle with the settings gear pinned
+            // to the right. The old STT/TTS readiness chips were always-green
+            // noise and are gone — model download/retry lives in Settings.
+            Material(
+              color: scheme.surfaceContainerLow,
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      _PillModeToggle(
+                        value: _textInputMode,
+                        enabled: !recording,
+                        onChanged: _setTextInputMode,
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: IconButton(
+                          key: const Key('engine-bar-settings'),
+                          tooltip: 'Settings',
+                          icon: const Icon(Icons.settings_outlined),
+                          onPressed: _openBackendSettings,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
           ],
         ),
@@ -675,118 +734,133 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   }
 }
 
-/// Status interjection line shown below the hero: displays the live per-turn
-/// status (e.g. 'Thinking…', 'Working — …') and any transient notice (e.g.
-/// 'Dropped — one utterance at a time.'). Shared by voice and text modes.
-class _TurnStatusLine extends StatelessWidget {
-  const _TurnStatusLine({this.status, this.notice});
+/// The hero phase label ('Speak' / 'Listening' / 'Working' / 'Speaking').
+///
+/// Idle renders the static 'Speak' copy; in an active phase the trailing dots
+/// animate (one → two → three → loop) to signal liveness. The word stays
+/// anchored in place — a fixed-width dot slot expands rightward — and the
+/// single displaySmall line never shifts the surrounding layout.
+class _PhaseLabel extends StatefulWidget {
+  const _PhaseLabel({required this.phase, this.style});
 
-  final String? status;
-  final String? notice;
+  /// Phase word WITHOUT trailing dots ('Speak' for the idle state).
+  final String phase;
+
+  final TextStyle? style;
+
+  @override
+  State<_PhaseLabel> createState() => _PhaseLabelState();
+}
+
+class _PhaseLabelState extends State<_PhaseLabel>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _dots;
+
+  @override
+  void initState() {
+    super.initState();
+    _dots = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    );
+    if (widget.phase != 'Speak') _dots.repeat();
+  }
+
+  @override
+  void didUpdateWidget(covariant _PhaseLabel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.phase == 'Speak' && widget.phase != 'Speak') {
+      _dots.repeat();
+    } else if (oldWidget.phase != 'Speak' && widget.phase == 'Speak') {
+      _dots.stop();
+      _dots.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _dots.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    if (status == null && notice == null) return const SizedBox.shrink();
-    final scheme = Theme.of(context).colorScheme;
-    return Column(
-      children: [
-        if (status != null) ...[
-          const SizedBox(height: 6),
-          Text(
-            status!,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  fontStyle: FontStyle.italic,
-                  color: scheme.onSurfaceVariant,
+    if (widget.phase == 'Speak') {
+      return Text('Speak', style: widget.style);
+    }
+    return AnimatedBuilder(
+      animation: _dots,
+      builder: (context, _) {
+        final dots = 1 + (_dots.value * 3).floor() % 3;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(widget.phase, style: widget.style),
+            // Fixed-width slot (sized by an invisible 3-dot spacer) so the
+            // word keeps its position while the dots expand rightward.
+            Stack(
+              alignment: Alignment.centerLeft,
+              children: [
+                Opacity(
+                  opacity: 0,
+                  child: Text('...', style: widget.style),
                 ),
-          ),
-        ],
-        if (notice != null) ...[
-          const SizedBox(height: 6),
-          Text(
-            notice!,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
-                ),
-          ),
-        ],
-      ],
+                Text('.' * dots, style: widget.style),
+              ],
+            ),
+          ],
+        );
+      },
     );
   }
 }
 
-/// Quiet status line above the speak button (§3.4): idle copy, or the live
-/// state (recording / generating / AI speaking / paused / connected).
-class _HeroStatus extends StatelessWidget {
-  const _HeroStatus({
-    required this.recording,
-    required this.aiSpeaking,
-    required this.generating,
-    required this.connected,
-    required this.paused,
-    required this.premium,
-  });
+/// Transient notice line shown below the hero (e.g. 'Dropped — one utterance
+/// at a time.'). The live phase (Thinking/Working/Speaking) is shown by the
+/// big status label and the detailed per-turn status by the caption under the
+/// button, so this line carries only non-duplicative notices. Always reserves
+/// its height so appearing notices never shift the layout. Shared by voice and
+/// text modes.
+class _TurnStatusLine extends StatelessWidget {
+  const _TurnStatusLine({this.notice});
 
-  final bool recording;
-  final bool aiSpeaking;
-  final bool generating;
-  final bool connected;
-  final bool paused;
-  final bool premium;
+  final String? notice;
+
+  /// Height the notice line always reserves, so the layout never shifts when
+  /// it appears or disappears.
+  static const _slotHeight = 22.0;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-
-    final (icon, color, label) = paused
-        ? (Icons.pause_circle_outline, scheme.onSurfaceVariant, 'Paused')
-        : switch ((recording, aiSpeaking, generating, connected)) {
-            (true, _, _, _) => (
-              Icons.mic,
-              premium ? AppColors.goldDark : scheme.error,
-              'Listening…',
-            ),
-            (false, true, _, _) => (
-              Icons.volume_up,
-              premium ? AppColors.goldBase : scheme.primary,
-              'AI is speaking…',
-            ),
-            (false, false, true, _) => (
-              Icons.hourglass_top,
-              scheme.onSurfaceVariant,
-              'Working…',
-            ),
-            (false, false, false, true) => (
-              Icons.check_circle,
-              premium ? AppColors.goldBase : scheme.primary,
-              'Connected',
-            ),
-            _ => (
-              Icons.mic_none,
-              scheme.onSurfaceVariant,
-              'Press and hold to talk',
-            ),
-          };
-
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(icon, color: color, size: 18),
-        const SizedBox(width: 8),
-        Text(
-          label,
-          style: theme.textTheme.labelMedium?.copyWith(color: color),
+    final scheme = Theme.of(context).colorScheme;
+    final noticeStyle = Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: scheme.onSurfaceVariant,
+        );
+    return SizedBox(
+      height: _slotHeight,
+      child: Visibility(
+        visible: notice != null,
+        maintainSize: true,
+        maintainState: true,
+        maintainAnimation: true,
+        child: Center(
+          child: Text(
+            notice ?? '',
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: noticeStyle,
+          ),
         ),
-      ],
+      ),
     );
   }
 }
 
 /// Compact text composer replacing the SpeakButton in text mode. Sends via the
 /// keyboard action or the trailing send button; no attachments/tool chips yet.
-class _Composer extends StatelessWidget {
+class _Composer extends StatefulWidget {
   const _Composer({
     required this.controller,
     required this.enabled,
@@ -802,6 +876,34 @@ class _Composer extends StatelessWidget {
   final VoidCallback onChanged;
 
   @override
+  State<_Composer> createState() => _ComposerState();
+}
+
+class _ComposerState extends State<_Composer> {
+  final ScrollController _scroll = ScrollController();
+  bool _scrolled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+  }
+
+  @override
+  void dispose() {
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    final scrolled = _scroll.hasClients && _scroll.offset > 0;
+    if (scrolled != _scrolled) {
+      setState(() => _scrolled = scrolled);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Material(
@@ -812,20 +914,56 @@ class _Composer extends StatelessWidget {
         child: Row(
           children: [
             Expanded(
-              child: TextField(
-                key: const Key('voice-composer-field'),
-                controller: controller,
-                enabled: enabled,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) {
-                  if (canSend) onSend();
-                },
-                onChanged: (_) => onChanged(),
-                decoration: const InputDecoration(
-                  hintText: 'Message the assistant…',
-                  border: InputBorder.none,
-                  isDense: true,
-                ),
+              child: Stack(
+                children: [
+                  TextField(
+                    key: const Key('voice-composer-field'),
+                    controller: widget.controller,
+                    enabled: widget.enabled,
+                    minLines: 1,
+                    maxLines: 4,
+                    keyboardType: TextInputType.multiline,
+                    scrollController: _scroll,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) {
+                      if (widget.canSend) widget.onSend();
+                    },
+                    onChanged: (_) => widget.onChanged(),
+                    decoration: const InputDecoration(
+                      hintText: 'Message the assistant…',
+                      border: InputBorder.none,
+                      isDense: true,
+                    ),
+                  ),
+                  // Top fade once the field is scrolled past the first line:
+                  // it reads as "more text above, scroll up" without ever
+                  // blocking taps or selection on the field.
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    child: IgnorePointer(
+                      child: AnimatedOpacity(
+                        opacity: _scrolled ? 1 : 0,
+                        duration: const Duration(milliseconds: 150),
+                        child: Container(
+                          height: 14,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.topCenter,
+                              end: Alignment.bottomCenter,
+                              colors: [
+                                scheme.surfaceContainerHighest,
+                                scheme.surfaceContainerHighest
+                                    .withValues(alpha: 0),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             IconButton(
@@ -833,7 +971,7 @@ class _Composer extends StatelessWidget {
               icon: const Icon(Icons.send),
               tooltip: 'Send',
               color: scheme.primary,
-              onPressed: canSend ? onSend : null,
+              onPressed: widget.canSend ? widget.onSend : null,
             ),
           ],
         ),
@@ -1356,183 +1494,6 @@ class _AssistantSpeakingBubble extends StatelessWidget {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-/// Bottom bar with per-engine readiness chips (STT/TTS), model download
-/// progress / retry actions, and the settings entry point (the top bar no
-/// longer carries settings).
-class _EngineStatusBar extends ConsumerWidget {
-  const _EngineStatusBar({
-    required this.downloading,
-    required this.onDownload,
-    required this.onOpenSettings,
-  });
-
-  final bool downloading;
-  final Future<void> Function() onDownload;
-  final VoidCallback onOpenSettings;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final statuses = ref.watch(voiceEngineStatusProvider);
-    final progress = ref.watch(modelDownloadProgressProvider).value;
-    final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: scheme.surfaceContainerLow,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: _EngineStatusChip(
-                      label: 'Whisper',
-                      status:
-                          statuses[EngineConfig.whisperTinyId] ??
-                          VoiceEngineStatus.notStarted,
-                      progress: progress,
-                      onAction: downloading ? null : onDownload,
-                    ),
-                  ),
-                  // Engines surfaced as `unavailable` are intentionally off —
-                  // hide their chip entirely instead of offering a download
-                  // that can never succeed.
-                    if (statuses[EngineConfig.supertonic3Id] !=
-                        VoiceEngineStatus.unavailable) ...[
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _EngineStatusChip(
-                          label: 'Supertonic 3',
-                          status:
-                              statuses[EngineConfig.supertonic3Id] ??
-                              VoiceEngineStatus.notStarted,
-                          progress: progress,
-                          onAction: downloading ? null : onDownload,
-                        ),
-                      ),
-                    ],
-                    const SizedBox(width: 4),
-                    IconButton(
-                      key: const Key('engine-bar-settings'),
-                      tooltip: 'Settings',
-                      icon: const Icon(Icons.settings_outlined),
-                      onPressed: onOpenSettings,
-                    ),
-                  ],
-                ),
-              if (downloading) ...[
-                const SizedBox(height: 8),
-                const LinearProgressIndicator(minHeight: 2),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Single engine readiness chip: status icon, label, progress or action.
-class _EngineStatusChip extends StatelessWidget {
-  const _EngineStatusChip({
-    required this.label,
-    required this.status,
-    required this.progress,
-    required this.onAction,
-  });
-
-  final String label;
-  final VoiceEngineStatus status;
-  final ModelDownloadProgress? progress;
-  final VoidCallback? onAction;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final downloading = status == VoiceEngineStatus.downloading;
-    final needsAction = status == VoiceEngineStatus.failed ||
-        status == VoiceEngineStatus.notStarted;
-    final actionLabel =
-        status == VoiceEngineStatus.failed ? 'Retry' : 'Download';
-    final percent = progress?.percent;
-
-    final (icon, color, subtitle) = switch (status) {
-      VoiceEngineStatus.ready => (
-          Icons.check_circle,
-          Colors.green.shade600,
-          'ready',
-        ),
-      VoiceEngineStatus.downloading => (
-          Icons.downloading,
-          scheme.primary,
-          percent == null
-              ? 'downloading…'
-              : 'downloading ${(percent * 100).round()}%',
-        ),
-      VoiceEngineStatus.failed => (
-          Icons.error_outline,
-          scheme.error,
-          'download failed',
-        ),
-      VoiceEngineStatus.notStarted => (
-          Icons.download_outlined,
-          scheme.onSurfaceVariant,
-          'not downloaded',
-        ),
-      VoiceEngineStatus.unavailable => (
-          Icons.block,
-          scheme.onSurfaceVariant,
-          'unavailable',
-        ),
-    };
-
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerLowest,
-        borderRadius: BorderRadius.circular(AppRadii.lg),
-        border: Border.all(color: scheme.outline),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, color: color, size: 18),
-              const SizedBox(width: 6),
-              Expanded(child: Text(label, style: theme.textTheme.labelLarge)),
-            ],
-          ),
-          const SizedBox(height: 2),
-          Text(
-            subtitle,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.bodySmall?.copyWith(color: color),
-          ),
-          if (needsAction) ...[
-            const SizedBox(height: 6),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                onPressed: onAction,
-                icon: const Icon(Icons.download, size: 18),
-                label: Text(actionLabel),
-              ),
-            ),
-          ] else if (downloading) ...[
-            const SizedBox(height: 6),
-            LinearProgressIndicator(value: percent, minHeight: 4),
-          ],
-        ],
       ),
     );
   }

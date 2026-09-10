@@ -57,12 +57,15 @@ class AudioSessionManagerImpl implements AudioSessionManager {
               AVAudioSessionCategoryOptions.defaultToSpeaker |
               AVAudioSessionCategoryOptions.duckOthers,
           androidAudioAttributes: const AndroidAudioAttributes(
-            contentType: AndroidAudioContentType.speech,
-            // USAGE_MEDIA, not voiceCommunication: the session is half-duplex
-            // (hold-to-talk), so TTS belongs on the media stream — media
-            // volume, speaker routing. voiceCommunication routes to the
-            // earpiece with STREAM_VOICE_CALL volume, which reads as "TTS
-            // produced samples but silence" when call volume is low/zero.
+            // CONTENT_TYPE_MUSIC, not speech: Android's audio policy maps
+            // USAGE_MEDIA to STREAM_VOICE_CALL (in-call volume) for every
+            // content type except music — so "speech" TTS was playing on the
+            // call stream: quiet over Bluetooth SCO (headset call volume)
+            // even while the phone speaker sounded fine. Music content keeps
+            // the media stream: media volume and A2DP routing on BT, matching
+            // regular media playback. voiceCommunication is avoided for the
+            // same reason (earpiece + STREAM_VOICE_CALL volume).
+            contentType: AndroidAudioContentType.music,
             usage: AndroidAudioUsage.media,
           ),
         ),

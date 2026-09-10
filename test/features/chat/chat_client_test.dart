@@ -255,6 +255,42 @@ void main() {
       expect(deltas.first, (0, 'get_weather', '{"city":'));
     });
 
+    test('forwards the name-only first tool fragment with empty args', () async {
+      final adapter = _ScriptedAdapter([
+        _StreamAction([
+          frame(chunk(toolCalls: [
+            toolCall(index: 0, id: 'call_1', name: 'get_weather'),
+          ])),
+          frame(chunk(toolCalls: [
+            toolCall(index: 0, arguments: '{"city":'),
+          ])),
+          frame(chunk(toolCalls: [
+            toolCall(index: 0, arguments: '"Paris"}'),
+          ])),
+          frame(chunk(finishReason: 'tool_calls')),
+        ]),
+      ]);
+      final client = _client(adapter);
+
+      final deltas = <(int, String, String)>[];
+      final result = await client.streamCompletions(
+        messages: messages,
+        onToolCallDelta: (index, name, fragment) =>
+            deltas.add((index, name, fragment)),
+      );
+
+      expect(result.toolCalls, hasLength(1));
+      expect(result.toolCalls.single.name, 'get_weather');
+      expect(result.toolCalls.single.args, {'city': 'Paris'});
+      // The name-only first fragment IS forwarded (empty args) so a listener
+      // can resolve a domain from the tool name immediately.
+      expect(deltas, [
+        (0, 'get_weather', ''),
+        (0, 'get_weather', '{"city":'),
+        (0, 'get_weather', '"Paris"}'),
+      ]);
+    });
+
     test('falls back to non-streaming completions once when args fail to decode',
         () async {
       final adapter = _ScriptedAdapter([

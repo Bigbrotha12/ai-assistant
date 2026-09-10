@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import './auth_credentials_store.dart';
@@ -15,8 +16,10 @@ final authCredentialsProvider =
 
 class AuthCredentialsNotifier extends AsyncNotifier<AuthCredentials?> {
   @override
-  Future<AuthCredentials?> build() async =>
-      ref.read(authCredentialsStoreProvider).load();
+  Future<AuthCredentials?> build() async {
+    if (kDebugMode) debugPrint('AuthCredentialsProvider: building (reload)');
+    return ref.read(authCredentialsStoreProvider).load();
+  }
 
   /// True when a usable API key is present in the current state.
   bool get hasCredentials {

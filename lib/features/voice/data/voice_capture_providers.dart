@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -44,8 +45,14 @@ final voiceCapturePipelineProvider =
     );
 
 class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
+  static int _buildCount = 0;
+
   @override
   VoiceCapturePipeline build() {
+    _buildCount++;
+    if (kDebugMode) {
+      debugPrint('Pipeline build #$_buildCount (rebuild=$_buildCount > 1)');
+    }
     final pipeline = VoiceCapturePipeline(
       micCapture: ref.watch(micCaptureServiceProvider),
       vad: ref.watch(vadProcessorProvider),
@@ -91,6 +98,9 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
   /// the app moves to the background. Voice calls are short-lived; dropping
   /// the session on background is the conservative, audio-safe choice.
   Future<void> _handleBackground() async {
+    if (kDebugMode) {
+      debugPrint('Pipeline: app → background (recording=${state.isRecording})');
+    }
     // Capture references before the first await: the notifier may be
     // rebuilt/disposed while the teardown is in flight, which would leave
     // this ref dead mid-await.

@@ -249,7 +249,7 @@ void main() {
     });
 
     group('speak cap', () {
-      test('>4 distinct tool phrases caps at 4 speaks', () {
+      test('multiple tool calls speak once and update display per call', () {
         final spoken = <String>[];
         final displays = <String>[];
         final tracker = StatusTracker(
@@ -269,8 +269,29 @@ void main() {
           tracker.onToolCall(name, '');
         }
 
-        expect(spoken, hasLength(4));
+        expect(spoken, hasLength(1));
         expect(displays, hasLength(5));
+        tracker.cancel();
+      });
+
+      test('domain flip as args stream in speaks once, updates display', () {
+        final spoken = <String>[];
+        final displays = <String>[];
+        final tracker = StatusTracker(
+          onSpeak: spoken.add,
+          onDisplay: displays.add,
+          random: Random(42),
+        );
+
+        tracker.onToolCall('invoke_tool_mcp_tool-discovery', '');
+        tracker.onToolCall(
+          'invoke_tool_mcp_tool-discovery',
+          '{"name":"tasks_list"}',
+        );
+
+        expect(spoken, hasLength(1));
+        expect(displays, hasLength(2));
+        expect(displays.last, startsWith('Working — '));
         tracker.cancel();
       });
     });

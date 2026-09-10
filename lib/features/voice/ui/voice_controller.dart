@@ -280,6 +280,9 @@ final class VoiceController {
 
   /// Ends the current conversation session and deactivates the mic.
   Future<void> endConversation() async {
+    if (kDebugMode) {
+      debugPrint('Controller: endConversation (recording=${_state.isRecording})');
+    }
     // Invalidate any queued or in-flight turn: nothing may transcribe, hit
     // the network, or start playback after the session is gone.
     _turnEpoch++;
@@ -304,7 +307,7 @@ final class VoiceController {
     // Drop per-turn fields so a later restarted session cannot re-emit the
     // previous session's utterance/reply as phantom bubbles.
     clearTurnFields();
-    _update(_state.copyWith(isConnected: false, isAiSpeaking: false, status: null));
+    _update(_state.copyWith(isConnected: false, isAiSpeaking: false, isSpeaking: false, status: null));
     // Conversation over: let the screen fall asleep again.
     await screenWakeLock?.disable();
   }
@@ -332,6 +335,9 @@ final class VoiceController {
   /// Stops capturing microphone audio.
   Future<void> stopRecording() async {
     if (!_state.isRecording) return;
+    if (kDebugMode) {
+      debugPrint('Controller: stopRecording');
+    }
     try {
       await micCapture.stop();
     } catch (e) {
@@ -538,6 +544,7 @@ final class VoiceController {
       final accumulator = SentenceAccumulator();
       final toolArgs = <int, StringBuffer>{};
       final toolNames = <int, String>{};
+      final reportedToolIndices = <int>{};
       _lastInterjectionAt = null;
       final tracker = StatusTracker(
         onSpeak: (phrase) {
@@ -595,6 +602,11 @@ final class VoiceController {
             // (the first name-less fragment has arrived; wait for the next).
             final accName = toolNames[index]!;
             if (accName.isEmpty && buf.isEmpty) return;
+            // Report the tracker once per tool call, from the full name, so
+            // the interjection domain is not re-resolved on every streamed
+            // args fragment.
+            if (reportedToolIndices.contains(index)) return;
+            reportedToolIndices.add(index);
             tracker.onToolCall(accName, buf.toString());
           },
         );
@@ -640,7 +652,7 @@ final class VoiceController {
           // catches up); the turn is over — hand the speaker back. Epoch-
           // guarded: interrupt() owns the false update after a barge-in.
           if (epoch == _turnEpoch && _state.isAiSpeaking) {
-            _update(_state.copyWith(isAiSpeaking: false));
+            _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
           }
         }
       }
@@ -903,7 +915,11 @@ final class VoiceController {
         // through the inter-sentence gaps — the flag is only cleared once
         // the queue has drained and the last playback has finished.
         if (!_state.isAiSpeaking) {
-          _update(_state.copyWith(isAiSpeaking: true));
+          _update(_state.copyWith(isAiSpeaking: true, isSpeaking: true));
+        } else if (!_state.isSpeaking) {
+          // A later chunk starting playback: the precise speaking flag was
+          // cleared when the previous chunk ended.
+          _update(_state.copyWith(isSpeaking: true));
         }
         if (!played) {
           played = true;
@@ -1001,6 +1017,12 @@ final class VoiceController {
           break;
         }
         _lastPlaybackEndedAtMs = _diagStopwatch.elapsedMilliseconds;
+        // This chunk's audio has finished: the precise speaking flag drops
+        // now, before any inter-sentence synthesis gap (isAiSpeaking stays
+        // held so the mic/VAD gates don't flicker open mid-turn).
+        if (_state.isSpeaking) {
+          _update(_state.copyWith(isSpeaking: false));
+        }
         if (kDebugMode) {
           debugPrint(
             'VoiceController[diag]: chunk played '
@@ -1027,7 +1049,7 @@ final class VoiceController {
       // after an interrupt — interrupt() already set it false and must stay
       // authoritative.
       if (played && epoch == _turnEpoch && !_state.isGenerating) {
-        _update(_state.copyWith(isAiSpeaking: false));
+        _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
       }
     } finally {
       // Release the handle only if this drain still owns it: a newer-epoch
@@ -1074,7 +1096,7 @@ final class VoiceController {
     // Stale audio from the interrupted utterance must never leak into the
     // next one's transcription.
     _micAudioBuffer.clear();
-    _update(_state.copyWith(isAiSpeaking: false, notice: null, status: null));
+    _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false, notice: null, status: null));
     try {
       // Bounded: one hung stop must never wedge the mic gates shut for a
       // barge-in hold.
@@ -1141,7 +1163,7 @@ final class VoiceController {
     // playback-end event, and it must already see isPaused at its loop top —
     // otherwise it would start the next sentence in the race window before
     // the paused flag lands.
-    _update(_state.copyWith(isPaused: true, isAiSpeaking: false));
+    _update(_state.copyWith(isPaused: true, isAiSpeaking: false, isSpeaking: false));
     try {
       await playback.stop();
     } catch (_) {

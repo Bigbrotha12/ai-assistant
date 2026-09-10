@@ -8,6 +8,7 @@ void main() {
       expect(s.isConnected, isFalse);
       expect(s.isRecording, isFalse);
       expect(s.isAiSpeaking, isFalse);
+      expect(s.isSpeaking, isFalse);
       expect(s.isPaused, isFalse);
       expect(s.isGenerating, isFalse);
       expect(s.error, isNull);
@@ -22,6 +23,7 @@ void main() {
         isConnected: true,
         isRecording: true,
         isAiSpeaking: true,
+        isSpeaking: true,
         isPaused: true,
         isGenerating: true,
         error: 'boom',
@@ -34,6 +36,7 @@ void main() {
       expect(next.isConnected, isTrue);
       expect(next.isRecording, isTrue);
       expect(next.isAiSpeaking, isTrue);
+      expect(next.isSpeaking, isTrue);
       expect(next.isPaused, isTrue);
       expect(next.isGenerating, isTrue);
       expect(next.error, 'boom');
@@ -103,6 +106,7 @@ void main() {
         base.copyWith(isConnected: true),
         base.copyWith(isRecording: true),
         base.copyWith(isAiSpeaking: true),
+        base.copyWith(isSpeaking: true),
         base.copyWith(isPaused: true),
         base.copyWith(isGenerating: true),
         base.copyWith(error: 'x'),

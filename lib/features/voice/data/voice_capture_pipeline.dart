@@ -303,6 +303,9 @@ class VoiceCapturePipeline {
 
   /// Release all resources.
   Future<void> dispose() async {
+    if (kDebugMode) {
+      debugPrint('Pipeline dispose (recording was $_isRecording)');
+    }
     _selfHealTimer?.cancel();
     _selfHealTimer = null;
     if (_isRecording) {

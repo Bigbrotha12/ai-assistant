@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/backend_settings.dart';
@@ -16,8 +17,10 @@ final settingsProvider =
 
 class SettingsNotifier extends AsyncNotifier<BackendSettings?> {
   @override
-  Future<BackendSettings?> build() async =>
-      ref.read(settingsStoreProvider).load();
+  Future<BackendSettings?> build() async {
+    if (kDebugMode) debugPrint('SettingsProvider: building (reload)');
+    return ref.read(settingsStoreProvider).load();
+  }
 
   /// Persists [settings] and updates the in-memory state. On write failure the
   /// state becomes [AsyncError] instead of keeping stale data.

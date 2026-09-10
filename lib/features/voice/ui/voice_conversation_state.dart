@@ -9,6 +9,7 @@ class VoiceConversationState {
     this.isConnected = false,
     this.isRecording = false,
     this.isAiSpeaking = false,
+    this.isSpeaking = false,
     this.isPaused = false,
     this.isGenerating = false,
     this.error,
@@ -36,6 +37,13 @@ class VoiceConversationState {
   /// mic/VAD gate reads this, so it must not flicker false between
   /// sentences the way raw playback state does.
   final bool isAiSpeaking;
+
+  /// Whether audio is actually playing through the speaker right now. Set
+  /// immediately before each chunk's playback and cleared the moment that
+  /// chunk finishes (and on interrupt/end/pause). Unlike [isAiSpeaking] it is
+  /// NOT held across inter-sentence gaps, so UI can show the waveform only
+  /// while the assistant is genuinely audible.
+  final bool isSpeaking;
 
   /// Whether the session is suspended by an OS audio interruption (e.g. a
   /// phone call or alarm). Recording and playback halt while true.
@@ -83,6 +91,7 @@ class VoiceConversationState {
     bool? isConnected,
     bool? isRecording,
     bool? isAiSpeaking,
+    bool? isSpeaking,
     bool? isPaused,
     bool? isGenerating,
     Object? error = _unset,
@@ -95,6 +104,7 @@ class VoiceConversationState {
     isConnected: isConnected ?? this.isConnected,
     isRecording: isRecording ?? this.isRecording,
     isAiSpeaking: isAiSpeaking ?? this.isAiSpeaking,
+    isSpeaking: isSpeaking ?? this.isSpeaking,
     isPaused: isPaused ?? this.isPaused,
     isGenerating: isGenerating ?? this.isGenerating,
     error: identical(error, _unset) ? this.error : error,
@@ -119,6 +129,7 @@ class VoiceConversationState {
       other.isConnected == isConnected &&
       other.isRecording == isRecording &&
       other.isAiSpeaking == isAiSpeaking &&
+      other.isSpeaking == isSpeaking &&
       other.isPaused == isPaused &&
       other.isGenerating == isGenerating &&
       other.error == error &&
@@ -133,6 +144,7 @@ class VoiceConversationState {
     isConnected,
     isRecording,
     isAiSpeaking,
+    isSpeaking,
     isPaused,
     isGenerating,
     error,
@@ -146,7 +158,8 @@ class VoiceConversationState {
   @override
   String toString() =>
       'VoiceConversationState(connected: $isConnected, '
-      'recording: $isRecording, aiSpeaking: $isAiSpeaking, paused: $isPaused, '
+      'recording: $isRecording, aiSpeaking: $isAiSpeaking, '
+      'speaking: $isSpeaking, paused: $isPaused, '
       'generating: $isGenerating, '
       'error: $error, notice: $notice, status: $status, '
       'transcript: $lastTranscript, reply: $lastReply, '

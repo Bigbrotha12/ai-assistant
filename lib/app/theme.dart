@@ -92,6 +92,27 @@ LinearGradient goldGradient({
       colors: const [AppColors.goldLight, AppColors.goldBase, AppColors.goldDark],
     );
 
+/// Higher-contrast gold sweep for engraved glyphs (§3.3): the same tokens but
+/// with the light band pinned to the top-left and a deeper dark at the
+/// bottom-right, so the mic reads as polished metal at display size rather
+/// than flat gold.
+LinearGradient goldGlyphGradient({
+  AlignmentGeometry begin = Alignment.topLeft,
+  AlignmentGeometry end = Alignment.bottomRight,
+}) =>
+    LinearGradient(
+      begin: begin,
+      end: end,
+      colors: const [
+        AppColors.goldLight,
+        AppColors.goldLight,
+        AppColors.goldBase,
+        AppColors.goldDark,
+        AppColors.goldDark,
+      ],
+      stops: const [0.0, 0.4, 0.6, 0.8, 1.0],
+    );
+
 // ---------------------------------------------------------------------------
 // Theme extension
 // ---------------------------------------------------------------------------

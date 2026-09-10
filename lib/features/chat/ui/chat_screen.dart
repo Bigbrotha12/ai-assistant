@@ -193,6 +193,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
+        centerTitle: true,
         leading: IconButton(
           key: const Key('new-conversation'),
           tooltip: 'New Chat',

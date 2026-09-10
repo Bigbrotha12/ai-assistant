@@ -365,8 +365,14 @@ class ChatApiClient implements ChatClient {
                 toolAccums.putIfAbsent(delta.index, _ToolAccumulator.new);
             if (delta.id != null) acc.id = delta.id;
             if (delta.name != null) acc.name = delta.name;
-            if (delta.argsFragment.isNotEmpty) {
-              acc.args.write(delta.argsFragment);
+            // Forward every fragment — including the name-only first one
+            // (empty args) — so a listener (e.g. the status tracker) can
+            // resolve a domain from the tool name immediately, instead of
+            // only once argument fragments accumulate a keyword.
+            if (delta.name != null || delta.argsFragment.isNotEmpty) {
+              if (delta.argsFragment.isNotEmpty) {
+                acc.args.write(delta.argsFragment);
+              }
               onToolCallDelta
                   ?.call(delta.index, acc.name ?? '', delta.argsFragment);
             }

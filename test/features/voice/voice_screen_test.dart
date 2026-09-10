@@ -662,8 +662,8 @@ void main() {
     );
   });
 
-  testWidgets('the Stop control appears while the AI speaks and tapping it '
-      'stops playback', (tester) async {
+  testWidgets('the SpeakButton shows a stop affordance while the AI speaks',
+      (tester) async {
     final tts = FakeTtsEngine();
     final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
     final container = buildContainer(tts: tts, playback: playback);
@@ -678,28 +678,44 @@ void main() {
     final controller = container.read(voiceControllerProvider);
     await controller.startConversation();
 
-    // No stop control while idle.
-    expect(find.byKey(const Key('voice-stop-speaking')), findsNothing);
+    // Mic glyph while idle (no stop affordance).
+    expect(find.byIcon(Icons.stop), findsNothing);
 
     // The AI starts a reply that keeps playing (held open).
     unawaited(controller.synthesizeOnDevice('reply'));
     await settle(tester);
     expect(controller.state.isAiSpeaking, isTrue);
 
-    // The Stop control is visible while the AI is speaking.
-    final stop = find.byKey(const Key('voice-stop-speaking'));
-    expect(stop, findsOneWidget);
+    // The stop affordance signals that pressing the button will barge in.
+    expect(find.byIcon(Icons.stop), findsWidgets);
 
-    // Tapping it stops playback and hides the control.
-    await tester.tap(stop);
-    await settle(tester);
-    expect(controller.state.isAiSpeaking, isFalse);
-    expect(find.byKey(const Key('voice-stop-speaking')), findsNothing);
-
-    // Releasing the held track must not restart anything.
+    // Releasing the held track must not leave the stop affordance behind.
     playback.holdCompletion!.complete();
     await settle(tester);
     expect(controller.state.isAiSpeaking, isFalse);
+    expect(find.byIcon(Icons.stop), findsNothing);
+  });
+
+  testWidgets('the SpeakButton sits at the exact vertical middle of the hero',
+      (tester) async {
+    final container = buildContainer();
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    // The hero text above (status line, phase label, waveform) and the
+    // caption below must not pull the button off the viewport's vertical
+    // middle.
+    final buttonCenter = tester.getCenter(find.byType(SpeakButton));
+    final heroRect = tester.getRect(find.byType(SingleChildScrollView));
+    expect(
+      buttonCenter.dy,
+      moreOrLessEquals(heroRect.center.dy, epsilon: 0.5),
+    );
   });
 
   testWidgets('holding the talk button while the AI speaks stops the AI and '
@@ -868,7 +884,8 @@ void main() {
     await settle(tester);
 
     expect(controller.state.isGenerating, isTrue);
-    expect(find.text('Working…'), findsOneWidget);
+    // The phase label animates its trailing dots, so match on the phase word.
+    expect(find.textContaining('Working'), findsOneWidget);
 
     chat.hang!.complete(
       const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
@@ -876,7 +893,7 @@ void main() {
     await settle(tester);
 
     expect(controller.state.isGenerating, isFalse);
-    expect(find.text('Working…'), findsNothing);
+    expect(find.textContaining('Working'), findsNothing);
   });
 
   testWidgets('renders the transient notice when a busy flush is dropped',
@@ -998,7 +1015,7 @@ void main() {
       expect(find.text('Backend not configured'), findsNothing);
     });
 
-    testWidgets('Settings screen opens from the engine status bar',
+    testWidgets('Settings screen opens from the bottom bar gear',
         (tester) async {
       final store = FakeSettingsStore(
         stored: const BackendSettings(host: 'myhost'),
@@ -1011,7 +1028,7 @@ void main() {
       ));
       await pumpBounded(tester);
 
-      // The settings gear in the engine status bar opens the settings screen.
+      // The settings gear in the bottom bar opens the settings screen.
       await tester.tap(find.byKey(const Key('engine-bar-settings')));
       await pumpBounded(tester);
       await tester.pump(const Duration(milliseconds: 300));
