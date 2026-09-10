@@ -598,6 +598,128 @@ void main() {
     });
   });
 
+  group('background suspension', () {
+    test('background keeps an in-flight LLM stream alive and defers its reply',
+        () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['partial'],
+        ],
+        results: [
+          ChatResult(content: 'partial', toolCalls: const [], finishReason: 'stop'),
+        ],
+      )..hang = Completer<ChatResult>();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      final transcripts = <String>[];
+      controller.onTranscript = transcripts.add;
+
+      // The stream accumulates a delta, then hangs in flight.
+      final send = controller.sendText('hello');
+      await Future<void>.delayed(Duration.zero);
+      expect(chat.callCount, 1);
+      expect(controller.state.lastTranscript, 'partial');
+
+      // The app backgrounds while the stream is in flight: audio is suspended
+      // but the turn is NOT cancelled.
+      await controller.enterBackground();
+
+      // The stream completes in the background: the reply is produced and
+      // persisted, but nothing is synthesised or played yet.
+      chat.hang!.complete(
+        const ChatResult(content: 'partial', toolCalls: [], finishReason: 'stop'),
+      );
+      await send;
+
+      expect(chat.callCount, 1);
+      expect(controller.state.isConnected, isTrue);
+      expect(controller.state.lastReply, 'partial');
+      expect(transcripts, ['partial']);
+      expect(tts.synthesized, isEmpty);
+      expect(playback.playedChunks, isEmpty);
+
+      // Returning to the foreground plays the deferred reply and closes the
+      // turn.
+      await controller.exitBackground();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(playback.playedChunks, hasLength(1));
+      expect(tts.synthesized, ['partial']);
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('background stops playback mid-reply and plays the rest on resume',
+        () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['First sentence.', ' Second sentence.'],
+        ],
+        results: [
+          ChatResult(
+            content: 'First sentence. Second sentence.',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      // The first sentence is enqueued mid-stream; the trailing second
+      // sentence flushes at end of stream. The first chunk plays (held open).
+      final send = controller.sendText('hello');
+      await pumpEventQueue();
+      expect(controller.state.isAiSpeaking, isTrue);
+      expect(playback.playedChunks, hasLength(1));
+
+      // Background mid-playback: the player stops, the drain suspends with the
+      // remaining sentence still queued, and the turn flag is released (the
+      // stream already completed).
+      await controller.enterBackground();
+      await pumpEventQueue();
+      expect(controller.state.isAiSpeaking, isFalse);
+      expect(playback.playedChunks, hasLength(1));
+
+      // Foreground: the rest of the reply plays and the turn closes.
+      await controller.exitBackground();
+      await pumpEventQueue();
+      playback.holdCompletion!.complete();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(playback.playedChunks, hasLength(2));
+      expect(controller.state.isAiSpeaking, isFalse);
+      // First sentence + the paused turn's prefetch of the second (discarded
+      // on the background break) + the resumed playback's fresh synthesis.
+      expect(tts.synthesized, hasLength(3));
+
+      await send;
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+  });
+
   group('interrupt', () {
     test('interrupt during playback stops playback and clears isAiSpeaking',
         () async {

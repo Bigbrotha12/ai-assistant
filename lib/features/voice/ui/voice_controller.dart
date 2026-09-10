@@ -252,6 +252,14 @@ final class VoiceController {
   /// the interjection-still-playing instrumentation.
   DateTime? _lastInterjectionAt;
 
+  /// True between [enterBackground] and [exitBackground]: the app is not
+  /// visible, so the speak queue holds its utterances instead of playing them
+  /// and no new playback starts. The in-flight LLM turn is NOT cancelled —
+  /// its reply completes in the background and queues for [exitBackground] to
+  /// speak. Recording/playback/focus teardown still happens ([enterBackground]),
+  /// so nothing leaks audio while the app is hidden.
+  bool _isBackgrounded = false;
+
   VoiceConversationState _state = VoiceConversationState.initial();
   final StreamController<VoiceConversationState> _stateController =
       StreamController<VoiceConversationState>.broadcast();
@@ -310,6 +318,47 @@ final class VoiceController {
     _update(_state.copyWith(isConnected: false, isAiSpeaking: false, isSpeaking: false, status: null));
     // Conversation over: let the screen fall asleep again.
     await screenWakeLock?.disable();
+  }
+
+  /// Suspends the conversation when the app moves to the background WITHOUT
+  /// cancelling the in-flight LLM turn: mic, playback, and the wake lock are
+  /// released so nothing leaks while the app is not visible, but the stream
+  /// keeps running. Completed sentences accumulate in the speak queue and the
+  /// final reply fires [onTranscript] as usual; the queued audio waits for
+  /// [exitBackground] to be spoken. Idempotent.
+  Future<void> enterBackground() async {
+    if (_disposed || _isBackgrounded) return;
+    _isBackgrounded = true;
+    if (_state.isRecording) {
+      await stopRecording();
+    }
+    try {
+      await playback.stop();
+    } catch (_) {
+      // Best-effort stop.
+    }
+    // Screen is off; a held wake lock must not keep the device above idle
+    // while backgrounded.
+    await screenWakeLock?.disable();
+  }
+
+  /// Resumes a backgrounded conversation: the queued reply (accumulated while
+  /// the app was not visible) starts playing — playback re-acquires audio
+  /// focus — and the wake lock is restored for the connected session.
+  /// Idempotent.
+  Future<void> exitBackground() async {
+    if (!_isBackgrounded) return;
+    _isBackgrounded = false;
+    if (_state.isConnected) {
+      await screenWakeLock?.enable();
+    }
+    // The drain suspended itself when backgrounded, leaving the queue intact;
+    // restart it so the held reply actually plays. No-op while a drain is
+    // running (one that never observed the background flag simply continues).
+    if (_speakQueue.isNotEmpty && _drainFuture == null) {
+      _drainEpoch = _turnEpoch;
+      _drainFuture = _drainSpeakQueue();
+    }
   }
 
   /// Starts capturing microphone audio for on-device STT. No-op when already
@@ -841,6 +890,12 @@ final class VoiceController {
         // items synchronously; anything here belongs to a newer turn and is
         // the newer drain's business.
         if (epoch != _turnEpoch) break;
+        // The app is backgrounded: suspend WITHOUT consuming the queue. No
+        // playback may start on a hidden surface, and the sentences accumulate
+        // for [exitBackground], which restarts the drain and speaks them on
+        // resume. No epoch bump here — the in-flight turn keeps its identity
+        // so its reply still lands in this queue.
+        if (_isBackgrounded) break;
         // An OS interruption halts the queue WITHOUT consuming it: the rest
         // of the reply resumes after [resumeAfterInterruption] instead of
         // being lost.

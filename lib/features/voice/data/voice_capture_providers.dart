@@ -94,9 +94,11 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
     return pipeline;
   }
 
-  /// Tears down recording and playback and ends the text conversation when
-  /// the app moves to the background. Voice calls are short-lived; dropping
-  /// the session on background is the conservative, audio-safe choice.
+  /// Suspends recording and playback when the app moves to the background but
+  /// KEEPS the in-flight LLM turn alive: inference completes in the background
+  /// and its reply queues (persisted via onTranscript) for playback on the next
+  /// foreground. The audio-safe parts of a full teardown still happen — mic,
+  /// player, and focus are all released so nothing leaks while not visible.
   Future<void> _handleBackground() async {
     if (kDebugMode) {
       debugPrint('Pipeline: app → background (recording=${state.isRecording})');
@@ -110,16 +112,20 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
     if (pipeline.isRecording) {
       await pipeline.stopRecording();
     }
-    await controller.endConversation();
-    // endConversation stops playback but owns no focus; a reply playing at
-    // this moment would otherwise leak the audio focus for the app session.
+    // enterBackground stops playback but owns no focus; a reply that was
+    // playing at this moment would otherwise leak the audio focus for the app
+    // session.
+    await controller.enterBackground();
     await session.abandonAudioFocus();
   }
 
-  /// Resets the session to idle on foreground. Deliberately does not
-  /// auto-reconnect — the user re-taps the mic to rejoin.
+  /// Resumes a backgrounded session on foreground: any reply held while the
+  /// app was hidden starts playing (playback re-acquires focus), and a
+  /// session left paused by an OS audio interruption is resumed. The
+  /// conversation itself stays connected across the background period.
   Future<void> _handleForeground() async {
     final controller = ref.read(voiceControllerProvider);
+    await controller.exitBackground();
     if (controller.state.isPaused) {
       await controller.resumeAfterInterruption();
     }
