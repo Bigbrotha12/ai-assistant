@@ -6,31 +6,32 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../../chat/ui/chat_providers.dart';
-import '../../chat/ui/conversation_list.dart';
-import '../../chat/data/database_providers.dart';
-import '../../chat/data/message_model.dart';
-import '../../settings/ui/settings_screen.dart';
-import '../../../app/app_startup.dart';
-import '../../auth/data/auth_credentials_providers.dart';
-import '../../chat/data/chat_client.dart';
-import '../../settings/data/settings_providers.dart';
 import '../../../app/theme.dart';
+import '../../../app/app_startup.dart';
 import '../../../app/widgets/app_logo.dart';
-import '../../../app/widgets/golden_pill.dart';
 import '../../../app/widgets/speak_button.dart';
+import '../../../app/widgets/voice_text_mode_pill.dart';
+import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/ui/auth_flow.dart';
+import '../../chat/data/chat_client.dart';
+import '../../chat/ui/chat_providers.dart';
+import '../../chat/ui/chat_screen.dart';
+import '../../chat/ui/conversation_list.dart';
+import '../../settings/data/settings_providers.dart';
+import '../../settings/ui/settings_screen.dart';
 import '../data/engine_config.dart';
 import '../data/engine_errors.dart';
 import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/voice_capture_providers.dart';
-import './voice_conversation_state.dart';
 import './voice_controller_provider.dart';
 
 /// Voice-first home screen: a single large hold-to-talk [SpeakButton], a
-/// quiet status line, and a Transcript [GoldenPill] whose panel expands
-/// upward from the bottom of the screen.
+/// quiet status line, and a bottom bar carrying the shared Voice/Text mode
+/// switch. Tapping **Text** hands off to [ChatScreen]; the chat screen's own
+/// pill hands back to this screen, so the two surfaces stay one affordance
+/// apart with a single text-chat implementation (no separate voice text
+/// composer).
 ///
 /// Consumes the existing voice providers ([voiceConversationStateProvider],
 /// [voiceCapturePipelineProvider] and the engine status providers); it does not
@@ -44,42 +45,6 @@ class VoiceScreen extends ConsumerStatefulWidget {
 }
 
 class _VoiceScreenState extends ConsumerState<VoiceScreen> {
-  final _logScroll = ScrollController();
-
-  /// Ordered, de-duplicated user transcripts shown as chat bubbles.
-  /// Transcript log: user utterances and assistant replies, in order.
-  final _transcripts = <_LogEntry>[];
-
-  /// Number of [_transcripts] entries seeded from the active conversation's
-  /// persisted history (see [_seedFromConversation]). Live appends must never
-  /// dedupe against this seeded prefix — the user may legitimately repeat the
-  /// exact text of their last stored message.
-  int _seededCount = 0;
-
-  /// Bumped on every re-seed request so a slow store load for a stale
-  /// conversation can never clobber a newer one (e.g. rapid history switches).
-  int _seedEpoch = 0;
-
-  /// True while [_seedFromConversation] has cleared the panel but not yet
-  /// landed the loaded history. Live appends landing in that window are
-  /// queued into [_pendingLive] instead of being appended, so they can never
-  /// scramble the seeded order or duplicate a message the seed then re-imports.
-  bool _seeding = false;
-
-  /// Live transcript entries received while [_seeding]; replayed after the
-  /// seed lands (in arrival order, after the seeded prefix).
-  final _pendingLive = <_LogEntry>[];
-
-  /// Composer input; voice hold-to-talk when false, text composer when true.
-  bool _textInputMode = false;
-
-  final _textInput = TextEditingController();
-
-  /// True while a text-mode turn is streaming. The controller serialises turns
-  /// internally, but the UI disables the SpeakButton and composer while it is
-  /// set so the in-flight turn is never stacked visually.
-  bool _turnInFlight = false;
-
   bool _micBusy = false;
 
   /// The in-flight [_holdStart], so a very quick release can wait for it.
@@ -97,139 +62,23 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   void initState() {
     super.initState();
     // The active conversation may already exist (set by an earlier chat/voice
-    // session); ensure one exists, then seed the transcript from its history.
-    final id = ref.read(activeConversationIdProvider.notifier).ensure();
-    _seedFromConversation(id);
+    // session); ensure one exists so the shared conversation id is stable when
+    // the user later switches to the chat screen. Clear the controller's
+    // per-turn fields so stale turn data from a previous session can never
+    // re-emit as phantom state.
+    ref.read(activeConversationIdProvider.notifier).ensure();
+    ref.read(voiceControllerProvider).clearTurnFields();
   }
 
   @override
   void dispose() {
-    _logScroll.dispose();
-    _textInput.dispose();
-    // The voice providers own their teardown: `VoiceCapturePipelineNotifier`
-    // and `VoiceControllerNotifier` dispose the pipeline (stopping any active
-    // recording) and the controller (ending the conversation) via their
-    // `ref.onDispose` callbacks once the last listener — this screen and the
-    // conversation-state notifier — is gone. Calling `ref.read(...)` here is
-    // both unsafe (Riverpod forbids ref after unmount) and unnecessary.
+    // The shared voice providers are NOT autoDispose, so this screen does not
+    // rely on them tearing down when it unmounts. Leaving via the pill ends the
+    // session explicitly (see [_openChat]); the providers' own `ref.onDispose`
+    // callbacks (pipeline dispose, controller dispose) run when the provider
+    // container is torn down. Calling `ref.read(...)` here is unsafe (Riverpod
+    // forbids ref after unmount) and unnecessary.
     super.dispose();
-  }
-
-  /// Loads [id]'s messages from the store and seeds `_transcripts` with them.
-  ///
-  /// Clears the panel immediately (switching conversations must never show
-  /// stale bubbles) and resets `_seededCount` so the whole list is treated as
-  /// seeded history by the live-append dedupe. A store load must not race an
-  /// unopened database, so [databaseReadyProvider] is awaited first.
-  Future<void> _seedFromConversation(String id) async {
-    final epoch = ++_seedEpoch;
-    // A shared controller carries per-turn state across conversations; clear
-    // its fields so a stale lastReply / onDeviceTranscript from the previous
-    // conversation can never re-emit into this one as a phantom bubble.
-    ref.read(voiceControllerProvider).clearTurnFields();
-    _seeding = true;
-    _pendingLive.clear();
-    if (_transcripts.isNotEmpty || _seededCount != 0) {
-      setState(() {
-        _transcripts.clear();
-        _seededCount = 0;
-      });
-    }
-    await ref.read(databaseReadyProvider);
-    if (!mounted || epoch != _seedEpoch) {
-      if (mounted) setState(() => _seeding = false);
-      return;
-    }
-    final conversation = await ref.read(chatStoreProvider).loadConversation(id);
-    if (!mounted || epoch != _seedEpoch) {
-      if (mounted) setState(() => _seeding = false);
-      return;
-    }
-    final entries = <_LogEntry>[];
-    for (final message in conversation?.messages ?? const <Message>[]) {
-      switch (message.role) {
-        case MessageRole.user:
-          entries.add(_LogEntry(message.content, fromUser: true));
-        case MessageRole.assistant:
-          entries.add(_LogEntry(message.content, fromUser: false));
-        // Tool/system rows are internal plumbing, never surfaced.
-        case MessageRole.tool || MessageRole.system:
-          break;
-      }
-    }
-    setState(() {
-      _transcripts.addAll(entries);
-      _seededCount = _transcripts.length;
-      // Replay any live appends that landed while the seed was loading, in
-      // order, after the seeded prefix. They were accepted (deduped) at
-      // arrival time, so replaying them keeps order without duplication.
-      if (_pendingLive.isNotEmpty) {
-        _transcripts.addAll(_pendingLive);
-        _pendingLive.clear();
-      }
-      _seeding = false;
-    });
-    _scrollLogToEnd();
-  }
-
-  /// Appends a freshly recognised user utterance to the log. Empty text is
-  /// ignored so the list stays stable across unrelated state updates. The
-  /// consecutive-identical dedupe only applies to LIVE appends: once the
-  /// transcript has grown past [_seededCount] the last entry is known to be
-  /// live, so a repeated utterance (same value re-emitted across state flips)
-  /// is dropped — but it never collapses a live utterance into the seeded
-  /// history.
-  void _appendTranscript(VoiceConversationState state) {
-    final text = state.onDeviceTranscript;
-    if (text == null || text.trim().isEmpty) return;
-    if (_transcripts.length > _seededCount &&
-        _transcripts.isNotEmpty &&
-        _transcripts.last.fromUser &&
-        _transcripts.last.text == text) {
-      return;
-    }
-    final entry = _LogEntry(text, fromUser: true);
-    if (_seeding) {
-      // The seed will re-import this utterance if it has been persisted; queue
-      // it so it is replayed in order after the seed lands (never scrambled
-      // ahead of the loaded history).
-      _pendingLive.add(entry);
-      return;
-    }
-    setState(() => _transcripts.add(entry));
-    _scrollLogToEnd();
-  }
-
-  /// Appends the assistant's final reply to the log. [lastReply] is cleared
-  /// at the start of each turn and set once at its end, so this fires exactly
-  /// once per completed turn (even for identical reply text). Like
-  /// [_appendTranscript], the dedupe is skipped while the log is still inside
-  /// the seeded prefix.
-  void _appendAssistantReply(VoiceConversationState state) {
-    final text = state.lastReply;
-    if (text == null || text.trim().isEmpty) return;
-    if (_transcripts.length > _seededCount &&
-        _transcripts.isNotEmpty &&
-        !_transcripts.last.fromUser &&
-        _transcripts.last.text == text) {
-      return;
-    }
-    final entry = _LogEntry(text, fromUser: false);
-    if (_seeding) {
-      // Queue as with [_appendTranscript]; replayed after the seed lands.
-      _pendingLive.add(entry);
-      return;
-    }
-    setState(() => _transcripts.add(entry));
-    _scrollLogToEnd();
-  }
-
-  void _scrollLogToEnd() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_logScroll.hasClients) {
-        _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
-      }
-    });
   }
 
   /// Starts a hold-to-talk recording: stops any active recording (toggle), or
@@ -361,78 +210,45 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   /// Switches the active conversation to a fresh, empty one.
   void _newConversation() {
     ref.read(activeConversationIdProvider.notifier).newConversation();
-    _seedFromConversation(ref.read(activeConversationIdProvider.notifier).ensure());
   }
 
   /// Opens the session history; selecting a conversation switches the active
-  /// id and re-seeds the transcript from that conversation's messages.
+  /// id so the chat screen (and voice persistence) targets it next.
   Future<void> _openHistory() async {
     final selected = await Navigator.of(context).push<String>(
       MaterialPageRoute(builder: (_) => const ConversationListScreen()),
     );
     if (selected != null && mounted) {
       ref.read(activeConversationIdProvider.notifier).set(selected);
-      _seedFromConversation(selected);
     }
   }
 
-  /// Sends the composer text as a text-mode turn: starts the conversation
-  /// session when needed, then hands off to the controller with `speakReply:
-  /// false` so TTS never runs for a typed message. The field is cleared only
-  /// once the message has actually been accepted by the controller.
-  Future<void> _sendText() async {
-    final text = _textInput.text.trim();
-    if (text.isEmpty || _turnInFlight || _micBusy) return;
-    final controller = ref.read(voiceControllerProvider);
-    setState(() {
-      _turnInFlight = true;
-      _localError = null;
-    });
+  /// Hands off to the text-chat surface (shared pill affordance). Ends the
+  /// voice session first so the screen wake lock, mic capture, and playback
+  /// are released — the shared voice providers are not autoDispose, so leaving
+  /// this screen would otherwise retain them. Also flushes any queued
+  /// persistence writes so the chat screen loads the complete conversation.
+  /// Replaces this screen so toggling modes never stacks surfaces.
+  Future<void> _openChat() async {
     try {
-      // A typed turn while the AI is speaking stops it first (barge-in), so
-      // the new reply is not spoken over the tail of the previous one and the
-      // typed turn can never be silently dropped by a later voice barge-in.
-      // The union gate covers the whole turn span: generating (no audio yet)
-      // as well as audibly speaking (after the stream ended).
-      if (controller.state.isAiSpeaking || controller.state.isGenerating) {
-        await controller.interrupt();
-      }
-      if (!controller.state.isConnected) {
-        await controller.startConversation();
-      }
-      if (!controller.state.isConnected) {
-        return; // Session error already surfaced through the state.
-      }
-      await controller.sendText(text, speakReply: false);
-      _textInput.clear();
-    } catch (e) {
-      if (mounted) {
-        setState(() => _localError = e.toString());
-      }
-    } finally {
-      if (mounted) setState(() => _turnInFlight = false);
+      final controller = ref.read(voiceControllerProvider);
+      await controller.endConversation();
+      await ref
+          .read(voiceControllerProvider.notifier)
+          .flushPersistence();
+    } catch (_) {
+      // Best-effort teardown: a failed stop/flush must never block the mode
+      // switch (the chat surface still works; the session is abandoned).
     }
-  }
-
-  void _setTextInputMode(bool value) {
-    if (value == _textInputMode) return;
-    setState(() => _textInputMode = value);
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const ChatScreen()),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(voiceConversationStateProvider);
-    ref.listen(voiceConversationStateProvider, (_, next) {
-      _appendTranscript(next);
-      _appendAssistantReply(next);
-    });
-    // Re-seed whenever the app-wide active conversation changes while this
-    // screen is mounted (e.g. a history pick in another surface).
-    ref.listen<String?>(activeConversationIdProvider, (previous, next) {
-      if (next != null && next != previous) {
-        _seedFromConversation(next);
-      }
-    });
 
     final scheme = Theme.of(context).colorScheme;
     final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
@@ -509,196 +325,149 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                       onRetry: _retryConnection,
                     ),
             Expanded(
-              child: Column(
-                children: [
-                  if (_textInputMode) ...[
-                    // Text mode: a compact hero (status line only) so the
-                    // message view takes most of the vertical space, with the
-                    // composer underneath the history.
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                      child: Column(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  // The hero text keeps the full scroll-viewport width
+                  // (as in the previous centered column) while the
+                  // button itself is pinned to the exact vertical
+                  // middle of the viewport.
+                  final double heroWidth = constraints.maxWidth - 48;
+                  final double blockLeft = (heroBox - heroWidth) / 2;
+                  return Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 12,
+                      ),
+                      // The SpeakButton is the stack's only flow
+                      // child, so the stack sizes to it and Center
+                      // places it at the exact vertical middle of the
+                      // viewport. The hero text and caption anchor to
+                      // the tappable circle's edges, so they never
+                      // shift the button.
+                      child: Stack(
+                        // Don't clip the hero text/caption to the
+                        // button's box: they intentionally extend
+                        // above/below it while staying centered on the
+                        // button.
+                        clipBehavior: Clip.none,
+                        alignment: Alignment.center,
                         children: [
-                          _TurnStatusLine(
-                            notice: state.notice,
+                          // Hero text above the button: status line,
+                          // phase label and the fixed-height waveform
+                          // slot (16 top pad + 20 max bar), so the
+                          // waveform's appearance never shifts the
+                          // button.
+                          Positioned(
+                            left: blockLeft,
+                            width: heroWidth,
+                            bottom: circleEdge + 20,
+                            child: Column(
+                              children: [
+                                _TurnStatusLine(
+                                  notice: state.notice,
+                                ),
+                                const SizedBox(height: 10),
+                                _PhaseLabel(
+                                  phase: recording
+                                      ? 'Listening'
+                                      : state.isGenerating
+                                          ? 'Working'
+                                          : state.isAiSpeaking
+                                              ? 'Speaking'
+                                              : 'Speak',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .displaySmall
+                                      ?.copyWith(
+                                        color: scheme.onSurface,
+                                      ),
+                                ),
+                                SizedBox(
+                                  height: 36,
+                                  child: AnimatedSwitcher(
+                                    duration: const Duration(
+                                        milliseconds: 200),
+                                    child: recording ||
+                                            state.isSpeaking
+                                        ? Padding(
+                                            key: const ValueKey(
+                                                'waveform'),
+                                            padding:
+                                                const EdgeInsets.only(
+                                                    top: 16),
+                                            child: _Waveform(
+                                              active: recording ||
+                                                  state.isSpeaking,
+                                              color: tier.premium
+                                                  ? AppColors.goldBase
+                                                  : scheme.primary,
+                                            ),
+                                          )
+                                        : const SizedBox(
+                                            key: ValueKey(
+                                                'waveform-idle'),
+                                            height: 1,
+                                          ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          SpeakButton(
+                            recording: recording,
+                            aiSpeaking: state.isAiSpeaking,
+                            generating: state.isGenerating,
+                            busy: _micBusy,
+                            onHoldStart: _holdStart,
+                            onHoldEnd: _holdEnd,
+                          ),
+                          // Per-turn caption below the button, at the
+                          // same distance the phase label sits above
+                          // it.
+                          Positioned(
+                            left: blockLeft,
+                            width: heroWidth,
+                            top: circleEdge + heroLabelGap,
+                            child: SizedBox(
+                              height: 20,
+                              child: Center(
+                                child: Text(
+                                  state.status ??
+                                      'PRESS AND HOLD TO TALK',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.center,
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .labelSmall
+                                      ?.copyWith(
+                                        letterSpacing:
+                                            state.status == null
+                                                ? 1.4
+                                                : null,
+                                        fontStyle: state.status == null
+                                            ? null
+                                            : FontStyle.italic,
+                                        color: state.status == null &&
+                                                tier.premium
+                                            ? AppColors.goldDark
+                                            : scheme.onSurfaceVariant,
+                                      ),
+                                ),
+                              ),
+                            ),
                           ),
                         ],
                       ),
                     ),
-                    Expanded(
-                      child: _MessageLog(
-                        controller: _logScroll,
-                        entries: _transcripts,
-                        aiSpeaking: state.isAiSpeaking,
-                        connected: state.isConnected,
-                        inTextMode: true,
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                      child: _Composer(
-                        controller: _textInput,
-                        enabled: !_turnInFlight && !_micBusy,
-                        canSend: !_turnInFlight &&
-                            !_micBusy &&
-                            _textInput.text.trim().isNotEmpty,
-                        onSend: _sendText,
-                        onChanged: () => setState(() {}),
-                      ),
-                    ),
-                  ] else ...[
-                    // Voice mode: the centered scrollable hero with the
-                    // SpeakButton. No transcript panel in voice mode — the
-                    // message view only appears in text mode.
-                    Expanded(
-                      child: LayoutBuilder(
-                        builder: (context, constraints) {
-                          // The hero text keeps the full scroll-viewport width
-                          // (as in the previous centered column) while the
-                          // button itself is pinned to the exact vertical
-                          // middle of the viewport.
-                          final double heroWidth = constraints.maxWidth - 48;
-                          final double blockLeft = (heroBox - heroWidth) / 2;
-                          return Center(
-                            child: SingleChildScrollView(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 24,
-                                vertical: 12,
-                              ),
-                              // The SpeakButton is the stack's only flow
-                              // child, so the stack sizes to it and Center
-                              // places it at the exact vertical middle of the
-                              // viewport. The hero text and caption anchor to
-                              // the tappable circle's edges, so they never
-                              // shift the button.
-                              child: Stack(
-                                // Don't clip the hero text/caption to the
-                                // button's box: they intentionally extend
-                                // above/below it while staying centered on the
-                                // button.
-                                clipBehavior: Clip.none,
-                                alignment: Alignment.center,
-                                children: [
-                                  // Hero text above the button: status line,
-                                  // phase label and the fixed-height waveform
-                                  // slot (16 top pad + 20 max bar), so the
-                                  // waveform's appearance never shifts the
-                                  // button.
-                                  Positioned(
-                                    left: blockLeft,
-                                    width: heroWidth,
-                                    bottom: circleEdge + 20,
-                                    child: Column(
-                                      children: [
-                                        _TurnStatusLine(
-                                          notice: state.notice,
-                                        ),
-                                        const SizedBox(height: 10),
-                                        _PhaseLabel(
-                                          phase: recording
-                                              ? 'Listening'
-                                              : state.isGenerating
-                                                  ? 'Working'
-                                                  : state.isAiSpeaking
-                                                      ? 'Speaking'
-                                                      : 'Speak',
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .displaySmall
-                                              ?.copyWith(
-                                                color: scheme.onSurface,
-                                              ),
-                                        ),
-                                        SizedBox(
-                                          height: 36,
-                                          child: AnimatedSwitcher(
-                                            duration: const Duration(
-                                                milliseconds: 200),
-                                            child: recording ||
-                                                    state.isSpeaking
-                                                ? Padding(
-                                                    key:
-                                                        const ValueKey(
-                                                            'waveform'),
-                                                    padding:
-                                                        const EdgeInsets.only(
-                                                            top: 16),
-                                                    child: _Waveform(
-                                                      active: recording ||
-                                                          state.isSpeaking,
-                                                      color: tier.premium
-                                                          ? AppColors.goldBase
-                                                          : scheme.primary,
-                                                    ),
-                                                  )
-                                                : const SizedBox(
-                                                    key: ValueKey(
-                                                        'waveform-idle'),
-                                                    height: 1,
-                                                  ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  SpeakButton(
-                                    recording: recording,
-                                    aiSpeaking: state.isAiSpeaking,
-                                    generating: state.isGenerating,
-                                    busy: _micBusy,
-                                    onHoldStart: _holdStart,
-                                    onHoldEnd: _holdEnd,
-                                  ),
-                                  // Per-turn caption below the button, at the
-                                  // same distance the phase label sits above
-                                  // it.
-                                  Positioned(
-                                    left: blockLeft,
-                                    width: heroWidth,
-                                    top: circleEdge + heroLabelGap,
-                                    child: SizedBox(
-                                      height: 20,
-                                      child: Center(
-                                        child: Text(
-                                          state.status ??
-                                              'PRESS AND HOLD TO TALK',
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          textAlign: TextAlign.center,
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .labelSmall
-                                              ?.copyWith(
-                                                letterSpacing:
-                                                    state.status == null
-                                                        ? 1.4
-                                                        : null,
-                                                fontStyle: state.status == null
-                                                    ? null
-                                                    : FontStyle.italic,
-                                                color: state.status == null &&
-                                                        tier.premium
-                                                    ? AppColors.goldDark
-                                                    : scheme.onSurfaceVariant,
-                                              ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  ],
-                ],
+                  );
+                },
               ),
             ),
-            // Bottom bar: centered mode toggle with the settings gear pinned
-            // to the right. The old STT/TTS readiness chips were always-green
-            // noise and are gone — model download/retry lives in Settings.
+            // Bottom bar: the shared Voice/Text pill with the settings gear
+            // pinned to the right. Text mode lives on the chat screen; this
+            // segment hands off to it.
             Material(
               color: scheme.surfaceContainerLow,
               child: SafeArea(
@@ -709,10 +478,20 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      _PillModeToggle(
-                        value: _textInputMode,
-                        enabled: !recording,
-                        onChanged: _setTextInputMode,
+                      VoiceTextModePill(
+                        selected: false,
+                        // Block switching away mid-turn (recording, streaming,
+                        // speaking, or a hold-start still warming up the mic)
+                        // so the conversation state is consistent and the mic
+                        // is never left live when this screen unmounts —
+                        // mirrors the chat screen's own `enabled: !isStreaming`.
+                        enabled: !recording &&
+                            !state.isGenerating &&
+                            !state.isAiSpeaking &&
+                            !_micBusy,
+                        onChanged: (text) {
+                          if (text) unawaited(_openChat());
+                        },
                       ),
                       Align(
                         alignment: Alignment.centerRight,
@@ -821,8 +600,7 @@ class _PhaseLabelState extends State<_PhaseLabel>
 /// at a time.'). The live phase (Thinking/Working/Speaking) is shown by the
 /// big status label and the detailed per-turn status by the caption under the
 /// button, so this line carries only non-duplicative notices. Always reserves
-/// its height so appearing notices never shift the layout. Shared by voice and
-/// text modes.
+/// its height so appearing notices never shift the layout.
 class _TurnStatusLine extends StatelessWidget {
   const _TurnStatusLine({this.notice});
 
@@ -854,213 +632,6 @@ class _TurnStatusLine extends StatelessWidget {
             style: noticeStyle,
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// Compact text composer replacing the SpeakButton in text mode. Sends via the
-/// keyboard action or the trailing send button; no attachments/tool chips yet.
-class _Composer extends StatefulWidget {
-  const _Composer({
-    required this.controller,
-    required this.enabled,
-    required this.canSend,
-    required this.onSend,
-    required this.onChanged,
-  });
-
-  final TextEditingController controller;
-  final bool enabled;
-  final bool canSend;
-  final VoidCallback onSend;
-  final VoidCallback onChanged;
-
-  @override
-  State<_Composer> createState() => _ComposerState();
-}
-
-class _ComposerState extends State<_Composer> {
-  final ScrollController _scroll = ScrollController();
-  bool _scrolled = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _scroll.addListener(_onScroll);
-  }
-
-  @override
-  void dispose() {
-    _scroll.removeListener(_onScroll);
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  void _onScroll() {
-    final scrolled = _scroll.hasClients && _scroll.offset > 0;
-    if (scrolled != _scrolled) {
-      setState(() => _scrolled = scrolled);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: scheme.surfaceContainerHighest,
-      borderRadius: BorderRadius.circular(AppRadii.lg),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        child: Row(
-          children: [
-            Expanded(
-              child: Stack(
-                children: [
-                  TextField(
-                    key: const Key('voice-composer-field'),
-                    controller: widget.controller,
-                    enabled: widget.enabled,
-                    minLines: 1,
-                    maxLines: 4,
-                    keyboardType: TextInputType.multiline,
-                    scrollController: _scroll,
-                    textInputAction: TextInputAction.send,
-                    onSubmitted: (_) {
-                      if (widget.canSend) widget.onSend();
-                    },
-                    onChanged: (_) => widget.onChanged(),
-                    decoration: const InputDecoration(
-                      hintText: 'Message the assistant…',
-                      border: InputBorder.none,
-                      isDense: true,
-                    ),
-                  ),
-                  // Top fade once the field is scrolled past the first line:
-                  // it reads as "more text above, scroll up" without ever
-                  // blocking taps or selection on the field.
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    top: 0,
-                    child: IgnorePointer(
-                      child: AnimatedOpacity(
-                        opacity: _scrolled ? 1 : 0,
-                        duration: const Duration(milliseconds: 150),
-                        child: Container(
-                          height: 14,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                scheme.surfaceContainerHighest,
-                                scheme.surfaceContainerHighest
-                                    .withValues(alpha: 0),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            IconButton(
-              key: const Key('voice-composer-send'),
-              icon: const Icon(Icons.send),
-              tooltip: 'Send',
-              color: scheme.primary,
-              onPressed: widget.canSend ? widget.onSend : null,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Voice / text mode switch rendered in the shared pill chrome ([PillChrome]),
-/// the same visual style as [GoldenPill] minus the chevron.
-class _PillModeToggle extends StatelessWidget {
-  const _PillModeToggle({
-    required this.value,
-    required this.enabled,
-    required this.onChanged,
-  });
-
-  final bool value;
-  final bool enabled;
-  final ValueChanged<bool> onChanged;
-
-  Widget _segment(
-    BuildContext context, {
-    required bool selected,
-    required IconData icon,
-    required String label,
-    required bool segmentValue,
-  }) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final tier = theme.extension<TierTheme>() ?? const TierTheme(premium: false);
-    final color = !enabled
-        ? scheme.onSurfaceVariant
-        : selected
-            ? (tier.premium ? AppColors.goldDark : scheme.onSurface)
-            : scheme.onSurfaceVariant;
-    return InkWell(
-      onTap: enabled ? () => onChanged(segmentValue) : null,
-      borderRadius: BorderRadius.circular(AppRadii.pill),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 16, color: color),
-            const SizedBox(width: 6),
-            Text(
-              label,
-              style: theme.textTheme.labelMedium?.copyWith(
-                color: color,
-                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final tier = theme.extension<TierTheme>() ?? const TierTheme(premium: false);
-    return PillChrome(
-      key: const Key('voice-input-mode-toggle'),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _segment(
-            context,
-            selected: !value,
-            icon: Icons.mic_none,
-            label: 'Voice',
-            segmentValue: false,
-          ),
-          Container(
-            height: 20,
-            width: 1,
-            color: tier.premium ? AppColors.goldBase : theme.colorScheme.outline,
-          ),
-          _segment(
-            context,
-            selected: value,
-            icon: Icons.keyboard_outlined,
-            label: 'Text',
-            segmentValue: true,
-          ),
-        ],
       ),
     );
   }
@@ -1330,172 +901,6 @@ class _WaveformState extends State<_Waveform>
           ],
         );
       },
-    );
-  }
-}
-
-/// Scrollable conversation log: recognised user utterances as right-aligned
-/// bubbles and a live left-aligned bubble while the AI is speaking.
-/// One transcript-log entry: who said it and what.
-class _LogEntry {
-  const _LogEntry(this.text, {required this.fromUser});
-
-  final String text;
-  final bool fromUser;
-}
-
-class _MessageLog extends StatelessWidget {
-  const _MessageLog({
-    required this.controller,
-    required this.entries,
-    required this.aiSpeaking,
-    required this.connected,
-    this.inTextMode = false,
-  });
-
-  final ScrollController controller;
-  final List<_LogEntry> entries;
-  final bool aiSpeaking;
-  final bool connected;
-
-  /// Selects the empty-state copy: voice mode invites talking, text mode
-  /// invites typing.
-  final bool inTextMode;
-
-  @override
-  Widget build(BuildContext context) {
-    final itemCount = entries.length + (aiSpeaking ? 1 : 0);
-    if (itemCount == 0) {
-      return Center(
-        child: Text(
-          inTextMode
-              ? (connected
-                  ? 'Nothing yet — type a message'
-                  : 'Type a message to start a conversation')
-              : (connected
-                  ? 'Nothing yet — start speaking'
-                  : 'Hold the button to start a conversation'),
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-        ),
-      );
-    }
-    return ListView.builder(
-      controller: controller,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      itemCount: itemCount,
-      itemBuilder: (context, index) {
-        if (index >= entries.length) {
-          return const _AssistantSpeakingBubble();
-        }
-        final entry = entries[index];
-        return entry.fromUser
-            ? _UserBubble(text: entry.text)
-            : _AssistantBubble(text: entry.text);
-      },
-    );
-  }
-}
-
-/// Right-aligned transcript bubble styled as a user message.
-class _UserBubble extends StatelessWidget {
-  const _UserBubble({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: Alignment.centerRight,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: scheme.primaryContainer,
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(16),
-            bottomLeft: Radius.circular(16),
-            bottomRight: Radius.circular(4),
-          ),
-        ),
-        child: Text(text, style: TextStyle(color: scheme.onPrimaryContainer)),
-      ),
-    );
-  }
-}
-
-/// Left-aligned transcript bubble styled as an assistant message.
-class _AssistantBubble extends StatelessWidget {
-  const _AssistantBubble({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: scheme.surfaceContainerHighest,
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(16),
-            bottomLeft: Radius.circular(4),
-            bottomRight: Radius.circular(16),
-          ),
-        ),
-        child: Text(
-          text,
-          style: TextStyle(color: scheme.onSurfaceVariant),
-        ),
-      ),
-    );
-  }
-}
-
-/// Left-aligned bubble shown while TTS audio from the AI is playing back.
-class _AssistantSpeakingBubble extends StatelessWidget {
-  const _AssistantSpeakingBubble();
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: scheme.surfaceContainerHighest,
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(16),
-            bottomLeft: Radius.circular(4),
-            bottomRight: Radius.circular(16),
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-            const SizedBox(width: 8),
-            Text(
-              'Assistant is speaking…',
-              style: TextStyle(color: scheme.onSurfaceVariant),
-            ),
-          ],
-        ),
-      ),
     );
   }
 }

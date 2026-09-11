@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import '../../chat/data/chat_client.dart';
 import '../../chat/data/message_model.dart';
+import '../../chat/data/sse.dart' show stripStructuredTokens;
 import '../../chat/data/status_tracker.dart';
 import './voice_conversation_state.dart';
 import '../data/audio_playback_service.dart';
@@ -445,7 +446,16 @@ final class VoiceController {
         // State only: the callback fires exactly once per utterance, in
         // [sendText] (this utterance's turn) — firing it here too would
         // double-report to any consumer.
-        _update(_state.copyWith(onDeviceTranscript: transcript));
+        //
+        // Clear the previous turn's [lastReply] in the SAME emission: the
+        // transcript listener appends onDeviceTranscript (user) and lastReply
+        // (assistant) from each state, so a stale lastReply here would be
+        // appended again right after the new user bubble.
+        _update(_state.copyWith(
+          onDeviceTranscript: transcript,
+          lastTranscript: null,
+          lastReply: null,
+        ));
         // The turn's audio is fully serialised inside sendText: it returns
         // only after the speak queue has drained and the last playback
         // finished (_waitQueueDrained). No extra playback wait here — it was
@@ -506,7 +516,17 @@ final class VoiceController {
     // consecutive identical value); text-mode turns rely on this so the user's
     // text appears in the transcript. Persistence of the user message goes
     // through onUserMessage ONLY (otherwise voice turns would persist twice).
-    _update(_state.copyWith(onDeviceTranscript: trimmed));
+    //
+    // The previous turn's [lastReply] MUST be cleared in the SAME emission:
+    // the transcript listener appends onDeviceTranscript (user) and lastReply
+    // (assistant) from each state, so a stale lastReply carried here would be
+    // appended again right after the new user bubble — the reported "last LLM
+    // message duplicated after my new message".
+    _update(_state.copyWith(
+      onDeviceTranscript: trimmed,
+      lastTranscript: null,
+      lastReply: null,
+    ));
     onDeviceTranscript?.call(trimmed);
     onUserMessage?.call(trimmed);
     // Snapshot the active token: interrupt() cancels and replaces it, so a
@@ -520,16 +540,10 @@ final class VoiceController {
     final speak = speakReply && ttsEngine != null;
     _turnStartedAt = DateTime.now();
     try {
-      // Clearing lastReply and onDeviceTranscript too: consecutive identical
-      // replies must still flip the field so per-turn listeners fire, and the
-      // recognised utterance must not be re-emitted by later state changes
-      // (streaming deltas, playback flips) into a duplicated transcript
-      // entry. A stale notice from a dropped utterance is consumed here:
-      // this turn is the acknowledgement that the pipeline is moving again.
+      // A stale notice from a dropped utterance is consumed here: this turn
+      // is the acknowledgement that the pipeline is moving again.
       _update(
         _state.copyWith(
-          lastTranscript: null,
-          lastReply: null,
           error: null,
           notice: null,
           status: null,
@@ -625,8 +639,10 @@ final class VoiceController {
         return;
       }
       // Prefer the streamed content, falling back to the final result for
-      // clients that return a complete reply without streaming deltas.
-      final streamed = buffer.toString().trim();
+      // clients that return a complete reply without streaming deltas. The
+      // accumulated buffer is cleaned of structured-output control tokens too
+      // (a PUA tool marker can span multiple SSE deltas).
+      final streamed = stripStructuredTokens(buffer.toString()).trim();
       final reply = streamed.isNotEmpty ? streamed : result.content.trim();
       _update(_state.copyWith(status: null));
       if (reply.isNotEmpty) {

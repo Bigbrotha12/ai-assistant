@@ -78,15 +78,24 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     _persistTail = _persistTail.then((_) => action()).catchError((_) {});
   }
 
-  /// Persists the user message into the turn's conversation, creating the
+  /// Awaits the queued persistence writes to drain. Called before handing off
+  /// to the chat screen so the conversation loaded there includes every
+  /// message persisted by voice turns (the chat notifier reads the store once
+  /// on build; a racing un-flushed write would be missing from that load).
+  Future<void> flushPersistence() => _persistTail;
+
+  /// Persists the user message into [conversationId], creating the
   /// conversation row (with a title from the first user text) when absent.
-  Future<void> _persistUserMessage(String userText) async {
+  /// The id is captured at call time: the caller enqueues persistence with the
+  /// conversation that was active when the turn STARTED, so a later
+  /// conversation switch can never reroute this turn's writes.
+  Future<void> _persistUserMessage(
+    String conversationId,
+    String userText,
+  ) async {
     if (!ref.mounted) return;
     final store = ref.read(chatStoreProvider);
-    final id =
-        _turnConversationId ??
-        ref.read(activeConversationIdProvider.notifier).ensure();
-    final existing = await store.loadConversation(id);
+    final existing = await store.loadConversation(conversationId);
     if (existing == null) {
       final now = DateTime.now();
       final title = userText.length <= 60
@@ -96,7 +105,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
       // overwrite) so a concurrent first-turn write from the chat surface on
       // the same conversation id can never clobber this one.
       await store.ensureConversation(
-        id,
+        conversationId,
         title: title,
         firstMessage: Message(
           id: _uuid.v4(),
@@ -106,7 +115,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
         ),
       );
     } else {
-      await store.appendMessage(id, Message(
+      await store.appendMessage(conversationId, Message(
         id: _uuid.v4(),
         role: MessageRole.user,
         content: userText,
@@ -115,15 +124,15 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     }
   }
 
-  /// Persists the assistant reply into the turn's conversation. Runs after the
-  /// user message on [_persistTail], so the conversation row always exists.
-  Future<void> _persistAssistantReply(String reply) async {
+  /// Persists the assistant reply into [conversationId]. Runs after the user
+  /// message on [_persistTail], so the conversation row always exists.
+  Future<void> _persistAssistantReply(
+    String conversationId,
+    String reply,
+  ) async {
     if (!ref.mounted) return;
     final store = ref.read(chatStoreProvider);
-    final id =
-        _turnConversationId ??
-        ref.read(activeConversationIdProvider.notifier).ensure();
-    await store.appendMessage(id, Message(
+    await store.appendMessage(conversationId, Message(
       id: _uuid.v4(),
       role: MessageRole.assistant,
       content: reply,
@@ -181,11 +190,20 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
         if (!ref.mounted) return;
         _turnConversationId =
             ref.read(activeConversationIdProvider.notifier).ensure();
-        _enqueuePersist(() => _persistUserMessage(userText));
+        // Capture the id now: the queued write may not run until after a later
+        // conversation switch, and it must target the conversation this turn
+        // started in.
+        final turnId = _turnConversationId!;
+        _enqueuePersist(() => _persistUserMessage(turnId, userText));
       },
       onTranscript: (reply) {
         if (!ref.mounted) return;
-        _enqueuePersist(() => _persistAssistantReply(reply));
+        // The user message enqueue ran before this reply's enqueue, so
+        // [_turnConversationId] is set and still points at this turn's
+        // conversation. Capture it now so a later conversation switch cannot
+        // reroute this reply's write.
+        final turnId = _turnConversationId!;
+        _enqueuePersist(() => _persistAssistantReply(turnId, reply));
       },
       contextBuilder: (userText) => _buildRequestMessages(userText),
       systemPrompt: kSystemPrompt,

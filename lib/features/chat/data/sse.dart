@@ -168,7 +168,28 @@ final _thinkingBlock = RegExp(r'<thinking>[\s\S]*?</thinking>');
 final _thinkingTag = RegExp(r'</?thinking>');
 
 String _stripThinking(String content) {
-  return content.replaceAll(_thinkingBlock, '').replaceAll(_thinkingTag, '');
+  var result = content
+      .replaceAll(_thinkingBlock, '')
+      .replaceAll(_thinkingTag, '');
+  return stripStructuredTokens(result);
+}
+
+/// Strips structured-output control tokens emitted by the inference API.
+///
+/// The model frames tool / citation references with Private Use Area (PUA)
+/// sentinels (`\uE200`–`\uE202` …), e.g. `\ue200cite\ue202turn0file0\ue201` or
+/// a bare tool reference `\ue202turn0search0`. These are machine markers that
+/// must never surface in a rendered bubble, and they can be split across SSE
+/// deltas, so callers strip on both per-delta content and the accumulated
+/// buffer.
+String stripStructuredTokens(String content) {
+  if (!content.contains(RegExp(r'[\uE000-\uF8FF]'))) return content;
+  // A PUA sentinel plus its reference payload: either a `turn<N><tool><N>`
+  // tool/citation reference (e.g. `turn0search0`, `turn0file0`) or a short
+  // lowercase block keyword (`cite`). Bounded so a following real word is
+  // never clipped (non-greedy lowercase-only payload).
+  return content
+      .replaceAll(RegExp(r'[\uE000-\uF8FF](?:turn\d+[a-z]+\d*|[a-z]+)?'), '');
 }
 
 String _errorMessage(Object? error) {

@@ -249,9 +249,9 @@ void main() {
     expect(await store.watchConversations().first, isEmpty);
   });
 
-  test('schemaVersion is 4 and a fresh database round-trips a FileRow',
+  test('schemaVersion is 5 and a fresh database round-trips a FileRow',
       () async {
-    expect(db.schemaVersion, 4);
+    expect(db.schemaVersion, 5);
 
     await store.saveConversation(conversation(id: 'c1'));
     final fileStore = DriftFileStore(db);
@@ -281,17 +281,35 @@ void main() {
       }
     });
 
-    // Build a v1 database containing only Conversations + Messages. The
-    // NativeDatabase setup hook marks the file as schema version 1 *before*
-    // drift's migration logic reads user_version, so opening AppDatabase (which
-    // is at schema version 2) runs the onUpgrade path instead of onCreate.
+    // Build a v1 database containing only Conversations + Messages. The schema
+    // is created via raw SQL in the setup hook (which runs BEFORE drift's
+    // onUpgrade), with user_version pinned to 1 so opening AppDatabase (at
+    // schema version 5) runs the onUpgrade path instead of onCreate.
     final v1 = AppDatabase(NativeDatabase(
       file,
-      setup: (raw) => raw.execute('PRAGMA user_version = 1;'),
+      setup: (raw) {
+        raw.execute(
+          'CREATE TABLE conversations ('
+          'id TEXT NOT NULL PRIMARY KEY, '
+          'title TEXT NOT NULL DEFAULT \'\', '
+          'created_at INTEGER NOT NULL, '
+          'updated_at INTEGER NOT NULL, '
+          'message_count INTEGER NOT NULL DEFAULT 0)',
+        );
+        raw.execute(
+          'CREATE TABLE messages ('
+          'id TEXT NOT NULL PRIMARY KEY, '
+          'conversation_id TEXT NOT NULL '
+          'REFERENCES conversations (id) ON DELETE CASCADE, '
+          'role TEXT NOT NULL, '
+          'content TEXT NOT NULL DEFAULT \'\', '
+          'tool_calls TEXT, '
+          'tool_call_id TEXT, '
+          'created_at INTEGER NOT NULL)',
+        );
+        raw.execute('PRAGMA user_version = 1;');
+      },
     ));
-    final migrator = v1.createMigrator();
-    await migrator.createTable(v1.conversations);
-    await migrator.createTable(v1.messages);
     await v1.close();
 
     // Reopen with the current schema: onUpgrade must add the Files table and
@@ -338,18 +356,51 @@ void main() {
     });
 
     // Build a v3 database containing Conversations + Messages + Files. The
-    // NativeDatabase setup hook marks the file as schema version 3 *before*
-    // drift's migration logic reads user_version, so opening AppDatabase (which
-    // is at schema version 4) runs the onUpgrade path instead of onCreate.
+    // schema is created via raw SQL in the setup hook (which runs BEFORE
+    // drift's onUpgrade), with user_version pinned to 3 so opening AppDatabase
+    // (at schema version 5) runs the onUpgrade path instead of onCreate.
     final v3 = AppDatabase(NativeDatabase(
       file,
-      setup: (raw) => raw.execute('PRAGMA user_version = 3;'),
+      setup: (raw) {
+        raw.execute(
+          'CREATE TABLE conversations ('
+          'id TEXT NOT NULL PRIMARY KEY, '
+          'title TEXT NOT NULL DEFAULT \'\', '
+          'created_at INTEGER NOT NULL, '
+          'updated_at INTEGER NOT NULL, '
+          'message_count INTEGER NOT NULL DEFAULT 0)',
+        );
+        raw.execute(
+          'CREATE TABLE messages ('
+          'id TEXT NOT NULL PRIMARY KEY, '
+          'conversation_id TEXT NOT NULL '
+          'REFERENCES conversations (id) ON DELETE CASCADE, '
+          'role TEXT NOT NULL, '
+          'content TEXT NOT NULL DEFAULT \'\', '
+          'tool_calls TEXT, '
+          'tool_call_id TEXT, '
+          'created_at INTEGER NOT NULL)',
+        );
+        raw.execute(
+          'CREATE TABLE files ('
+          'id TEXT NOT NULL PRIMARY KEY, '
+          'conversation_id TEXT '
+          'REFERENCES conversations (id) ON DELETE CASCADE, '
+          'server_file_id TEXT NOT NULL, '
+          'local_path TEXT NOT NULL, '
+          'filename TEXT NOT NULL, '
+          'size_bytes INTEGER NOT NULL, '
+          'mime_type TEXT NOT NULL, '
+          'created_at INTEGER NOT NULL, '
+          'updated_at INTEGER NOT NULL, '
+          'description TEXT)',
+        );
+        raw.execute(
+          'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
+        );
+        raw.execute('PRAGMA user_version = 3;');
+      },
     ));
-    final migrator = v3.createMigrator();
-    await migrator.createTable(v3.conversations);
-    await migrator.createTable(v3.messages);
-    await migrator.createTable(v3.files);
-    await migrator.createIndex(v3.filesConversationIdIdx);
     await v3.close();
 
     // Reopen with the current schema: onUpgrade must add the memories table,
@@ -375,6 +426,15 @@ void main() {
         )
         .get();
     expect(indexRows, hasLength(1));
+
+    // v4→v5: the messages.conversationId index is created on upgrade too.
+    final messagesIndexRows = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master "
+          "WHERE type = 'index' AND name = 'messages_conversation_id_idx'",
+        )
+        .get();
+    expect(messagesIndexRows, hasLength(1));
 
     final memoryStore = DriftMemoryStore(upgraded);
     await memoryStore.saveMemory(
