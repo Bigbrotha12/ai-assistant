@@ -8,14 +8,15 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart'
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
-import 'package:ai_assistant/app/theme_providers.dart';
 import 'package:ai_assistant/features/settings/data/prefs_providers.dart';
+import 'package:ai_assistant/app/theme_providers.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/app/widgets/speak_button.dart';
 import 'package:ai_assistant/features/auth/ui/auth_flow.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
+import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/ui/conversation_list.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
@@ -32,8 +33,7 @@ import 'package:ai_assistant/main.dart';
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';
 
-/// [ActiveConversationNotifier] pinned to a fixed initial id, so the seeded
-/// transcript tests can target a specific conversation.
+/// [ActiveConversationNotifier] pinned to a fixed initial id.
 class _FixedActiveConversation extends ActiveConversationNotifier {
   _FixedActiveConversation(this.initial);
 
@@ -43,23 +43,8 @@ class _FixedActiveConversation extends ActiveConversationNotifier {
   String? build() => initial;
 }
 
-/// [FakeChatStore] whose [loadConversation] can be held open with a gate, so a
-/// test can deterministically pause a re-seed in its loading window.
-class _GatedChatStore extends FakeChatStore {
-  _GatedChatStore({super.initial});
-
-  Completer<void>? loadGate;
-
-  @override
-  Future<Conversation?> loadConversation(String id) async {
-    final gate = loadGate;
-    if (gate != null) await gate.future;
-    return super.loadConversation(id);
-  }
-}
-
-/// [FakeEngineManager] that exposes a [FakeTtsEngine], so the text-mode test
-/// can prove TTS is never invoked (an accidental synthesis would record it).
+/// [FakeEngineManager] that exposes a [FakeTtsEngine], so voice-turn tests can
+/// assert TTS is invoked as expected.
 class _TtsAwareEngineManager extends FakeEngineManager {
   _TtsAwareEngineManager(this.tts);
 
@@ -107,6 +92,7 @@ void main() {
             stored: const AuthCredentials(apiKey: 'sk-1', email: 'me@x.dev'),
           ),
         ),
+        backendProbeProvider.overrideWithValue(FakeProbe()),
         micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
         audioPlaybackServiceProvider.overrideWithValue(
           playback ?? FakeAudioPlayback(),
@@ -117,6 +103,7 @@ void main() {
           chatClient ?? FakeChatClient(),
         ),
         chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
+        filesStoreProvider.overrideWithValue(FakeFileStore()),
         if (activeConversationId != null)
           activeConversationIdProvider.overrideWith(
             () => _FixedActiveConversation(activeConversationId),
@@ -239,29 +226,9 @@ void main() {
     expect(find.textContaining('HTTP 503'), findsOneWidget);
   });
 
-  testWidgets('seeds the transcript from the active conversation on init',
+  testWidgets('the Text segment of the pill opens the chat screen',
       (tester) async {
-    final store = FakeChatStore(initial: [
-      conversation(
-        id: 'conv-1',
-        title: 'First',
-        messages: [
-          message(
-            id: 'm1',
-            role: MessageRole.user,
-            content: 'Where is the moon?',
-          ),
-          message(
-            id: 'm2',
-            role: MessageRole.assistant,
-            content: 'Above you.',
-          ),
-          // Tool rows are internal plumbing and must not surface as bubbles.
-          message(id: 'm3', role: MessageRole.tool, content: 'call result'),
-        ],
-      ),
-    ]);
-    final container = buildContainer(store: store, activeConversationId: 'conv-1');
+    final container = buildContainer(activeConversationId: 'conv-1');
     await tester.pumpWidget(
       UncontrolledProviderScope(
         container: container,
@@ -270,185 +237,20 @@ void main() {
     );
     await settle(tester);
 
-    // The transcript panel only renders in text mode.
-    await tester.tap(find.text('Text'));
+    // The voice surface has no text composer — text mode lives on the chat
+    // screen, reached through the shared pill. Assert no TextField (the chat
+    // composer) is present while on the voice surface.
+    expect(find.byType(TextField), findsNothing);
+    expect(find.byType(SpeakButton), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('voice-mode-text')));
     await pumpFrames(tester);
 
-    expect(find.text('Where is the moon?'), findsOneWidget);
-    expect(find.text('Above you.'), findsOneWidget);
-    expect(find.text('call result'), findsNothing);
+    expect(find.byType(ChatScreen), findsOneWidget);
   });
 
-  testWidgets(
-      'a live turn repeating the last seeded user text still appends a new bubble',
-      (tester) async {
-    final store = FakeChatStore(initial: [
-      conversation(
-        id: 'conv-1',
-        title: 'First',
-        messages: [
-          message(
-            id: 'm1',
-            role: MessageRole.user,
-            content: 'book me a flight',
-          ),
-        ],
-      ),
-    ]);
-    final chat = FakeChatClient(
-      streamDeltas: const [
-        ['Done'],
-      ],
-      results: const [
-        ChatResult(content: 'Done', toolCalls: [], finishReason: 'stop'),
-      ],
-    );
-    final container = buildContainer(
-      chatClient: chat,
-      store: store,
-      activeConversationId: 'conv-1',
-    );
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: VoiceScreen()),
-      ),
-    );
-    await settle(tester);
-    await tester.tap(find.text('Text'));
-    await pumpFrames(tester);
-
-    // A new (voice) turn with the exact text of the seeded last message must
-    // not be collapsed into the seeded history by the append dedupe.
-    final controller = container.read(voiceControllerProvider);
-    await controller.startConversation();
-    await controller.sendText('book me a flight', speakReply: false);
-    await settle(tester);
-
-    expect(find.text('book me a flight'), findsNWidgets(2));
-    expect(find.text('Done'), findsOneWidget);
-  });
-
-  testWidgets(
-      'text mode sends a typed message, streams a reply without TTS, and '
-      'persists the conversation', (tester) async {
-    final chat = FakeChatClient(
-      streamDeltas: const [
-        ['Hi there'],
-      ],
-      results: const [
-        ChatResult(content: 'Hi there', toolCalls: [], finishReason: 'stop'),
-      ],
-    );
-    final store = FakeChatStore();
-    final tts = FakeTtsEngine();
-    final container = buildContainer(
-      chatClient: chat,
-      store: store,
-      tts: tts,
-      activeConversationId: 'conv-text',
-    );
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: VoiceScreen()),
-      ),
-    );
-    await settle(tester);
-
-    // Switch to text mode and send a message.
-    await tester.tap(find.text('Text'));
-    await tester.pump();
-    expect(find.byKey(const Key('voice-composer-field')), findsOneWidget);
-    expect(find.text('PRESS AND HOLD TO TALK'), findsNothing);
-
-    await tester.enterText(
-      find.byKey(const Key('voice-composer-field')),
-      'hello',
-    );
-    await tester.pump();
-    await tester.tap(find.byKey(const Key('voice-composer-send')));
-    await settle(tester);
-
-    // TTS must never run for a text-mode turn.
-    expect(tts.synthesized, isEmpty);
-    final playback =
-        container.read(audioPlaybackServiceProvider) as FakeAudioPlayback;
-    expect(playback.playedChunks, isEmpty);
-
-    // The user bubble appears immediately and the reply after it streams.
-    // (The transcript panel is expanded by default in text mode.)
-    await pumpFrames(tester);
-    expect(find.text('hello'), findsOneWidget);
-    expect(find.text('Hi there'), findsOneWidget);
-
-    // The turn was persisted to the active conversation.
-    final conv = await store.loadConversation('conv-text');
-    expect(conv, isNotNull);
-    expect(conv!.title, 'hello');
-    expect(
-      conv.messages.map((m) => m.role).toList(),
-      [MessageRole.user, MessageRole.assistant],
-    );
-    expect(conv.messages[0].content, 'hello');
-    expect(conv.messages[1].content, 'Hi there');
-  });
-
-  testWidgets('sending a typed message while the AI speaks barges in first',
-      (tester) async {
-    final tts = FakeTtsEngine();
-    final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
-    final chat = FakeChatClient(
-      streamDeltas: const [
-        ['Typed reply'],
-      ],
-      results: const [
-        ChatResult(content: 'Typed reply', toolCalls: [], finishReason: 'stop'),
-      ],
-    );
-    final container = buildContainer(
-      chatClient: chat,
-      tts: tts,
-      playback: playback,
-      activeConversationId: 'conv-barge',
-    );
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: VoiceScreen()),
-      ),
-    );
-    await settle(tester);
-
-    final controller = container.read(voiceControllerProvider);
-    await controller.startConversation();
-
-    // The AI starts a reply that keeps playing (held open).
-    unawaited(controller.synthesizeOnDevice('spoken reply'));
-    await settle(tester);
-    expect(controller.state.isAiSpeaking, isTrue);
-    expect(playback.playedChunks, hasLength(1));
-
-    // Switch to text mode and send a typed message while the AI is speaking.
-    await tester.tap(find.text('Text'));
-    await tester.pump();
-    await tester.enterText(
-      find.byKey(const Key('voice-composer-field')),
-      'typed',
-    );
-    await tester.pump();
-    await tester.tap(find.byKey(const Key('voice-composer-send')));
-    await settle(tester);
-
-    // Barge-in: the AI's speech is stopped before the typed turn is sent.
-    expect(controller.state.isAiSpeaking, isFalse);
-    // TTS must still not run for the text-mode turn.
-    expect(tts.synthesized, ['spoken reply']);
-    expect(controller.state.lastReply, 'Typed reply');
-  });
-
-  testWidgets('history action opens the session list and switching re-seeds',
-      (tester) async {
+  testWidgets('history action opens the session list and switching selects '
+      'the conversation', (tester) async {
     final store = FakeChatStore(initial: [
       conversation(
         id: 'conv-a',
@@ -458,11 +260,6 @@ void main() {
             id: 'a1',
             role: MessageRole.user,
             content: 'Hello A',
-          ),
-          message(
-            id: 'a2',
-            role: MessageRole.assistant,
-            content: 'Reply A',
           ),
         ],
       ),
@@ -483,12 +280,6 @@ void main() {
     );
     await settle(tester);
 
-    // Conversation A's history is seeded.
-    await tester.tap(find.text('Text'));
-    await pumpFrames(tester);
-    expect(find.text('Hello A'), findsOneWidget);
-    expect(find.text('Hello B'), findsNothing);
-
     // Open history and pick Conversation B.
     await tester.tap(find.byKey(const Key('history')));
     await pumpFrames(tester);
@@ -499,167 +290,9 @@ void main() {
     // past it (the SpeakButton below re-animates, so never pumpAndSettle).
     await pumpFrames(tester, 25);
 
-    // The active id switched and the transcript re-seeded from B.
+    // The active id switched; the chat screen will read it when opened.
     expect(container.read(activeConversationIdProvider), 'conv-b');
     expect(find.byType(ConversationListScreen), findsNothing);
-    expect(find.text('Hello A'), findsNothing);
-    expect(find.text('Hello B'), findsOneWidget);
-  });
-
-  testWidgets(
-      'switching conversations never re-emits the previous conversation\'s '
-      'reply as a phantom bubble', (tester) async {
-    final store = FakeChatStore(initial: [
-      conversation(
-        id: 'conv-a',
-        title: 'Conversation A',
-        messages: [
-          message(
-            id: 'a1',
-            role: MessageRole.user,
-            content: 'Hello A',
-          ),
-          message(
-            id: 'a2',
-            role: MessageRole.assistant,
-            content: 'Reply A',
-          ),
-        ],
-      ),
-      conversation(
-        id: 'conv-b',
-        title: 'Conversation B',
-        messages: [
-          message(id: 'b1', role: MessageRole.user, content: 'Hello B'),
-        ],
-      ),
-    ]);
-    final chat = FakeChatClient(
-      streamDeltas: const [
-        ['Reply A'],
-      ],
-      results: const [
-        ChatResult(content: 'Reply A', toolCalls: [], finishReason: 'stop'),
-      ],
-    );
-    final container = buildContainer(
-      chatClient: chat,
-      store: store,
-      activeConversationId: 'conv-a',
-    );
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: VoiceScreen()),
-      ),
-    );
-    await settle(tester);
-
-    // Complete a turn in conversation A so lastReply is set on the shared
-    // controller.
-    final controller = container.read(voiceControllerProvider);
-    await controller.startConversation();
-    await controller.sendText('hello', speakReply: false);
-    await settle(tester);
-
-    // Open history and switch to B.
-    await tester.tap(find.byKey(const Key('history')));
-    await pumpFrames(tester);
-    await tester.tap(find.text('Conversation B'));
-    await pumpFrames(tester, 25);
-
-    await tester.tap(find.text('Text'));
-    await pumpFrames(tester);
-
-    // B's seeded history shows; A's reply must NOT appear as a phantom bubble.
-    expect(find.text('Hello B'), findsOneWidget);
-    expect(find.text('Hello A'), findsNothing);
-    expect(find.text('Reply A'), findsNothing);
-
-    // Any subsequent controller emission must not leak A's reply either.
-    await controller.startConversation();
-    await pumpFrames(tester);
-    expect(find.text('Reply A'), findsNothing);
-  });
-
-  testWidgets(
-      'a live append during re-seed is queued, then replayed after the seeded '
-      'history', (tester) async {
-    final store = _GatedChatStore(initial: [
-      conversation(
-        id: 'conv-a',
-        title: 'Conversation A',
-        messages: [
-          message(id: 'a1', role: MessageRole.user, content: 'Hello A'),
-        ],
-      ),
-      conversation(
-        id: 'conv-b',
-        title: 'Conversation B',
-        messages: [
-          message(id: 'b1', role: MessageRole.user, content: 'Hello B'),
-        ],
-      ),
-    ]);
-    final chat = FakeChatClient(
-      streamDeltas: const [
-        ['Reply live'],
-      ],
-      results: const [
-        ChatResult(content: 'Reply live', toolCalls: [], finishReason: 'stop'),
-      ],
-    );
-    final container = buildContainer(
-      chatClient: chat,
-      store: store,
-      activeConversationId: 'conv-a',
-    );
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: VoiceScreen()),
-      ),
-    );
-    await settle(tester);
-    await tester.tap(find.text('Text'));
-    await pumpFrames(tester);
-    expect(find.text('Hello A'), findsOneWidget);
-
-    final controller = container.read(voiceControllerProvider);
-    await controller.startConversation();
-
-    // Gate the next seed's store load, then switch to B: the seed clears the
-    // panel and blocks inside its loading window.
-    store.loadGate = Completer<void>();
-    container.read(activeConversationIdProvider.notifier).set('conv-b');
-    await tester.pump();
-
-    // A live turn lands while the seed is in flight; its bubbles are queued.
-    // (Not awaited: sendText's context builder also blocks on the gate.)
-    unawaited(controller.sendText('live', speakReply: false));
-    await tester.pump();
-
-    // The seed hasn't landed yet.
-    expect(find.text('Hello B'), findsNothing);
-
-    // Release the gate: the seed lands first, then the queued live entries
-    // replay in arrival order after the seeded prefix.
-    store.loadGate!.complete();
-    store.loadGate = null;
-    await pumpFrames(tester);
-
-    expect(find.text('Hello B'), findsOneWidget);
-    expect(find.text('live'), findsOneWidget);
-    expect(find.text('Reply live'), findsOneWidget);
-    // Seeded history renders above the live turn (never scrambled before it).
-    expect(
-      tester.getTopLeft(find.text('Hello B')).dy,
-      lessThan(tester.getTopLeft(find.text('live')).dy),
-    );
-    expect(
-      tester.getTopLeft(find.text('live')).dy,
-      lessThan(tester.getTopLeft(find.text('Reply live')).dy),
-    );
   });
 
   testWidgets('the SpeakButton shows a stop affordance while the AI speaks',
@@ -750,9 +383,6 @@ void main() {
     expect(controller.state.isRecording, isTrue);
     expect(playback.playedChunks, hasLength(1));
 
-    // Release: the hold ends cleanly. Drain the hold-end chain (subscription
-    // cancels, mic stop, controller sync) — settle's frame pumps alone do not
-    // flush every cancel future in the fake-async zone.
     // Release: the hold ends cleanly. The teardown chain (stream-subscription
     // cancels) runs on the real event loop, which fake-async frame pumps do
     // not drive, so end the session directly instead of asserting the
@@ -963,6 +593,7 @@ void main() {
         backendProbeProvider.overrideWithValue(probe),
         chatStoreProvider.overrideWithValue(chatStore),
         chatApiClientProvider.overrideWithValue(client),
+        filesStoreProvider.overrideWithValue(FakeFileStore()),
         // The voice home boots the real audio stack (record, just_audio,
         // secure storage, path_provider); none of that exists in widget
         // tests, so every voice service is faked.
@@ -1007,7 +638,7 @@ void main() {
       expect(find.text('Voice Assist'), findsOneWidget);
       expect(find.byType(SpeakButton), findsOneWidget);
       expect(find.text('PRESS AND HOLD TO TALK'), findsOneWidget);
-      // The voice/text toggle pill renders in both modes.
+      // The shared voice/text pill renders in voice home too.
       expect(
         find.byKey(const Key('voice-input-mode-toggle')),
         findsOneWidget,

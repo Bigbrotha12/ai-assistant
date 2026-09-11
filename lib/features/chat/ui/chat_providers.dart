@@ -541,8 +541,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   Future<void> stop() async {
     _active?.cancel();
     _active = null;
-    _throttle?.cancel();
-    _throttle = null;
+    _cancelThrottle();
     // Flush any coalesced content, then read the updated state so the partial
     // content is retained when streaming flags are cleared below.
     _flushThrottle();
@@ -563,6 +562,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     }
     _pendingAssistantId = null;
     _pendingContent = null;
+    _cancelThrottle();
   }
 
   Future<void> clear() async {
@@ -579,8 +579,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       await _streamOnce(token);
     } finally {
       _active = null;
-      _throttle?.cancel();
-      _throttle = null;
+      _cancelThrottle();
       _flushThrottle();
     }
   }
@@ -659,6 +658,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         ));
         _pendingAssistantId = null;
         _pendingContent = null;
+        _cancelThrottle();
         return;
       }
 
@@ -701,6 +701,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         ));
         _pendingAssistantId = null;
         _pendingContent = null;
+        _cancelThrottle();
         return;
       }
     }
@@ -771,6 +772,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     if (token.isCancelled) {
       _pendingAssistantId = null;
       _pendingContent = null;
+      _cancelThrottle();
       return;
     }
 
@@ -829,6 +831,15 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     ));
     _pendingAssistantId = null;
     _pendingContent = null;
+    _cancelThrottle();
+  }
+
+  /// Cancels any pending coalescing timer. Flushing a stale turn's buffer into
+  /// a later turn's placeholder must never happen, so every path that clears
+  /// the pending stream state also cancels the timer.
+  void _cancelThrottle() {
+    _throttle?.cancel();
+    _throttle = null;
   }
 
   void _setState(ConversationState next) {

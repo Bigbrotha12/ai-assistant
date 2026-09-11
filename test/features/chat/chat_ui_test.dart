@@ -21,8 +21,15 @@ import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/ui/message_bubble.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
+import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
+import 'package:ai_assistant/features/voice/ui/voice_controller_provider.dart';
+import 'package:ai_assistant/features/voice/ui/voice_screen.dart';
+import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
 
 import '../../fakes.dart';
+import '../voice/voice_test_fakes.dart';
 
 Widget chatApp({
   required FakeSettingsStore store,
@@ -431,5 +438,44 @@ void main() {
     // Surrounding text still renders.
     expect(find.textContaining('Here is the file'), findsOneWidget);
     expect(find.textContaining('for you'), findsOneWidget);
+  });
+
+  testWidgets('the Voice segment of the pill opens the voice screen',
+      (tester) async {
+    final store = FakeSettingsStore(
+      stored: const BackendSettings(host: 'myhost'),
+    );
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        settingsStoreProvider.overrideWithValue(store),
+        backendProbeProvider.overrideWithValue(FakeProbe()),
+        chatStoreProvider.overrideWithValue(FakeChatStore()),
+        chatApiClientProvider.overrideWithValue(FakeChatClient()),
+        filesStoreProvider.overrideWithValue(FakeFileStore()),
+        // The voice screen needs the faked voice service graph.
+        engineManagerProvider.overrideWithValue(FakeEngineManager()),
+        micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
+        audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+        audioSessionManagerProvider
+            .overrideWithValue(FakeAudioSessionManager()),
+        screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+        voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
+      ],
+      child: const MaterialApp(home: ChatScreen()),
+    ));
+    await tester.pumpAndSettle();
+
+    // The chat screen has no mic FAB — voice is reached through the pill.
+    expect(find.byType(FloatingActionButton), findsNothing);
+    expect(find.byKey(const Key('voice-input-mode-toggle')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('voice-mode-voice')));
+    // The voice screen's SpeakButton animates forever, so pumpAndSettle never
+    // settles — use bounded pumps to ride out the route transition.
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 40));
+    }
+
+    expect(find.byType(VoiceScreen), findsOneWidget);
   });
 }

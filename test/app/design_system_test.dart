@@ -7,7 +7,6 @@ import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/app/theme.dart';
 import 'package:ai_assistant/app/theme_providers.dart';
 import 'package:ai_assistant/app/widgets/gold_band.dart';
-import 'package:ai_assistant/app/widgets/golden_pill.dart';
 import 'package:ai_assistant/app/widgets/speak_button.dart';
 import 'package:ai_assistant/features/settings/ui/settings_screen.dart';
 
@@ -111,49 +110,6 @@ void main() {
       expect(find.byType(GoldEdge), findsWidgets);
       expect(find.byIcon(Icons.mic), findsWidgets);
       expect(tester.takeException(), isNull);
-    });
-  });
-
-  group('GoldenPill', () {
-    testWidgets('shows label and up-chevron when closed', (tester) async {
-      await tester.pumpWidget(MaterialApp(
-        home: Scaffold(
-          body: GoldenPill(label: 'Transcript', open: false, onTap: () {}),
-        ),
-      ));
-
-      expect(find.text('Transcript'), findsOneWidget);
-      expect(find.byIcon(Icons.expand_less), findsOneWidget);
-      expect(find.byIcon(Icons.keyboard_arrow_down), findsNothing);
-    });
-
-    testWidgets('chevron flips when open', (tester) async {
-      await tester.pumpWidget(MaterialApp(
-        home: Scaffold(
-          body: GoldenPill(label: 'Transcript', open: true, onTap: () {}),
-        ),
-      ));
-
-      expect(find.byIcon(Icons.keyboard_arrow_down), findsOneWidget);
-    });
-
-    testWidgets('premium renders the gold edge, tapping fires onTap',
-        (tester) async {
-      var taps = 0;
-      await tester.pumpWidget(MaterialApp(
-        theme: buildPremiumTheme(),
-        home: Scaffold(
-          body: GoldenPill(
-            label: 'Transcript',
-            open: false,
-            onTap: () => taps++,
-          ),
-        ),
-      ));
-
-      expect(find.byType(GoldEdge), findsOneWidget);
-      await tester.tap(find.text('Transcript'));
-      expect(taps, 1);
     });
   });
 

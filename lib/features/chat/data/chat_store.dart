@@ -195,7 +195,12 @@ class DriftChatStore implements ChatStore {
   Future<Conversation> _toConversation(ConversationRow row) async {
     final messages = await (_db.select(_db.messages)
           ..where((t) => t.conversationId.equals(row.id))
-          ..orderBy([(t) => OrderingTerm.asc(t.createdAt)]))
+          // Order by the implicit monotonic rowid: drift stores DateTime as
+          // unix-seconds integers (no store_date_time_values_as_text), so two
+          // messages appended within the same second tie on createdAt and a
+          // random-id tiebreaker would let the assistant reply sort BEFORE
+          // its user message. rowid preserves exact append order.
+          ..orderBy([(t) => OrderingTerm.asc(t.rowId)]))
         .get();
     return Conversation(
       id: row.id,

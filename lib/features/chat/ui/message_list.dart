@@ -39,6 +39,17 @@ class _MessageListState extends State<MessageList>
   /// read is not yanked back down by streaming updates.
   bool _nearBottom = true;
 
+  /// Id of the last visible message this list auto-scrolled to while idle.
+  /// Rebuilds that don't change the tail (upload progress, error banner
+  /// toggles) are ignored so the list never re-animates for irrelevant data.
+  String? _pinnedTailId;
+
+  /// True while a [_scrollToBottom] animation is in flight. Streaming flushes
+  /// every ~80ms; without this guard each flush would start a new 200ms
+  /// `animateTo` against a stale `maxScrollExtent`, producing overlapping
+  /// animations that fight the growing list.
+  bool _scrollAnimationActive = false;
+
   @override
   void initState() {
     super.initState();
@@ -109,17 +120,68 @@ class _MessageListState extends State<MessageList>
     if (!_nearBottom) return;
     final controller = widget.scrollController;
     if (!controller.hasClients) return;
-    final position = controller.position;
-    if (position.maxScrollExtent <= 0) return;
-    final target = position.maxScrollExtent;
+    // While idle, only re-animate when the tail actually changed; skip the
+    // redundant rebuilds (attachment uploads, error banner toggles) that
+    // don't move the bottom of the list.
+    if (!widget.isStreaming) {
+      final tailId = _tailMessageId();
+      if (tailId == _pinnedTailId) return;
+      _pinnedTailId = tailId;
+    }
+    // One animation at a time: overlapping `animateTo` calls each target a
+    // stale maxScrollExtent (captured before the next flush grows the list).
+    // Set the guard synchronously so a second call in the same frame (e.g.
+    // multiple state updates before the first frame paints) cannot schedule a
+    // second overlapping callback.
+    if (_scrollAnimationActive) return;
+    _scrollAnimationActive = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!controller.hasClients) return;
-      controller.animateTo(
-        target,
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.easeOut,
-      );
+      // Every path must clear the guard — the post-frame callback can run
+      // after the flag was set even when there is nothing to scroll, and
+      // leaving it true would disable auto-scroll for the State's lifetime.
+      if (!controller.hasClients) {
+        _scrollAnimationActive = false;
+        return;
+      }
+      final position = controller.position;
+      if (position.maxScrollExtent <= 0) {
+        _scrollAnimationActive = false;
+        return;
+      }
+      // Resolve the target against the live extent at animation start so the
+      // caret keeps chasing the growing content instead of a captured value.
+      final target = position.maxScrollExtent;
+      position
+          .animateTo(
+            target,
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOut,
+          )
+          .then((_) => _onScrollAnimationDone(target),
+              onError: (_) => _onScrollAnimationDone(target));
     });
+  }
+
+  /// Re-arms scrolling after an animation finishes — but only when the list
+  /// actually grew past the animated [target] while the animation was in
+  /// flight (a streaming flush landed during the 200ms). Re-animating
+  /// unconditionally would busy-loop during a long generation gap.
+  void _onScrollAnimationDone(double target) {
+    _scrollAnimationActive = false;
+    final controller = widget.scrollController;
+    if (!controller.hasClients) return;
+    if (controller.position.maxScrollExtent > target) {
+      _scrollToBottom();
+    }
+  }
+
+  /// Id of the last visible (non-tool) message, or null when none.
+  String? _tailMessageId() {
+    final messages = widget.messages;
+    for (var i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role != MessageRole.tool) return messages[i].id;
+    }
+    return null;
   }
 
   @override
@@ -144,9 +206,23 @@ class _MessageListState extends State<MessageList>
             itemCount: visible.length + (widget.isStreaming ? 1 : 0),
             itemBuilder: (context, index) {
               if (index < visible.length) {
-                return MessageBubble(message: visible[index]);
+                // Stable key by message id: the ListView reconciles children
+                // by runtimeType + index otherwise, so when the streaming
+                // caret (a different widget type) vacates a slot and a
+                // MessageBubble lands on it, the previous element's composited
+                // layer can be repurposed and paint a stale bubble (the last
+                // assistant reply showing up "duplicated" after a new send).
+                return MessageBubble(
+                  key: ValueKey('message-${visible[index].id}'),
+                  message: visible[index],
+                );
               }
-              return _StreamingCaret(opacity: _caretOpacity);
+              // Distinct key type from MessageBubble so it can never swap
+              // layers with a bubble slot during reconciliation.
+              return _StreamingCaret(
+                key: const ValueKey('streaming-caret'),
+                opacity: _caretOpacity,
+              );
             },
           ),
         ),
@@ -157,7 +233,7 @@ class _MessageListState extends State<MessageList>
 
 /// Blinking caret shown after the last assistant message while streaming.
 class _StreamingCaret extends StatelessWidget {
-  const _StreamingCaret({required this.opacity});
+  const _StreamingCaret({super.key, required this.opacity});
 
   final Animation<double> opacity;
 
