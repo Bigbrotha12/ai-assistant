@@ -164,9 +164,10 @@ flutter_launcher_icons:
   web:
     generate: true
   image_path: "assets/branding/app_logo.png"
-  # Variant C is full-bleed indigo; the tool's default 16% adaptive inset keeps
-  # the mark inside Android's safe zone, so the same asset serves as foreground.
-  adaptive_icon_background: "#272F4A"
+  # Variant C ivory/gold is full-bleed ivory; the tool's default 16% adaptive
+  # inset keeps the mark inside Android's safe zone, so the same asset serves
+  # as foreground. Background matches the tile's ivory paper.
+  adaptive_icon_background: "#F6F2E9"
   adaptive_icon_foreground: "assets/branding/app_logo.png"
   remove_alpha_ios: true
   min_sdk_android: 21
