@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
 
 /// Reacts to app lifecycle changes so an in-progress voice conversation is
@@ -33,13 +35,17 @@ class VoiceLifecycleObserver with WidgetsBindingObserver {
     if (_disposed) return;
     switch (state) {
       case AppLifecycleState.resumed:
-        onForeground?.call();
+        unawaited(onForeground?.call());
+        break;
       case AppLifecycleState.inactive:
-        // Handled by audio-focus-loss; do NOT tear down the session.
+        // Handled by audio-focus-loss; do NOT suspend or tear down the
+        // session. `break` (not a terminating suspend) keeps this genuine —
+        // an empty Dart case would fall through to paused/hidden/detached.
+        break;
       case AppLifecycleState.paused:
       case AppLifecycleState.hidden:
       case AppLifecycleState.detached:
-        onBackground();
+        unawaited(onBackground());
     }
   }
 

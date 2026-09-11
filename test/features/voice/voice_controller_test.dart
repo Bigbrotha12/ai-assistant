@@ -718,6 +718,135 @@ void main() {
       await mic.dispose();
       await playback.dispose();
     });
+
+    test('background landing mid-synthesis defers the reply instead of playing '
+        'it on a hidden surface', () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Reply to that.'],
+        ],
+        results: [
+          ChatResult(
+            content: 'Reply to that.',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine()..gate = Completer<void>();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      final send = controller.sendText('hello');
+      // The drain dequeues the sentence and parks inside synthesis.
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(controller.state.lastTranscript, 'Reply to that.');
+      expect(tts.synthesized, ['Reply to that.']);
+
+      // The app backgrounds while synthesis is held in flight: nothing may
+      // start playing on a hidden surface.
+      await controller.enterBackground();
+      expect(playback.playedChunks, isEmpty);
+
+      // Synthesis completes in the background: the utterance must be
+      // requeued, not played.
+      tts.gate!.complete();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(playback.playedChunks, isEmpty);
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      // Foreground resumes it: re-synthesised and played.
+      await controller.exitBackground();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      expect(playback.playedChunks, hasLength(1));
+      expect(tts.synthesized, hasLength(2));
+      expect(controller.state.isAiSpeaking, isFalse);
+
+      await send;
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('synthesizeOnDevice resolves immediately while backgrounded',
+        () async {
+      final chat = FakeChatClient();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+      await controller.enterBackground();
+
+      // The queue drain is suspended while hidden: a backgrounded speak must
+      // not hang on the item's completer nor synthesise anything.
+      final result = await controller.synthesizeOnDevice('Say this');
+      expect(result, isEmpty);
+      expect(tts.synthesized, isEmpty);
+      expect(playback.playedChunks, isEmpty);
+
+      await controller.exitBackground();
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+  });
+
+  group('speak normalization', () {
+    test('symbols are normalised for speech but not for the transcript',
+        () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['The price is \u20AC5.'],
+        ],
+        results: [
+          ChatResult(
+            content: 'The price is \u20AC5.',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final tts = FakeTtsEngine();
+      final controller = VoiceController(
+        chatClient: chat,
+        micCapture: mic,
+        playback: playback,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
+
+      await controller.sendText('What does it cost?');
+      await pumpEventQueue();
+      await pumpEventQueue();
+      await pumpEventQueue();
+
+      // The transcript keeps the raw reply text…
+      expect(controller.state.lastReply, 'The price is \u20AC5.');
+      // …but the spoken audio reads the expanded currency.
+      expect(tts.synthesized, ['The price is 5 euros.']);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
   });
 
   group('interrupt', () {
