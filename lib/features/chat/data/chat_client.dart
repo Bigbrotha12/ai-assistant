@@ -63,6 +63,14 @@ class ChatServerError extends ChatApiError {
   final int? statusCode;
 }
 
+/// HTTP 401 from the configured inference API (the `LLM_*` dart-defines, see
+/// AGENTS.md): the compile-time `LLM_API_KEY` was rejected/revoked. NOT the
+/// gateway minted-key rejection — re-authenticating with the gateway cannot
+/// fix it; the app must ship a valid build-time key.
+class InferenceAuthError extends ChatServerError {
+  const InferenceAuthError(super.message) : super(statusCode: 401);
+}
+
 /// The server sent an error envelope inside the stream.
 class ChatStreamError extends ChatApiError {
   const ChatStreamError(super.message);
@@ -120,27 +128,26 @@ abstract interface class ChatClient {
   });
 }
 
-/// OpenAI-compatible chat completions client. Targets either the gateway LLM
-/// proxy or an external OpenAI-compatible API (e.g. a LibreChat agents
-/// endpoint); both serve `POST $baseUrl/chat/completions` SSE streams.
+/// OpenAI-compatible chat completions client against the configured external
+/// inference API (e.g. a LibreChat agents endpoint). Inference never routes
+/// through the gateway (see [chatApiClientProvider]); requests go straight to
+/// `$baseUrl/chat/completions` SSE streams.
 class ChatApiClient implements ChatClient {
   ChatApiClient({
     required this.baseUrl,
     Dio? dio,
-    this.model = 'Qwen3-8B-Q4_K_M.gguf',
+    this.model = '',
     this.apiKey,
   }) : _dio = dio ?? Dio();
 
   /// OpenAI-compatible API base root including the `/v1` prefix, e.g.
-  /// `http://192.168.1.5:17600/v1` (gateway) or
   /// `https://librechat.../api/agents/v1`. No trailing slash.
   final String baseUrl;
 
   final String model;
 
-  /// Gateway or external API bearer key sent as `Authorization: Bearer <apiKey>`
-  /// on every request. Null when no key is available; requests then go out
-  /// unauthenticated (and the gateway 401s them).
+  /// External inference API bearer key sent as `Authorization: Bearer <apiKey>`
+  /// on every request.
   final String? apiKey;
 
   final Dio _dio;
@@ -155,7 +162,7 @@ class ChatApiClient implements ChatClient {
   String get _endpoint => '$baseUrl/chat/completions';
 
   /// Builds the per-request [Options]. The bearer API key (when set) is
-  /// attached to every request so the gateway never 401s a chat call. The
+  /// attached to every request so the inference API never 401s a chat call. The
   /// streaming path also opts into an SSE `accept` header and stream response
   /// type.
   Options _options({bool stream = false}) {
@@ -168,6 +175,9 @@ class ChatApiClient implements ChatClient {
     return Options(
       headers: headers,
       responseType: stream ? ResponseType.stream : null,
+      // Never replay the bearer key to a redirect target on another origin;
+      // a 3xx is a misconfiguration and must surface as an error.
+      followRedirects: false,
       connectTimeout: _connectTimeout,
       receiveTimeout: _receiveTimeout,
     );
@@ -258,7 +268,7 @@ class ChatApiClient implements ChatClient {
 
     final status = response.statusCode;
     if (status == null || status < 200 || status >= 300) {
-      throw ChatServerError('HTTP $status', statusCode: status);
+      throw _serverStatusError(status);
     }
 
     onReceived?.call();
@@ -473,15 +483,27 @@ class ChatApiClient implements ChatClient {
       case DioErrorCategory.cancelled:
         throw ChatNetworkError('cancelled');
       case DioErrorCategory.badResponse:
-        throw ChatServerError(
-          describeDioException(e),
-          statusCode: e.response?.statusCode,
-        );
+        throw _serverStatusError(e.response?.statusCode,
+            message: describeDioException(e));
       case DioErrorCategory.timeoutNetwork:
         throw _ConnectionFailure(describeDioException(e));
       case DioErrorCategory.other:
         throw ChatNetworkError(describeDioException(e));
     }
+  }
+
+  /// A non-2xx status from the inference API. A 401 names the source
+  /// explicitly: it is the build-time `LLM_API_KEY` being rejected, not the
+  /// gateway stored key, so it must not drive the gateway re-auth affordance.
+  Never _serverStatusError(int? status, {String? message}) {
+    if (status == 401) {
+      throw InferenceAuthError(
+        message ??
+            'Inference API key rejected (401). Rebuild the app with a valid '
+                'LLM_API_KEY dart-define.',
+      );
+    }
+    throw ChatServerError(message ?? 'HTTP $status', statusCode: status);
   }
 
   /// Decodes a tool-call `arguments` JSON string into a map. Returns null for
@@ -498,8 +520,12 @@ class ChatApiClient implements ChatClient {
   }
 }
 
-/// True when [error] is a gateway authentication rejection (HTTP 401 from a
-/// chat/vision call), which drives the re-auth affordances in the chat and
-/// voice UIs.
+/// True when [error] is the gateway minted-key rejection that the gateway
+/// re-auth flow can remedy. A plain [ChatServerError] 401 qualifies; an
+/// [InferenceAuthError] (the inference API rejecting the build-time
+/// `LLM_API_KEY`) does NOT — rebuilding with a valid define is the only fix,
+/// so the chat and voice UIs surface its message instead of the re-auth card.
 bool isAuthRequiredError(Object error) =>
-    error is ChatServerError && error.statusCode == 401;
+    error is ChatServerError &&
+    error.statusCode == 401 &&
+    error is! InferenceAuthError;

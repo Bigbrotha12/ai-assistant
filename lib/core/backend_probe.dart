@@ -21,8 +21,10 @@ enum ProbeStatus {
   ok,
   error,
 
-  /// The stored API key was rejected by the backend (HTTP 401). Downstream UI
-  /// routes this to a re-authentication flow.
+  /// The stored gateway API key was rejected by the auth check (HTTP 401).
+  /// Downstream UI routes this to a re-authentication flow. Only the auth
+  /// check produces it — inference/vision 401s (the build-time LLM key) are
+  /// reported as [ProbeStatus.error].
   unauthorized,
 
   /// No API key is stored, so the authenticated checks cannot run.
@@ -73,21 +75,30 @@ abstract interface class BackendProbe {
   Future<BackendStatus> probe(BackendSettings settings);
 }
 
-/// [BackendProbe] over the authenticated gateway (auth, inference, vision).
+/// Probes the gateway auth chain plus the configured external inference API.
 ///
-/// All three checks authenticate with the API key from the injected
-/// [ApiKeyReader]. HTTP 401 surfaces as [ProbeStatus.unauthorized] (so the UI
-/// can route to re-auth); a missing key surfaces as
+/// The auth check authenticates on the gateway with the API key from the
+/// injected [ApiKeyReader]. HTTP 401 surfaces as [ProbeStatus.unauthorized]
+/// (so the UI can route to re-auth); a missing key surfaces as
 /// [ProbeStatus.noCredentials].
+///
+/// The inference and vision checks target the external OpenAI-compatible API
+/// from the `LLM_*` dart-defines (see AGENTS.md) — inference never routes
+/// through the gateway. They authenticate with that API's own key
+/// ([inferenceApiKey]), reported as [ProbeStatus.error] when unconfigured or
+/// when the API rejects it (401): re-minting a gateway key cannot fix that,
+/// so it must not surface as [ProbeStatus.unauthorized].
 class DioBackendProbe implements BackendProbe {
   DioBackendProbe({
     Dio? dio,
     ApiKeyReader? apiKeyReader,
-    this.model = 'Qwen3-8B-Q4_K_M.gguf',
+    this.inferenceBaseUrl = BackendConfig.defaultLlmBaseUrl,
+    this.inferenceModel = BackendConfig.defaultLlmModel,
+    this.inferenceApiKey = BackendConfig.defaultLlmApiKey,
     Duration authTimeout = const Duration(seconds: 8),
     Duration inferenceTimeout = const Duration(seconds: 25),
     Duration visionTimeout = const Duration(seconds: 5),
-  })  : _dio = dio ??
+  }) : _dio = dio ??
             Dio(
               BaseOptions(
                 connectTimeout: const Duration(seconds: 8),
@@ -104,17 +115,26 @@ class DioBackendProbe implements BackendProbe {
   final Dio _dio;
   final ApiKeyReader _apiKeyReader;
 
-  /// Model identifier used by the inference probe ping, mirroring the default
+  /// External inference base URL (e.g. a LibreChat agents endpoint). The
+  /// `chat/completions` suffix is appended for the inference ping; a version
+  /// root is derived via [BackendConfig.stripV1Suffix] for the vision models
+  /// probe.
+  final String inferenceBaseUrl;
+
+  /// Model identifier used by the inference probe ping, mirroring the model
   /// the real chat client sends.
-  final String model;
+  final String inferenceModel;
+
+  /// Bearer key for the external inference API.
+  final String inferenceApiKey;
   final ({Duration auth, Duration inference, Duration vision}) _timeouts;
 
   @override
   Future<BackendStatus> probe(BackendSettings settings) async {
     final results = await Future.wait([
       _probeAuth(settings),
-      _probeInference(settings),
-      _probeVision(settings),
+      _probeInference(),
+      _probeVision(),
     ]);
     return BackendStatus(checks: results);
   }
@@ -138,7 +158,7 @@ class DioBackendProbe implements BackendProbe {
     return _guard(
       BackendCheck.auth,
       () async {
-        final url = BackendConfig.llmProxy(
+        final url = BackendConfig.gatewayBase(
           host,
           environment: settings.environment,
         ).replace(path: '/v1/auth/check');
@@ -170,25 +190,38 @@ class DioBackendProbe implements BackendProbe {
     );
   }
 
-  Future<CheckResult> _probeInference(BackendSettings settings) async {
-    final apiKey = await _readApiKey();
-    if (apiKey == null) {
+  Future<CheckResult> _probeInference() async {
+    final base = BackendConfig.trimTrailingSlash(inferenceBaseUrl);
+    final model = inferenceModel.trim();
+    final apiKey = inferenceApiKey.trim();
+    if (base.isEmpty) {
       return const CheckResult(
         check: BackendCheck.inference,
-        status: ProbeStatus.noCredentials,
-        detail: 'no API key stored',
+        status: ProbeStatus.error,
+        detail: 'LLM_BASE_URL not configured',
       );
     }
-    final host = settings.trimmedHost;
+    if (model.isEmpty) {
+      return const CheckResult(
+        check: BackendCheck.inference,
+        status: ProbeStatus.error,
+        detail: 'LLM_MODEL not configured',
+      );
+    }
+    if (apiKey.isEmpty) {
+      return const CheckResult(
+        check: BackendCheck.inference,
+        status: ProbeStatus.error,
+        detail: 'LLM_API_KEY not configured',
+      );
+    }
+    final url = Uri.parse('$base/chat/completions');
     return _guard(
       BackendCheck.inference,
       () async {
         final resp = await _dio
             .postUri(
-              BackendConfig.llmCompletions(
-                host,
-                environment: settings.environment,
-              ),
+              url,
               data: {
                 'model': model,
                 'messages': [
@@ -220,23 +253,27 @@ class DioBackendProbe implements BackendProbe {
     );
   }
 
-  Future<CheckResult> _probeVision(BackendSettings settings) async {
-    final apiKey = await _readApiKey();
-    if (apiKey == null) {
+  Future<CheckResult> _probeVision() async {
+    final base = BackendConfig.stripV1Suffix(inferenceBaseUrl);
+    final apiKey = inferenceApiKey.trim();
+    if (base.isEmpty) {
       return const CheckResult(
         check: BackendCheck.vision,
-        status: ProbeStatus.noCredentials,
-        detail: 'no API key stored',
+        status: ProbeStatus.error,
+        detail: 'LLM_BASE_URL not configured',
       );
     }
-    final host = settings.trimmedHost;
+    if (apiKey.isEmpty) {
+      return const CheckResult(
+        check: BackendCheck.vision,
+        status: ProbeStatus.error,
+        detail: 'LLM_API_KEY not configured',
+      );
+    }
+    final modelsUrl = Uri.parse('$base/v1/models');
     return _guard(
       BackendCheck.vision,
       () async {
-        final modelsUrl = BackendConfig.llmProxy(
-          host,
-          environment: settings.environment,
-        ).replace(path: '/v1/models');
         final response = await _dio
             .getUri(
               modelsUrl,
@@ -288,7 +325,8 @@ class DioBackendProbe implements BackendProbe {
 
   /// Runs [run], translating non-2xx responses into error results and every
   /// other failure through [_classify]. [httpError] fully customizes the
-  /// result of an HTTP error response (e.g. mapping 401 to unauthorized).
+  /// result of an HTTP error response (e.g. the auth check mapping 401 to
+  /// unauthorized).
   Future<CheckResult> _guard(
     BackendCheck check,
     Future<CheckResult> Function() run, {
@@ -336,25 +374,26 @@ class DioBackendProbe implements BackendProbe {
     if (code == 401) {
       return CheckResult(
         check: check,
-        status: ProbeStatus.unauthorized,
-        detail: 'API key rejected (401)',
+        status: ProbeStatus.error,
+        detail: 'inference API key rejected (401) — re-check the LLM_API_KEY '
+            'build define',
       );
     }
     return switch (code) {
       503 => CheckResult(
           check: check,
           status: ProbeStatus.error,
-          detail: 'RabbitMQ not reachable (503)',
+          detail: 'inference backend loading (503)',
         ),
       502 || 504 => CheckResult(
           check: check,
           status: ProbeStatus.error,
-          detail: 'backend not ready ($code)',
+          detail: 'inference backend not ready ($code)',
         ),
       400 || 422 => CheckResult(
           check: check,
           status: ProbeStatus.error,
-          detail: 'proxy returned $code (unexpected request shape)',
+          detail: 'request rejected by the API ($code)',
         ),
       _ => CheckResult(
           check: check,
@@ -369,8 +408,9 @@ class DioBackendProbe implements BackendProbe {
     if (code == 401) {
       return CheckResult(
         check: check,
-        status: ProbeStatus.unauthorized,
-        detail: 'API key rejected (401)',
+        status: ProbeStatus.error,
+        detail: 'inference API key rejected (401) — re-check the LLM_API_KEY '
+            'build define',
       );
     }
     return CheckResult(

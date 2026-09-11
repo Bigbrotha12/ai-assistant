@@ -10,8 +10,16 @@ import 'package:ai_assistant/core/backend_settings.dart';
 const _host = 'myhost';
 const _apiKey = 'sk_test123';
 const _authUrl = 'http://myhost:17600/v1/auth/check';
-const _llmProxyUrl = 'http://myhost:17600/v1/chat/completions';
-const _modelsUrl = 'http://myhost:17600/v1/models';
+
+/// The external inference API (e.g. LibreChat agents endpoint) the probe now
+/// targets instead of the gateway LLM proxy.
+const _llmBase = 'https://librechat.example/api/agents/v1';
+const _llmModel = 'agent_1';
+const _inferenceUrl = '$_llmBase/chat/completions';
+
+/// The vision models probe appends `/v1/models` to the version root (the LLM
+/// base with its own `/v1` suffix stripped).
+const _modelsUrl = 'https://librechat.example/api/agents/v1/models';
 
 final _settings = const BackendSettings(host: _host);
 Future<String?> _key() async => _apiKey;
@@ -26,7 +34,13 @@ Future<String?> _noKey() async => null;
 }
 
 DioBackendProbe probe(Dio dio, {Future<String?> Function()? apiKeyReader}) =>
-    DioBackendProbe(dio: dio, apiKeyReader: apiKeyReader ?? _key);
+    DioBackendProbe(
+      dio: dio,
+      apiKeyReader: apiKeyReader ?? _key,
+      inferenceBaseUrl: _llmBase,
+      inferenceModel: _llmModel,
+      inferenceApiKey: _apiKey,
+    );
 
 /// A non-2xx server response surfaced as a `badResponse` [DioException].
 DioException httpError(String path, int statusCode) => DioException(
@@ -47,7 +61,7 @@ DioException networkError(String path, DioExceptionType type) => DioException(
 /// Registers healthy routes for every probe endpoint.
 void registerAllOk(DioAdapter adapter) {
   adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
-  adapter.onPost(_llmProxyUrl, (r) => r.reply(200, {'id': 'chat-1'}));
+  adapter.onPost(_inferenceUrl, (r) => r.reply(200, {'id': 'chat-1'}));
   adapter.onGet(_modelsUrl, (r) {
     return r.reply(200, {
       'data': [
@@ -82,7 +96,7 @@ void main() {
   group('auth', () {
     test('returns ok on a 200 with a valid API key', () async {
       final (dio, adapter) = makeDio();
-adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
+      adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
 
       final status = await probe(dio).probe(_settings);
 
@@ -148,38 +162,39 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
         ProbeStatus.unreachable,
       );
     });
-
   });
 
   group('inference', () {
     test('returns ok on 200', () async {
       final (dio, adapter) = makeDio();
-      adapter.onPost(_llmProxyUrl, (r) => r.reply(200, {'id': 'chat-1'}));
+      adapter.onPost(_inferenceUrl, (r) => r.reply(200, {'id': 'chat-1'}));
 
       final status = await probe(dio).probe(_settings);
 
       expect(status.resultFor(BackendCheck.inference)!.status, ProbeStatus.ok);
     });
 
-    test('returns unauthorized on a 401 response', () async {
+    test('returns error (not unauthorized) on a 401 response', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
-        _llmProxyUrl,
-        (r) => r.throws(401, httpError(_llmProxyUrl, 401)),
+        _inferenceUrl,
+        (r) => r.throws(401, httpError(_inferenceUrl, 401)),
       );
 
       final status = await probe(dio).probe(_settings);
 
       final result = status.resultFor(BackendCheck.inference)!;
-      expect(result.status, ProbeStatus.unauthorized);
-      expect(result.detail, contains('401'));
+      // The 401 rejects the build-time LLM API key, which the gateway re-auth
+      // flow cannot fix — it must surface as an error, not unauthorized.
+      expect(result.status, ProbeStatus.error);
+      expect(result.detail, contains('LLM_API_KEY'));
     });
 
     test('returns error with 503 in the detail', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
-        _llmProxyUrl,
-        (r) => r.throws(503, httpError(_llmProxyUrl, 503)),
+        _inferenceUrl,
+        (r) => r.throws(503, httpError(_inferenceUrl, 503)),
       );
 
       final status = await probe(dio).probe(_settings);
@@ -192,8 +207,8 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
     test('returns error on 502', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
-        _llmProxyUrl,
-        (r) => r.throws(502, httpError(_llmProxyUrl, 502)),
+        _inferenceUrl,
+        (r) => r.throws(502, httpError(_inferenceUrl, 502)),
       );
 
       final status = await probe(dio).probe(_settings);
@@ -207,10 +222,10 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
     test('returns unreachable on a network error', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
-        _llmProxyUrl,
+        _inferenceUrl,
         (r) => r.throws(
           0,
-          networkError(_llmProxyUrl, DioExceptionType.connectionError),
+          networkError(_inferenceUrl, DioExceptionType.connectionError),
         ),
       );
 
@@ -222,6 +237,22 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       );
     });
 
+    test('reports error (never falls back) when not configured', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
+
+      // Compile-time LLM_* defines default to '' in a test build, so a probe
+      // without explicit inference params is "unconfigured".
+      final status =
+          await DioBackendProbe(dio: dio, apiKeyReader: _key).probe(_settings);
+
+      final inference = status.resultFor(BackendCheck.inference)!;
+      expect(inference.status, ProbeStatus.error);
+      expect(inference.detail, contains('LLM_BASE_URL'));
+      final vision = status.resultFor(BackendCheck.vision)!;
+      expect(vision.status, ProbeStatus.error);
+      expect(vision.detail, contains('LLM_BASE_URL'));
+    });
   });
 
   group('vision', () {
@@ -260,7 +291,7 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       expect(result.detail, 'model.vl not found');
     });
 
-    test('returns unauthorized on a 401 response', () async {
+    test('returns error (not unauthorized) on a 401 response', () async {
       final (dio, adapter) = makeDio();
       adapter.onGet(
         _modelsUrl,
@@ -270,7 +301,8 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       final status = await probe(dio).probe(_settings);
 
       final result = status.resultFor(BackendCheck.vision)!;
-      expect(result.status, ProbeStatus.unauthorized);
+      expect(result.status, ProbeStatus.error);
+      expect(result.detail, contains('LLM_API_KEY'));
     });
 
     test('returns error on a 500 response', () async {
@@ -302,22 +334,24 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
         ProbeStatus.unreachable,
       );
     });
-
   });
 
   group('aggregation', () {
-    test('a missing API key yields noCredentials on every check', () async {
+    test(
+        'a missing stored API key yields noCredentials on auth only; '
+        'inference/vision use the configured LLM key', () async {
       final (dio, adapter) = makeDio();
       registerAllOk(adapter);
 
       final status = await probe(dio, apiKeyReader: _noKey).probe(_settings);
 
-      for (final check in BackendCheck.values) {
-        expect(status.resultFor(check)!.status, ProbeStatus.noCredentials,
-            reason: '$check');
-      }
       expect(
-          status.resultFor(BackendCheck.auth)!.detail, contains('no API key'));
+        status.resultFor(BackendCheck.auth)!.status,
+        ProbeStatus.noCredentials,
+      );
+      expect(status.resultFor(BackendCheck.auth)!.detail, contains('no API key'));
+      expect(status.resultFor(BackendCheck.inference)!.status, ProbeStatus.ok);
+      expect(status.resultFor(BackendCheck.vision)!.status, ProbeStatus.ok);
     });
 
     test('probe returns checks in the documented order', () async {
@@ -424,30 +458,42 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
       expect(authRequest.followRedirects, isFalse);
     });
 
-    test('inference check sends the bearer API key and never follows '
-        'redirects', () async {
+    test('inference check sends the LLM key and never follows redirects',
+        () async {
       final adapter = CapturingAdapter();
       final dio = Dio()..httpClientAdapter = adapter;
 
       await probe(dio).probe(_settings);
 
-      final inferenceRequest = adapter.requests
-          .firstWhere((r) => r.path.contains('/v1/chat/completions'));
+      final inferenceRequest =
+          adapter.requests.firstWhere((r) => r.path.contains('/v1/chat/completions'));
       expect(inferenceRequest.method, 'POST');
       expect(inferenceRequest.headers['Authorization'], 'Bearer $_apiKey');
       expect(inferenceRequest.followRedirects, isFalse);
     });
 
-    test('inference check pings with the chat client default model', () async {
+    test('vision check sends the LLM key on the models probe', () async {
       final adapter = CapturingAdapter();
       final dio = Dio()..httpClientAdapter = adapter;
 
       await probe(dio).probe(_settings);
 
-      final inferenceRequest = adapter.requests
-          .firstWhere((r) => r.path.contains('/v1/chat/completions'));
+      final modelsRequest =
+          adapter.requests.firstWhere((r) => r.path.contains('/v1/models'));
+      expect(modelsRequest.method, 'GET');
+      expect(modelsRequest.headers['Authorization'], 'Bearer $_apiKey');
+    });
+
+    test('inference check pings with the configured model', () async {
+      final adapter = CapturingAdapter();
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await probe(dio).probe(_settings);
+
+      final inferenceRequest =
+          adapter.requests.firstWhere((r) => r.path.contains('/v1/chat/completions'));
       final body = inferenceRequest.data as Map;
-      expect(body['model'], 'Qwen3-8B-Q4_K_M.gguf');
+      expect(body['model'], _llmModel);
     });
   });
 
@@ -455,8 +501,8 @@ adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
     test('probe with a URL-like host reports failures instead of throwing',
         () async {
       final (dio, adapter) = makeDio();
-      registerAllOk(adapter);
 
+      // No routes registered: every request errors without throwing.
       final status = await probe(dio).probe(
         const BackendSettings(host: 'https://evil.example'),
       );

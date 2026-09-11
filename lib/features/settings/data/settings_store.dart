@@ -29,9 +29,15 @@ class SecureSettingsStore implements SettingsStore {
   static const _kMcpSecret = 'backend_mcp_secret';
   static const _kFilesSecret = 'backend_files_secret';
   static const _kStorageUrl = 'backend_storage_url';
-  static const _kLlmBaseUrl = 'backend_llm_base_url';
-  static const _kLlmModel = 'backend_llm_model';
-  static const _kLlmApiKey = 'backend_llm_api_key';
+
+  /// Keys written by earlier builds that carried runtime LLM override fields.
+  /// Inference now comes only from the build-time `LLM_*` dart-defines, so
+  /// any persisted values are orphaned and must be scrubbed on write paths.
+  static const _kLegacyLlmKeys = [
+    'backend_llm_base_url',
+    'backend_llm_model',
+    'backend_llm_api_key',
+  ];
 
   final FlutterSecureStorage _storage;
 
@@ -48,9 +54,6 @@ class SecureSettingsStore implements SettingsStore {
     final mcpSecret = await _storage.read(key: _kMcpSecret);
     final filesSecret = await _storage.read(key: _kFilesSecret);
     final storageUrl = await _storage.read(key: _kStorageUrl);
-    final llmBaseUrl = await _storage.read(key: _kLlmBaseUrl);
-    final llmModel = await _storage.read(key: _kLlmModel);
-    final llmApiKey = await _storage.read(key: _kLlmApiKey);
     return BackendSettings(
       host: host,
       environment: environment,
@@ -60,11 +63,6 @@ class SecureSettingsStore implements SettingsStore {
           filesSecret == null || filesSecret.trim().isEmpty ? null : filesSecret,
       storageUrl:
           storageUrl == null || storageUrl.trim().isEmpty ? null : storageUrl,
-      llmBaseUrl:
-          llmBaseUrl == null || llmBaseUrl.trim().isEmpty ? null : llmBaseUrl,
-      llmModel: llmModel == null || llmModel.trim().isEmpty ? null : llmModel,
-      llmApiKey:
-          llmApiKey == null || llmApiKey.trim().isEmpty ? null : llmApiKey,
     );
   }
 
@@ -95,23 +93,14 @@ class SecureSettingsStore implements SettingsStore {
     } else {
       await _storage.delete(key: _kStorageUrl);
     }
-    final llmBaseUrl = settings.trimmedLlmBaseUrl;
-    if (llmBaseUrl != null) {
-      await _storage.write(key: _kLlmBaseUrl, value: llmBaseUrl);
-    } else {
-      await _storage.delete(key: _kLlmBaseUrl);
-    }
-    final llmModel = settings.trimmedLlmModel;
-    if (llmModel != null) {
-      await _storage.write(key: _kLlmModel, value: llmModel);
-    } else {
-      await _storage.delete(key: _kLlmModel);
-    }
-    final llmApiKey = settings.trimmedLlmApiKey;
-    if (llmApiKey != null) {
-      await _storage.write(key: _kLlmApiKey, value: llmApiKey);
-    } else {
-      await _storage.delete(key: _kLlmApiKey);
+    await _scrubLegacyLlmKeys();
+  }
+
+  /// Removes any persisted LLM override keys from earlier builds — inference
+  /// is build-time only now, and stale secrets must not linger.
+  Future<void> _scrubLegacyLlmKeys() async {
+    for (final key in _kLegacyLlmKeys) {
+      await _storage.delete(key: key);
     }
   }
 
@@ -122,8 +111,6 @@ class SecureSettingsStore implements SettingsStore {
     await _storage.delete(key: _kMcpSecret);
     await _storage.delete(key: _kFilesSecret);
     await _storage.delete(key: _kStorageUrl);
-    await _storage.delete(key: _kLlmBaseUrl);
-    await _storage.delete(key: _kLlmModel);
-    await _storage.delete(key: _kLlmApiKey);
+    await _scrubLegacyLlmKeys();
   }
 }

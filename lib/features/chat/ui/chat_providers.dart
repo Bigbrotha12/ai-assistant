@@ -149,12 +149,13 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   @override
   Future<ConversationState> build() async {
     _store = ref.watch(chatStoreProvider);
-    // Read (not watch) the settings-dependent providers: both
-    // chatApiClientProvider and filesServiceProvider rebuild when the user
-    // saves settings, and re-running build() would dispose the UploadQueue
-    // owned here — silently cancelling any in-flight upload and losing the
-    // `[file:<id>]` ref. The client instances are snapshot at build time and
-    // stay pinned to this conversation's lifetime.
+    // Read (not watch) the shared providers: chatApiClientProvider resolves
+    // once against the build-time LLM_* defines (it does not rebuild on
+    // settings saves; see AGENTS.md), and filesServiceProvider rebuilds when
+    // the user saves settings — re-running build() would dispose the
+    // UploadQueue owned here, silently cancelling any in-flight upload and
+    // losing the `[file:<id>]` ref. The client instances are snapshot at build
+    // time and stay pinned to this conversation's lifetime.
     _client = ref.read(chatApiClientProvider);
     _trimmer = ref.watch(contextTrimmerProvider);
     _registry = ref.watch(toolRegistryProvider);

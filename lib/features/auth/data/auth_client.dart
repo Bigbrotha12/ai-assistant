@@ -111,8 +111,9 @@ class BetterAuthClient implements AuthClient {
   BetterAuthClient({required this.baseUrl, Dio? dio})
       : _dio = dio ?? Dio();
 
-  /// The auth base URL, e.g. `http://192.168.1.5:17600` (the gateway origin,
-  /// same port as the LLM proxy). No trailing slash.
+  /// The auth base URL, e.g. `http://192.168.1.5:17600` (the gateway origin;
+  /// it hosts account services only — inference never routes here). No
+  /// trailing slash.
   final String baseUrl;
 
   final Dio _dio;

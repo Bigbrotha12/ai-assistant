@@ -347,6 +347,17 @@ void main() {
       expect(phrases.first, anyOf(authErrorPhrases));
     });
 
+    test('server error for InferenceAuthError 401 (re-auth cannot help)', () {
+      final phrases = [
+        statusPhraseForError(
+          const InferenceAuthError('inference key rejected'),
+          random: Random(42),
+        ),
+      ];
+      expect(phrases.first, anyOf(serverErrorPhrases));
+      expect(phrases.first, isNot(anyOf(authErrorPhrases)));
+    });
+
     test('auth error for ChatServerError 403', () {
       final phrase = statusPhraseForError(
         ChatServerError('forbidden', statusCode: 403),

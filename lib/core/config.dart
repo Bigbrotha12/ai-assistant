@@ -101,51 +101,89 @@ class BackendConfig {
     return uri.replace(scheme: env.scheme).toString();
   }
 
-  /// Gateway LLM proxy: OpenAI-compatible chat completions (streaming SSE).
-  static Uri llmProxy(String host, {BackendEnvironment? environment}) =>
-      Uri(scheme: _scheme(environment), host: host, port: 17600);
+  /// Gateway origin for the app's account services only (better-auth under
+  /// `/api/auth`): `host:17600`. Inference never routes through the gateway —
+  /// it targets the configured external API (see [defaultLlmBaseUrl]).
+  static Uri gatewayBase(String host, {BackendEnvironment? environment}) =>
+      Uri(
+        scheme: _scheme(environment),
+        host: _sanitizeAuthority(host),
+        port: 17600,
+      );
 
-  /// Gateway LLM proxy chat completions endpoint: `POST /v1/chat/completions`.
-  static Uri llmCompletions(String host, {BackendEnvironment? environment}) =>
-      llmProxy(host, environment: environment)
-          .replace(path: '/v1/chat/completions');
+  /// Normalises a user-entered or stored authority so the service URI builders
+  /// can't throw on it: trims, strips a scheme prefix, truncates any `/path`,
+  /// and drops a trailing `:port` (these builders always fix the service port,
+  /// so a stored port is meaningless). Falls back to [defaultHost] when nothing
+  /// usable remains — the auth/files/mcp providers must degrade, not crash.
+  static String _sanitizeAuthority(String authority) {
+    var value = authority.trim();
+    final schemeEnd = value.indexOf('://');
+    if (schemeEnd != -1) value = value.substring(schemeEnd + 3);
+    final pathStart = value.indexOf('/');
+    if (pathStart != -1) value = value.substring(0, pathStart);
+    if (!value.startsWith('[')) {
+      final port = RegExp(r':\d+$').firstMatch(value);
+      if (port != null) value = value.substring(0, port.start);
+    }
+    value = value.trim();
+    return value.isEmpty ? defaultHost : value;
+  }
 
-  /// The OpenAI-compatible LLM API base root derived from the gateway proxy:
-  /// `host:17600` plus the `/v1` prefix the chat client appends
-  /// `chat/completions` to. Used when no inference override is configured.
-  static Uri llmApiBase(String host, {BackendEnvironment? environment}) =>
-      llmProxy(host, environment: environment).replace(path: '/v1');
-
-  /// Gateway llama.cpp model used when no inference override is configured.
-  static const String gatewayLlmModel = 'Qwen3-8B-Q4_K_M.gguf';
-
-  /// Optional inference base URL dart-define pointing at an external
-  /// OpenAI-compatible API (e.g. a LibreChat agents endpoint
-  /// `https://<host>/api/agents/v1`). Blank falls back to the gateway.
+  /// External OpenAI-compatible inference base URL dart-define (e.g. a
+  /// LibreChat agents endpoint `https://<host>/api/agents/v1`, including the
+  /// API-version `/v1` prefix the chat client appends `chat/completions` to).
+  ///
+  /// THE ONLY inference routing source: there is no gateway fallback. A build
+  /// without this (and [defaultLlmModel] / [defaultLlmApiKey]) fails loudly at
+  /// chat-client creation.
   static const String defaultLlmBaseUrl = String.fromEnvironment(
     'LLM_BASE_URL',
   );
 
-  /// Optional inference model dart-define (e.g. a LibreChat agent id). Blank
-  /// falls back to [gatewayLlmModel].
-  static const String defaultLlmModel = String.fromEnvironment(
-    'LLM_MODEL',
-    defaultValue: gatewayLlmModel,
-  );
+  /// Inference model dart-define (e.g. a LibreChat agent id).
+  static const String defaultLlmModel = String.fromEnvironment('LLM_MODEL');
 
-  /// Optional inference bearer key dart-define (e.g. a LibreChat API key).
-  /// Blank falls back to the gateway's better-auth key.
-  static const String defaultLlmApiKey = String.fromEnvironment(
-    'LLM_API_KEY',
-  );
+  /// Inference bearer key dart-define (e.g. a LibreChat API key).
+  static const String defaultLlmApiKey = String.fromEnvironment('LLM_API_KEY');
+
+  /// Normalises [base] for clients that append their own `/v1/...` path
+  /// (vision's models probe + client): strips whitespace, a trailing slash,
+  /// and a trailing API-version `/v1` suffix. `https://h/api/agents/v1` →
+  /// `https://h/api/agents`; `https://h/api/openai/v1/` → `https://h/api/openai`.
+  static String stripV1Suffix(String base) {
+    final value = trimTrailingSlash(base);
+    if (value.endsWith('/v1')) {
+      return value.substring(0, value.length - 3);
+    }
+    return value;
+  }
+
+  /// Removes surrounding whitespace and a trailing `/` from [value]. Keeps
+  /// any API-version `/v1` prefix — that is [stripV1Suffix]'s job.
+  static String trimTrailingSlash(String value) {
+    var result = value.trim();
+    while (result.endsWith('/')) {
+      result = result.substring(0, result.length - 1);
+    }
+    return result;
+  }
 
   /// voice-mcp: tool bridge (bearer-gated).
   static Uri mcp(String host, {BackendEnvironment? environment}) =>
-      Uri(scheme: _scheme(environment), host: host, port: 17601);
+      Uri(
+        scheme: _scheme(environment),
+        host: _sanitizeAuthority(host),
+        port: 17601,
+      );
 
   /// files service: bearer-gated upload/list/fetch/delete.
   static Uri files(String host, {BackendEnvironment? environment}) =>
-      Uri(scheme: _scheme(environment), host: host, port: 17603);
+      Uri(
+        scheme: _scheme(environment),
+        host: _sanitizeAuthority(host),
+        port: 17603,
+      );
 
   static String _scheme(BackendEnvironment? environment) =>
       (environment ?? defaultEnvironment).scheme;

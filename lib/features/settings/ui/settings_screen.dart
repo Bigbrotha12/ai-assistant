@@ -23,8 +23,9 @@ import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
 import '../../auth/ui/auth_flow.dart';
 
-/// App home screen: configure and verify connectivity to the self-hosted
-/// backend gateway (auth, inference, vision).
+/// App home screen: configure the gateway host for account services and
+/// verify connectivity (auth on the gateway; inference/vision against the
+/// build-time LLM_* API — see AGENTS.md).
 class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
 

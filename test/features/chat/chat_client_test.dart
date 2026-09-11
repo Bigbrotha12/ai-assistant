@@ -141,9 +141,10 @@ class _ScriptedAdapter implements HttpClientAdapter {
 
 ChatApiClient _client(_ScriptedAdapter adapter, {String? apiKey}) =>
     ChatApiClient(
-      baseUrl: 'http://192.168.1.5:17600/v1',
+      baseUrl: 'https://librechat.test/api/agents/v1',
       dio: Dio()..httpClientAdapter = adapter,
       apiKey: apiKey,
+      model: 'agent_1',
     );
 
 void main() {
@@ -175,7 +176,7 @@ void main() {
       final req = adapter.requests.single;
       final body = req.data as Map<String, dynamic>;
       expect(req.responseType, ResponseType.stream);
-      expect(body['model'], 'Qwen3-8B-Q4_K_M.gguf');
+      expect(body['model'], 'agent_1');
       expect(body['stream'], isTrue);
       expect(body['max_tokens'], 4096);
       expect(body['chat_template_kwargs'], {'enable_thinking': false});
@@ -596,23 +597,31 @@ void main() {
       expect(receivedCount, 1);
     });
 
-    test('does NOT fire on 401 and throws ChatServerError', () async {
+    test('does NOT fire on 401 and throws InferenceAuthError', () async {
       final adapter = _ScriptedAdapter([
         _ErrorAction(401, body: 'Unauthorized'),
       ]);
       final client = _client(adapter);
 
       var receivedCount = 0;
-      await expectLater(
-        client.streamCompletions(
+      Object? caught;
+      try {
+        await client.streamCompletions(
           messages: messages,
           onReceived: () => receivedCount++,
-        ),
-        throwsA(
-          isA<ChatServerError>()
-              .having((e) => e.statusCode, 'statusCode', 401),
-        ),
+        );
+      } on Object catch (e) {
+        caught = e;
+      }
+
+      expect(
+        caught,
+        isA<InferenceAuthError>()
+            .having((e) => e.statusCode, 'statusCode', 401),
       );
+      // The inference API 401 is not the gateway minted-key rejection the
+      // re-auth flow can fix.
+      expect(isAuthRequiredError(caught!), isFalse);
       expect(receivedCount, 0);
     });
 

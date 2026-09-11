@@ -6,18 +6,13 @@ import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
-import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
-import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/core/http/dio_provider.dart';
-import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/features/vision/data/vision_client.dart';
 import 'package:ai_assistant/features/vision/data/vision_config.dart';
 import 'package:ai_assistant/features/vision/data/vision_provider.dart';
 import 'package:ai_assistant/features/vision/data/vram_gate.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
 
-import '../../fakes.dart';
 import '../voice/voice_test_fakes.dart';
 
 /// Scripted [HttpClientAdapter] for the vision-provider preflight probe.
@@ -62,20 +57,14 @@ void main() {
           voiceSettingsStoreProvider.overrideWithValue(
             FakeVoiceSettingsStore(),
           ),
-          settingsStoreProvider.overrideWithValue(
-            FakeSettingsStore(
-              stored: const BackendSettings(host: 'myhost'),
+          inferenceConfigProvider.overrideWithValue(
+            const (
+              baseUrl: 'https://librechat.test/api/agents/v1',
+              model: 'agent_1',
+              apiKey: 'sk-test123',
             ),
           ),
           dioProvider.overrideWithValue(Dio()..httpClientAdapter = adapter),
-          authCredentialsStoreProvider.overrideWithValue(
-            FakeAuthCredentialsStore(
-              stored: const AuthCredentials(
-                apiKey: 'sk-test123',
-                email: 'me@example.com',
-              ),
-            ),
-          ),
         ],
       );
       addTearDown(container.dispose);
@@ -103,20 +92,14 @@ void main() {
           voiceSettingsStoreProvider.overrideWithValue(
             FakeVoiceSettingsStore(),
           ),
-          settingsStoreProvider.overrideWithValue(
-            FakeSettingsStore(
-              stored: const BackendSettings(host: 'myhost'),
+          inferenceConfigProvider.overrideWithValue(
+            const (
+              baseUrl: 'https://librechat.test/api/agents/v1',
+              model: 'agent_1',
+              apiKey: 'sk-test123',
             ),
           ),
           dioProvider.overrideWithValue(Dio()..httpClientAdapter = adapter),
-          authCredentialsStoreProvider.overrideWithValue(
-            FakeAuthCredentialsStore(
-              stored: const AuthCredentials(
-                apiKey: 'sk-test123',
-                email: 'me@example.com',
-              ),
-            ),
-          ),
         ],
       );
       addTearDown(container.dispose);
@@ -130,6 +113,27 @@ void main() {
         adapter.requests.single.headers['Authorization'],
         'Bearer sk-test123',
       );
+    });
+
+    test('falls back to NoOpVisionClient when inference is unconfigured',
+        () async {
+      final adapter = _ModelsAdapter();
+      final container = ProviderContainer(
+        overrides: [
+          vramGateProvider.overrideWithValue(const NoOpVRAMGate()),
+          voiceSettingsStoreProvider.overrideWithValue(
+            FakeVoiceSettingsStore(),
+          ),
+          // Defaults (blank LLM_* define in a test build): no backend.
+          dioProvider.overrideWithValue(Dio()..httpClientAdapter = adapter),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      final client = await container.read(visionClientProvider.future);
+
+      expect(client, isA<NoOpVisionClient>());
+      expect(adapter.requests, isEmpty);
     });
   });
 }

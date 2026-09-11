@@ -109,6 +109,9 @@ class VisionApiClient implements VisionClient {
         data: body,
         options: Options(
           headers: headers,
+          // Never replay the bearer key to a redirect target on another
+          // origin; a 3xx is a misconfiguration and must surface as an error.
+          followRedirects: false,
           connectTimeout: _connectTimeout,
           receiveTimeout: _receiveTimeout,
         ),

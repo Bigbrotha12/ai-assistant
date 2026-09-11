@@ -37,9 +37,10 @@ final audioPlaybackServiceProvider = Provider<AudioPlayback>((ref) {
 
 /// Owns the [VoiceController] for the current (or next) conversation.
 ///
-/// Rebuilds when backend settings or auth credentials change (the latter
-/// matters after a re-auth mints a fresh API key): watching [chatApiClientProvider]
-/// creates a fresh controller wired to a client carrying the current key.
+/// Rebuilds when backend auth credentials change: watching
+/// [chatApiClientProvider] keeps a fresh controller wired to the shared chat
+/// client (the inference target is fixed at build time via the `LLM_*`
+/// dart-defines — see AGENTS.md).
 final voiceControllerProvider =
     NotifierProvider<VoiceControllerNotifier, VoiceController>(
       VoiceControllerNotifier.new,
