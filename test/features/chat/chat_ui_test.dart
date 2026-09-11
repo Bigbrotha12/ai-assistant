@@ -60,7 +60,7 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
-    expect(find.text('AI Assistant'), findsOneWidget);
+    expect(find.text('Voice Assist'), findsOneWidget);
     expect(find.text('Message…'), findsOneWidget);
     final textField = tester.widget<TextField>(find.byType(TextField));
     expect(textField.enabled, isTrue);

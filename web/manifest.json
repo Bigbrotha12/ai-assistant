@@ -1,6 +1,6 @@
 {
-    "name": "AI Assistant",
-    "short_name": "AI Assistant",
+    "name": "Voice Assist",
+    "short_name": "Voice Assist",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#FBFBFC",

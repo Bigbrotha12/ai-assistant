@@ -1004,7 +1004,7 @@ void main() {
       ));
       await pumpBounded(tester);
 
-      expect(find.text('AI Assistant'), findsOneWidget);
+      expect(find.text('Voice Assist'), findsOneWidget);
       expect(find.byType(SpeakButton), findsOneWidget);
       expect(find.text('PRESS AND HOLD TO TALK'), findsOneWidget);
       // The voice/text toggle pill renders in both modes.

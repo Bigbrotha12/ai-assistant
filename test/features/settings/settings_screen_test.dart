@@ -195,7 +195,7 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      expect(find.text('AI Assistant'), findsOneWidget);
+      expect(find.text('Voice Assist'), findsOneWidget);
       expect(find.text('Backend host'), findsOneWidget);
       expect(probe.calls, 0);
     });

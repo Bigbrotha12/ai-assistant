@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../theme.dart';
 
-/// Brand logo tile for the AI Assistant app.
+/// Brand logo tile for the Voice Assist app.
 ///
 /// Renders the bundled logo asset inside a rounded tile with a 1px hairline
 /// `outline` border — the design system prefers hairline borders over shadows
@@ -88,7 +88,7 @@ class BrandAppBarTitle extends StatelessWidget {
       children: [
         AppLogo(size: logoSize),
         const SizedBox(width: AppSpacing.sm),
-        Text('AI Assistant', style: theme.textTheme.titleLarge),
+        Text('Voice Assist', style: theme.textTheme.titleLarge),
       ],
     );
   }

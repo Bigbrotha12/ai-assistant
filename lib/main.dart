@@ -17,7 +17,7 @@ class AiAssistantApp extends ConsumerWidget {
     final premium = tier == AppTier.premium;
 
     return MaterialApp(
-      title: 'AI Assistant',
+      title: 'Voice Assist',
       theme: premium ? buildPremiumTheme() : buildCoreTheme(),
       // The premium tier paints the warm-ivory paper base plus grain behind
       // every screen (the scaffold chrome is transparent so both show

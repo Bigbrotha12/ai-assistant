@@ -72,7 +72,7 @@ class _SplashView extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(
-              'AI Assistant',
+              'Voice Assist',
               style: Theme.of(context).textTheme.headlineMedium,
             ),
             const SizedBox(height: 24),

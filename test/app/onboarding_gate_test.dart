@@ -156,7 +156,7 @@ void main() {
       ));
       await tester.pump();
 
-      expect(find.text('AI Assistant'), findsOneWidget);
+      expect(find.text('Voice Assist'), findsOneWidget);
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
       expect(find.byType(SpeakButton), findsNothing);
       expect(find.byType(OnboardingScreen), findsNothing);

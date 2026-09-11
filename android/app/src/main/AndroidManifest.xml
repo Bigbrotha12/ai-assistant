@@ -3,7 +3,7 @@
     <!-- Voice Conversation (Phase 4): microphone capture only (foreground) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <application
-        android:label="ai_assistant"
+        android:label="Voice Assist"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
