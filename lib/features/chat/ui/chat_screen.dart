@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -9,7 +7,7 @@ import '../../attachments/data/files_service.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../../app/theme.dart';
 import '../../../app/widgets/app_logo.dart';
-import '../../../app/widgets/gold_band.dart';
+import '../../../app/widgets/voice_text_mode_pill.dart';
 import '../../attachments/ui/attachment_picker.dart';
 import '../../attachments/data/file_model.dart';
 import '../../auth/ui/auth_flow.dart';
@@ -17,6 +15,7 @@ import '../../settings/ui/settings_screen.dart';
 import '../../voice/ui/voice_screen.dart';
 import './chat_providers.dart';
 import './conversation_list.dart';
+import '../data/database_providers.dart';
 import './message_list.dart';
 import '../data/message_model.dart';
 
@@ -98,21 +97,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // Critical (§3.6): the input is only cleared once the message has actually
     // been persisted. If the send fails before persisting (the notifier throws
     // before appending the user message), the input and attachment selection
-    // are preserved so the user can retry.
+    // are preserved so the user can retry. A turn that fails AFTER the user
+    // message was persisted must still clear the input — otherwise a retry
+    // would append the same message twice.
     try {
       await ref
           .read(conversationProvider(_conversationId).notifier)
           .sendMessage(text, attachments: attachments);
     } catch (_) {
-      return;
+      // Fall through: the persistence check below decides whether the message
+      // actually landed (clearing the input) or the send never started
+      // (preserving it).
     }
     if (!mounted) return;
 
-    final after = ref.read(conversationProvider(_conversationId)).value;
-    final persisted = after != null &&
-        after.messages.length > state.messages.length &&
-        after.messages[state.messages.length].role == MessageRole.user &&
-        after.messages[state.messages.length].content == text;
+    // Verify the user message was actually PERSISTED (not merely optimistically
+    // appended to in-memory state) before clearing the input. Reading from the
+    // store disambiguates a turn that failed before persisting (the message is
+    // absent → keep the input for retry) from one that failed after (present →
+    // clear it), and survives an autoDispose rebuild mid-send. Match on a
+    // prefix because vision may expand the content with appended
+    // [Image: ...] descriptions.
+    final persisted = await _isUserMessagePersisted(text);
     if (!persisted) return;
 
     _input.clear();
@@ -125,26 +131,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     });
   }
 
-  /// Voice shortcut FAB. In the premium tier the FAB gets a metallic gold
-  /// ring (§3.2: gold on the edge, never as a fill).
-  Widget _buildVoiceFab() {
-    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
-    final fab = FloatingActionButton(
-      tooltip: 'Voice Conversation',
-      onPressed: () => Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const VoiceScreen()),
-      ),
-      child: const Icon(Icons.mic),
-    );
-    if (!tier.premium) return fab;
-    return GoldEdge(
-      bandWidth: GoldBand.cta,
-      radius: AppRadii.pill,
-      fill: AppColors.paperRaised,
-      child: Padding(
-        padding: const EdgeInsets.all(GoldBand.cta),
-        child: fab,
-      ),
+  /// True when a user message starting with [text] exists in the persisted
+  /// conversation, i.e. the send actually landed in the store.
+  Future<bool> _isUserMessagePersisted(String text) async {
+    final conversation =
+        await ref.read(chatStoreProvider).loadConversation(_conversationId);
+    if (conversation == null) return false;
+    return conversation.messages.any((m) =>
+        m.role == MessageRole.user && m.content.startsWith(text));
+  }
+
+  /// Hands off to the voice screen via the shared Voice/Text pill. Replaces
+  /// this screen so toggling modes never stacks surfaces (Voice→Text→Voice
+  /// would otherwise grow the back stack unboundedly).
+  void _openVoice() {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const VoiceScreen()),
     );
   }
 
@@ -155,6 +157,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final activeId = ref.watch(activeConversationIdProvider);
     if (activeId != null && activeId != _conversationId) {
       _conversationId = activeId;
+      // Switching conversations must not carry a draft / selected files from
+      // the previous conversation into the next send.
+      _input.clear();
+      _attachments.clear();
     }
     final stateAsync = ref.watch(conversationProvider(_conversationId));
     final state = stateAsync.value;
@@ -211,7 +217,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
         ],
       ),
-      floatingActionButton: _buildVoiceFab(),
       body: Column(
         children: [
           if (!settingsValid) _ConfigureBanner(),
@@ -254,6 +259,43 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     enabled: filesConfigured,
                   )
                 : null,
+          ),
+          // Bottom bar: the shared Voice/Text pill (Text selected) hands off
+          // to the voice screen; the settings gear is pinned right.
+          Material(
+            color: Theme.of(context).colorScheme.surfaceContainerLow,
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    VoiceTextModePill(
+                      selected: true,
+                      enabled: !isStreaming,
+                      onChanged: (text) {
+                        if (!text) _openVoice();
+                      },
+                    ),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: IconButton(
+                        key: const Key('engine-bar-settings'),
+                        tooltip: 'Settings',
+                        icon: const Icon(Icons.settings_outlined),
+                        onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => const SettingsScreen(),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ],
       ),
@@ -372,7 +414,6 @@ class _InputBar extends StatelessWidget {
                       tooltip: 'Send',
                       onPressed: canSend ? onSend : null,
                     ),
-                  const SizedBox(width: 56),
                 ],
               ),
             ],

@@ -1837,6 +1837,10 @@ abstract class _$AppDatabase extends GeneratedDatabase {
   late final $MessagesTable messages = $MessagesTable(this);
   late final $FilesTable files = $FilesTable(this);
   late final $MemoriesTable memories = $MemoriesTable(this);
+  late final Index messagesConversationIdIdx = Index(
+    'messages_conversation_id_idx',
+    'CREATE INDEX messages_conversation_id_idx ON messages (conversation_id)',
+  );
   late final Index filesConversationIdIdx = Index(
     'files_conversation_id_idx',
     'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
@@ -1854,6 +1858,7 @@ abstract class _$AppDatabase extends GeneratedDatabase {
     messages,
     files,
     memories,
+    messagesConversationIdIdx,
     filesConversationIdIdx,
     memoriesUpdatedAtIdx,
   ];

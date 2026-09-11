@@ -15,6 +15,7 @@ class Conversations extends Table {
 }
 
 @DataClassName('MessageRow')
+@TableIndex(name: 'messages_conversation_id_idx', columns: {#conversationId})
 class Messages extends Table {
   TextColumn get id => text()();
   TextColumn get conversationId =>
@@ -81,7 +82,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 4;
+  int get schemaVersion => 5;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -102,7 +103,12 @@ class AppDatabase extends _$AppDatabase {
             await m.createIndex(memoriesUpdatedAtIdx);
             await _createMemoryFts(m);
           }
+          if (from < 5) {
+            await m.createIndex(messagesConversationIdIdx);
+          }
           // v4: memories table + FTS5 full-text search (see DriftMemoryStore).
+          // v5: index on messages.conversationId (per-conversation message
+          // loads and watchConversations scan no longer table-scan).
         },
         beforeOpen: (details) async {
           // SQLite does NOT enable FK enforcement by default — without this

@@ -433,7 +433,10 @@ class ChatApiClient implements ChatClient {
     }
 
     return ChatResult(
-      content: content.toString(),
+      // Strip any structured-output control tokens that survived the
+      // per-delta parser cleaning (a PUA tool/citation marker can be split
+      // across multiple SSE deltas, so the accumulated buffer is cleaned too).
+      content: stripStructuredTokens(content.toString()),
       toolCalls: toolCalls,
       finishReason: effectiveFinish,
     );

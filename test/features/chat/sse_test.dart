@@ -148,6 +148,45 @@ void main() {
       expect(events.map((e) => e.type), [SseEventType.content, SseEventType.done]);
       expect(events.first.content, 'answer');
     });
+
+    test('structured-output tool markers are stripped from content', () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: ${chunk(content: 'Done. \ue202turn0search0')}\n\n'
+        'data: ${chunk(content: 'Let me check that.')}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      expect(
+        events
+            .where((e) => e.type == SseEventType.content)
+            .map((e) => e.content!)
+            .join(),
+        'Done. Let me check that.',
+      );
+    });
+
+    test('a citation block with sentinels is stripped', () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: ${chunk(content: 'Source: \ue200cite\ue202turn0file0\ue201')}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      expect(
+        events
+            .where((e) => e.type == SseEventType.content)
+            .map((e) => e.content!)
+            .join(),
+        'Source: ',
+      );
+    });
+
+    test('stripStructuredTokens is idempotent and safe on plain text', () {
+      expect(stripStructuredTokens('Hello world'), 'Hello world');
+      expect(
+        stripStructuredTokens('a\ue202turn0search0b'),
+        'ab',
+      );
+    });
   });
 
   group('termination', () {
