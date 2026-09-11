@@ -16,6 +16,7 @@ import '../../auth/data/auth_credentials_providers.dart';
 import '../../chat/data/chat_client.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../../app/theme.dart';
+import '../../../app/widgets/app_logo.dart';
 import '../../../app/widgets/golden_pill.dart';
 import '../../../app/widgets/speak_button.dart';
 import '../../auth/ui/auth_flow.dart';
@@ -470,7 +471,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
           icon: const Icon(Icons.add_comment_outlined),
           onPressed: _newConversation,
         ),
-        title: const Text('AI Assistant'),
+        title: const BrandAppBarTitle(),
         actions: [
           IconButton(
             key: const Key('history'),

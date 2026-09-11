@@ -1,11 +1,11 @@
 {
-    "name": "ai_assistant",
-    "short_name": "ai_assistant",
+    "name": "AI Assistant",
+    "short_name": "AI Assistant",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#FBFBFC",
+    "theme_color": "#4A5D8A",
+    "description": "Voice-first AI assistant.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

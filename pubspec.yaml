@@ -82,6 +82,7 @@ dev_dependencies:
   json_serializable: ^6.14.1
   build_runner: ^2.16.0
   drift_dev: ^2.34.3
+  flutter_launcher_icons: ^0.14.4
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -93,6 +94,10 @@ flutter:
   # included with your application, so that it uses the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # App branding assets (see docs/logo-variants/ for the design review set).
+  assets:
+    - assets/branding/
 
   # Design system fonts (see docs/design-system.md). Both are variable fonts;
   # each declared weight maps to the same file so the named weight is applied.
@@ -150,3 +155,18 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+# App launcher icons — generated from the selected logo (Variant C "Echo",
+# see docs/logo-variants/). Regenerate with: dart run flutter_launcher_icons
+flutter_launcher_icons:
+  android: true
+  ios: true
+  web:
+    generate: true
+  image_path: "assets/branding/app_logo.png"
+  # Variant C is full-bleed indigo; the tool's default 16% adaptive inset keeps
+  # the mark inside Android's safe zone, so the same asset serves as foreground.
+  adaptive_icon_background: "#272F4A"
+  adaptive_icon_foreground: "assets/branding/app_logo.png"
+  remove_alpha_ios: true
+  min_sdk_android: 21

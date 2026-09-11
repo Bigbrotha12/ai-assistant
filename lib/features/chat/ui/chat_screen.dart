@@ -8,6 +8,7 @@ import '../../attachments/data/files_providers.dart';
 import '../../attachments/data/files_service.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../../app/theme.dart';
+import '../../../app/widgets/app_logo.dart';
 import '../../../app/widgets/gold_band.dart';
 import '../../attachments/ui/attachment_picker.dart';
 import '../../attachments/data/file_model.dart';
@@ -200,7 +201,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           icon: const Icon(Icons.add_comment_outlined),
           onPressed: _newChat,
         ),
-        title: const Text('AI Assistant'),
+        title: const BrandAppBarTitle(),
         actions: [
           IconButton(
             key: const Key('history'),

@@ -157,10 +157,15 @@ void main() {
     await tester.tap(find.byIcon(Icons.send));
     await tester.pumpAndSettle();
 
-    // Plain and sized image markdown must not produce an Image widget (which
-    // would fetch the URL via Image.network and allow SSRF into internal
-    // tailnet services).
-    expect(find.byType(Image), findsNothing);
+    // Plain and sized image markdown must not produce a network-fetching
+    // Image widget (Image.network would fetch the URL and allow SSRF into
+    // internal tailnet services). Match on a NetworkImage provider rather than
+    // any Image: the app-bar brand logo is a bundled Image.asset and is
+    // harmless, so a blanket `findsNothing` would be a false positive.
+    expect(
+      find.byWidgetPredicate((w) => w is Image && w.image is NetworkImage),
+      findsNothing,
+    );
   });
 
   testWidgets('tool-call chip renders when assistant message has toolCalls',

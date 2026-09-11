@@ -13,6 +13,7 @@ import '../../settings/data/prefs_providers.dart';
 import '../../settings/data/prefs_store.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../../app/theme.dart';
+import '../../../app/widgets/app_logo.dart';
 import '../../auth/ui/auth_flow.dart';
 import '../../voice/data/engine_config.dart';
 import '../../voice/data/engine_manager.dart';
@@ -535,7 +536,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     ];
 
     return Scaffold(
-      appBar: AppBar(title: const Text('AI Assistant')),
+      appBar: AppBar(title: const BrandAppBarTitle()),
       body: SafeArea(
         child: Stepper(
           type: StepperType.vertical,

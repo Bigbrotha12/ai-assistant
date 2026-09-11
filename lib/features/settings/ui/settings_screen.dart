@@ -16,6 +16,7 @@ import '../data/prefs_store.dart';
 import '../../../core/probe_providers.dart';
 import '../data/settings_providers.dart';
 import '../../../app/theme_providers.dart';
+import '../../../app/widgets/app_logo.dart';
 import '../../../app/widgets/probe_status_row.dart';
 import '../../voice/data/voice_settings.dart';
 import '../../voice/ui/voice_settings_providers.dart';
@@ -317,7 +318,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final canSave = canTest;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('AI Assistant')),
+      appBar: AppBar(title: const BrandAppBarTitle()),
       body: Column(
         children: [
           if (isLoading) const LinearProgressIndicator(minHeight: 2),
