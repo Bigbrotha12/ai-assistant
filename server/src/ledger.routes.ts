@@ -6,6 +6,7 @@ import type { Context } from "hono";
 import { env } from "./env.ts";
 import { requireApiKey, unauthorized } from "./inference.ts";
 import { Ledger, LedgerError, migrateLedger } from "./ledger.ts";
+import type { VerifyApiKeyFn } from "./plugins/routes.ts";
 
 /**
  * The ledger lives in a dedicated SQLite file (`LEDGER_DB_PATH`, default
@@ -34,11 +35,15 @@ if (orphanedCount > 0) {
   );
 }
 
-export function createLedgerRoutes(l: Ledger): Hono {
+export function createLedgerRoutes(
+  l: Ledger,
+  opts: { verifyKey?: VerifyApiKeyFn } = {},
+): Hono {
+  const verifyKey = opts.verifyKey ?? requireApiKey;
   const routes = new Hono();
 
   routes.post("/tasks", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       intentKey?: unknown;
@@ -58,13 +63,25 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.get("/tasks", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     return c.json(l.listTasks(owner));
   });
 
+  // Status-by-idempotency-key: the client's poll-after-drop endpoint (plan
+  // line 228). Owner-scoped via getTaskByIntentKey — a cross-owner lookup is a
+  // miss → 404 (IDOR), never a leak. Registered before `/tasks/:id`; Hono's
+  // router disambiguates by segment count regardless.
+  routes.get("/tasks/by-key/:intentKey", async (c) => {
+    const owner = await verifyKey(c);
+    if (!owner) return unauthorized(c);
+    const task = l.getTaskByIntentKey(owner, c.req.param("intentKey"));
+    if (!task) return c.json({ error: "not_found" }, 404);
+    return c.json(task);
+  });
+
   routes.get("/tasks/:id", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const id = c.req.param("id");
     // Scope the read to the caller (IDOR): cross-owner reads are a miss → 404.
@@ -78,7 +95,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/claim", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     try {
       return c.json(l.claimTask(c.req.param("id"), owner));
@@ -88,7 +105,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/steps", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       stage?: unknown;
@@ -121,7 +138,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/heartbeat", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       fenceToken?: unknown;
@@ -142,7 +159,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/resume", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     try {
       return c.json(l.resumeTask(c.req.param("id"), owner));
@@ -152,7 +169,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/complete", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       status?: unknown;

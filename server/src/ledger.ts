@@ -64,6 +64,8 @@ export type StepRow = {
   action: string;
   result: string | null;
   ts: number;
+  /** Tool-call id (v4) for replay dedupe; null for non-tool steps. */
+  tool_call_id: string | null;
 };
 
 export type ChainRow = {
@@ -248,6 +250,41 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
         ADD COLUMN fence_token TEXT NOT NULL DEFAULT '';
     `);
   },
+  // v4 — idempotency (Phase 2 Wave B).
+  //
+  // (a) Unique (owner, intent_key): a client's idempotency key (messageId)
+  // maps to EXACTLY ONE task, forever, under one owner. This is the
+  // owner-scoped uniqueness that makes get-or-create-by-key race-safe. The v1
+  // comment deferred this constraint to Phase 6 (M12); Wave B's idempotency
+  // needs it now, so it lands here — and the get-or-create catches the
+  // SQLITE_CONSTRAINT violation and re-reads the existing row instead of
+  // erroring (no raw-INSERT 500 on a repeat). An UNCONDITIONAL index (no
+  // partial WHERE) is deliberate: a terminal task's intentKey is never
+  // re-sent as a new message (the client generates messageId once per send),
+  // so a partial index would only introduce "which row wins" ambiguity when a
+  // terminal and a fresh task share a key.
+  //
+  // (b) Replay dedupe: `ledger_step` gains a nullable `tool_call_id` (an
+  // OpenAI-style tool call id) recorded atomically with the tool's result, so
+  // a resumed checkpoint can look it up and NEVER re-execute a tool whose
+  // result was already stored. Partial unique index (only tool steps carry a
+  // tool_call_id) makes `hasToolResult` an indexed point lookup, not a scan,
+  // and makes a duplicate record a SQLITE_CONSTRAINT that `recordToolResult`
+  // catches (idempotent record). The column is intentionally NOT part of the
+  // hash-chain content (`canonicalStepContent`): adding it would change digest
+  // computation for pre-existing chains and break `verifyChain` backward
+  // compatibility. Data-preserving (existing steps get NULL tool_call_id).
+  (db) => {
+    db.exec(`
+      CREATE UNIQUE INDEX idx_ledger_task_owner_intent
+        ON ledger_task(owner, intent_key);
+
+      ALTER TABLE ledger_step ADD COLUMN tool_call_id TEXT;
+      CREATE UNIQUE INDEX idx_ledger_step_tool_call
+        ON ledger_step(task_id, tool_call_id)
+        WHERE tool_call_id IS NOT NULL;
+    `);
+  },
 ];
 
 export const CURRENT_LEDGER_VERSION = LEDGER_MIGRATIONS.length;
@@ -300,6 +337,9 @@ export interface AppendStepInput {
   stage: string;
   action: string;
   result: string | null;
+  /** Tool-call id (v4) recorded with the step for replay dedupe; undefined for
+   *  non-tool steps. */
+  toolCallId?: string;
 }
 
 export class Ledger {
@@ -376,6 +416,47 @@ export class Ledger {
   }
 
   /**
+   * Owner-scoped lookup by idempotency key (v4 unique index). The get-or-create
+   * path and the status-by-key endpoint both use this instead of a raw INSERT,
+   * so a repeat (owner, intent_key) re-reads the existing row and never 500s.
+   * Cross-owner reads are a miss (`null`).
+   */
+  getTaskByIntentKey(owner: string, intentKey: string): TaskRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, owner, intent_key, spec, worker, status, created_ts,
+                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
+                fence_token
+         FROM ledger_task WHERE owner = ? AND intent_key = ?`,
+      )
+      .get(owner, intentKey) as TaskRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Replay-dedupe lookup (v4): the step (if any) that already recorded this
+   * tool-call-id's result for a task. Backed by the partial unique index on
+   * (task_id, tool_call_id), so it is an indexed point lookup, not a scan.
+   * When [owner] is provided, cross-owner reads are a miss (`null`).
+   */
+  getStepByToolCallId(
+    taskId: string,
+    toolCallId: string,
+    owner?: string,
+  ): StepRow | null {
+    if (owner !== undefined && this.getTask(taskId, owner) === null) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
+         FROM ledger_step WHERE task_id = ? AND tool_call_id = ?`,
+      )
+      .get(taskId, toolCallId) as StepRow | undefined;
+    return row ?? null;
+  }
+
+  /**
    * Lists tasks. When [owner] is provided, only that owner's tasks are
    * returned (the routes always pass the caller's reference id, so a tenant
    * never sees another tenant's tasks).
@@ -411,7 +492,7 @@ export class Ledger {
     }
     return this.db
       .prepare(
-        `SELECT id, task_id, seq, stage, action, result, ts
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
          FROM ledger_step WHERE task_id = ? ORDER BY seq`,
       )
       .all(taskId) as StepRow[];
@@ -543,8 +624,9 @@ export class Ledger {
       const stepId = randomUUID();
       this.db
         .prepare(
-          `INSERT INTO ledger_step (id, task_id, seq, stage, action, result, ts)
-           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts)`,
+          `INSERT INTO ledger_step
+             (id, task_id, seq, stage, action, result, ts, tool_call_id)
+           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts, @toolCallId)`,
         )
         .run({
           id: stepId,
@@ -554,6 +636,7 @@ export class Ledger {
           action: input.action,
           result: input.result,
           ts,
+          toolCallId: input.toolCallId ?? null,
         });
 
       const prevDigest = this.readChain(taskId).at(-1)?.digest ?? genesisDigest(taskId);
@@ -583,6 +666,7 @@ export class Ledger {
         action: input.action,
         result: input.result,
         ts,
+        tool_call_id: input.toolCallId ?? null,
       };
     });
     if (!step) throw new LedgerError("APPEND_ONLY_VIOLATION", "step append failed");

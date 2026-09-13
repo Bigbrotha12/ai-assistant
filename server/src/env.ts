@@ -4,6 +4,15 @@ import { parseTrustedHostEntries } from "./plugins/ssrf.ts";
 
 config({ quiet: true });
 
+/**
+ * Development-only encryption key for the checkpoint store. Conversations must
+ * survive gateway restarts in dev too, so this default is a STABLE literal
+ * (never randomly re-derived — a fresh random key per boot would make every
+ * previously-written checkpoint DB unreadable). It is a loud anti-pattern
+ * named as such; production is fail-fast instead (see the superRefine below).
+ */
+const CHECKPOINT_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
+
 const envSchema = z.object({
   BETTER_AUTH_SECRET: z
     .string()
@@ -21,6 +30,32 @@ const envSchema = z.object({
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),
+  CHECKPOINT_DB_PATH: z.string().default("./data/checkpoints.db"),
+  // Encrypted-at-rest key for the checkpoint store. Required in production
+  // (fail-fast below); development falls back to a stable DEV-ONLY default and
+  // warns loudly. The transform guarantees a non-undefined value by export.
+  CHECKPOINT_DB_KEY: z
+    .string()
+    .optional()
+    .superRefine((value, ctx) => {
+      if (process.env.NODE_ENV === "production" && !value) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "CHECKPOINT_DB_KEY is required when NODE_ENV=production; " +
+            "the checkpoint DB is encrypted at rest and refuses a plaintext default",
+        });
+      }
+    })
+    .transform((value) => {
+      if (value) return value;
+      console.warn(
+        "Gateway: CHECKPOINT_DB_KEY is unset; using a DEVELOPMENT-ONLY default " +
+          "key for the checkpoint store. Set CHECKPOINT_DB_KEY to a real secret " +
+          "(e.g. `openssl rand -hex 32`) before production.",
+      );
+      return CHECKPOINT_DEV_DEFAULT_KEY;
+    }),
   PLUGINS_STORE_PATH: z.string().default("./data/plugins.json"),
   PLUGINS_TRUSTED_HOSTS: z
     .string()

@@ -1,6 +1,8 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { auth } from "./auth.ts";
+import { createCheckpointRoutes } from "./checkpoints/routes.ts";
+import { createCheckpointStore } from "./checkpoints/store.ts";
 import { env } from "./env.ts";
 import { inferenceRoutes } from "./inference.ts";
 import { ledgerRoutes } from "./ledger.routes.ts";
@@ -28,12 +30,22 @@ pluginRegistry.watch({
 });
 app.route("/v1", createPluginRoutes({ registry: pluginRegistry, store: pluginStore }));
 
+// Durable, encrypted conversation checkpoints (Phase 2, Wave B1). The store
+// opens the SQLCipher-keyed SQLite file at CHECKPOINT_DB_PATH; the transport
+// (Wave C1) compiles the agent graph over `checkpointStore.checkpointer`.
+const checkpointStore = await createCheckpointStore({
+  dbPath: env.CHECKPOINT_DB_PATH,
+  dbKey: env.CHECKPOINT_DB_KEY,
+});
+app.route("/v1", createCheckpointRoutes({ store: checkpointStore }));
+
 app.get("/", (c) =>
   c.json({
     name: "ai-assistant-gateway",
     auth: "/api/auth",
     inference: "/v1/chat/completions",
     ledger: "/ledger",
+    threads: "/v1/threads",
   }),
 );
 
