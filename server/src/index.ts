@@ -3,9 +3,12 @@ import { Hono } from "hono";
 import { auth } from "./auth.ts";
 import { createCheckpointRoutes } from "./checkpoints/routes.ts";
 import { createCheckpointStore } from "./checkpoints/store.ts";
+import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
 import { inferenceRoutes } from "./inference.ts";
-import { ledgerRoutes } from "./ledger.routes.ts";
+import { createJobRunner } from "./jobs/runner.ts";
+import type { JobRunner } from "./jobs/runner.ts";
+import { ledgerRoutes, ledger } from "./ledger.routes.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 
@@ -38,6 +41,28 @@ const checkpointStore = await createCheckpointStore({
   dbKey: env.CHECKPOINT_DB_KEY,
 });
 app.route("/v1", createCheckpointRoutes({ store: checkpointStore }));
+
+// Async job runner (Phase 2, Wave C1). Constructed GUARDED: background jobs
+// are not wired into the HTTP transport yet (Phase 3), so boot must never fail
+// because a dep is unavailable. The in-memory pin store starts empty — Phase 5
+// pins credentials at admission; `buildModel` (model plugin resolution) and
+// `credentialSource` (restart re-pin) are Phase 3/5 seams.
+let jobRunner: JobRunner | undefined;
+try {
+  jobRunner = createJobRunner({
+    ledger,
+    registry: pluginRegistry,
+    pins: new CredentialPinStore(),
+    checkpointer: checkpointStore.checkpointer,
+    getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
+  });
+  // Restart-loss startup pass: `ledger.reconcileOrphans()` (ledger.routes.ts)
+  // already marked orphans `stuck`; resumeStuckJobs fails them cleanly with
+  // credentials_expired when pins can't be re-established (no vault yet).
+  await jobRunner.resumeStuckJobs();
+} catch (err) {
+  console.warn("jobs: JobRunner unavailable; background jobs disabled:", err);
+}
 
 app.get("/", (c) =>
   c.json({
