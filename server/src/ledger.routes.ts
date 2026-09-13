@@ -23,6 +23,16 @@ export const ledger = new Ledger(ledgerDb, {
   stuckTimeoutMs: env.LEDGER_STUCK_TIMEOUT_MS,
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,
 });
+// One-time startup orphan reconciliation: tasks left `running` by a crash or
+// restart with a lapsed lease / stale heartbeat become `stuck` before the
+// server accepts requests, so they can be resumed instead of lying false-stuck.
+// Count only, no task details.
+const orphanedCount = ledger.reconcileOrphans().marked.length;
+if (orphanedCount > 0) {
+  console.log(
+    `ledger: reconciled ${orphanedCount} orphaned running task(s) as stuck`,
+  );
+}
 
 export function createLedgerRoutes(l: Ledger): Hono {
   const routes = new Hono();
@@ -84,6 +94,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
       stage?: unknown;
       action?: unknown;
       result?: unknown;
+      fenceToken?: unknown;
     } | null;
     if (
       !body ||
@@ -93,11 +104,16 @@ export function createLedgerRoutes(l: Ledger): Hono {
       return c.json({ error: "invalid_request" }, 400);
     }
     try {
-      const out = l.appendStep(c.req.param("id"), owner, {
-        stage: body.stage,
-        action: body.action,
-        result: typeof body.result === "string" ? body.result : null,
-      });
+      const out = l.appendStep(
+        c.req.param("id"),
+        owner,
+        {
+          stage: body.stage,
+          action: body.action,
+          result: typeof body.result === "string" ? body.result : null,
+        },
+        typeof body.fenceToken === "string" ? body.fenceToken : undefined,
+      );
       return c.json(out, 201);
     } catch (e) {
       return ledgerError(c, e);
@@ -107,8 +123,19 @@ export function createLedgerRoutes(l: Ledger): Hono {
   routes.post("/tasks/:id/heartbeat", async (c) => {
     const owner = await requireApiKey(c);
     if (!owner) return unauthorized(c);
+    const body = (await c.req.json().catch(() => null)) as {
+      fenceToken?: unknown;
+    } | null;
     try {
-      return c.json(l.heartbeat(c.req.param("id"), owner));
+      return c.json(
+        l.heartbeat(
+          c.req.param("id"),
+          owner,
+          body && typeof body.fenceToken === "string"
+            ? body.fenceToken
+            : undefined,
+        ),
+      );
     } catch (e) {
       return ledgerError(c, e);
     }
@@ -152,7 +179,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
 function ledgerError(c: Context, e: unknown): Response {
   if (e instanceof LedgerError) {
     if (e.code === "TASK_NOT_FOUND") return c.json({ error: "not_found" }, 404);
-    if (e.code === "FORBIDDEN" || e.code === "LEASE_CONFLICT") {
+    if (e.code === "FORBIDDEN" || e.code === "LEASE_CONFLICT" || e.code === "FENCE_CONFLICT") {
       return c.json({ error: e.code.toLowerCase() }, 403);
     }
     if (e.code === "INVALID_CONFIG") return c.json({ error: "invalid_config" }, 500);

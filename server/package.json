@@ -13,11 +13,15 @@
     "typecheck": "tsc --noEmit",
     "migrate": "auth migrate && npm run migrate:ledger",
     "migrate:ledger": "tsx src/migrate-ledger.ts",
-    "test": "tsx --test test/**/*.test.ts"
+    "test": "tsx --test test/*.test.ts test/**/*.test.ts"
   },
   "dependencies": {
     "@better-auth/api-key": "^1.7.2",
     "@hono/node-server": "^2.1.1",
+    "@langchain/core": "^1.2.11",
+    "@langchain/langgraph": "^1.4.15",
+    "@langchain/langgraph-checkpoint-sqlite": "^1.0.4",
+    "@langchain/openai": "^1.5.13",
     "better-auth": "^1.7.2",
     "better-sqlite3": "^12.2.0",
     "dotenv": "^17.4.2",
