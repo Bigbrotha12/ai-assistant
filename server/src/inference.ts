@@ -78,26 +78,7 @@ inferenceRoutes.post("/chat/completions", async (c) => {
     return c.json({ error: "inference_unavailable" }, 502);
   }
 });
-
-inferenceRoutes.get("/models", async (c) => {
-  const apiKey = await requireApiKey(c);
-  if (!apiKey) return unauthorized(c);
-
-  const upstream = new URL("/v1/models", env.INFERENCE_URL);
-
-  try {
-    const resp = await fetch(upstream, {
-      method: "GET",
-      headers: { accept: "application/json" },
-    });
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: {
-        "content-type": resp.headers.get("content-type") ?? "application/json",
-      },
-    });
-  } catch (err) {
-    console.error("gateway: upstream models request failed", err);
-    return c.json({ error: "inference_unavailable" }, 502);
-  }
-});
+// NOTE: `GET /v1/models` was REMOVED here in Phase 3, Wave B — it moved to
+// `src/transport/models.ts` (createModelsRoutes), which serves the installed
+// MODEL plugins (incl. visionCapable) instead of proxying INFERENCE_URL. This
+// keeps a single `/v1/models` owner and avoids a duplicate-path mount conflict.

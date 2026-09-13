@@ -12,6 +12,7 @@ import type { JobRunner } from "./jobs/runner.ts";
 import { ledgerRoutes, ledger } from "./ledger.routes.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
+import { createModelsRoutes } from "./transport/models.ts";
 
 const app = new Hono();
 
@@ -33,6 +34,13 @@ pluginRegistry.watch({
   },
 });
 app.route("/v1", createPluginRoutes({ registry: pluginRegistry, store: pluginStore }));
+
+// Phase 3, Wave B: `GET /v1/models` now serves the installed MODEL plugins
+// (incl. `visionCapable`) from the registry instead of proxying INFERENCE_URL.
+// The old proxy handler was removed from inferenceRoutes (above), so this is
+// the single `/v1/models` owner — no duplicate-path shadowing regardless of
+// mount order. Never leaks plugin endpoints/baseUrls (see transport/models.ts).
+app.route("/v1", createModelsRoutes({ registry: pluginRegistry }));
 
 // Durable, encrypted conversation checkpoints (Phase 2, Wave B1). The store
 // opens the SQLCipher-keyed SQLite file at CHECKPOINT_DB_PATH; the transport

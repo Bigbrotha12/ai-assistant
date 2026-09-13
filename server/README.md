@@ -117,7 +117,7 @@ not the session token):
 | ------------------------- | -------------------------------------------------------------------- |
 | `GET  /v1/auth/check`     | API-key validity check (no upstream call). `200 {"status":"ok"}` with a valid key, else `401 {"error":"unauthorized"}`. |
 | `POST /v1/chat/completions` | Forwarded to `${INFERENCE_URL}/v1/chat/completions`. SSE passthrough. |
-| `GET  /v1/models`         | Forwarded to `${INFERENCE_URL}/v1/models`.                           |
+| `GET  /v1/models`         | Lists installed MODEL plugins (id + capability flags incl. `visionCapable`); never leaks provider endpoints. |
 
 Invalid or missing key → `401 {"error":"unauthorized"}`. Upstream unreachable →
 `502 {"error":"inference_unavailable"}`. `POST /v1/chat/completions` is
