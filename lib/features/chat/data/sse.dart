@@ -59,6 +59,7 @@ Stream<SseEvent> parseSse(Stream<List<int>> byteStream) async* {
 
   final seenIndexes = <int>{};
   final startedArgs = <int>{};
+  String? finishReason;
 
   await for (final line in lines) {
     if (line.isEmpty) continue;
@@ -69,7 +70,7 @@ Stream<SseEvent> parseSse(Stream<List<int>> byteStream) async* {
     if (payload.isEmpty) continue;
 
     if (payload == '[DONE]') {
-      yield const SseEvent.done(null);
+      yield SseEvent.done(finishReason);
       return;
     }
 
@@ -154,14 +155,15 @@ Stream<SseEvent> parseSse(Stream<List<int>> byteStream) async* {
       }
     }
 
-    final finishReason = choice['finish_reason'];
-    if (finishReason is String && finishReason.isNotEmpty) {
-      yield SseEvent.done(finishReason);
-      return;
+    final rawFinishReason = choice['finish_reason'];
+    if (rawFinishReason is String &&
+        rawFinishReason.isNotEmpty &&
+        finishReason == null) {
+      finishReason = rawFinishReason;
     }
   }
 
-  yield const SseEvent.done(null);
+  yield SseEvent.done(finishReason);
 }
 
 final _thinkingBlock = RegExp(r'<thinking>[\s\S]*?</thinking>');

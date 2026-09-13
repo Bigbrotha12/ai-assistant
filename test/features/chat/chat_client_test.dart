@@ -8,44 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 
-/// Wraps [payload] in a single SSE `data:` frame.
-String frame(String payload) => 'data: $payload\n\n';
-
-/// Builds an OpenAI-style streaming chunk payload as a JSON string.
-String chunk({
-  String? content,
-  List<Map<String, Object?>>? toolCalls,
-  String? finishReason,
-}) {
-  final delta = <String, Object?>{};
-  if (content != null) delta['content'] = content;
-  if (toolCalls != null) delta['tool_calls'] = toolCalls;
-  return jsonEncode({
-    'id': 'chatcmpl-1',
-    'object': 'chat.completion.chunk',
-    'choices': [
-      {'delta': delta, 'index': 0, 'finish_reason': finishReason},
-    ],
-  });
-}
-
-/// Builds a single `delta.tool_calls[]` entry as a map.
-Map<String, Object?> toolCall({
-  int index = 0,
-  String? id,
-  String? name,
-  String? arguments,
-}) {
-  final function = <String, Object?>{};
-  if (name != null) function['name'] = name;
-  if (arguments != null) function['arguments'] = arguments;
-  return {
-    'index': index,
-    'type': 'function',
-    'id': ?id,
-    'function': function,
-  };
-}
+import 'sse_fixtures.dart';
 
 sealed class _AdapterAction {}
 
@@ -233,6 +196,7 @@ void main() {
             toolCall(index: 1, arguments: '"UTC"}'),
           ])),
           frame(chunk(finishReason: 'tool_calls')),
+          frame('[DONE]'),
         ]),
       ]);
       final client = _client(adapter);

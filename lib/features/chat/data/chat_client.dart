@@ -6,24 +6,6 @@ import './message_model.dart';
 import '../../../core/http/dio_errors.dart';
 import './sse.dart';
 
-/// Structured event from the LLM stream.
-sealed class ChatEvent {}
-
-/// A content delta (thinking already stripped by the SSE parser).
-class ChatContentEvent extends ChatEvent {
-  ChatContentEvent(this.text);
-
-  final String text;
-}
-
-/// Terminal event signalling the end of the stream.
-class ChatDoneEvent extends ChatEvent {
-  ChatDoneEvent(this.finishReason);
-
-  /// 'stop' | 'tool_calls' | null (clean EOF without an explicit reason).
-  final String? finishReason;
-}
-
 /// The fully-assembled result of a chat completion turn.
 class ChatResult {
   const ChatResult({
@@ -387,7 +369,7 @@ class ChatApiClient implements ChatClient {
                   ?.call(delta.index, acc.name ?? '', delta.argsFragment);
             }
           case SseEventType.done:
-            finishReason = event.finishReason;
+            if (event.finishReason != null) finishReason = event.finishReason;
           case SseEventType.error:
             throw ChatStreamError(event.error ?? 'stream error');
         }
