@@ -13,6 +13,7 @@ import { ledgerRoutes, ledger } from "./ledger.routes.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createModelsRoutes } from "./transport/models.ts";
+import { createChatRoutes } from "./transport/chat.ts";
 
 const app = new Hono();
 
@@ -67,6 +68,23 @@ try {
 if (checkpointStore) {
   app.route("/v1", createCheckpointRoutes({ store: checkpointStore }));
 }
+
+// Phase 3, Wave C1: `POST /v1/chat/completions` is now the LangChain transport
+// (`src/transport/chat.ts`) — model built from the MODEL plugin + per-request
+// credentials, agent graph streamed via the SSE adapter. The old proxy handler
+// was removed from inferenceRoutes. The checkpoint store is optional here: if
+// boot degraded (corrupt DB / wrong key), the transport falls back to
+// STATELESS runs using the client's messages directly.
+app.route(
+  "/v1",
+  createChatRoutes({
+    registry: pluginRegistry,
+    pluginStore,
+    checkpointStore,
+    ledger,
+    trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+  }),
+);
 
 // Async job runner (Phase 2, Wave C1). Constructed GUARDED: background jobs
 // are not wired into the HTTP transport yet (Phase 3), so boot must never fail
