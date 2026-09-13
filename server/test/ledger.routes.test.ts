@@ -119,4 +119,108 @@ describe("ledger routes — status by idempotency key", () => {
     const body = (await byId.json()) as { id: string };
     assert.equal(body.id, created.id);
   });
+
+  test("M2: POST /ledger/tasks with a duplicate intentKey returns the existing task (200, same id) — no 500", async () => {
+    const { app } = makeApp();
+    const first = await createTask(app, "dup-key");
+
+    const res = await app.request("/ledger/tasks", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ intentKey: "dup-key", spec: { x: 1 } }),
+    });
+    assert.equal(res.status, 200, "a repeat must not 500 on the unique index");
+    const body = (await res.json()) as { id: string };
+    assert.equal(body.id, first.id, "the SAME task id must be returned");
+  });
+
+  test("M2: the duplicate is owner-scoped — another owner's duplicate is a fresh task", async () => {
+    const { app, ledger } = makeApp();
+    await createTask(app, "scope-key");
+
+    const other = new Hono();
+    other.route(
+      "/ledger",
+      createLedgerRoutes(ledger, { verifyKey: async () => "user-2" }),
+    );
+    const res = await other.request("/ledger/tasks", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ intentKey: "scope-key", spec: {} }),
+    });
+    assert.equal(res.status, 201, "a different owner gets their own task");
+  });
+});
+
+describe("ledger routes — fence enforcement on running tasks (M8)", () => {
+  async function claimTask(app: Hono, taskId: string): Promise<string> {
+    const res = await app.request(`/ledger/tasks/${taskId}/claim`, {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(res.status, 200);
+    return ((await res.json()) as { fence_token: string }).fence_token;
+  }
+
+  test("heartbeat without a fence token on a running task → 403 fence_conflict", async () => {
+    const { app } = makeApp();
+    const created = await createTask(app, "fence-hb");
+    const fence = await claimTask(app, created.id);
+
+    const res = await app.request(`/ledger/tasks/${created.id}/heartbeat`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "fence_conflict" });
+
+    const ok = await app.request(`/ledger/tasks/${created.id}/heartbeat`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ fenceToken: fence }),
+    });
+    assert.equal(ok.status, 200, "with the fence token the heartbeat works");
+  });
+
+  test("appendStep without a fence token on a running task → 403 fence_conflict", async () => {
+    const { app } = makeApp();
+    const created = await createTask(app, "fence-steps");
+    const fence = await claimTask(app, created.id);
+
+    const res = await app.request(`/ledger/tasks/${created.id}/steps`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ stage: "tool", action: "A", result: "r" }),
+    });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "fence_conflict" });
+
+    const ok = await app.request(`/ledger/tasks/${created.id}/steps`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        stage: "tool",
+        action: "A",
+        result: "r",
+        fenceToken: fence,
+      }),
+    });
+    assert.equal(ok.status, 201, "with the fence token the step appends");
+  });
+
+  test("a non-running task (queued/terminal) is not fence-gated", async () => {
+    const { app } = makeApp();
+    const created = await createTask(app, "fence-queued");
+
+    // Queued task: heartbeat without a fence still fails as a transition
+    // error (409 invalid_transition), NOT a fence gate — the fence check only
+    // applies to running tasks.
+    const res = await app.request(`/ledger/tasks/${created.id}/heartbeat`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 409, "queued heartbeat is a transition error, not a fence conflict");
+  });
 });

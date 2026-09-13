@@ -81,8 +81,22 @@ export function createAgentGraph({
         "a tool-capable model is required to run the supervisor agent",
     );
   }
-  const modelWithTools = model.bindTools(tools);
-  const toolNode = new ToolNode(tools);
+  // LOW: never hand a provider an empty tool array — a model with zero tools
+  // would be asked to decide between nothing. Log and run chat-only instead.
+  const hasTools = tools.length > 0;
+  if (!hasTools) {
+    console.warn(
+      "[agents] createAgentGraph: no tools bound; running a chat-only agent " +
+        "(no tool calls will be emitted)",
+    );
+  }
+  const modelWithTools = hasTools ? model.bindTools(tools) : model;
+  // M7: `handleToolErrors: false` — a tool failure must NOT become a ToolMessage
+  // (which the graph would feed back to the model and let the job complete
+  // `succeeded`). With the default `true` the runner's failJob path never sees
+  // the error; here it surfaces as a thrown error and the job is failed with a
+  // recorded error step.
+  const toolNode = new ToolNode(tools, { handleToolErrors: false });
 
   /** Decide the next action: emit an AIMessage (possibly with tool_calls). */
   const orchestrator = async (state: AgentState): Promise<AgentUpdate> => {

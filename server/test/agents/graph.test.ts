@@ -175,6 +175,30 @@ describe("agent graph — supervisor loop", () => {
     const toolMessages = result.messages.filter((m) => m instanceof ToolMessage);
     assert.equal(toolMessages.length, MAX_TOOL_ROUNDS);
   });
+
+  test("M7: a tool that throws rejects the invoke (handleToolErrors: false — no swallowed ToolMessage)", async () => {
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }),
+        new AIMessage("never"),
+      ],
+    });
+    const throwingTool = new DynamicStructuredTool({
+      name: "list_tasks",
+      description: "List tasks from a project",
+      schema: z.object({ projectId: z.string() }),
+      func: async () => {
+        throw new Error("backend exploded");
+      },
+    });
+    const graph = createAgentGraph({ model, tools: [throwingTool] });
+
+    await assert.rejects(
+      graph.invoke({ messages: [new HumanMessage("list my tasks")] }),
+      /backend exploded/,
+      "the tool error must propagate instead of becoming a ToolMessage",
+    );
+  });
 });
 
 describe("agent graph — zod translation from plugin JsonSchema", () => {

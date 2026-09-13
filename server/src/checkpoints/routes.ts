@@ -1,6 +1,6 @@
 import { Hono } from "hono";
-import type { Context } from "hono";
 import { requireApiKey, unauthorized } from "../inference.ts";
+import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { CheckpointStore } from "./store.ts";
 
 /**
@@ -23,8 +23,9 @@ import type { CheckpointStore } from "./store.ts";
  *   DELETE /v1/threads            — per-user GC; `{"deleted": N}`.
  */
 
-/** Shape of `requireApiKey`: returns the owned user id or null. */
-export type VerifyApiKeyFn = (c: Context) => Promise<string | null>;
+/** Shape of `requireApiKey`: returns the owned user id or null. Re-exported
+ *  from `plugins/routes.ts` (single definition; the plugin surface owns it). */
+export type { VerifyApiKeyFn };
 
 export type CheckpointRoutesOptions = {
   store: CheckpointStore;

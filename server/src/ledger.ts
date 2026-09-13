@@ -264,6 +264,15 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
   // so a partial index would only introduce "which row wins" ambiguity when a
   // terminal and a fresh task share a key.
   //
+  // M4: a pre-v4 DB written through the raw-insert path can already hold
+  // duplicate (owner, intent_key) rows; creating the UNIQUE index over them
+  // would abort the whole migration at import. So BEFORE the index, delete the
+  // older duplicates, keeping the NEWEST row per group (newest by updated_ts,
+  // id as the deterministic tie-breaker) — the same "newest wins" rule the
+  // get-or-create re-read applies. (Orphaned steps/chain rows of the deleted
+  // duplicates remain — they are never surfaced because reads are keyed by
+  // task_id, and ledger_step's append-only trigger forbids cleanup.)
+  //
   // (b) Replay dedupe: `ledger_step` gains a nullable `tool_call_id` (an
   // OpenAI-style tool call id) recorded atomically with the tool's result, so
   // a resumed checkpoint can look it up and NEVER re-execute a tool whose
@@ -276,6 +285,15 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
   // compatibility. Data-preserving (existing steps get NULL tool_call_id).
   (db) => {
     db.exec(`
+      DELETE FROM ledger_task AS older
+      WHERE EXISTS (
+        SELECT 1 FROM ledger_task AS newer
+        WHERE newer.owner = older.owner
+          AND newer.intent_key = older.intent_key
+          AND (newer.updated_ts > older.updated_ts
+               OR (newer.updated_ts = older.updated_ts AND newer.id > older.id))
+      );
+
       CREATE UNIQUE INDEX idx_ledger_task_owner_intent
         ON ledger_task(owner, intent_key);
 

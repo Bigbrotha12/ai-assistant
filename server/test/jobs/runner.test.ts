@@ -19,6 +19,7 @@ import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
 import { createAgentGraph } from "../../src/agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../../src/agents/compile.ts";
 import { HumanMessage } from "@langchain/core/messages";
+import { checkpointThreadId } from "../../src/checkpoints/store.ts";
 import {
   JobError,
   ToolExecutor,
@@ -32,6 +33,7 @@ import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import { recordToolResult } from "../../src/credentials/idempotency.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
+import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolPluginDefinition } from "../../src/plugins/types.ts";
 
@@ -137,6 +139,7 @@ function toolCallMessage(
 
 const DNS: Record<string, LookupAddress[]> = {
   "vikunja.example.com": [{ address: "1.1.1.1", family: 4 }],
+  "vikunja.local": [{ address: "192.168.1.10", family: 4 }],
 };
 
 function fakeLookup(): LookupFn {
@@ -244,7 +247,7 @@ function descriptor(
     owner: "user-1",
     intentKey: "job-1",
     spec: "list my tasks",
-    threadId: "thr-1",
+    clientThreadId: "thr-1",
     toolPlugins: ["vikunja"],
     modelPluginId: "openrouter",
     ...overrides,
@@ -414,7 +417,9 @@ describe("JobRunner.runJob", () => {
     assert.equal(calls.length, 0, "the recorded tool must not execute again");
 
     const state = await checkpointer.get({
-      configurable: { thread_id: "thr-1" },
+      configurable: {
+        thread_id: checkpointThreadId("user-1", "thr-1"),
+      },
     });
     const messages = (state?.channel_values?.messages ?? []) as Array<{
       content?: unknown;
@@ -520,10 +525,10 @@ describe("JobRunner.runJob", () => {
 
     const [a, b] = await Promise.all([
       runner.runJob(
-        descriptor({ intentKey: "job-a", threadId: "shared", modelRequestConfig: "a" }),
+        descriptor({ intentKey: "job-a", clientThreadId: "shared", modelRequestConfig: "a" }),
       ),
       runner.runJob(
-        descriptor({ intentKey: "job-b", threadId: "shared", modelRequestConfig: "b" }),
+        descriptor({ intentKey: "job-b", clientThreadId: "shared", modelRequestConfig: "b" }),
       ),
     ]);
     assert.equal(a.status, "succeeded");
@@ -531,7 +536,9 @@ describe("JobRunner.runJob", () => {
     assert.equal(maxActive, 1, "only one invoke may run per thread at a time");
 
     const checkpoint = await checkpointer.get({
-      configurable: { thread_id: "shared" },
+      configurable: {
+        thread_id: checkpointThreadId("user-1", "shared"),
+      },
     });
     const messages = (checkpoint?.channel_values?.messages ?? []) as unknown[];
     assert.equal(
@@ -556,6 +563,316 @@ describe("JobRunner.runJob", () => {
     assert.equal(result.status, "succeeded");
     assert.equal(runner.getJobStatus("user-1", "status-key")?.id, result.taskId);
     assert.equal(runner.getJobStatus("user-2", "status-key"), null);
+  });
+
+  test("H2: a misconfigured heartbeat interval fails the job cleanly — no orphaned running task, pins released", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        // stuckTimeoutMs=10_000 → max interval 3333; 9999 is INVALID_CONFIG.
+        heartbeatIntervalMs: 9_999,
+        buildModel: () =>
+          new ScriptedChatModel({ responses: [new AIMessage("never")] }),
+      }),
+    );
+    const result = await runner.runJob(descriptor());
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "job_failed");
+    assert.equal(
+      ledger.getTask(result.taskId)?.status,
+      "failed",
+      "a failed heartbeat setup must not leave the task running",
+    );
+    assert.ok(
+      ledger
+        .listSteps(result.taskId)
+        .some((s) => s.action === "error:job_failed"),
+      "an error step must record the failure",
+    );
+    assert.throws(
+      () => pins.get("user-1", "vikunja"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "the finally must release the pin even though the heartbeat never started",
+    );
+  });
+
+  test("M6: a running task with a stale heartbeat is marked stuck and resumed on the next runJob (not in_flight forever)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    // Simulate a crashed worker: a task claimed but never completed.
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "wedged",
+      spec: "{}",
+    });
+    ledger.claimTask(task.id, "user-1");
+    clock.advance(20_000); // heartbeat stale past the stuck timeout
+
+    const model = new ScriptedChatModel({ responses: [new AIMessage("recovered")] });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(descriptor({ intentKey: "wedged" }));
+    assert.notEqual(result.status, "in_flight", "a stale running task must not wedge");
+    assert.equal(result.status, "succeeded");
+    assert.equal(ledger.getTask(task.id)?.status, "succeeded");
+  });
+
+  test("M7: a tool handler throwing fails the job with an error step (not a succeeded ToolMessage)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const failingHandler: ToolCallHandler = {
+      async execute() {
+        throw new Error("backend exploded");
+      },
+    };
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }, "call_fail"),
+        new AIMessage("never"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({ toolHandler: failingHandler }),
+    );
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "job_failed");
+    assert.equal(ledger.getTask(result.taskId)?.status, "failed");
+    assert.ok(
+      ledger
+        .listSteps(result.taskId)
+        .some((s) => s.action === "error:job_failed"),
+      "the tool error must surface as a failed job with an error step",
+    );
+  });
+
+  test("H3: a FRESH job may execute a mutating tool (allowMutatingRetry true)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const calls: RecordedCall[] = [];
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("create_task", { title: "x" }, "call_mut_fresh"),
+        new AIMessage("done"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({ toolHandler: recordingHandler(calls) }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.toolName, "create_task");
+    assert.ok(
+      ledger
+        .listSteps(result.taskId)
+        .some((s) => s.action === "tool:create_task"),
+      "the fresh run's mutating tool result is recorded",
+    );
+  });
+
+  test("H3: a resumed (isReplay) job refuses to re-execute a mutating tool with no stored result → tool_retry_forbidden", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const calls: RecordedCall[] = [];
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("create_task", { title: "x" }, "call_mut_replay"),
+        new AIMessage("never"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({ toolHandler: recordingHandler(calls), isReplay: true }),
+    );
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "tool_retry_forbidden");
+    assert.equal(ledger.getTask(result.taskId)?.status, "failed");
+    assert.ok(
+      ledger
+        .listSteps(result.taskId)
+        .some((s) => s.action === "error:tool_retry_forbidden"),
+    );
+    assert.equal(calls.length, 0, "the mutating tool must not execute during a replay");
+  });
+
+  test("M1: runJob records the owner→thread mapping (touchThread) with the hashed thread id", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const touched: Array<{ owner: string; threadId: string }> = [];
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () =>
+          new ScriptedChatModel({ responses: [new AIMessage("ok")] }),
+        touchThread: (owner, threadId) => {
+          touched.push({ owner, threadId });
+        },
+      }),
+    );
+    const result = await runner.runJob(descriptor());
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(touched, [
+      { owner: "user-1", threadId: checkpointThreadId("user-1", "thr-1") },
+    ]);
+  });
+
+  test("M5: on an optimistic-lock conflict the re-evaluation re-applies the ORIGINAL input (input survives)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    // A checkpointer that fabricates a diverging id on the runner's DIRECT
+    // `get` reads (readCheckpointId), simulating another writer having advanced
+    // the thread past our final write. graph internals use getTuple (real), so
+    // only the conflict-detection re-read diverges and the branch fires once.
+    class SimulatedInterleavingSaver extends MemorySaver {
+      override async get(config: Parameters<MemorySaver["get"]>[0]) {
+        const checkpoint = await super.get(config);
+        if (!checkpoint) return checkpoint;
+        return { ...checkpoint, id: `simulated-${checkpoint.id}` };
+      }
+    }
+    const checkpointer = new SimulatedInterleavingSaver();
+
+    // Seed the thread so `beforeId` is non-null (the conflict branch requires it).
+    const threadId = checkpointThreadId("user-1", "thr-1");
+    const seedGraph = compileGraphWithCheckpointer(
+      createAgentGraph({
+        model: new ScriptedChatModel({ responses: [new AIMessage("seed reply")] }),
+        tools: [],
+      }),
+      checkpointer,
+    );
+    await seedGraph.invoke(
+      { messages: [new HumanMessage("seed")] },
+      { configurable: { thread_id: threadId } },
+    );
+
+    let generateCalls = 0;
+    const model = new ScriptedChatModel({
+      responses: [new AIMessage("reply")],
+      onGenerate: () => {
+        generateCalls += 1;
+      },
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        checkpointer,
+        buildModel: () => model,
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({ input: { messages: [new HumanMessage("original user input")] } }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(generateCalls, 2, "the conflict re-evaluation must have run once");
+
+    const state = await checkpointer.get({
+      configurable: { thread_id: threadId },
+    });
+    const messages = (state?.channel_values?.messages ?? []) as Array<{
+      content?: unknown;
+    }>;
+    assert.ok(
+      messages.some((m) => String(m.content) === "original user input"),
+      "the original input must survive the conflict re-evaluation",
+    );
+  });
+
+  test("LOW: the per-thread mutex is GC'd from the map once a job finishes", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () =>
+          new ScriptedChatModel({ responses: [new AIMessage("ok")] }),
+      }),
+    );
+    await runner.runJob(descriptor({ intentKey: "gc-1" }));
+    const internals = runner as unknown as { mutexes: Map<string, AsyncMutex> };
+    assert.equal(
+      internals.mutexes.size,
+      0,
+      "a finished job's per-thread mutex must be evicted",
+    );
+  });
+
+  test("LOW: per-thread mutexes are GC'd after concurrent jobs on the same thread both finish (no split lock)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    let active = 0;
+    let maxActive = 0;
+    const buildModel = (label: string) =>
+      new ScriptedChatModel({
+        responses: [new AIMessage(`reply-${label}`)],
+        onGenerate: async () => {
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          active -= 1;
+        },
+      });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (_id, config) => buildModel(String(config)),
+      }),
+    );
+
+    const [a, b] = await Promise.all([
+      runner.runJob(
+        descriptor({ intentKey: "gc-a", clientThreadId: "shared-gc", modelRequestConfig: "a" }),
+      ),
+      runner.runJob(
+        descriptor({ intentKey: "gc-b", clientThreadId: "shared-gc", modelRequestConfig: "b" }),
+      ),
+    ]);
+    assert.equal(a.status, "succeeded");
+    assert.equal(b.status, "succeeded");
+    assert.equal(maxActive, 1, "the shared-thread lock must never split");
+    const internals = runner as unknown as { mutexes: Map<string, AsyncMutex> };
+    assert.equal(
+      internals.mutexes.size,
+      0,
+      "both finished jobs' shared-thread mutex must be evicted",
+    );
   });
 });
 
@@ -620,6 +937,44 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     assert.deepEqual(pins.get("user-1", "vikunja").credentials, {
       apiKey: "restored",
     });
+  });
+
+  test("H3: with a model seam wired, a repinned stuck task is re-run through runJob as a replay (mutating tool → tool_retry_forbidden)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "orphan-replay",
+      spec: "{}",
+    });
+    ledger.claimTask(task.id, "user-1");
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(task.id)?.status, "stuck");
+
+    const calls: RecordedCall[] = [];
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("create_task", { title: "x" }, "call_replay_resume"),
+        new AIMessage("never"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => model,
+        credentialSource: () => ({ vikunja: { apiKey: "restored" } }),
+      }),
+    );
+    const result = await runner.resumeStuckJobs();
+    assert.equal(result.outcomes[0]?.outcome, "tool_retry_forbidden");
+    assert.equal(ledger.getTask(task.id)?.status, "failed");
+    assert.ok(
+      ledger
+        .listSteps(task.id)
+        .some((s) => s.action === "error:tool_retry_forbidden"),
+    );
+    assert.equal(calls.length, 0, "the mutating tool must not re-execute during a replay");
   });
 });
 
@@ -797,7 +1152,7 @@ describe("ToolExecutor (real validatedFetch path)", () => {
     );
   });
 
-  test("the optimistic-lock re-evaluation idiom: graph.invoke({ messages: [] }) re-reads and re-evaluates the merged state (never a blind retry)", async () => {
+  test("the optimistic-lock re-evaluation idiom: on conflict the graph re-runs with the ORIGINAL input re-applied (M5 — input survives)", async () => {
     const checkpointer = new MemorySaver();
     const model = new ScriptedChatModel({
       responses: [new AIMessage("first"), new AIMessage("re-evaluated")],
@@ -807,16 +1162,19 @@ describe("ToolExecutor (real validatedFetch path)", () => {
       checkpointer,
     );
     await graph.invoke(
-      { messages: [new HumanMessage("hi")] },
+      { messages: [new HumanMessage("base")] },
       { configurable: { thread_id: "t" } },
     );
-    // A conflict detected after our write would re-run this exact evaluation.
-    const result = await graph.invoke(
-      { messages: [] },
-      { configurable: { thread_id: "t" } },
+    // A conflict detected after our write re-invokes with the ORIGINAL input —
+    // never a blind `{ messages: [] }` re-evaluation (M5).
+    const input = { messages: [new HumanMessage("original user input")] };
+    const result = await graph.invoke(input, { configurable: { thread_id: "t" } });
+    const contents = result.messages.map((m: BaseMessage) => String(m.content));
+    assert.ok(
+      contents.includes("original user input"),
+      "the original input survives the re-evaluation",
     );
-    assert.equal(result.messages.length, 3);
-    assert.equal(String(result.messages[2]?.content), "re-evaluated");
+    assert.ok(contents.includes("re-evaluated"));
   });
 
   test("a plugin with no pinned IPs is plugin_unavailable and never fetches", async (t) => {
@@ -837,5 +1195,44 @@ describe("ToolExecutor (real validatedFetch path)", () => {
       (e: unknown) => e instanceof JobError && e.code === "plugin_unavailable",
     );
     assert.equal(fetched, false);
+  });
+
+  test("H1: an admin-trusted *.local host is NOT rejected at call time when trustedHosts is forwarded", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const pinned = [
+      {
+        entryId: "vikunja-api",
+        url: "https://vikunja.local",
+        pinned: ["192.168.1.10"],
+      },
+    ];
+    const makeExecutor = (trustedHosts: readonly string[] | undefined) =>
+      new ToolExecutor({
+        registry,
+        getPinnedIps: (pluginId) =>
+          pluginId === "vikunja" ? pinned : undefined,
+        fetchFn: (async () =>
+          new Response('{"ok":true}', { status: 200 })) as unknown as typeof fetch,
+        lookup: fakeLookup(),
+        mode: "test",
+        trustedHosts,
+      });
+
+    // Without the trusted-host list, the call-time re-resolution rejects the
+    // private .local backend as DNS_REBINDING — the pre-fix behavior that
+    // broke every admin-trusted internal plugin tool call.
+    await assert.rejects(
+      makeExecutor(undefined).execute("vikunja", "list_tasks", {}, { apiKey: "k" }),
+      (e: unknown) => e instanceof SsrfValidationError && e.code === "DNS_REBINDING",
+    );
+
+    // With the same list the pins were computed under, the call succeeds.
+    const result = await makeExecutor(["vikunja.local"]).execute(
+      "vikunja",
+      "list_tasks",
+      {},
+      { apiKey: "k" },
+    );
+    assert.equal(result, '{"ok":true}');
   });
 });

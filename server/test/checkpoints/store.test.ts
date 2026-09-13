@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { TestContext } from "node:test";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
@@ -322,6 +322,46 @@ describe("checkpoint store — credential redaction", () => {
     assert.ok(blobs.includes("***"), "redaction marker must be persisted");
     assert.equal(blobs.includes("sk-abc123"), false, "secret must not be persisted");
   });
+
+  test("H4: Basic/ApiKey/X-Api-Key headers and JSON api_key/token/secret fields are fully masked", () => {
+    assert.equal(
+      redactForCheckpoint("Authorization: Basic dXNlcjpwYXNz"),
+      "Authorization: ***",
+      "Basic auth's credential must be fully masked",
+    );
+    assert.equal(
+      redactForCheckpoint("Authorization: Basic dXNlcjpwYXNz with a tail"),
+      "Authorization: ***",
+      "the generic mask must cover the value to end-of-line",
+    );
+    assert.equal(redactForCheckpoint("Api-Key: abc123"), "Api-Key: ***");
+    assert.equal(
+      redactForCheckpoint("X-Api-Key: abc123def"),
+      "X-Api-Key: ***",
+    );
+    assert.equal(redactForCheckpoint("x-api-key: abc123"), "x-api-key: ***");
+    assert.equal(
+      redactForCheckpoint('{"api_key": "abc123"}'),
+      '{"api_key": "***"}',
+    );
+    assert.equal(
+      redactForCheckpoint('{"apiKey": "abc123", "next": 1}'),
+      '{"apiKey": "***", "next": 1}',
+      "a following key/value on the same line must survive",
+    );
+    assert.equal(
+      redactForCheckpoint('"token": "secret-value"'),
+      '"token": "***"',
+    );
+    assert.equal(
+      redactForCheckpoint('"secret": "sup3r-secret"'),
+      '"secret": "***"',
+    );
+    assert.equal(
+      redactForCheckpoint('{"x-api-key": "abc123"}'),
+      '{"x-api-key": "***"}',
+    );
+  });
 });
 
 describe("checkpoint store — encryption at rest", () => {
@@ -386,6 +426,25 @@ describe("checkpoint store — encryption at rest", () => {
       (err: unknown) =>
         err instanceof CheckpointStoreError && err.code === "KEY_REQUIRED",
       "a missing key must be refused outright",
+    );
+  });
+
+  test("M3: a genuinely corrupt checkpoint file fails the open cleanly (OPEN_FAILED, never a crash)", async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), "checkpoints-corrupt-"));
+    const dbPath = join(dir, "checkpoints.db");
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await writeFile(
+      dbPath,
+      Buffer.from("this is definitely not a sqlite database file, not even close"),
+    );
+
+    // The boot guard in index.ts relies on this surfacing as OPEN_FAILED so it
+    // can degrade gracefully (no checkpoints) instead of crashing the gateway.
+    await assert.rejects(
+      createCheckpointStore({ dbPath, dbKey: TEST_KEY }),
+      (err: unknown) =>
+        err instanceof CheckpointStoreError && err.code === "OPEN_FAILED",
+      "a corrupt file must surface as OPEN_FAILED",
     );
   });
 });

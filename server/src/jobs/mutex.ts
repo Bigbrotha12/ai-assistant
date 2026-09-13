@@ -17,9 +17,14 @@
  */
 export class AsyncMutex {
   private tail: Promise<unknown> = Promise.resolve();
+  /** Active holders + queued waiters (incremented on acquire, decremented on
+   *  release). Lets the JobRunner safely GC a thread's mutex: a mutex may only
+   *  be evicted when nobody holds it and nobody is queued behind it. */
+  private waiters = 0;
 
   /** Wait for the lock; resolves with a release function that MUST be called. */
   async acquire(): Promise<() => void> {
+    this.waiters += 1;
     let release: () => void = () => {};
     const next = new Promise<void>((resolve) => {
       release = resolve;
@@ -27,7 +32,15 @@ export class AsyncMutex {
     const previous = this.tail;
     this.tail = this.tail.then(() => next);
     await previous;
-    return release;
+    return () => {
+      release();
+      this.waiters -= 1;
+    };
+  }
+
+  /** True when nobody holds the lock and nobody is waiting for it. */
+  get isIdle(): boolean {
+    return this.waiters === 0;
   }
 
   /** Acquire → run `fn` → release (release happens even if `fn` throws). */

@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
 import { requireApiKey, unauthorized } from "./inference.ts";
 import { Ledger, LedgerError, migrateLedger } from "./ledger.ts";
@@ -53,13 +54,18 @@ export function createLedgerRoutes(
     if (!body || typeof body.intentKey !== "string") {
       return c.json({ error: "invalid_request" }, 400);
     }
-    const task = l.createTask({
+    // M2: owner-scoped get-or-create. A repeat (owner, intentKey) returns the
+    // EXISTING task with 200 instead of raw-INSERT 500ing on the v4 unique
+    // index. The pre-check distinguishes created (201) from returned (200).
+    const existing = l.getTaskByIntentKey(owner, body.intentKey);
+    const created = existing === null;
+    const task = await getOrCreateTask(l, {
       owner,
       intentKey: body.intentKey,
       spec: JSON.stringify(body.spec ?? {}),
       worker: typeof body.worker === "string" ? body.worker : undefined,
     });
-    return c.json(task, 201);
+    return c.json(task, created ? 201 : 200);
   });
 
   routes.get("/tasks", async (c) => {
@@ -120,16 +126,28 @@ export function createLedgerRoutes(
     ) {
       return c.json({ error: "invalid_request" }, 400);
     }
+    const id = c.req.param("id");
+    const task = l.getTask(id, owner);
+    if (!task) return c.json({ error: "not_found" }, 404);
+    const fenceToken =
+      typeof body.fenceToken === "string" ? body.fenceToken : undefined;
+    // M8: a RUNNING task is fence-protected — a caller appending steps without
+    // the claim/resume fence token is (or may be) a superseded worker and must
+    // not write. Queued/terminal transitions never carry a fence, so the gate
+    // is conditional on `running`.
+    if (task.status === "running" && !fenceToken) {
+      return c.json({ error: "fence_conflict" }, 403);
+    }
     try {
       const out = l.appendStep(
-        c.req.param("id"),
+        id,
         owner,
         {
           stage: body.stage,
           action: body.action,
           result: typeof body.result === "string" ? body.result : null,
         },
-        typeof body.fenceToken === "string" ? body.fenceToken : undefined,
+        fenceToken,
       );
       return c.json(out, 201);
     } catch (e) {
@@ -143,16 +161,19 @@ export function createLedgerRoutes(
     const body = (await c.req.json().catch(() => null)) as {
       fenceToken?: unknown;
     } | null;
+    const id = c.req.param("id");
+    const task = l.getTask(id, owner);
+    if (!task) return c.json({ error: "not_found" }, 404);
+    const fenceToken =
+      body && typeof body.fenceToken === "string" ? body.fenceToken : undefined;
+    // M8: heartbeats only apply to `running` tasks, and those are
+    // fence-protected — a heartbeat without the fence token is a superseded
+    // worker trying to extend a lease it no longer holds.
+    if (task.status === "running" && !fenceToken) {
+      return c.json({ error: "fence_conflict" }, 403);
+    }
     try {
-      return c.json(
-        l.heartbeat(
-          c.req.param("id"),
-          owner,
-          body && typeof body.fenceToken === "string"
-            ? body.fenceToken
-            : undefined,
-        ),
-      );
+      return c.json(l.heartbeat(id, owner, fenceToken));
     } catch (e) {
       return ledgerError(c, e);
     }

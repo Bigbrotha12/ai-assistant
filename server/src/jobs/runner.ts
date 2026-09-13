@@ -6,7 +6,7 @@ import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { jsonSchemaToZod } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
-import { redactForCheckpoint } from "../checkpoints/store.ts";
+import { checkpointThreadId, redactForCheckpoint } from "../checkpoints/store.ts";
 import {
   canRetryTool,
   getOrCreateTask,
@@ -39,26 +39,31 @@ import { AsyncMutex } from "./mutex.ts";
  *   1. `getOrCreateTask(ledger, { owner, intentKey, spec })` — owner-scoped
  *      idempotent admission. A repeat (owner, intentKey) returns the EXISTING
  *      task instead of creating a duplicate row.
- *   2. Already `running` → return early as `in_flight` (never double-execute).
- *      Any other non-queued status → return early as `already_terminal`.
- *   3. `claimTask(taskId, owner)` → the fence token. A concurrent claim that
- *      wins between admission and claim surfaces as `in_flight`.
- *   4. `ledger.startHeartbeat(taskId, owner, fenceToken, ...)` — runs for the
- *      whole job (pin fetch → graph invoke → tool execution), stopped in a
- *      finally.
+ *   2. Already `running` → if the heartbeat is STALE (`markStuckIfHeartbeatStale`)
+ *      the crashed worker is marked `stuck` and this call becomes the resume;
+ *      otherwise return early as `in_flight` (never double-execute). Any other
+ *      non-queued/non-stuck status → return early as `already_terminal`.
+ *   3. `claimTask` (queued) or `resumeTask` (stuck — a replay) → the fence token.
+ *      A concurrent claim that wins between admission and claim surfaces as
+ *      `in_flight`.
+ *   4. `ledger.startHeartbeat(taskId, owner, fenceToken, ...)` — INSIDE the try,
+ *      so a misconfigured interval fails the job cleanly. Runs for the whole job
+ *      (pin fetch → graph invoke → tool execution), stopped in a finally.
  *   5. Fetch a credential pin per plugin (`CredentialPinStore.get(owner,
  *      pluginId)`). A `credentials_expired` pin fails the job with a
  *      `credentials_expired` step — no graph invoke happens.
  *   6. Build the agent (`createAgentGraph` + `compileGraphWithCheckpointer`)
  *      with a REAL `ToolCallHandler`: the {@link ToolExecutor} (validatedFetch
- *      + pinned IPs + credentials) wrapped with tool-call replay dedupe
- *      (`hasToolResult`/`recordToolResult`, `tool_retry_forbidden` for mutating
- *      tools that cannot be proven never-run).
+ *      + pinned IPs + credentials + trusted hosts) wrapped with tool-call replay
+ *      dedupe (`hasToolResult`/`recordToolResult`, `tool_retry_forbidden` for
+ *      mutating tools that cannot be proven never-run when `isReplay`/stuck).
  *   7. `graph.invoke` under the per-thread mutex + `checkpoint_id` optimistic
- *      lock (see {@link JobRunner.invokeWithCheckpointLock}).
+ *      lock (see {@link JobRunner.invokeWithCheckpointLock}). The thread's
+ *      owner mapping is recorded via the `touchThread` seam.
  *   8. On success: `completeTask(..., "succeeded")` + the notification hook.
  *      On error: fail the task with a redacted error step. Pins are released
- *      and swept in the finally.
+ *      and swept, the per-thread mutex is GC'd, and the heartbeat is stopped in
+ *      the finally.
  *
  * RESTART-LOSS (`resumeStuckJobs`): `ledger.reconcileOrphans()` (Wave A2) runs
  * at boot and marks orphaned `running` tasks `stuck`. The pin store is
@@ -162,6 +167,15 @@ export type ToolExecutorOptions = {
   lookup?: LookupFn;
   /** Scheme enforcement mode override for `validatedFetch`. */
   mode?: Mode;
+  /**
+   * Admin-trusted hostnames/IPs forwarded into `validatedFetch`. The pins were
+   * computed WITH the trusted-hosts list at install/load time (a `*.local` /
+   * RFC1918 backend is allowed because the admin vouched for it); a call-time
+   * re-resolution WITHOUT the same list would reject those hosts as
+   * DNS_REBINDING. This MUST carry the plugin store's trusted hosts so an
+   * admin-trusted internal plugin keeps working.
+   */
+  trustedHosts?: readonly string[];
 };
 
 /**
@@ -214,6 +228,10 @@ export class ToolExecutor implements ToolCallHandler {
         mode: this.opts.mode,
         lookup: this.opts.lookup,
         fetchFn: this.opts.fetchFn,
+        // Re-resolution must apply the SAME trusted-hosts policy the pins were
+        // computed under, or an admin-trusted internal plugin (e.g. `vikunja.local`
+        // behind `*.local`) would be rejected at call time (see ToolExecutorOptions).
+        trustedHosts: this.opts.trustedHosts,
       },
     );
     if (response.status >= 300) {
@@ -244,8 +262,11 @@ export type JobDescriptor = {
   intentKey: string;
   /** Human-readable intent; default invoke input when `input` is absent. */
   spec: string;
-  /** Checkpoint thread id (the sha256(userId + clientThreadId) mapping). */
-  threadId: string;
+  /** RAW client conversation thread id (the app's messageId-scoped thread id).
+   *  `runJob` hashes it into the checkpoint thread key via
+   *  `checkpointThreadId(owner, clientThreadId)`, so a client cannot guess or
+   *  collide with another owner's thread id. */
+  clientThreadId: string;
   /** Tool plugins this job may call; each must have a credential pin. */
   toolPlugins: string[];
   /** Model plugin id — forwarded to the `buildModel` seam (Phase 3 wires it). */
@@ -256,6 +277,15 @@ export type JobDescriptor = {
   toolHandler?: ToolCallHandler;
   /** Invoke input; defaults to `{ messages: [new HumanMessage(spec)] }`. */
   input?: Record<string, unknown>;
+  /**
+   * True when this run is a REPLAY (a resumed stuck task, a restart, or any
+   * caller re-running a previously-started job). Replays bind tools with
+   * `allowMutatingRetry: false`: a mutating tool whose result is NOT already
+   * stored is refused with `tool_retry_forbidden` instead of re-executing a
+   * possibly-applied side effect. A task that is `stuck` at admission is a
+   * replay regardless of this flag.
+   */
+  isReplay?: boolean;
 };
 
 export type RunJobResult =
@@ -309,6 +339,24 @@ export type JobRunnerDeps = {
   credentialSource?: CredentialSource;
   /** Override the real ToolExecutor (tests inject a real one with a stubbed fetch). */
   executor?: ToolExecutor;
+  /**
+   * Admin-trusted hosts forwarded into the default executor's `validatedFetch`
+   * (see `ToolExecutorOptions.trustedHosts`). Wire the plugin store's
+   * trusted-host list (env `PLUGINS_TRUSTED_HOSTS`) so admin-trusted internal
+   * plugin backends are not rejected at call time.
+   */
+  trustedHosts?: readonly string[];
+  /**
+   * Owner-scoped thread-metadata upsert (the checkpoint store's `touchThread`).
+   * Populates the thread_owner table so the `/v1/threads` surface works. Runs
+   * around every invoke; on failure the error is recorded as the thread's
+   * `lastError`. Absent (tests / no store) → no-op.
+   */
+  touchThread?: (
+    owner: string,
+    threadId: string,
+    lastError?: string | null,
+  ) => void;
   /** Explicit heartbeat interval; defaults to the ledger's floor(stuck/3). */
   heartbeatIntervalMs?: number;
   /** Optional periodic pin GC. `dispose()` stops it. */
@@ -485,22 +533,63 @@ export class JobRunner {
    * double-executes the graph.
    */
   async runJob(descriptor: JobDescriptor): Promise<RunJobResult> {
-    const { owner, intentKey, spec, threadId, toolPlugins } = descriptor;
+    const { owner, intentKey, spec, clientThreadId, toolPlugins } = descriptor;
+    // The checkpoint thread key is the owner-bound hash of the RAW client
+    // thread id (checkpoints/store.ts): an unguessable, owner-scoped key.
+    const threadId = checkpointThreadId(owner, clientThreadId);
 
     // 1. Owner-scoped idempotent admission.
-    const task = await getOrCreateTask(this.deps.ledger, {
+    let task = await getOrCreateTask(this.deps.ledger, {
       owner,
       intentKey,
       spec,
     });
 
-    // 2. Duplicate/in-flight handling — never double-execute.
+    // 2. Duplicate/in-flight handling — never double-execute. M6: a running
+    //    task whose heartbeat has gone stale past the stuck-timeout means the
+    //    worker crashed — mark it `stuck` and treat THIS call as the resume
+    //    instead of returning `in_flight` forever (which would wedge the
+    //    intentKey until a reboot).
     if (task.status === "running") {
-      return { status: "in_flight", taskId: task.id, threadId };
+      const marked = this.deps.ledger.markStuckIfHeartbeatStale(task.id);
+      if (marked && marked.status === "stuck") {
+        task = marked;
+      } else {
+        return { status: "in_flight", taskId: task.id, threadId };
+      }
     }
-    if (task.status !== "queued") {
-      // Terminal (or `stuck` — the boot pass owns stuck tasks). Re-submitting a
-      // finished intentKey is an idempotent no-op, not a new job.
+
+    // 2b. Replay semantics (H3): a task admitted as `stuck` (crashed/restarted
+    //     worker) IS a resume, so mutating tools with no stored result must
+    //     not re-execute; an explicit `isReplay` forces the same for any
+    //     caller. Fresh (queued) jobs may retry mutating tools.
+    const replaying = descriptor.isReplay === true || task.status === "stuck";
+
+    // 3. Claim: lease + fresh fence token. A `stuck` task is resumed (new
+    //    fence) so the checkpoint re-run owns a live lease.
+    let claimed: TaskRow;
+    if (task.status === "queued") {
+      try {
+        claimed = this.deps.ledger.claimTask(task.id, owner);
+      } catch (e) {
+        if (isConflict(e)) {
+          // A concurrent worker won the claim between admission and claim.
+          return { status: "in_flight", taskId: task.id, threadId };
+        }
+        throw e;
+      }
+    } else if (task.status === "stuck") {
+      try {
+        claimed = this.deps.ledger.resumeTask(task.id, owner);
+      } catch (e) {
+        if (isConflict(e)) {
+          // A concurrent worker resumed the stuck task first.
+          return { status: "in_flight", taskId: task.id, threadId };
+        }
+        throw e;
+      }
+    } else {
+      // Terminal — re-submitting a finished intentKey is an idempotent no-op.
       return {
         status: "already_terminal",
         taskId: task.id,
@@ -508,32 +597,25 @@ export class JobRunner {
         terminalStatus: task.status,
       };
     }
-
-    // 3. Claim: lease + fresh fence token.
-    let claimed: TaskRow;
-    try {
-      claimed = this.deps.ledger.claimTask(task.id, owner);
-    } catch (e) {
-      if (isConflict(e)) {
-        // A concurrent worker won the claim between admission and claim.
-        return { status: "in_flight", taskId: task.id, threadId };
-      }
-      throw e;
-    }
     const fenceToken = claimed.fence_token;
 
     // 4. Timer heartbeat covers the WHOLE job (pin fetch → graph invoke →
-    //    tool execution); stopped in the finally below.
-    const heartbeat = this.deps.ledger.startHeartbeat(claimed.id, owner, fenceToken, {
-      ...(this.deps.heartbeatIntervalMs
-        ? { intervalMs: this.deps.heartbeatIntervalMs }
-        : {}),
-      onError: (err) => {
-        console.warn(`[jobs] heartbeat error for task ${claimed.id}:`, err);
-      },
-    });
+    //    tool execution); started INSIDE the try so a misconfigured interval
+    //    (H2) fails the job cleanly with an error step + pin release instead
+    //    of orphaning the task as `running` forever. Stopped in the finally.
+    let heartbeat: { stop(): void } | undefined;
+    let mutex: AsyncMutex | undefined;
 
     try {
+      heartbeat = this.deps.ledger.startHeartbeat(claimed.id, owner, fenceToken, {
+        ...(this.deps.heartbeatIntervalMs
+          ? { intervalMs: this.deps.heartbeatIntervalMs }
+          : {}),
+        onError: (err) => {
+          console.warn(`[jobs] heartbeat error for task ${claimed.id}:`, err);
+        },
+      });
+
       // 5. Pin credentials per plugin. A missing/expired pin fails the job
       //    BEFORE any graph invoke.
       const credentialsByPlugin: Record<string, Record<string, string>> = {};
@@ -542,7 +624,10 @@ export class JobRunner {
         credentialsByPlugin[pluginId] = pin.credentials;
       }
 
-      // 6. Build the agent with the real executor + replay dedupe.
+      // 6. Build the agent with the real executor + replay dedupe. Replays
+      //    bind with `allowMutatingRetry: false` (H3): a mutating tool with no
+      //    stored result throws `tool_retry_forbidden` rather than re-applying
+      //    a side effect the crashed run may already have executed.
       const model = await this.resolveModel(descriptor);
       const executor = this.deps.executor ?? this.createDefaultExecutor();
       const handler = descriptor.toolHandler ?? executor;
@@ -554,16 +639,20 @@ export class JobRunner {
         taskId: claimed.id,
         owner,
         fenceToken,
-        allowMutatingRetry: true,
+        allowMutatingRetry: !replaying,
       });
       const graph = compileGraphWithCheckpointer(
         createAgentGraph({ model, tools }),
         this.deps.checkpointer,
       );
 
-      // 7. Per-thread mutex + checkpoint_id optimistic locking.
+      // 7. Per-thread mutex + checkpoint_id optimistic locking. The owner
+      //    mapping for the thread is recorded (M1) so the /v1/threads surface
+      //    can resolve ownership.
       const input = descriptor.input ?? { messages: [new HumanMessage(spec)] };
-      const result = await this.mutexFor(threadId).runExclusive(() =>
+      this.deps.touchThread?.(owner, threadId);
+      mutex = this.mutexFor(threadId);
+      const result = await mutex.runExclusive(() =>
         this.invokeWithCheckpointLock(graph, threadId, input),
       );
 
@@ -577,9 +666,17 @@ export class JobRunner {
       return { status: "succeeded", taskId: claimed.id, threadId };
     } catch (e) {
       const code = jobErrorCodeOf(e);
+      this.deps.touchThread?.(owner, threadId, errorMessageOf(e));
       return this.failJob(claimed, owner, fenceToken, threadId, code, errorMessageOf(e));
     } finally {
-      heartbeat.stop();
+      // LOW: GC the per-thread mutex once the job is done — but ONLY when the
+      // map still holds OUR instance AND it is idle (no holder, no waiters), so
+      // a concurrent job queued behind us on the same thread keeps its lock and
+      // a later job cannot split the thread across two mutexes.
+      if (mutex && this.mutexes.get(threadId) === mutex && mutex.isIdle) {
+        this.mutexes.delete(threadId);
+      }
+      heartbeat?.stop();
       for (const pluginId of toolPlugins) {
         this.deps.pins.release(owner, pluginId);
       }
@@ -597,9 +694,11 @@ export class JobRunner {
    *
    * The ledger persists owner/spec only (not the job's plugin set), so every
    * `stuck` task in the gateway's ledger is processed and the `credentialSource`
-   * seam resolves keys by (owner, task). A source that re-establishes pins
-   * leaves the task `running` for a later scheduler pass (Phase 3 transport) to
-   * re-run from the checkpoint.
+   * seam resolves keys by (owner, task). When a source re-establishes pins AND
+   * a `buildModel` seam is wired, the task is re-run through the full `runJob`
+   * path as a REPLAY (H3) — mutating tools with no stored result fail
+   * `tool_retry_forbidden`; without a model seam the task is resumed so a later
+   * scheduler pass (Phase 3 transport) can re-run it from the checkpoint.
    */
   async resumeStuckJobs(): Promise<ResumeStuckJobsResult> {
     const stuck = this.deps.ledger
@@ -615,10 +714,34 @@ export class JobRunner {
           for (const [pluginId, credentials] of Object.entries(reestablished)) {
             this.deps.pins.pin(task.owner, pluginId, credentials);
           }
-          // Pins restored: resume the task so a later scheduler pass (Phase 3
-          // transport) can re-run its graph from the checkpoint.
-          this.deps.ledger.resumeTask(task.id, task.owner);
-          outcomes.push({ taskId: task.id, owner: task.owner, outcome: "repinned" });
+          if (this.deps.buildModel) {
+            // Pins restored AND a model seam is wired: re-run the task through
+            // the full runJob path (H3). The task is still `stuck` here, so
+            // runJob's admission treats it as a replay — it resumes it under a
+            // fresh fence and binds tools with `allowMutatingRetry: false`, so
+            // a mutating tool with no stored result fails `tool_retry_forbidden`
+            // instead of re-executing a possibly-applied side effect.
+            const replay = await this.runJob({
+              owner: task.owner,
+              intentKey: task.intent_key,
+              spec: task.spec,
+              clientThreadId: task.intent_key,
+              toolPlugins: Object.keys(reestablished),
+              modelPluginId: "",
+              isReplay: true,
+            });
+            outcomes.push({
+              taskId: task.id,
+              owner: task.owner,
+              outcome:
+                replay.status === "failed" ? replay.code : "repinned",
+            });
+          } else {
+            // No model seam (Phase 3 transport): resume the task so a later
+            // scheduler pass can re-run its graph from the checkpoint.
+            this.deps.ledger.resumeTask(task.id, task.owner);
+            outcomes.push({ taskId: task.id, owner: task.owner, outcome: "repinned" });
+          }
         } else {
           outcomes.push(await this.failStuck(task, "credentials_expired"));
         }
@@ -650,6 +773,7 @@ export class JobRunner {
     return new ToolExecutor({
       registry: this.deps.registry,
       getPinnedIps: this.deps.getPinnedIps ?? (() => undefined),
+      trustedHosts: this.deps.trustedHosts,
     });
   }
 
@@ -685,9 +809,9 @@ export class JobRunner {
    *
    * If the current id advanced PAST our own write (`ownFinalId !== currentId`),
    * another writer interleaved: we RE-READ the merged graph state and
-   * RE-EVALUATE once (`graph.invoke({ messages: [] }, ...)` runs the
-   * orchestrator against the current state) — never a blind retry of the
-   * original input, and never more than one re-evaluation.
+   * RE-EVALUATE once — re-applying the ORIGINAL input messages on top of the
+   * merged state so the user's input survives a superseding writer (M5), and
+   * never more than one re-evaluation.
    */
   private async invokeWithCheckpointLock(
     graph: AnyCompiledGraph,
@@ -708,10 +832,11 @@ export class JobRunner {
     ) {
       console.warn(
         `[jobs] thread ${threadId}: checkpoint advanced past our write ` +
-          `(${ownFinalId} -> ${currentId}); re-reading state and re-evaluating once`,
+          `(${ownFinalId} -> ${currentId}); re-reading state and re-evaluating ` +
+          "once with the original input",
       );
       return graph.invoke(
-        { messages: [] },
+        input,
         { configurable: { thread_id: threadId } },
       );
     }

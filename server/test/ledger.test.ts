@@ -822,4 +822,88 @@ describe("migration", () => {
     assert.ok(cols.includes("fence_token"), "fresh DB must have fence_token");
     assert.ok(cols.includes("last_heartbeat_ts"));
   });
+
+  test("M4: v4 migration dedupes pre-existing duplicate (owner, intent_key) rows, keeping the newest", () => {
+    // Rebuild the exact pre-v4 (v1..v3) schema, seed two duplicate-key rows,
+    // then run the REAL migration chain: v4 must delete the older duplicate
+    // BEFORE creating the unique index instead of aborting the import.
+    const db = new Database(":memory:") as DatabaseType;
+    const v1 = (d: DatabaseType) => {
+      d.exec(`
+        CREATE TABLE ledger_task (
+          id               TEXT PRIMARY KEY,
+          owner            TEXT NOT NULL,
+          intent_key       TEXT NOT NULL,
+          spec             TEXT NOT NULL,
+          worker           TEXT,
+          status           TEXT NOT NULL CHECK (
+            status IN ('queued','running','succeeded','failed','cancelled','stuck','awaiting_review')
+          ),
+          created_ts       INTEGER NOT NULL,
+          updated_ts       INTEGER NOT NULL,
+          lease_expires_at INTEGER,
+          lease_owner      TEXT
+        );
+
+        CREATE TABLE ledger_step (
+          id      TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES ledger_task(id),
+          seq     INTEGER NOT NULL,
+          stage   TEXT NOT NULL,
+          action  TEXT NOT NULL,
+          result  TEXT,
+          ts      INTEGER NOT NULL,
+          UNIQUE (task_id, seq)
+        );
+
+        CREATE TABLE ledger_chain (
+          seq         INTEGER NOT NULL,
+          task_id     TEXT NOT NULL,
+          step_id     TEXT NOT NULL,
+          digest      TEXT NOT NULL,
+          prev_digest TEXT,
+          ts          INTEGER NOT NULL,
+          PRIMARY KEY (task_id, seq),
+          UNIQUE (task_id, step_id)
+        );
+      `);
+    };
+    const v2 = (d: DatabaseType) => {
+      d.exec(
+        `ALTER TABLE ledger_task ADD COLUMN last_heartbeat_ts INTEGER NOT NULL DEFAULT 0;`,
+      );
+    };
+    const v3 = (d: DatabaseType) => {
+      d.exec(
+        `ALTER TABLE ledger_task ADD COLUMN fence_token TEXT NOT NULL DEFAULT '';`,
+      );
+    };
+    applyMigrations(db, [v1, v2, v3], 3);
+    const insertTask = db.prepare(
+      `INSERT INTO ledger_task
+         (id, owner, intent_key, spec, status, created_ts, updated_ts, last_heartbeat_ts)
+       VALUES (@id, @owner, @intentKey, @spec, 'queued', @ts, @ts, 0)`,
+    );
+    insertTask.run({ id: "dup-old", owner: "o", intentKey: "k", spec: "old", ts: 1 });
+    insertTask.run({ id: "dup-new", owner: "o", intentKey: "k", spec: "new", ts: 2 });
+
+    migrateLedger(db); // applies v4 over the pre-v4 data
+    assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
+    const rows = db
+      .prepare("SELECT id FROM ledger_task ORDER BY id")
+      .all() as Array<{ id: string }>;
+    assert.deepEqual(
+      rows.map((r) => r.id),
+      ["dup-new"],
+      "only the newest duplicate must survive",
+    );
+
+    // The unique index now exists and rejects a fresh duplicate insert.
+    assert.throws(
+      () =>
+        insertTask.run({ id: "dup-again", owner: "o", intentKey: "k", spec: "x", ts: 3 }),
+      /UNIQUE/i,
+      "the unique (owner, intent_key) index must be in force after migration",
+    );
+  });
 });
