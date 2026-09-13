@@ -6,6 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
+import Database from "better-sqlite3";
 import {
   AIMessage,
   AIMessageChunk,
@@ -32,6 +33,7 @@ import type {
 } from "../../src/plugins/types.ts";
 import { createChatRoutes } from "../../src/transport/chat.ts";
 import { toLangChainMessages } from "../../src/transport/chat.ts";
+import type { JobModelRequestConfig } from "../../src/transport/chat.ts";
 import {
   buildModel,
   createValidatedFetchAdapter,
@@ -39,6 +41,15 @@ import {
 } from "../../src/transport/model.ts";
 import type { BuildModelInput } from "../../src/transport/model.ts";
 import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
+import { Ledger, migrateLedger } from "../../src/ledger.ts";
+import { CredentialPinStore } from "../../src/credentials/pins.ts";
+import { ThreadLockRegistry } from "../../src/jobs/thread_lock.ts";
+import type {
+  JobDescriptor,
+  JobErrorCode,
+  JobRunner,
+  RunJobResult,
+} from "../../src/jobs/runner.ts";
 
 /**
  * Wave C1 chat-transport tests. Everything is fake/in-memory: a real
@@ -235,11 +246,84 @@ class RecordingChatModel extends BaseChatModel<BaseChatModelCallOptions> {
   }
 }
 
+/**
+ * Scripted streaming model whose `_streamResponseChunks` serializes on an
+ * injected `active` tracker while it runs. Used by the per-thread-lock tests to
+ * prove two concurrent streams on one thread never overlap a model turn.
+ */
+class SlowScriptedChatModel extends BaseChatModel<BaseChatModelCallOptions> {
+  private turns: Array<Array<Record<string, unknown>>>;
+  readonly recordedInputs: BaseMessage[][];
+  private readonly delayMs: number;
+  private readonly active: { current: number; max: number };
+
+  constructor(opts: {
+    turns: Array<Array<Record<string, unknown>>>;
+    recordedInputs: BaseMessage[][];
+    delayMs: number;
+    active: { current: number; max: number };
+  }) {
+    super({});
+    this.turns = opts.turns.map((turn) => [...turn]);
+    this.recordedInputs = opts.recordedInputs;
+    this.delayMs = opts.delayMs;
+    this.active = opts.active;
+  }
+
+  _llmType(): string {
+    return "slow-scripted";
+  }
+
+  bindTools(tools: StructuredToolInterface[]) {
+    const next = new SlowScriptedChatModel({
+      turns: this.turns,
+      recordedInputs: this.recordedInputs,
+      delayMs: this.delayMs,
+      active: this.active,
+    });
+    return next.withConfig({ tools } as BaseChatModelCallOptions);
+  }
+
+  async _generate(_messages: BaseMessage[]): Promise<ChatResult> {
+    this.recordedInputs.push(_messages);
+    return { generations: [{ message: new AIMessage("(scripted)"), text: "" }] };
+  }
+
+  async *_streamResponseChunks(
+    _messages: BaseMessage[],
+    _options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun,
+  ): AsyncGenerator<ChatGenerationChunk> {
+    this.active.current += 1;
+    this.active.max = Math.max(this.active.max, this.active.current);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      this.recordedInputs.push(_messages);
+      const turn = this.turns.shift() ?? [];
+      for (const fields of turn) {
+        const chunk = new AIMessageChunk(fields);
+        const text = typeof chunk.content === "string" ? chunk.content : "";
+        const generation = new ChatGenerationChunk({ message: chunk, text });
+        await runManager?.handleLLMNewToken(text, undefined, undefined, undefined, undefined, {
+          chunk: generation,
+        });
+        yield generation;
+      }
+    } finally {
+      this.active.current -= 1;
+    }
+  }
+}
+
 type AppOptions = {
   verifyKey?: VerifyApiKeyFn;
   limiter?: (key: string) => boolean;
   checkpointStore?: CheckpointStore;
   buildModel?: typeof buildModel;
+  jobRunner?: JobRunner;
+  pins?: CredentialPinStore;
+  ledger?: Ledger;
+  threadLocks?: ThreadLockRegistry;
 };
 
 async function makeApp(
@@ -258,10 +342,38 @@ async function makeApp(
       verifyKey: opts.verifyKey ?? (async () => "test-user"),
       limiter: opts.limiter ?? (() => true),
       buildModel: opts.buildModel,
+      jobRunner: opts.jobRunner,
+      pins: opts.pins,
+      ledger: opts.ledger,
+      threadLocks: opts.threadLocks,
       trustedHosts: [],
     }),
   );
   return { app, store, registry };
+}
+
+/** In-memory ledger for background-admission assertions (same shape as the
+ *  job-runner tests: real Ledger on an in-memory SQLite DB). */
+function makeLedger(): Ledger {
+  const db = new Database(":memory:");
+  migrateLedger(db);
+  return new Ledger(db, { stuckTimeoutMs: 10_000, leaseExpiryMs: 60_000 });
+}
+
+type FakeJobRunner = {
+  runJob: JobRunner["runJob"];
+  /** Every descriptor handed to `runJob`, in call order. */
+  calls: JobDescriptor[];
+};
+
+/** A recording fake `JobRunner` that returns the scripted results in order. */
+function makeFakeJobRunner(results: RunJobResult[]): FakeJobRunner {
+  const calls: JobDescriptor[] = [];
+  const runJob: JobRunner["runJob"] = async (descriptor) => {
+    calls.push(descriptor);
+    return results[Math.min(calls.length, results.length) - 1]!;
+  };
+  return { runJob, calls };
 }
 
 function postChat(
@@ -384,15 +496,321 @@ describe("POST /v1/chat/completions — pre-stream errors (§5.1)", () => {
     assert.equal(empty.status, 400);
     assert.deepEqual(await empty.json(), { error: "invalid_request" });
   });
+});
 
-  test("501 { error: not_implemented } when body.background is set (Wave C2 owns async)", async (t) => {
-    const { app } = await makeApp(t);
-    const res = await postChat(app, chatBody({ background: true }));
-    assert.equal(res.status, 501);
-    assert.deepEqual(await res.json(), {
-      error: "not_implemented",
-      message: "async background delegation is not yet supported",
+describe("POST /v1/chat/completions — async delegation (background: true, Wave C2)", () => {
+  test("happy path: admits a task, pins model + tool credentials, delegates runJob with the right descriptor", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([
+      { status: "succeeded", taskId: "task-1", threadId: "thr-hash" },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
     });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        background: true,
+        messageId: "msg-1",
+        thread_id: "thread-1",
+        messages: [{ role: "user", content: "list my tasks" }],
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "tok-123" },
+        },
+      }),
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      status: "succeeded",
+      taskId: "task-1",
+      threadId: "thr-hash",
+    });
+
+    assert.equal(fake.calls.length, 1, "runJob delegated exactly once");
+    const d = fake.calls[0]!;
+    assert.equal(d.owner, "test-user");
+    assert.equal(d.intentKey, "msg-1");
+    assert.equal(d.spec, "list my tasks", "spec = last user message text");
+    assert.equal(d.clientThreadId, "thread-1");
+    assert.equal(d.modelPluginId, "openrouter");
+    assert.deepEqual(d.toolPlugins, ["vikunja"]);
+    const requestConfig = d.modelRequestConfig as JobModelRequestConfig;
+    assert.equal(requestConfig.owner, "test-user");
+    const input = d.input as { messages: BaseMessage[] };
+    assert.equal(input.messages.length, 1, "fresh thread seeds from client history");
+
+    // Model + tool credentials are pinned for the job (the runner resolves them).
+    assert.deepEqual(pins.get("test-user", "openrouter").credentials, {
+      apiKey: "sk-test-123",
+    });
+    assert.deepEqual(pins.get("test-user", "vikunja").credentials, {
+      apiKey: "tok-123",
+    });
+    // The task was admitted owner-scoped by (owner, messageId).
+    const admitted = ledger.getTaskByIntentKey("test-user", "msg-1");
+    assert.ok(admitted, "task admitted by (owner, messageId)");
+    assert.equal(admitted!.spec, "list my tasks");
+    assert.equal(ledger.getTaskByIntentKey("other-user", "msg-1"), null);
+  });
+
+  test("a background request without thread_id runs on a thread keyed by its messageId", async (t) => {
+    const fake = makeFakeJobRunner([
+      { status: "succeeded", taskId: "task-1", threadId: "thr-1" },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      pins: new CredentialPinStore(),
+      ledger: makeLedger(),
+      jobRunner: fake as unknown as JobRunner,
+    });
+    const res = await postChat(app, chatBody({ background: true, messageId: "msg-no-thread" }));
+    assert.equal(res.status, 200);
+    await res.json();
+    assert.equal(fake.calls[0]!.clientThreadId, "msg-no-thread");
+  });
+
+  test("idempotent retry: the same messageId admits ONE task; the second delegate returns already_terminal", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([
+      { status: "succeeded", taskId: "task-1", threadId: "thr-1" },
+      {
+        status: "already_terminal",
+        taskId: "task-1",
+        threadId: "thr-1",
+        terminalStatus: "succeeded",
+      },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+    });
+
+    const res1 = await postChat(app, chatBody({ background: true, messageId: "msg-same" }));
+    assert.equal(res1.status, 200);
+
+    const res2 = await postChat(app, chatBody({ background: true, messageId: "msg-same" }));
+    assert.equal(res2.status, 200);
+    assert.deepEqual(await res2.json(), {
+      status: "succeeded",
+      taskId: "task-1",
+      threadId: "thr-1",
+    });
+
+    assert.equal(fake.calls.length, 2);
+    assert.equal(fake.calls[0]!.intentKey, "msg-same");
+    assert.equal(fake.calls[1]!.intentKey, "msg-same");
+    const tasks = ledger.listTasks("test-user").filter((task) => task.intent_key === "msg-same");
+    assert.equal(tasks.length, 1, "one task row per (owner, messageId)");
+  });
+
+  test("a duplicate while the first job runs maps to 202 { status: accepted }", async (t) => {
+    const fake = makeFakeJobRunner([
+      { status: "in_flight", taskId: "task-1", threadId: "thr-1" },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      pins: new CredentialPinStore(),
+      ledger: makeLedger(),
+      jobRunner: fake as unknown as JobRunner,
+    });
+    const res = await postChat(app, chatBody({ background: true, messageId: "msg-running" }));
+    assert.equal(res.status, 202);
+    assert.deepEqual(await res.json(), {
+      status: "accepted",
+      taskId: "task-1",
+      threadId: "thr-1",
+    });
+  });
+
+  test("missing messageId -> 400 invalid_request, runJob never called", async (t) => {
+    const fake = makeFakeJobRunner([]);
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      pins: new CredentialPinStore(),
+      ledger: makeLedger(),
+      jobRunner: fake as unknown as JobRunner,
+    });
+    const res = await postChat(app, chatBody({ background: true }));
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), {
+      error: "invalid_request",
+      message: "messageId required for background requests",
+    });
+    assert.equal(fake.calls.length, 0);
+  });
+
+  test("async path not wired (no runner/checkpointer/ledger/pins) -> 503 background_unavailable", async (t) => {
+    const { app } = await makeApp(t); // no checkpointStore/jobRunner/pins/ledger
+    const res = await postChat(app, chatBody({ background: true, messageId: "msg-x" }));
+    assert.equal(res.status, 503);
+    assert.deepEqual(await res.json(), { error: "background_unavailable" });
+  });
+
+  test("checkpointStore present but jobRunner absent -> 503 background_unavailable", async (t) => {
+    const { app } = await makeApp(t, { checkpointStore: fakeCheckpointStore() });
+    const res = await postChat(app, chatBody({ background: true, messageId: "msg-x" }));
+    assert.equal(res.status, 503);
+    assert.deepEqual(await res.json(), { error: "background_unavailable" });
+  });
+
+  test("an invalid tool-plugin credential -> 400 invalid_credentials before admission, nothing pinned, no task", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+    });
+    const res = await postChat(
+      app,
+      chatBody({
+        background: true,
+        messageId: "msg-bad-tool",
+        credentials: { openrouter: { apiKey: "sk-test-123" }, vikunja: { apiKey: "  " } },
+      }),
+    );
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_credentials" });
+    assert.equal(fake.calls.length, 0);
+    assert.equal(ledger.getTaskByIntentKey("test-user", "msg-bad-tool"), null);
+    assert.throws(
+      () => pins.get("test-user", "openrouter"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "a rejected admission must not leave a model pin behind",
+    );
+  });
+
+  test("runJob failed: JobErrorCode -> HTTP mapping", async (t) => {
+    const cases: Array<{ code: JobErrorCode; status: number }> = [
+      { code: "credentials_expired", status: 401 },
+      { code: "task_conflict", status: 409 },
+      { code: "tool_retry_forbidden", status: 409 },
+      { code: "plugin_unavailable", status: 502 },
+      { code: "job_failed", status: 500 },
+    ];
+    for (const { code, status } of cases) {
+      const fake = makeFakeJobRunner([
+        { status: "failed", taskId: "t", threadId: "thr", code, error: `boom-${code}` },
+      ]);
+      const { app } = await makeApp(t, {
+        checkpointStore: fakeCheckpointStore(),
+        pins: new CredentialPinStore(),
+        ledger: makeLedger(),
+        jobRunner: fake as unknown as JobRunner,
+      });
+      const res = await postChat(app, chatBody({ background: true, messageId: `msg-${code}` }));
+      assert.equal(res.status, status, `${code} -> HTTP ${status}`);
+      assert.deepEqual(await res.json(), { error: code, message: `boom-${code}` });
+    }
+  });
+
+  test("a non-boolean background value is rejected, never silently run synchronously", async (t) => {
+    const fake = makeFakeJobRunner([]);
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      pins: new CredentialPinStore(),
+      ledger: makeLedger(),
+      jobRunner: fake as unknown as JobRunner,
+    });
+    const res = await postChat(app, chatBody({ background: "yes", messageId: "msg-x" }));
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), {
+      error: "invalid_request",
+      message: "background must be a boolean",
+    });
+    assert.equal(fake.calls.length, 0);
+  });
+});
+
+describe("POST /v1/chat/completions — sync path per-thread lock (Wave C2)", () => {
+  test("two concurrent streams on the same thread serialize under the shared lock (no interleaved model turn)", async (t) => {
+    const tracker = { current: 0, max: 0 };
+    const recordedInputs: BaseMessage[][] = [];
+    const buildModelFn = ((_input: BuildModelInput) =>
+      new SlowScriptedChatModel({
+        turns: [[{ content: "reply" }]],
+        recordedInputs,
+        delayMs: 40,
+        active: tracker,
+      })) as typeof buildModel;
+    const locks = new ThreadLockRegistry();
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      buildModel: buildModelFn,
+      threadLocks: locks,
+    });
+
+    // Both requests are dispatched before either body is consumed. The first
+    // handler acquires the thread's mutex and returns its Response; the second
+    // handler blocks on the mutex until the first stream has fully completed.
+    const res1Promise = postChat(
+      app,
+      chatBody({ thread_id: "shared", messages: [{ role: "user", content: "one" }] }),
+    );
+    const res2Promise = postChat(
+      app,
+      chatBody({ thread_id: "shared", messages: [{ role: "user", content: "two" }] }),
+    );
+    const res1 = await res1Promise;
+    const text1Promise = res1.text();
+    const res2 = await res2Promise;
+    const text2Promise = res2.text();
+    const [text1, text2] = await Promise.all([text1Promise, text2Promise]);
+
+    assert.equal(res1.status, 200);
+    assert.equal(res2.status, 200);
+    assert.ok(text1.includes("data: [DONE]"));
+    assert.ok(text2.includes("data: [DONE]"));
+    assert.equal(tracker.max, 1, "only one stream may run per thread at a time");
+    assert.ok(
+      recordedInputs.some((turn) =>
+        turn.some((m) => String(m.content) === "one"),
+      ),
+      "the first request's message reached the model",
+    );
+    assert.ok(
+      recordedInputs.some((turn) =>
+        turn.some((m) => String(m.content) === "two"),
+      ),
+      "the second request's message reached the model (after the first stream completed)",
+    );
+  });
+
+  test("a finished sync stream releases the thread's mutex (lock registry GCs it)", async (t) => {
+    const buildModelFn = ((_input: BuildModelInput) =>
+      new SlowScriptedChatModel({
+        turns: [[{ content: "hi" }]],
+        recordedInputs: [],
+        delayMs: 5,
+        active: { current: 0, max: 0 },
+      })) as typeof buildModel;
+    const locks = new ThreadLockRegistry();
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      buildModel: buildModelFn,
+      threadLocks: locks,
+    });
+    const res = await postChat(
+      app,
+      chatBody({ thread_id: "gc-1", messages: [{ role: "user", content: "x" }] }),
+    );
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(locks.size, 0, "the finished stream's mutex must be evicted");
   });
 });
 

@@ -7,13 +7,16 @@ import type { CheckpointStore } from "./checkpoints/store.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
 import { inferenceRoutes } from "./inference.ts";
-import { createJobRunner } from "./jobs/runner.ts";
+import { createJobRunner, JobError } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
+import { ThreadLockRegistry } from "./jobs/thread_lock.ts";
 import { ledgerRoutes, ledger } from "./ledger.routes.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createModelsRoutes } from "./transport/models.ts";
 import { createChatRoutes } from "./transport/chat.ts";
+import type { JobModelRequestConfig } from "./transport/chat.ts";
+import { buildModel } from "./transport/model.ts";
 
 const app = new Hono();
 
@@ -69,35 +72,20 @@ if (checkpointStore) {
   app.route("/v1", createCheckpointRoutes({ store: checkpointStore }));
 }
 
-// Phase 3, Wave C1: `POST /v1/chat/completions` is now the LangChain transport
-// (`src/transport/chat.ts`) — model built from the MODEL plugin + per-request
-// credentials, agent graph streamed via the SSE adapter. The old proxy handler
-// was removed from inferenceRoutes. The checkpoint store is optional here: if
-// boot degraded (corrupt DB / wrong key), the transport falls back to
-// STATELESS runs using the client's messages directly.
-app.route(
-  "/v1",
-  createChatRoutes({
-    registry: pluginRegistry,
-    pluginStore,
-    checkpointStore,
-    ledger,
-    trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
-  }),
-);
-
-// Async job runner (Phase 2, Wave C1). Constructed GUARDED: background jobs
-// are not wired into the HTTP transport yet (Phase 3), so boot must never fail
-// because a dep is unavailable. The in-memory pin store starts empty — Phase 5
-// pins credentials at admission; `buildModel` (model plugin resolution) and
-// `credentialSource` (restart re-pin) are Phase 3/5 seams.
+// Phase 3, Wave C2: the async background path and the sync stream share ONE
+// per-thread lock registry and ONE credential pin store. The chat transport
+// needs both, so the job runner (which owns the pin lifecycle) is constructed
+// BEFORE the chat routes are mounted.
 let jobRunner: JobRunner | undefined;
+let jobPins: CredentialPinStore | undefined;
+const threadLocks = new ThreadLockRegistry();
 try {
   if (checkpointStore) {
+    jobPins = new CredentialPinStore();
     jobRunner = createJobRunner({
       ledger,
       registry: pluginRegistry,
-      pins: new CredentialPinStore(),
+      pins: jobPins,
       checkpointer: checkpointStore.checkpointer,
       getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
       // H1: the executor's call-time validatedFetch re-resolution must apply
@@ -107,6 +95,35 @@ try {
       trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
       // M1: record owner→thread metadata so the /v1/threads surface works.
       touchThread: checkpointStore.touchThread.bind(checkpointStore),
+      // Wave C2: one lock authority for every checkpoint-thread writer, shared
+      // with the sync transport below.
+      threadLocks,
+      // The model-build seam (Wave C2): the async path pins the model-plugin
+      // credential at admission; this closure resolves the owner-scoped pin and
+      // builds the model exactly like the sync path (same plugin + request
+      // overrides + trusted-hosts SSRF policy). The request config carries the
+      // owner + overrides — never credential values (pins are the only channel).
+      buildModel: (modelPluginId, requestConfig) => {
+        const cfg = requestConfig as JobModelRequestConfig | undefined;
+        if (!cfg || !jobPins) {
+          throw new JobError(
+            "plugin_unavailable",
+            "no pinned credential source is wired for background model builds",
+          );
+        }
+        // Throws `credentials_expired` when the pin is missing/expired (the
+        // runner maps it to a failed job before any graph invoke).
+        const pin = jobPins.get(cfg.owner, modelPluginId);
+        return buildModel({
+          registry: pluginRegistry,
+          pluginStore,
+          modelPluginId,
+          requestModel: cfg.requestModel,
+          requestParameters: cfg.requestParameters,
+          credentials: pin.credentials,
+          trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+        });
+      },
     });
     // Restart-loss startup pass: `ledger.reconcileOrphans()` (ledger.routes.ts)
     // already marked orphans `stuck`; resumeStuckJobs fails them cleanly with
@@ -118,6 +135,26 @@ try {
 } catch (err) {
   console.warn("jobs: JobRunner unavailable; background jobs disabled:", err);
 }
+
+// Phase 3, Wave C1/C2: `POST /v1/chat/completions` is the LangChain transport
+// (`src/transport/chat.ts`) — model built from the MODEL plugin + per-request
+// credentials, agent graph streamed via the SSE adapter (sync), or admitted as
+// an idempotent background job (async, `background: true`). The checkpoint
+// store is optional: if boot degraded (corrupt DB / wrong key), every run is
+// STATELESS and async delegation returns 503 background_unavailable.
+app.route(
+  "/v1",
+  createChatRoutes({
+    registry: pluginRegistry,
+    pluginStore,
+    checkpointStore,
+    ledger,
+    jobRunner,
+    pins: jobPins,
+    threadLocks,
+    trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+  }),
+);
 
 app.get("/", (c) =>
   c.json({

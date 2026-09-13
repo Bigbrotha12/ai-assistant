@@ -23,6 +23,7 @@ import type { ToolDefinition, ToolPluginDefinition } from "../plugins/types.ts";
 import { validatedFetch } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import { AsyncMutex } from "./mutex.ts";
+import { ThreadLockRegistry } from "./thread_lock.ts";
 
 /**
  * Async job runner (Phase 2, Wave C1: background jobs).
@@ -357,6 +358,13 @@ export type JobRunnerDeps = {
     threadId: string,
     lastError?: string | null,
   ) => void;
+  /**
+   * Shared per-thread lock registry (Phase 3, Wave C2). When supplied, the
+   * runner serializes every invoke on a checkpoint thread through the SAME
+   * locks the synchronous transport uses, so a background job and a sync
+   * stream on one thread cannot interleave. Defaults to a private registry.
+   */
+  threadLocks?: ThreadLockRegistry;
   /** Explicit heartbeat interval; defaults to the ledger's floor(stuck/3). */
   heartbeatIntervalMs?: number;
   /** Optional periodic pin GC. `dispose()` stops it. */
@@ -487,13 +495,14 @@ function bindJobTool(
 }
 
 export class JobRunner {
-  private readonly mutexes = new Map<string, AsyncMutex>();
+  private readonly threadLocks: ThreadLockRegistry;
   private readonly deps: JobRunnerDeps;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
 
   constructor(deps: JobRunnerDeps) {
     this.deps = deps;
+    this.threadLocks = deps.threadLocks ?? new ThreadLockRegistry();
     if (deps.sweepIntervalMs && deps.sweepIntervalMs > 0) {
       const setInterval =
         deps.setInterval ?? globalThis.setInterval.bind(globalThis);
@@ -508,13 +517,9 @@ export class JobRunner {
     }
   }
 
-  private mutexFor(threadId: string): AsyncMutex {
-    let mutex = this.mutexes.get(threadId);
-    if (!mutex) {
-      mutex = new AsyncMutex();
-      this.mutexes.set(threadId, mutex);
-    }
-    return mutex;
+  /** Live per-thread mutex map (tests assert the GC behavior). */
+  get mutexes(): Map<string, AsyncMutex> {
+    return this.threadLocks.mutexes;
   }
 
   /** Owner-scoped status-by-idempotency-key (the client's poll-after-drop). */
@@ -604,7 +609,6 @@ export class JobRunner {
     //    (H2) fails the job cleanly with an error step + pin release instead
     //    of orphaning the task as `running` forever. Stopped in the finally.
     let heartbeat: { stop(): void } | undefined;
-    let mutex: AsyncMutex | undefined;
 
     try {
       heartbeat = this.deps.ledger.startHeartbeat(claimed.id, owner, fenceToken, {
@@ -648,11 +652,12 @@ export class JobRunner {
 
       // 7. Per-thread mutex + checkpoint_id optimistic locking. The owner
       //    mapping for the thread is recorded (M1) so the /v1/threads surface
-      //    can resolve ownership.
+      //    can resolve ownership. The mutex is the SHARED ThreadLockRegistry
+      //    when the transport supplied one (Wave C2): a sync stream and a
+      //    background job on the same thread serialize against each other.
       const input = descriptor.input ?? { messages: [new HumanMessage(spec)] };
       this.deps.touchThread?.(owner, threadId);
-      mutex = this.mutexFor(threadId);
-      const result = await mutex.runExclusive(() =>
+      const result = await this.threadLocks.runExclusive(threadId, () =>
         this.invokeWithCheckpointLock(graph, threadId, input),
       );
 
@@ -669,16 +674,17 @@ export class JobRunner {
       this.deps.touchThread?.(owner, threadId, errorMessageOf(e));
       return this.failJob(claimed, owner, fenceToken, threadId, code, errorMessageOf(e));
     } finally {
-      // LOW: GC the per-thread mutex once the job is done — but ONLY when the
-      // map still holds OUR instance AND it is idle (no holder, no waiters), so
-      // a concurrent job queued behind us on the same thread keeps its lock and
-      // a later job cannot split the thread across two mutexes.
-      if (mutex && this.mutexes.get(threadId) === mutex && mutex.isIdle) {
-        this.mutexes.delete(threadId);
-      }
       heartbeat?.stop();
+      // Release the tool-plugin pins AND the model-plugin pin (Wave C2). The
+      // model pin is minted by the transport at admission; the runner owns its
+      // lifecycle for the duration of the job. A duplicate (`in_flight`) /
+      // terminal re-submit returns BEFORE this try, so the original job's
+      // finally is the single release point — never a concurrent racer's.
       for (const pluginId of toolPlugins) {
         this.deps.pins.release(owner, pluginId);
+      }
+      if (descriptor.modelPluginId !== "") {
+        this.deps.pins.release(owner, descriptor.modelPluginId);
       }
       this.sweepPins();
     }

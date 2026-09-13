@@ -874,6 +874,59 @@ describe("JobRunner.runJob", () => {
       "both finished jobs' shared-thread mutex must be evicted",
     );
   });
+
+  test("Wave C2: the buildModel seam resolves the PINNED model credential by owner and builds the model", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" }); // tool pin
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" }); // model pin
+
+    const built: Array<{
+      modelPluginId: string;
+      requestConfig: unknown;
+      creds?: Record<string, string>;
+    }> = [];
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (modelPluginId, requestConfig) => {
+          const cfg = requestConfig as { owner?: string } | undefined;
+          let creds: Record<string, string> | undefined;
+          try {
+            if (cfg?.owner) creds = pins.get(cfg.owner, modelPluginId).credentials;
+          } catch {
+            creds = undefined;
+          }
+          built.push({ modelPluginId, requestConfig, creds });
+          return new ScriptedChatModel({ responses: [new AIMessage("built ok")] });
+        },
+      }),
+    );
+
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "seam-1",
+        modelRequestConfig: { owner: "user-1", requestModel: "anthropic/claude-3.5-sonnet" },
+        toolHandler: recordingHandler([]),
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(built.length, 1, "buildModel called once");
+    assert.equal(built[0]!.modelPluginId, "openrouter");
+    assert.equal(
+      (built[0]!.requestConfig as { requestModel?: string }).requestModel,
+      "anthropic/claude-3.5-sonnet",
+      "the request config (owner + overrides) reaches the seam",
+    );
+    assert.deepEqual(built[0]!.creds, { apiKey: "sk-model" });
+
+    // The runner owns the model pin's lifecycle: released in the job's finally.
+    assert.throws(
+      () => pins.get("user-1", "openrouter"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "the model pin must be released when the job completes",
+    );
+  });
 });
 
 describe("JobRunner.resumeStuckJobs (restart loss)", () => {
