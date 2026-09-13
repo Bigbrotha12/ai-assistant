@@ -99,9 +99,28 @@ function choiceFrame(
   };
 }
 
-/** The §3.3 finish chunk: empty delta, `finish_reason` on the terminal chunk. */
-export function finishFrame(finishReason: Exclude<FinishReason, null>): string {
-  return frame({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] });
+/**
+ * The §3.3 finish chunk: empty delta, `finish_reason` on the terminal chunk.
+ * L8: when the finish chunk is the FIRST frame emitted (a degenerate run with
+ * content but zero streamed deltas) it must still carry the id/object/created/
+ * model envelope, so it takes the same `takeEnvelope()` the content/tool frames
+ * use — `undefined` once the envelope has already been sent.
+ */
+export function finishFrame(
+  finishReason: Exclude<FinishReason, null>,
+  envelope?: Envelope,
+): string {
+  return frame(
+    envelope === undefined
+      ? { choices: [{ index: 0, delta: {}, finish_reason: finishReason }] }
+      : {
+          id: envelope.id,
+          object: "chat.completion.chunk",
+          created: envelope.created,
+          model: envelope.model,
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        },
+  );
 }
 
 /** The §3.4 error envelope frame. `message` must already be redacted. */
@@ -349,7 +368,7 @@ export async function* toOpenAiSse(
         if (finishReason === null) {
           yield DONE_FRAME;
         } else {
-          yield finishFrame(finishReason);
+          yield finishFrame(finishReason, takeEnvelope());
           yield DONE_FRAME;
         }
         terminated = true;
@@ -374,6 +393,18 @@ export async function* toOpenAiSse(
   // envelope so the stream still terminates per I4 / §5.2.
   if (!terminated && lastError !== undefined) {
     yield errorFrame(redact(errorMessage(lastError)), ERROR_TYPE_SERVER);
+    yield DONE_FRAME;
+    terminated = true;
+  }
+
+  // L9: the events iterable exhausted WITHOUT a root on_chain_end/error and
+  // without throwing. The wire contract requires `[DONE]` as the sole
+  // terminator, so guarantee it: emit a `stop` finish chunk (which, per L8,
+  // carries the envelope when nothing else has been emitted) and then `[DONE]`.
+  // Only degenerate streams reach this — a real graph run always delivers root
+  // termination.
+  if (!terminated) {
+    yield finishFrame("stop", takeEnvelope());
     yield DONE_FRAME;
   }
 }

@@ -721,19 +721,38 @@ export class JobRunner {
             this.deps.pins.pin(task.owner, pluginId, credentials);
           }
           if (this.deps.buildModel) {
-            // Pins restored AND a model seam is wired: re-run the task through
-            // the full runJob path (H3). The task is still `stuck` here, so
-            // runJob's admission treats it as a replay — it resumes it under a
-            // fresh fence and binds tools with `allowMutatingRetry: false`, so
-            // a mutating tool with no stored result fails `tool_retry_forbidden`
-            // instead of re-executing a possibly-applied side effect.
+            // Pins restored AND a model seam is wired: identify the model
+            // plugin among the restored pins (the registry distinguishes model
+            // from tool plugins). A task whose restored pins carry NO model
+            // plugin cannot be resumed — the honest restart-loss story is to
+            // fail it `plugin_unavailable` (M2), NOT to replay it with an empty
+            // model-plugin id (which the seam would mis-map to
+            // `credentials_expired`) or with a wrong checkpoint thread.
+            const modelPluginId = this.findModelPluginId(reestablished);
+            if (modelPluginId === null) {
+              outcomes.push(await this.failStuck(task, "plugin_unavailable"));
+              continue;
+            }
+            // Re-run the task through the full runJob path (H3). The task is
+            // still `stuck` here, so runJob's admission treats it as a replay —
+            // it resumes it under a fresh fence and binds tools with
+            // `allowMutatingRetry: false`, so a mutating tool with no stored
+            // result fails `tool_retry_forbidden` instead of re-executing a
+            // possibly-applied side effect.
             const replay = await this.runJob({
               owner: task.owner,
               intentKey: task.intent_key,
               spec: task.spec,
-              clientThreadId: task.intent_key,
-              toolPlugins: Object.keys(reestablished),
-              modelPluginId: "",
+              // M2: replay on the thread the ORIGINAL job actually used — the
+              // transport stores the raw client thread id in the task's
+              // `worker` column at admission — never `intent_key` (re-hashing
+              // the intent key would checkpoint a DIFFERENT thread and silently
+              // replay the job against empty state).
+              clientThreadId: task.worker ?? task.intent_key,
+              toolPlugins: Object.keys(reestablished).filter(
+                (pluginId) => pluginId !== modelPluginId,
+              ),
+              modelPluginId,
               isReplay: true,
             });
             outcomes.push({
@@ -783,7 +802,41 @@ export class JobRunner {
     });
   }
 
+  /**
+   * The model plugin id among a restored pin set, or null when the set carries
+   * no installed model plugin. `resumeStuckJobs` uses this to re-run a stuck
+   * task through `runJob` — an empty/missing model plugin id must fail
+   * `plugin_unavailable`, never replay onto a mis-identified model (M2).
+   */
+  private findModelPluginId(
+    restored: Record<string, Record<string, string>>,
+  ): string | null {
+    for (const pluginId of Object.keys(restored)) {
+      let plugin;
+      try {
+        plugin = this.deps.registry.requirePlugin(pluginId);
+      } catch {
+        continue; // not installed anymore — cannot be the model plugin
+      }
+      if (isToolPlugin(plugin)) continue;
+      if (plugin.type === "model") return pluginId;
+    }
+    return null;
+  }
+
   private async resolveModel(descriptor: JobDescriptor): Promise<BaseChatModel> {
+    // M2: an empty model-plugin id means the resumer could not identify the
+    // model the original job used. Fail `plugin_unavailable` — the honest,
+    // correct code — NOT `credentials_expired`, which a pin-store miss on an
+    // empty id would otherwise produce and which misleads the client into
+    // re-supplying a key when the real problem is a missing model plugin.
+    if (descriptor.modelPluginId === "") {
+      throw new JobError(
+        "plugin_unavailable",
+        "cannot resume a background job without a model plugin id; " +
+          "re-establish credentials with a model plugin before resuming",
+      );
+    }
     if (!this.deps.buildModel) {
       throw new JobError(
         "plugin_unavailable",

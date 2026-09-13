@@ -98,6 +98,11 @@ try {
       // Wave C2: one lock authority for every checkpoint-thread writer, shared
       // with the sync transport below.
       threadLocks,
+      // M1: periodic credential-pin GC. In-memory pins are released by the
+      // runner's finally / the transport's non-claimed-path releases, but a
+      // crash between admission and claim could still leak one; a periodic
+      // sweep bounds that window instead of relying on the release paths alone.
+      sweepIntervalMs: 60_000,
       // The model-build seam (Wave C2): the async path pins the model-plugin
       // credential at admission; this closure resolves the owner-scoped pin and
       // builds the model exactly like the sync path (same plugin + request

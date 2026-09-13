@@ -163,23 +163,55 @@ describe("modelListFromPlugins (pure)", () => {
   test("maps a model plugin to an OpenAI entry with redacted capability metadata", () => {
     const result = modelListFromPlugins([openRouterPlugin()]);
 
-    assert.deepEqual(result, {
-      object: "list",
-      data: [
-        {
-          id: "openrouter",
-          object: "model",
-          created: 0,
-          owned_by: "plugin",
-          visionCapable: true,
-          supportsStreaming: true,
-          defaultModel: "openrouter/auto",
-          tokenLimit: 131_072,
-          parameters: {},
+    assert.equal(result.object, "list");
+    assert.equal(result.data.length, 1);
+    const entry = result.data[0]!;
+    assert.equal(entry.id, "openrouter");
+    assert.equal(entry.object, "model");
+    assert.ok(
+      Number.isInteger(entry.created) && entry.created > 0,
+      "created is a real epoch-seconds timestamp, not 0",
+    );
+    assert.equal(entry.owned_by, "plugin");
+    assert.equal(entry.visionCapable, true);
+    assert.equal(entry.supportsStreaming, true);
+    assert.equal(entry.defaultModel, "openrouter/auto");
+    assert.equal(entry.tokenLimit, 131_072);
+    assert.deepEqual(entry.parameters, {});
+    assertNoUrlLeak(result, "result");
+  });
+
+  test("L3: sanitizes inference.parameters — URL-shaped values and url/endpoint/host keys never reach the wire", () => {
+    const plugin: ModelPluginDefinition = {
+      ...openRouterPlugin(),
+      inference: {
+        ...openRouterPlugin().inference,
+        parameters: {
+          temperature: 0.2,
+          maxTokens: 512,
+          endpoint: "https://openrouter.ai/api/v1",
+          url: "https://internal.vikunja.local",
+          host: "10.0.0.5",
+          baseUrlValue: "https://example.com",
+          nested: {
+            apiUrl: "https://admin.internal.example",
+            keep: true,
+          },
         },
-      ],
+      },
+    };
+    const result = modelListFromPlugins([plugin]);
+    assert.deepEqual(result.data[0]!.parameters, {
+      temperature: 0.2,
+      maxTokens: 512,
+      nested: { keep: true },
     });
     assertNoUrlLeak(result, "result");
+    assert.equal(
+      JSON.stringify(result).includes("https://"),
+      false,
+      "URL-shaped parameter values must not leak",
+    );
   });
 
   test("sorts entries by plugin id", () => {

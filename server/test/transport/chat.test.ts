@@ -11,6 +11,7 @@ import {
   AIMessage,
   AIMessageChunk,
   BaseMessage,
+  HumanMessage,
 } from "@langchain/core/messages";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import type {
@@ -25,8 +26,10 @@ import { MemorySaver } from "@langchain/langgraph";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import type { CheckpointStore } from "../../src/checkpoints/store.ts";
+import { checkpointThreadId } from "../../src/checkpoints/store.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
+import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
 import type {
   ModelPluginDefinition,
   ToolPluginDefinition,
@@ -320,6 +323,7 @@ type AppOptions = {
   limiter?: (key: string) => boolean;
   checkpointStore?: CheckpointStore;
   buildModel?: typeof buildModel;
+  toolHandler?: ToolCallHandler;
   jobRunner?: JobRunner;
   pins?: CredentialPinStore;
   ledger?: Ledger;
@@ -342,6 +346,7 @@ async function makeApp(
       verifyKey: opts.verifyKey ?? (async () => "test-user"),
       limiter: opts.limiter ?? (() => true),
       buildModel: opts.buildModel,
+      toolHandler: opts.toolHandler,
       jobRunner: opts.jobRunner,
       pins: opts.pins,
       ledger: opts.ledger,
@@ -496,6 +501,19 @@ describe("POST /v1/chat/completions — pre-stream errors (§5.1)", () => {
     assert.equal(empty.status, 400);
     assert.deepEqual(await empty.json(), { error: "invalid_request" });
   });
+
+  test("L7: 400 { error: invalid_request } for a role outside system/user/assistant/tool", async (t) => {
+    const { app } = await makeApp(t);
+    const bogus = await postChat(
+      app,
+      chatBody({ messages: [{ role: "bogus", content: "x" }] }),
+    );
+    assert.equal(bogus.status, 400);
+    assert.deepEqual(await bogus.json(), { error: "invalid_request" });
+    const nonRecord = await postChat(app, chatBody({ messages: ["not-an-object"] }));
+    assert.equal(nonRecord.status, 400);
+    assert.deepEqual(await nonRecord.json(), { error: "invalid_request" });
+  });
 });
 
 describe("POST /v1/chat/completions — async delegation (background: true, Wave C2)", () => {
@@ -633,6 +651,90 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     });
   });
 
+  test("M1: a background duplicate (in_flight) releases the transport's model + tool pins (the runner never claimed them)", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([
+      { status: "in_flight", taskId: "task-1", threadId: "thr-1" },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+    });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        background: true,
+        messageId: "msg-dup",
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "tok-123" },
+        },
+      }),
+    );
+    assert.equal(res.status, 202);
+    assert.throws(
+      () => pins.get("test-user", "openrouter"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "the model pin must not leak after an in_flight duplicate",
+    );
+    assert.throws(
+      () => pins.get("test-user", "vikunja"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "the tool pin must not leak after an in_flight duplicate",
+    );
+  });
+
+  test("M1: an already_terminal re-submit also releases the transport's pins", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([
+      {
+        status: "already_terminal",
+        taskId: "task-1",
+        threadId: "thr-1",
+        terminalStatus: "succeeded",
+      },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+    });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        background: true,
+        messageId: "msg-term",
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "tok-123" },
+        },
+      }),
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      status: "succeeded",
+      taskId: "task-1",
+      threadId: "thr-1",
+    });
+    assert.throws(
+      () => pins.get("test-user", "openrouter"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+    );
+    assert.throws(
+      () => pins.get("test-user", "vikunja"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+    );
+  });
+
   test("missing messageId -> 400 invalid_request, runJob never called", async (t) => {
     const fake = makeFakeJobRunner([]);
     const { app } = await makeApp(t, {
@@ -691,6 +793,13 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       () => pins.get("test-user", "openrouter"),
       (e: unknown) => (e as { code?: string }).code === "pin_not_found",
       "a rejected admission must not leave a model pin behind",
+    );
+    // L5: touchThread runs AFTER validation, so a 400 must not leave a phantom
+    // thread_owner row.
+    assert.equal(
+      checkpointStore.getThread(checkpointThreadId("test-user", "msg-bad-tool")),
+      undefined,
+      "a rejected request must not write a phantom thread_owner row",
     );
   });
 
@@ -907,6 +1016,128 @@ describe("POST /v1/chat/completions — happy path (stateless)", () => {
     assert.ok(contents.includes("assistant reply"));
     assert.ok(contents.includes("second"));
   });
+
+  test("H1: a stateless request (no thread_id) streams cleanly to a finish chunk + [DONE] even when a checkpoint store is wired", async (t) => {
+    // The checkpoint store is a real in-memory checkpointer whose `put` throws
+    // `Missing "thread_id"` (the same contract SqliteSaver enforces). Before
+    // the fix the graph was compiled WITH the checkpointer unconditionally, so
+    // a stateless run's first super-step write threw mid-stream and the adapter
+    // surfaced server_error + partial content — breaking every stateless
+    // request on a normally-configured gateway.
+    const fake = makeFakeBuildModel([[{ content: "Hello" }, { content: " world" }]]);
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
+
+    const res = await postChat(
+      app,
+      chatBody({ messages: [{ role: "user", content: "hello" }] }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(!text.includes("server_error"), "no server_error on the wire");
+    assert.ok(!text.includes("Missing \"thread_id\""), "no checkpointer crash leaks");
+
+    const frames = parseFrames(text);
+    assert.equal(frames[frames.length - 1], null, "stream terminates with [DONE]");
+    assert.deepEqual(
+      finishReasons(frames).at(-1),
+      "stop",
+      "a real finish chunk terminates the stream",
+    );
+  });
+});
+
+describe("POST /v1/chat/completions — sync path tool credentials (H2)", () => {
+  test("tool credentials from body.credentials[<toolPlugin>] reach the tool handler on every execute", async (t) => {
+    const recordedInputs: BaseMessage[][] = [];
+    const buildModelFn = ((_input: BuildModelInput) =>
+      new RecordingChatModel(
+        [
+          [
+            {
+              content: "",
+              tool_call_chunks: [
+                { index: 0, id: "call_1", name: "list_tasks", args: '{"projectId":"p1"}' },
+              ],
+            },
+          ],
+          [{ content: "done" }],
+        ],
+        recordedInputs,
+      )) as typeof buildModel;
+
+    const toolCalls: Array<{
+      pluginId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+      credentials?: Record<string, unknown>;
+    }> = [];
+    const { app } = await makeApp(t, {
+      buildModel: buildModelFn,
+      toolHandler: {
+        async execute(pluginId, toolName, args, credentials) {
+          toolCalls.push({ pluginId, toolName, args, credentials });
+          return JSON.stringify({ ok: true, toolName, ...args });
+        },
+      },
+    });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        messages: [{ role: "user", content: "list my tasks" }],
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "tok-123" },
+        },
+      }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(text.includes("data: [DONE]"), "the tool round-trip streams");
+
+    assert.equal(toolCalls.length, 1, "the model called the tool exactly once");
+    assert.equal(toolCalls[0]!.pluginId, "vikunja");
+    assert.equal(toolCalls[0]!.toolName, "list_tasks");
+    assert.deepEqual(toolCalls[0]!.args, { projectId: "p1" });
+    assert.deepEqual(
+      toolCalls[0]!.credentials,
+      { apiKey: "tok-123" },
+      "the sync tool call carries the client's validated tool-plugin credential",
+    );
+  });
+
+  test("a missing tool-plugin credential does NOT fail the request (the model may never call the tool)", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "hi" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
+
+    // vikunja's spec REQUIRES apiKey, but the client simply does not supply it
+    // — the request must still succeed (and simply never have that credential
+    // available if the model calls the tool).
+    const res = await postChat(
+      app,
+      chatBody({ credentials: { openrouter: { apiKey: "sk-test-123" } } }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(text.includes("data: [DONE]"));
+  });
+
+  test("an explicitly-supplied but invalid tool credential is a 400 invalid_credentials", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "hi" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
+    const res = await postChat(
+      app,
+      chatBody({
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "  " },
+        },
+      }),
+    );
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_credentials" });
+  });
 });
 
 describe("POST /v1/chat/completions — seed/resume with a checkpoint store", () => {
@@ -998,6 +1229,70 @@ describe("POST /v1/chat/completions — seed/resume with a checkpoint store", ()
       "owner B starts a FRESH thread (no checkpoint from owner A's thread)",
     );
   });
+
+  test("M3: resume with a non-user last message → 409 resume_conflict (never a silent re-seed)", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "First reply" }]]);
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
+
+    // Seed the thread so a checkpoint exists.
+    const res1 = await postChat(
+      app,
+      chatBody({ thread_id: "mid-tool", messages: [{ role: "user", content: "first" }] }),
+    );
+    assert.equal(res1.status, 200);
+    await res1.text();
+
+    // Resume mid-tool-loop: the LAST message is an assistant/tool message.
+    // Seeding with an older user message would drop tool results and re-run a
+    // pending tool call; the honest answer is a 409.
+    for (const messages of [
+      [
+        { role: "user", content: "continue" },
+        { role: "assistant", content: "let me check", tool_calls: [] },
+      ],
+      [{ role: "tool", tool_call_id: "call_1", content: "[]" }],
+    ]) {
+      const res = await postChat(
+        app,
+        chatBody({ thread_id: "mid-tool", messages }),
+      );
+      assert.equal(res.status, 409, `409 for last role ${messages.at(-1)!.role}`);
+      assert.deepEqual(await res.json(), {
+        error: "resume_conflict",
+        message: "resume with a user message only",
+      });
+    }
+  });
+
+  test("M3: a fresh thread (no checkpoint) accepts a seed whose last message is not a user message", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "hi" }]]);
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        thread_id: "fresh",
+        messages: [
+          { role: "system", content: "sys" },
+          { role: "user", content: "u1" },
+          { role: "assistant", content: "assistant reply" },
+          { role: "user", content: "last" },
+        ],
+      }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(text.includes("data: [DONE]"));
+    const turn = fake.recordedInputs[0]!;
+    const contents = contentsOf(turn);
+    assert.deepEqual(
+      contents,
+      ["u1", "assistant reply", "last"],
+      "a fresh seed uses the client's full history verbatim",
+    );
+  });
 });
 
 describe("transport/model.ts — model construction + SSRF fetch seam", () => {
@@ -1016,6 +1311,48 @@ describe("transport/model.ts — model construction + SSRF fetch seam", () => {
     assert.equal(clientConfig.baseURL, "https://openrouter.ai/api/v1");
     assert.equal(typeof clientConfig.fetch, "function");
     assert.notEqual(clientConfig.fetch, globalThis.fetch, "raw global fetch is never used");
+  });
+
+  test("M5: a real model.invoke actually invokes the validatedFetch-backed custom fetch (the SSRF seam is live)", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, registry } = await makeEnv(dir);
+    const seen: string[] = [];
+    const fetchFn = (async (url: string | URL | Request) => {
+      seen.push(String(url));
+      // ChatOpenAI (streaming: true) consumes an OpenAI SSE stream.
+      const body =
+        'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"openrouter/auto","choices":[{"index":0,"delta":{"role":"assistant","content":"hello from fake provider"},"finish_reason":null}]}\n\n' +
+        'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"openrouter/auto","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+        "data: [DONE]\n\n";
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    const model = buildModel({
+      registry,
+      pluginStore: store,
+      modelPluginId: "openrouter",
+      credentials: { apiKey: "sk-test" },
+      lookup: fakeLookup(),
+      fetchFn,
+      mode: "test",
+    });
+    const result = (await model.invoke([new HumanMessage("hi")])) as {
+      content?: unknown;
+    };
+
+    assert.equal(
+      seen.length,
+      1,
+      "the custom validatedFetch adapter was INVOKED (not just wired)",
+    );
+    assert.ok(
+      seen[0]!.includes("/chat/completions"),
+      `the provider call hit ${seen[0]}`,
+    );
+    assert.equal(String(result.content), "hello from fake provider");
   });
 
   test("buildModel resolves requestModel over the plugin defaultModel", async (t) => {

@@ -5,8 +5,6 @@ import type { PluginRegistry } from "../plugins/registry.ts";
 import { isModelPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 
-export type { VerifyApiKeyFn };
-
 /**
  * OpenAI-compatible `GET /v1/models` transport (Phase 3, Wave B).
  *
@@ -59,16 +57,46 @@ export function modelListFromPlugins(
     .map((plugin): ModelSummary => ({
       id: plugin.id,
       object: "model",
-      created: 0,
+      created: Math.floor(Date.now() / 1000),
       owned_by: "plugin",
       visionCapable: plugin.inference.visionCapable,
       supportsStreaming: plugin.inference.supportsStreaming,
       defaultModel: plugin.inference.defaultModel,
       tokenLimit: plugin.inference.tokenLimit,
-      parameters: plugin.inference.parameters,
+      parameters: sanitizeParameters(plugin.inference.parameters),
     }))
     .sort((a, b) => a.id.localeCompare(b.id));
   return { object: "list", data };
+}
+
+/**
+ * L3: a plugin's `inference.parameters` are echoed onto the wire verbatim —
+ * a URL-shaped parameter value (or a key named `url`/`endpoint`/`host`) could
+ * leak an admin-trusted internal endpoint, so they are stripped before the
+ * models response is serialized. String values that begin with `http` are
+ * dropped; keys named url/endpoint/host are dropped; nested objects are
+ * sanitized recursively. Everything else passes through unchanged.
+ */
+export function sanitizeParameters(
+  parameters: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parameters)) {
+    if (key === "url" || key === "endpoint" || key === "host") continue;
+    if (typeof value === "string" && value.toLowerCase().startsWith("http")) {
+      continue;
+    }
+    if (isRecord(value)) {
+      out[key] = sanitizeParameters(value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export type ModelsRoutesOptions = {

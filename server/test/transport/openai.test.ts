@@ -150,6 +150,26 @@ const GOLDEN_7_2 =
 
 const GOLDEN_7_4 = "data: [DONE]\n\n";
 
+// M4: REAL tool round-trip (tool executor runs, then a final answer) with a
+// byte-exact wire sequence. Two parallel tool-call indices in the same turn:
+//   - index 0 (`list_tasks`, a real bound tool) fragments `"" + {"projectId":
+//     "p1" + "}"` — valid when concatenated, so the tool EXECUTES;
+//   - index 1 (`search_web`) fragments `"" + "q":"dinner " + recipes"}"` — its
+//     first NON-EMPTY fragment lacks the leading `{`, so the adapter's
+//     normalization (§3.2) prepends it on the wire. The index-1 call is not in
+//     the registry, but the adapter never executes anything — it only
+//     translates stream deltas — so its normalized fragments still reach the
+//     wire and concatenate into valid JSON.
+// A final text answer follows, so the terminal chunk carries `"stop"`.
+const GOLDEN_7_5 =
+  'data: {"id":"chatcmpl-006","object":"chat.completion.chunk","created":1726080200,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"list_tasks","arguments":"{\\"projectId\\":\\"p1\\""}},{"index":1,"id":"call_1","type":"function","function":{"name":"search_web","arguments":""}}]},"finish_reason":null}]}\n\n' +
+  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"","arguments":"}"}},{"index":1,"type":"function","function":{"name":"","arguments":"{\\"q\\":\\"dinner "}}]},"finish_reason":null}]}\n\n' +
+  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"","arguments":"recipes\\"}"}}]},"finish_reason":null}]}\n\n' +
+  'data: {"choices":[{"index":0,"delta":{"content":"Here"},"finish_reason":null}]}\n\n' +
+  'data: {"choices":[{"index":0,"delta":{"content":" you go"},"finish_reason":null}]}\n\n' +
+  'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+  "data: [DONE]\n\n";
+
 describe("transport — §7 golden fixtures (byte-exact)", () => {
   test("§7.1 simple text completion: stop, single [DONE], no mid-stream finish_reason", async () => {
     const model = new ScriptedChatModel({
@@ -232,6 +252,70 @@ describe("transport — §7 golden fixtures (byte-exact)", () => {
       0,
       "no finish chunk on the empty run",
     );
+  });
+
+  test("M4: real tool round-trip golden — fragmented args concatenate to valid JSON, normalization prepends the missing '{', terminal chunk is byte-exact", async () => {
+    // index 0 is a REAL bound tool whose concatenated args parse, so the tool
+    // executor runs and the orchestrator streams a final answer (the wire
+    // proves the round trip: tool deltas → second-turn content → stop finish).
+    const model = new ScriptedChatModel({
+      turns: [
+        [
+          {
+            content: "",
+            tool_call_chunks: [
+              { index: 0, id: "call_0", name: "list_tasks", args: '{"projectId":"p1"' },
+              { index: 1, id: "call_1", name: "search_web", args: "" },
+            ],
+          },
+          {
+            content: "",
+            tool_call_chunks: [
+              { index: 0, args: "}" },
+              { index: 1, args: '"q":"dinner ' },
+            ],
+          },
+          { content: "", tool_call_chunks: [{ index: 1, args: 'recipes"}' }] },
+        ],
+        [{ content: "Here" }, { content: " you go" }],
+      ],
+    });
+    const graph = createAgentGraph({ model, tools: [listTasksTool()] });
+    const frames = await collectFrames(graph, {
+      modelId: "gpt-4o",
+      created: 1726080200,
+      id: "chatcmpl-006",
+    });
+
+    assert.equal(frames.join(""), GOLDEN_7_5, "byte-exact wire sequence");
+    assert.equal(countOccurrences(frames.join(""), "data: [DONE]"), 1);
+
+    // The concatenated tool arguments on the wire must parse as valid JSON for
+    // BOTH indices — including index 1, whose first non-empty fragment had no
+    // leading '{' (the adapter's normalizeArgsFragment prepended it).
+    const argsByIndex = new Map<number, string>();
+    for (const frame of frames) {
+      if (!frame.includes("tool_calls")) continue;
+      const payload = JSON.parse(frame.slice("data: ".length));
+      const calls = payload.choices[0].delta.tool_calls as Array<{
+        index: number;
+        function: { arguments: string };
+      }>;
+      for (const call of calls) {
+        argsByIndex.set(call.index, (argsByIndex.get(call.index) ?? "") + call.function.arguments);
+      }
+    }
+    assert.deepEqual(JSON.parse(argsByIndex.get(0)!), { projectId: "p1" });
+    assert.deepEqual(JSON.parse(argsByIndex.get(1)!), { q: "dinner recipes" });
+
+    const reasons = finishReasonsIn(frames);
+    assert.deepEqual(
+      reasons.slice(0, -1),
+      reasons.slice(0, -1).map(() => null),
+      "no finish_reason on any delta frame",
+    );
+    assert.equal(reasons[reasons.length - 1], "stop", "finish stop after the real round trip");
+    assert.equal(frames[frames.length - 1], DONE_FRAME);
   });
 
   test("no LangGraph internals leak onto the wire (Appendix A)", async () => {
@@ -503,5 +587,128 @@ describe("transport — pure helpers", () => {
       'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
     );
     assert.equal(DONE_FRAME, "data: [DONE]\n\n");
+  });
+});
+
+describe("transport — degenerate terminator handling (L8/L9)", () => {
+  test("L8: when the finish chunk is the FIRST frame (content but zero streamed deltas) it still carries the id/object/created/model envelope", async () => {
+    const events = async function* (): AsyncGenerator<StreamEvent, void, unknown> {
+      yield {
+        event: "on_chain_start",
+        name: "LangGraph",
+        run_id: "root-1",
+        metadata: {},
+        data: {},
+      };
+      // A run whose final state has content but whose model turn produced no
+      // streamed deltas — the finish chunk is the first (and only) frame.
+      yield {
+        event: "on_chain_end",
+        name: "LangGraph",
+        run_id: "root-1",
+        metadata: {},
+        data: {
+          output: { messages: [{ type: "ai", content: "hello" }] },
+        },
+      };
+    };
+
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(events(), {
+      modelId: "gpt-4o",
+      created: 1726080300,
+      id: "chatcmpl-007",
+    })) {
+      frames.push(frame);
+    }
+
+    assert.equal(frames.length, 2, "finish chunk + [DONE]");
+    assert.deepEqual(JSON.parse(frames[0]!.slice("data: ".length)), {
+      id: "chatcmpl-007",
+      object: "chat.completion.chunk",
+      created: 1726080300,
+      model: "gpt-4o",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    });
+    assert.equal(frames[1], DONE_FRAME);
+  });
+
+  test("L9: an iterable that exhausts without root termination still ends with a stop finish chunk + exactly one [DONE]", async () => {
+    const events = async function* (): AsyncGenerator<StreamEvent, void, unknown> {
+      yield {
+        event: "on_chain_start",
+        name: "LangGraph",
+        run_id: "root-1",
+        metadata: {},
+        data: {},
+      };
+      yield {
+        event: "on_chat_model_stream",
+        name: "ScriptedChatModel",
+        run_id: "run-1",
+        metadata: {},
+        data: { chunk: { content: "partial" } },
+      };
+      // generator ends — no root on_chain_end/error, no throw.
+    };
+
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(events(), {
+      modelId: "gpt-4o",
+      created: 1726080300,
+      id: "chatcmpl-008",
+    })) {
+      frames.push(frame);
+    }
+
+    assert.deepEqual(
+      frames.map((f) => (f === DONE_FRAME ? "DONE" : JSON.parse(f.slice("data: ".length)).choices[0].delta)),
+      [
+        { content: "partial" },
+        {},
+        "DONE",
+      ],
+    );
+    assert.equal(
+      frames[1]!.includes('"finish_reason":"stop"'),
+      true,
+      "the guaranteed terminator is a stop finish chunk",
+    );
+    assert.equal(countOccurrences(frames.join(""), "data: [DONE]"), 1, "exactly one [DONE]");
+    assert.equal(frames[frames.length - 1], DONE_FRAME);
+  });
+
+  test("L9: the safety-net error path still yields exactly one [DONE] (no double terminator)", async () => {
+    const events = async function* (): AsyncGenerator<StreamEvent, void, unknown> {
+      yield {
+        event: "on_chain_start",
+        name: "LangGraph",
+        run_id: "root-1",
+        metadata: {},
+        data: {},
+      };
+      yield {
+        event: "on_chat_model_stream",
+        name: "ScriptedChatModel",
+        run_id: "run-1",
+        metadata: {},
+        data: { chunk: { content: "partial" } },
+      };
+      throw new Error("boom");
+    };
+
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(events())) {
+      frames.push(frame);
+    }
+
+    const errorFrameIndex = frames.findIndex((frame) => frame.includes('"error"'));
+    assert.ok(errorFrameIndex >= 0, "an error envelope was emitted");
+    assert.equal(
+      countOccurrences(frames.join(""), "data: [DONE]"),
+      1,
+      "the error path must not double-terminate",
+    );
+    assert.equal(frames[frames.length - 1], DONE_FRAME);
   });
 });

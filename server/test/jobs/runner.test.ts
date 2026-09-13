@@ -35,7 +35,7 @@ import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
-import type { ToolPluginDefinition } from "../../src/plugins/types.ts";
+import type { ToolPluginDefinition, ModelPluginDefinition } from "../../src/plugins/types.ts";
 
 /**
  * Wave C1 job-runner tests. Everything is fake/in-memory: a real Ledger on an
@@ -184,6 +184,29 @@ function vikunjaManifest(): ToolPluginDefinition {
   };
 }
 
+/** Model plugin for the M2 restart-replay tests (resumeStuckJobs must be able
+ *  to identify the model plugin among a restored pin set). */
+function openRouterModelPlugin(): ModelPluginDefinition {
+  return {
+    id: "openrouter",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "model",
+    name: "OpenRouter",
+    description: "Aggregated LLM inference",
+    inference: {
+      endpoint: "https://openrouter.ai/api/v1",
+      defaultModel: "openrouter/auto",
+      tokenLimit: 131_072,
+      supportsStreaming: true,
+      visionCapable: true,
+      parameters: {},
+    },
+    baseUrls: [{ id: "openrouter-api", url: "https://openrouter.ai/api/v1" }],
+    credentials: { apiKey: { label: "OpenRouter API key", required: true } },
+  };
+}
+
 async function makeRegistry(
   t: TestContext,
 ): Promise<{ registry: PluginRegistry; store: PluginStore }> {
@@ -192,7 +215,7 @@ async function makeRegistry(
   const store = new PluginStore({
     storePath: join(dir, "plugins.json"),
     trustedHosts: [],
-    builtinPlugins: [],
+    builtinPlugins: [openRouterModelPlugin()],
     manifests: [vikunjaManifest()],
     lookup: fakeLookup(),
   });
@@ -992,7 +1015,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     });
   });
 
-  test("H3: with a model seam wired, a repinned stuck task is re-run through runJob as a replay (mutating tool → tool_retry_forbidden)", async (t) => {
+  test("H3: with a model seam wired and the model plugin identifiable among the restored pins, a repinned stuck task is re-run through runJob as a replay (mutating tool → tool_retry_forbidden)", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger, clock } = makeLedger();
     const pins = new CredentialPinStore();
@@ -1000,6 +1023,9 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       owner: "user-1",
       intentKey: "orphan-replay",
       spec: "{}",
+      // M2: the transport stores the ORIGINAL raw client thread id in the
+      // task's `worker` column; a replay must resume on that thread.
+      worker: "original-client-thread",
     });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000);
@@ -1007,6 +1033,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     assert.equal(ledger.getTask(task.id)?.status, "stuck");
 
     const calls: RecordedCall[] = [];
+    const checkpointer = new MemorySaver();
     const model = new ScriptedChatModel({
       responses: [
         toolCallMessage("create_task", { title: "x" }, "call_replay_resume"),
@@ -1015,8 +1042,12 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     });
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
+        checkpointer,
         buildModel: () => model,
-        credentialSource: () => ({ vikunja: { apiKey: "restored" } }),
+        credentialSource: () => ({
+          openrouter: { apiKey: "sk-model" },
+          vikunja: { apiKey: "restored" },
+        }),
       }),
     );
     const result = await runner.resumeStuckJobs();
@@ -1028,6 +1059,61 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
         .some((s) => s.action === "error:tool_retry_forbidden"),
     );
     assert.equal(calls.length, 0, "the mutating tool must not re-execute during a replay");
+
+    // M2: the replay ran on the STORED client thread (worker column), not on a
+    // re-hash of the intent key — the original thread now holds the replay's
+    // checkpoint, proving the resume was not mis-threaded.
+    const state = await checkpointer.get({
+      configurable: {
+        thread_id: checkpointThreadId("user-1", "original-client-thread"),
+      },
+    });
+    assert.ok(
+      state !== undefined,
+      "the replay wrote to the ORIGINAL checkpoint thread (worker column)",
+    );
+    const wrongThread = await checkpointer.get({
+      configurable: {
+        thread_id: checkpointThreadId("user-1", "orphan-replay"),
+      },
+    });
+    assert.equal(
+      wrongThread,
+      undefined,
+      "the replay must NOT checkpoint the intent-key thread",
+    );
+  });
+
+  test("M2: a repinned stuck task whose restored pins carry NO model plugin fails plugin_unavailable (never credentials_expired, never a wrong-thread resume)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "orphan-nomodel",
+      spec: "{}",
+    });
+    ledger.claimTask(task.id, "user-1");
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(task.id)?.status, "stuck");
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("never")] }),
+        // Only the TOOL plugin's key is restored — no model plugin id.
+        credentialSource: () => ({ vikunja: { apiKey: "restored" } }),
+      }),
+    );
+    const result = await runner.resumeStuckJobs();
+    assert.equal(result.outcomes[0]?.outcome, "plugin_unavailable");
+    assert.equal(ledger.getTask(task.id)?.status, "failed");
+    assert.ok(
+      ledger
+        .listSteps(task.id)
+        .some((s) => s.action === "error:plugin_unavailable"),
+      "the honest code is plugin_unavailable, not credentials_expired",
+    );
   });
 });
 

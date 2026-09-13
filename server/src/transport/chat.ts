@@ -9,6 +9,7 @@ import {
 import type { BaseMessage } from "@langchain/core/messages";
 import { inferenceLimiter, requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
+import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
@@ -188,6 +189,13 @@ export type ChatRoutesOptions = {
   limiter?: RateLimiterFn;
   /** Test seam; defaults to the real model builder (transport/model.ts). */
   buildModel?: typeof buildModel;
+  /**
+   * Test seam for the sync path's tool handler. Defaults to the real
+   * `ToolExecutor` (validatedFetch + pinned IPs + trusted hosts). When
+   * supplied, the transport still injects each call's per-plugin credentials
+   * (H2) so a fake can assert them.
+   */
+  toolHandler?: ToolCallHandler;
   /** Admin-trusted hosts for every outbound `validatedFetch` (model + tools). */
   trustedHosts?: readonly string[];
 };
@@ -258,6 +266,8 @@ type ResolvedChat = {
   requestModel: string | undefined;
   plugin: ModelPluginDefinition;
   credentials: Record<string, string>;
+  /** Per-tool-plugin validated credentials from `body.credentials` (H2). */
+  toolCredentialsByPlugin: Record<string, Record<string, string>>;
   rawMessages: unknown[];
   requestParameters: Record<string, unknown>;
   clientThreadId: string | undefined;
@@ -300,9 +310,38 @@ function resolveChatRequest(
     return { ok: false, response: c.json({ error: "internal" }, 500) };
   }
 
+  // H2: extract + validate every TOOL plugin credential the request carries.
+  // Missing credentials for a tool plugin do NOT fail the request — the model
+  // may never call that tool — so only what is supplied is validated, and only
+  // what passes is forwarded to the sync ToolExecutor. An explicitly supplied
+  // but invalid value (e.g. a whitespace-only required key) is rejected the
+  // same way as the async path's `pinToolPlugins`.
+  let toolCredentialsByPlugin: Record<string, Record<string, string>>;
+  try {
+    toolCredentialsByPlugin = collectToolCredentials(body, registry);
+  } catch (err) {
+    if (err instanceof PluginCredentialError) {
+      return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
+    }
+    return { ok: false, response: c.json({ error: "internal" }, 500) };
+  }
+
   const rawMessages = Array.isArray(body["messages"]) ? body["messages"] : [];
   if (rawMessages.length === 0) {
     return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+  }
+
+  // L7: reject roles outside the wire contract instead of silently converting
+  // them to zero LangChain messages (an unknown role must be a 400, not a
+  // degenerate empty run). Non-record entries are equally unusable.
+  for (const raw of rawMessages) {
+    if (!isRecord(raw)) {
+      return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+    }
+    const role = raw["role"];
+    if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
+      return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+    }
   }
 
   // Legacy-field tolerance: `chat_template_kwargs` / `enable_thinking` are
@@ -325,6 +364,7 @@ function resolveChatRequest(
       requestModel,
       plugin,
       credentials,
+      toolCredentialsByPlugin,
       rawMessages,
       requestParameters,
       clientThreadId,
@@ -380,16 +420,33 @@ async function handleSyncStream(
     return preStreamError(c, err);
   }
 
-  const toolHandler = new ToolExecutor({
-    registry: opts.registry,
-    getPinnedIps: opts.pluginStore.getPinnedIps.bind(opts.pluginStore),
-    trustedHosts: opts.trustedHosts,
+  const toolHandler =
+    opts.toolHandler ??
+    new ToolExecutor({
+      registry: opts.registry,
+      getPinnedIps: opts.pluginStore.getPinnedIps.bind(opts.pluginStore),
+      trustedHosts: opts.trustedHosts,
+    });
+  // H2: inject each tool call's per-plugin credentials (mirrors the async
+  // path's `bindJobTools` threading) so a tool backend that requires auth
+  // receives the client's key on the SYNC path too.
+  const toolCredentialsByPlugin = resolved.value.toolCredentialsByPlugin;
+  const tools = bindPluginTools(opts.registry, {
+    async execute(pluginId, toolName, args) {
+      return toolHandler.execute(pluginId, toolName, args, toolCredentialsByPlugin[pluginId]);
+    },
   });
-  const tools = bindPluginTools(opts.registry, toolHandler);
   const base = createAgentGraph({ model, tools });
-  const graph = checkpointStore
-    ? compileGraphWithCheckpointer(base, checkpointStore.checkpointer)
-    : base;
+  // H1: compile with the checkpointer ONLY for a threaded (checkpointed) run.
+  // A stateless run (no `thread_id`) streams WITHOUT `configurable.thread_id`;
+  // running that through a checkpointer would throw `Missing "thread_id"` on
+  // the first super-step write and surface as a server_error after partial
+  // content — exactly the crash a normally-configured gateway (checkpoints
+  // enabled) hit for every stateless request.
+  const graph =
+    threadId !== undefined && checkpointStore
+      ? compileGraphWithCheckpointer(base, checkpointStore.checkpointer)
+      : base;
   const modelId = requestModel ?? plugin.inference.defaultModel;
 
   const lock = opts.threadLocks;
@@ -409,10 +466,10 @@ async function handleSyncStream(
     try {
       const { input, streamOptions } = await computeThreadInput(
         checkpointStore,
-        owner,
         threadId,
         rawMessages,
       );
+      checkpointStore.touchThread(owner, threadId);
       return buildStreamResponse(
         graph,
         input,
@@ -423,6 +480,9 @@ async function handleSyncStream(
       );
     } catch (err) {
       releaseOnce();
+      if (isResumeConflict(err)) {
+        return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
+      }
       console.error("chat: locked stream setup failed", err);
       return c.json({ error: "internal" }, 500);
     }
@@ -433,14 +493,22 @@ async function handleSyncStream(
   let input: Record<string, unknown>;
   let streamOptions: StreamOptions;
   if (threadId !== undefined && checkpointStore) {
-    const computed = await computeThreadInput(
-      checkpointStore,
-      owner,
-      threadId,
-      rawMessages,
-    );
-    input = computed.input;
-    streamOptions = computed.streamOptions;
+    try {
+      const computed = await computeThreadInput(
+        checkpointStore,
+        threadId,
+        rawMessages,
+      );
+      input = computed.input;
+      streamOptions = computed.streamOptions;
+    } catch (err) {
+      if (isResumeConflict(err)) {
+        return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
+      }
+      console.error("chat: threaded stream setup failed", err);
+      return c.json({ error: "internal" }, 500);
+    }
+    checkpointStore.touchThread(owner, threadId);
   } else {
     input = { messages: toLangChainMessages(rawMessages) };
     streamOptions = { version: "v2" };
@@ -494,7 +562,26 @@ async function handleBackground(
   // messageId (deterministic per send); the runner recomputes the same hash.
   const clientThread = clientThreadId ?? messageId;
   const threadId = checkpointThreadId(owner, clientThread);
-  checkpointStore.touchThread(owner, threadId);
+
+  // Seed/resume input (mirrors the sync path): a fresh thread gets the client's
+  // full history; an existing checkpoint gets only the last user message. M3:
+  // a RESUME whose last client message is NOT a user message is a conflict
+  // (returning `{ messages: [] }` would re-run the checkpointed state and
+  // re-execute a pending tool call), so it is rejected 409 BEFORE any pin or
+  // admission — a conflict leaves nothing behind. L5: `touchThread` is
+  // deferred until after every validation so a rejected request never writes a
+  // phantom thread_owner row.
+  let input: Record<string, unknown>;
+  try {
+    const computed = await computeThreadInput(checkpointStore, threadId, rawMessages);
+    input = computed.input;
+  } catch (err) {
+    if (isResumeConflict(err)) {
+      return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
+    }
+    console.error("chat: background checkpoint probe failed", err);
+    return c.json({ error: "internal" }, 500);
+  }
 
   // Validate + pin tool credentials first (atomic: all-or-nothing), then the
   // model credential. Any validation failure -> 400 before admission, and no
@@ -515,6 +602,11 @@ async function handleBackground(
       owner,
       intentKey: messageId,
       spec: intentSpec(rawMessages),
+      // M2: persist the RAW client thread id so a restart-loss replay
+      // (`resumeStuckJobs`) can resume on the SAME checkpoint thread the
+      // original job used instead of re-hashing the intent key onto a
+      // different one.
+      worker: clientThread,
     });
   } catch (err) {
     console.error("chat: background task admission failed", err);
@@ -522,24 +614,9 @@ async function handleBackground(
     return c.json({ error: "internal" }, 500);
   }
 
-  // Seed/resume input (mirrors the sync path): a fresh thread gets the client's
-  // full history; an existing checkpoint gets only the last user message.
-  let input: Record<string, unknown>;
-  try {
-    const checkpoint = await checkpointStore.checkpointer.get({
-      configurable: { thread_id: threadId },
-    });
-    if (checkpoint) {
-      const lastUser = lastUserMessage(rawMessages);
-      input = { messages: lastUser ? [lastUser] : [] };
-    } else {
-      input = { messages: toLangChainMessages(rawMessages) };
-    }
-  } catch (err) {
-    console.error("chat: background checkpoint probe failed", err);
-    releasePins();
-    return c.json({ error: "internal" }, 500);
-  }
+  // L5: every validation (credentials, resume-conflict, admission) has passed;
+  // only now record the owner->thread mapping.
+  checkpointStore.touchThread(owner, threadId);
 
   let result: RunJobResult;
   try {
@@ -566,16 +643,52 @@ async function handleBackground(
     return c.json({ error: "internal" }, 500);
   }
 
+  // M1: for `in_flight` / `already_terminal` the runner returns BEFORE its
+  // finally (it never claimed the job), so nobody else releases the pins the
+  // transport minted at admission — release them here instead of leaking until
+  // a sweep.
+  if (result.status === "in_flight" || result.status === "already_terminal") {
+    releasePins();
+  }
+
   return mapRunJobResult(c, result);
+}
+
+/**
+ * Validate + collect every TOOL plugin credential the request supplies (H2).
+ * Missing credentials for a tool plugin do NOT fail — the model may never call
+ * that tool — so only what the client explicitly provided is validated, and
+ * only what passes is returned. Credentials for ids that are not installed
+ * tool plugins (e.g. the selected model plugin, or a plugin this gateway does
+ * not have) are ignored. An explicitly supplied but INVALID value throws
+ * `PluginCredentialError` (a rejected value, unlike a missing one, is a real
+ * 400). Shared by `resolveChatRequest` (sync) and `pinToolPlugins` (async) so
+ * the two paths never diverge on what is accepted.
+ */
+function collectToolCredentials(
+  body: Record<string, unknown>,
+  registry: PluginRegistry,
+): Record<string, Record<string, string>> {
+  const credentialsField = isRecord(body["credentials"]) ? body["credentials"] : {};
+  const validated: Record<string, Record<string, string>> = {};
+  for (const pluginId of Object.keys(credentialsField)) {
+    let plugin;
+    try {
+      plugin = registry.requirePlugin(pluginId);
+    } catch {
+      continue; // unknown / not installed — nothing to validate
+    }
+    if (!isToolPlugin(plugin)) continue; // model-plugin keys are not tool creds
+    const input = extractCredentialsFromBody(body, pluginId, plugin.credentials);
+    validated[pluginId] = validateCredentials(plugin.credentials, input, pluginId);
+  }
+  return validated;
 }
 
 /**
  * Validate and PIN every installed TOOL plugin named in `body.credentials`.
  * Validation is all-or-nothing: nothing is pinned until every entry validates,
- * so a rejected request leaves no pin behind. Credentials for ids that are not
- * installed tool plugins (e.g. the selected model plugin, or a plugin the
- * client sent but this gateway does not have) are ignored — the job pins only
- * what it can use.
+ * so a rejected request leaves no pin behind.
  */
 function pinToolPlugins(
   c: Context,
@@ -584,33 +697,19 @@ function pinToolPlugins(
   pins: CredentialPinStore,
   owner: string,
 ): { ok: true; toolPlugins: string[] } | { ok: false; response: Response } {
-  const credentialsField = isRecord(body["credentials"]) ? body["credentials"] : {};
-  const validated: Array<{ pluginId: string; credentials: Record<string, string> }> = [];
-  for (const pluginId of Object.keys(credentialsField)) {
-    let plugin;
-    try {
-      plugin = registry.requirePlugin(pluginId);
-    } catch {
-      continue; // unknown / not installed — nothing to pin
+  let validated: Record<string, Record<string, string>>;
+  try {
+    validated = collectToolCredentials(body, registry);
+  } catch (err) {
+    if (err instanceof PluginCredentialError) {
+      return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
     }
-    if (!isToolPlugin(plugin)) continue; // model-plugin keys are not tool pins
-    try {
-      const input = extractCredentialsFromBody(body, pluginId, plugin.credentials);
-      validated.push({
-        pluginId,
-        credentials: validateCredentials(plugin.credentials, input, pluginId),
-      });
-    } catch (err) {
-      if (err instanceof PluginCredentialError) {
-        return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
-      }
-      return { ok: false, response: c.json({ error: "internal" }, 500) };
-    }
+    return { ok: false, response: c.json({ error: "internal" }, 500) };
   }
-  for (const entry of validated) {
-    pins.pin(owner, entry.pluginId, entry.credentials);
+  for (const [pluginId, credentials] of Object.entries(validated)) {
+    pins.pin(owner, pluginId, credentials);
   }
-  return { ok: true, toolPlugins: validated.map((entry) => entry.pluginId) };
+  return { ok: true, toolPlugins: Object.keys(validated) };
 }
 
 /** `JobErrorCode` -> HTTP status for a failed background job. */
@@ -658,23 +757,54 @@ function mapRunJobResult(c: Context, result: RunJobResult): Response {
   }
 }
 
+/** Raised when a resumed thread's LAST client message is not a user message. */
+class ResumeConflictError extends Error {
+  constructor() {
+    super("resume requires the last message to be a user message");
+    this.name = "ResumeConflictError";
+  }
+}
+
+function isResumeConflict(err: unknown): boolean {
+  return err instanceof ResumeConflictError;
+}
+
+/**
+ * True when the client's LAST message on a resumed thread is a `user` message.
+ * A resume whose last message is an assistant/tool message cannot be seeded
+ * with a user turn (M3) — see `computeThreadInput`.
+ */
+function lastMessageIsUser(messages: unknown[]): boolean {
+  if (messages.length === 0) return false;
+  const last = messages[messages.length - 1];
+  return isRecord(last) && last["role"] === "user";
+}
+
 /**
  * The seed/resume input for a thread: a fresh thread gets the client's full
- * history; an existing checkpoint gets ONLY the last user message. Also records
- * the owner->thread mapping (`touchThread`). Shared by the sync (under lock)
- * and async paths.
+ * history; an existing checkpoint gets ONLY the last user message. Callers
+ * record the owner->thread mapping (`touchThread`) AFTER validation so a
+ * rejected request leaves no phantom thread_owner row (L5).
+ *
+ * M3: when a checkpoint EXISTS and the client's last message is NOT a user
+ * message, the resume cannot be seeded (returning `{ messages: [] }` would
+ * re-run the checkpointed state and re-execute a pending tool call). That is a
+ * `ResumeConflictError` (409) rather than silent mis-seeding. A fresh thread
+ * (no checkpoint) keeps accepting whatever the client seeds with — an initial
+ * seed may legitimately be just system+user.
  */
 async function computeThreadInput(
   checkpointStore: CheckpointStore,
-  owner: string,
   threadId: string,
   rawMessages: unknown[],
 ): Promise<{ input: Record<string, unknown>; streamOptions: StreamOptions }> {
   const checkpoint = await checkpointStore.checkpointer.get({
     configurable: { thread_id: threadId },
   });
-  checkpointStore.touchThread(owner, threadId);
   if (checkpoint) {
+    if (!lastMessageIsUser(rawMessages)) {
+      throw new ResumeConflictError();
+    }
     const lastUser = lastUserMessage(rawMessages);
     return {
       input: { messages: lastUser ? [lastUser] : [] },
