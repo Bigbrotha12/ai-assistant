@@ -1,5 +1,6 @@
 import { config } from "dotenv";
 import { z } from "zod";
+import { parseTrustedHostEntries } from "./plugins/ssrf.ts";
 
 config({ quiet: true });
 
@@ -20,6 +21,16 @@ const envSchema = z.object({
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),
+  PLUGINS_STORE_PATH: z.string().default("./data/plugins.json"),
+  PLUGINS_TRUSTED_HOSTS: z
+    .string()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((host) => host.trim())
+        .filter((host) => host.length > 0),
+    ),
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),
@@ -35,6 +46,18 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
+
+// PLUGINS_TRUSTED_HOSTS entries are used verbatim as SSRF trusted-host
+// patterns; a malformed entry (a scheme, port, path, whitespace, bare `*` or
+// mid-string wildcard) silently never matches and would leave an admin
+// thinking an internal host is allowed when it is not. Fail fast at load,
+// matching the other env checks below.
+try {
+  parseTrustedHostEntries(env.PLUGINS_TRUSTED_HOSTS);
+} catch (err) {
+  console.error(`Gateway: ${(err as Error).message}`);
+  process.exit(1);
+}
 
 const inferenceUrl = new URL(env.INFERENCE_URL);
 const inferencePort = inferenceUrl.port

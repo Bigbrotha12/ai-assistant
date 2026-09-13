@@ -61,6 +61,8 @@ the ledger needs migrating.
 | `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
 | `LEDGER_STUCK_TIMEOUT_MS`| no | `10000`               | Heartbeat silence that marks a task `stuck`. **Must be < lease.** |
 | `LEDGER_LEASE_EXPIRY_MS`| no  | `60000`               | Worker lease expiry. Final tuning is Phase 4 (M5).               |
+| `PLUGINS_STORE_PATH`    | no  | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests (Phase 1). Recreated empty on first boot. |
+| `PLUGINS_TRUSTED_HOSTS` | no  | `""`                  | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin baseUrls (admin-trusted internal hosts, e.g. `vikunja.local`, `*.local`). Scheme enforcement (`https` in production) is never bypassed. |
 | `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute per API key).             |
 | `INFERENCE_RATE_BURST`| no     | `20`                   | `/v1/chat/completions` burst ceiling (consecutive requests allowed at once).     |
 | `NODE_ENV`          | no       | `development`          | `production` switches on secure cookies.                                        |
@@ -195,6 +197,31 @@ user id):
 stuck<lease ordering, sequence-aware loop detection (`findLoop`), hash-chain
 verification + tamper detection, owner binding, and migration (fresh + upgrade
 + idempotency). `npm run typecheck` covers `src/` and `test/`.
+
+## Plugin store (`/v1/plugins`, Phase 1)
+
+Phase 1 of the backend LangChain plan (`docs/backend-langchain-plan.md`)
+introduces a plugin system foundation under `server/src/plugins/`:
+
+- `types.ts` — zod-validated `PluginDefinition` (tool + model) + store schema.
+- `ssrf.ts` — SSRF allowlist validation (scheme, private/loopback/metadata
+  ranges, DNS-rebinding defense, `redirect: "manual"`).
+- `store.ts` — `PluginStore`: persists which **tool-plugin manifests** are
+  installed as JSON (`PLUGINS_STORE_PATH`). Missing file → empty store written
+  with `schemaVersion` (fail-fast on mismatch). `install`/`uninstall` operate
+  **on manifests only** — builtins ship in the build, are always available and
+  can never be uninstalled (no disabling toggle in Phase 1). Every allowlisted
+  baseUrl is SSRF-validated on install; admin-trusted internal hosts are
+  listed in `PLUGINS_TRUSTED_HOSTS`. Saves are atomic (temp file + rename) at
+  `0600`, and credentials are persisted spec-only (label/required flags) —
+  credential **values** are never written.
+- `registry.ts` — `PluginRegistry` (lifecycle view): redacted public list
+  (`baseUrls` id+label only; model `endpoint` omitted) vs. auth-gated details
+  (full URLs), `requirePlugin` with actionable `PLUGIN_NOT_FOUND`/
+  `PLUGIN_DISABLED` errors, `hotReload()` + a debounced `fs.watch` on the store
+  file that never fights the store's own saves.
+- `index.ts` — composition root wiring env + bundled builtins +
+  `availableToolManifests` (both owned by the build artifact).
 
 ## Production notes
 
