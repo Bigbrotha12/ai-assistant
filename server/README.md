@@ -65,8 +65,10 @@ the ledger needs migrating.
 | `CHECKPOINT_DB_KEY`     | prod | *(dev default, warned)* | SQLCipher key for the checkpoint DB. **Required when `NODE_ENV=production`** (fail-fast). Dev falls back to a stable development-only default and logs a loud warning. `openssl rand -hex 32`. |
 | `PLUGINS_STORE_PATH`    | no  | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests (Phase 1). Recreated empty on first boot. |
 | `PLUGINS_TRUSTED_HOSTS` | no  | `""`                  | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin baseUrls (admin-trusted internal hosts, e.g. `vikunja.local`, `*.local`). Scheme enforcement (`https` in production) is never bypassed. |
-| `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute per API key).             |
+| `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute **per user**).            |
 | `INFERENCE_RATE_BURST`| no     | `20`                   | `/v1/chat/completions` burst ceiling (consecutive requests allowed at once).     |
+| `BUDGET_MAX_CONCURRENT`| no    | `2`                    | Per-user in-flight chat cap (sync streams + background jobs share the pool).     |
+| `BUDGET_QUEUE_MAX`    | no     | `3`                    | Per-user background queue depth before rejection (`503 busy` + `Retry-After`).   |
 | `NODE_ENV`          | no       | `development`          | `production` switches on secure cookies.                                        |
 
 The server refuses to start on invalid/missing env (fails fast). The `migrate`
@@ -285,14 +287,27 @@ content reaches checkpoint rows (reusing `CREDENTIAL_REDACTION`).
   deployments use `storage: "database"` or `"secondary-storage"` (Redis) instead of
   the default `"memory"`.
 - **Inference rate limiting**: `/v1/chat/completions` uses an in-memory
-  per-API-key token bucket (`INFERENCE_RATE_LIMIT` / `INFERENCE_RATE_BURST`). It
-  is per-process and not shared across instances — acceptable for a single
-  gateway; scale out needs a shared limiter (e.g. Redis) instead.
+  **per-user** token bucket (`INFERENCE_RATE_LIMIT` / `INFERENCE_RATE_BURST`)
+  built by `createPerOwnerRateLimiter` (`src/middleware/rate_limit.ts`): the
+  bucket key is the authenticated user id, so a user with many API keys cannot
+  rotate keys to bypass a rejection. A rejection returns
+  `429 { error: "rate_limited" }` + `Retry-After`. It is per-process and not
+  shared across instances — acceptable for a single gateway; scale out needs a
+  shared limiter (e.g. Redis) instead.
+- **Concurrency budget**: the same route also applies a per-user budget
+  (`src/middleware/budget.ts`, `BUDGET_MAX_CONCURRENT`/`BUDGET_QUEUE_MAX`) that
+  caps in-flight operations — sync streams and background jobs share one
+  per-user pool. Sync with a full pool returns `429 { error: "busy" }` +
+  `Retry-After`; an async admission queues on the owner's bounded FIFO (depth
+  `BUDGET_QUEUE_MAX`, wait bounded by the budget's `waitMs`) and a full queue
+  returns `503 { error: "busy" }` + `Retry-After`. Idempotent replay of the
+  same message is NOT blocked here — the task ledger's `(owner, messageId)`
+  dedupe handles that.
 - **API keys**: the `@better-auth/api-key` plugin (separate package since better-auth
   1.7). The gateway configures `defaultPrefix: "sk"`, `defaultKeyLength: 32`,
   `keyExpiration.defaultExpiresIn` (1 year, in **milliseconds**), and
   `rateLimit: { enabled: false }` — the plugin's default per-key cap (10
-  verifications/24h) is disabled so the gateway's own per-key inference limiter
+  verifications/24h) is disabled so the gateway's own per-user inference limiter
   (`INFERENCE_RATE_LIMIT`/`INFERENCE_RATE_BURST`) is the effective throttle.
   Note the option names changed from the pre-1.7 plugin
   (`prefix`/`length`/`expiresIn`).

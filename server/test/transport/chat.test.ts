@@ -53,6 +53,10 @@ import type {
   JobRunner,
   RunJobResult,
 } from "../../src/jobs/runner.ts";
+import { createPerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
+import type { PerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
+import { createBudgetManager } from "../../src/middleware/budget.ts";
+import type { BudgetManager } from "../../src/middleware/budget.ts";
 
 /**
  * Wave C1 chat-transport tests. Everything is fake/in-memory: a real
@@ -321,6 +325,8 @@ class SlowScriptedChatModel extends BaseChatModel<BaseChatModelCallOptions> {
 type AppOptions = {
   verifyKey?: VerifyApiKeyFn;
   limiter?: (key: string) => boolean;
+  rateLimiter?: PerOwnerRateLimiter;
+  budget?: BudgetManager;
   checkpointStore?: CheckpointStore;
   buildModel?: typeof buildModel;
   toolHandler?: ToolCallHandler;
@@ -345,6 +351,8 @@ async function makeApp(
       checkpointStore: opts.checkpointStore,
       verifyKey: opts.verifyKey ?? (async () => "test-user"),
       limiter: opts.limiter ?? (() => true),
+      rateLimiter: opts.rateLimiter,
+      budget: opts.budget,
       buildModel: opts.buildModel,
       toolHandler: opts.toolHandler,
       jobRunner: opts.jobRunner,
@@ -1477,5 +1485,360 @@ describe("toLangChainMessages (role mapping)", () => {
     assert.deepEqual(ai.tool_calls?.[0]?.args, { projectId: "p1" });
     assert.equal(messages[3]!.constructor.name, "ToolMessage");
     assert.equal(messages[4]!.constructor.name, "ToolMessage");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4, Wave A middleware-gate helpers and integration tests
+// ---------------------------------------------------------------------------
+
+/** Block until `predicate()` returns true; throws after `timeoutMs`. */
+async function waitFor(
+  predicate: () => boolean,
+  { timeoutMs = 2000, pollMs = 20 } = {},
+): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    await new Promise<void>((r) => setTimeout(r, pollMs));
+  }
+}
+
+/**
+ * Streaming model that blocks on an injectable `gate` promise before
+ * producing its chunk. `onEntered()` fires when the model's stream method
+ * begins — use it to coordinate that the budget slot is held before
+ * dispatching a second request.
+ */
+class BlockingChatModel extends BaseChatModel<BaseChatModelCallOptions> {
+  private readonly gate: Promise<void>;
+  private readonly onEntered: () => void;
+
+  constructor(opts: { gate: Promise<void>; onEntered: () => void }) {
+    super({});
+    this.gate = opts.gate;
+    this.onEntered = opts.onEntered;
+  }
+
+  _llmType(): string {
+    return "blocking";
+  }
+
+  bindTools(tools: StructuredToolInterface[]) {
+    return new BlockingChatModel({
+      gate: this.gate,
+      onEntered: this.onEntered,
+    }).withConfig({ tools } as BaseChatModelCallOptions);
+  }
+
+  async _generate(_messages: BaseMessage[]): Promise<ChatResult> {
+    this.onEntered();
+    return {
+      generations: [{ message: new AIMessage("(blocked)"), text: "" }],
+    };
+  }
+
+  async *_streamResponseChunks(
+    _messages: BaseMessage[],
+    _options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun,
+  ): AsyncGenerator<ChatGenerationChunk> {
+    this.onEntered();
+    await this.gate;
+    const chunk = new AIMessageChunk({ content: "hi" });
+    const text = typeof chunk.content === "string" ? chunk.content : "";
+    const generation = new ChatGenerationChunk({ message: chunk, text });
+    await runManager?.handleLLMNewToken(
+      text, undefined, undefined, undefined, undefined, { chunk: generation },
+    );
+    yield generation;
+  }
+}
+
+/** Admissible fake whose `runJob` blocks until `releaseAll()` is called. */
+type BlockingJobRunner = {
+  runJob: JobRunner["runJob"];
+  calls: JobDescriptor[];
+  releaseAll(): void;
+};
+
+function makeBlockingJobRunner(): BlockingJobRunner {
+  const calls: JobDescriptor[] = [];
+  const resolvers: Array<() => void> = [];
+  let callIdx = 0;
+
+  const runJob: JobRunner["runJob"] = async (d) => {
+    const i = callIdx++;
+    calls.push(d);
+    return new Promise<RunJobResult>((resolve) => {
+      resolvers.push(() =>
+        resolve({
+          status: "succeeded",
+          taskId: `task-${i}`,
+          threadId: `thr-${i}`,
+        }),
+      );
+    });
+  };
+
+  return {
+    runJob,
+    calls,
+    releaseAll() {
+      for (const fn of resolvers.splice(0)) fn();
+    },
+  };
+}
+
+describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
+  describe("per-owner rate limiter", () => {
+    test("429 { error: rate_limited } + Retry-After when the per-owner rate limiter denies", async (t) => {
+      const rateLimiter = createPerOwnerRateLimiter({ ratePerMinute: 1, burst: 1 });
+      const fake = makeFakeBuildModel([[{ content: "hi" }]]);
+      const { app } = await makeApp(t, {
+        rateLimiter,
+        buildModel: fake.buildModelFn,
+      });
+      const ok = await postChat(app, chatBody());
+      assert.equal(ok.status, 200);
+      await ok.text();
+
+      const denied = await postChat(app, chatBody());
+      assert.equal(denied.status, 429);
+      assert.deepEqual(await denied.json(), { error: "rate_limited" });
+      assert.equal(denied.headers.get("retry-after"), "60");
+    });
+
+    test("per-owner rate isolation: different owners get independent buckets", async (t) => {
+      let ownerN = 0;
+      // Returns "user-a" for the first TWO calls (requests 1 + 2 by the same
+      // owner), then "user-b" for request 3 (a different owner, unaffected).
+      const verifyKey: VerifyApiKeyFn = async () =>
+        ownerN++ < 2 ? "user-a" : "user-b";
+      const rateLimiter = createPerOwnerRateLimiter({
+        ratePerMinute: 1,
+        burst: 1,
+      });
+      const fake = makeFakeBuildModel([
+        [{ content: "a" }],
+        [{ content: "b" }],
+      ]);
+      const { app } = await makeApp(t, {
+        verifyKey,
+        rateLimiter,
+        buildModel: fake.buildModelFn,
+      });
+
+      // user-a: first succeeds, second denied (burst=1 exhausted).
+      const a1 = await postChat(app, chatBody());
+      assert.equal(a1.status, 200);
+      await a1.text();
+      const a2 = await postChat(app, chatBody());
+      assert.equal(a2.status, 429);
+
+      // user-b: unaffected by user-a's exhaustion.
+      const b1 = await postChat(app, chatBody());
+      assert.equal(b1.status, 200);
+      await b1.text();
+    });
+  });
+
+  describe("sync budget", () => {
+    test("429 { error: busy } + Retry-After when the sync budget is full", async (t) => {
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((r) => {
+        releaseGate = r;
+      });
+      let enteredResolve!: () => void;
+      const entered = new Promise<void>((r) => {
+        enteredResolve = r;
+      });
+      const budget = createBudgetManager({ maxConcurrentPerUser: 1 });
+      const buildModelFn = ((_input: BuildModelInput) =>
+        new BlockingChatModel({ gate, onEntered: enteredResolve })) as typeof buildModel;
+      const { app } = await makeApp(t, { budget, buildModel: buildModelFn });
+
+      const p1 = postChat(app, chatBody());
+      await entered;
+      assert.equal(budget.activeCount("test-user"), 1);
+
+      const p2 = postChat(app, chatBody());
+      const [res1, res2] = await Promise.all([p1, p2]);
+      assert.equal(res1.status, 200);
+      assert.equal(res2.status, 429);
+      assert.deepEqual(await res2.json(), { error: "busy" });
+      assert.equal(res2.headers.get("retry-after"), "10");
+
+      releaseGate();
+      await res1.text();
+      assert.equal(budget.activeCount("test-user"), 0);
+
+      const res3 = await postChat(app, chatBody());
+      assert.equal(res3.status, 200);
+      await res3.text();
+    });
+
+    test("cancelled sync stream frees the budget slot", async (t) => {
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((r) => {
+        releaseGate = r;
+      });
+      let enteredResolve!: () => void;
+      const entered = new Promise<void>((r) => {
+        enteredResolve = r;
+      });
+      const budget = createBudgetManager({ maxConcurrentPerUser: 1 });
+      const buildModelFn = ((_input: BuildModelInput) =>
+        new BlockingChatModel({ gate, onEntered: enteredResolve })) as typeof buildModel;
+      const { app } = await makeApp(t, { budget, buildModel: buildModelFn });
+
+      const res = await postChat(app, chatBody());
+      await entered;
+      assert.equal(budget.activeCount("test-user"), 1);
+
+      // Cancel the body reader — onRelease fires via ReadableStream.cancel().
+      await res.body?.cancel();
+      assert.equal(budget.activeCount("test-user"), 0);
+
+      // The gate-unblock lets the blocked generator finish so the test does
+      // not leak a pending stream chain; give it one tick to unwind.
+      releaseGate();
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      const res2 = await postChat(app, chatBody());
+      assert.equal(res2.status, 200);
+      await res2.text();
+    });
+  });
+
+  describe("async budget", () => {
+    test("503 { error: busy } + Retry-After when the async queue is full", async (t) => {
+      const checkpointStore = fakeCheckpointStore();
+      const pins = new CredentialPinStore();
+      const ledger = makeLedger();
+      const budget = createBudgetManager({
+        maxConcurrentPerUser: 1,
+        queueMaxPerUser: 1,
+      });
+      const fake = makeBlockingJobRunner();
+      const { app } = await makeApp(t, {
+        checkpointStore,
+        pins,
+        ledger,
+        budget,
+        jobRunner: fake as unknown as JobRunner,
+      });
+
+      const p1 = postChat(
+        app,
+        chatBody({
+          background: true,
+          messageId: "msg-1",
+          thread_id: "thread-1",
+          messages: [{ role: "user", content: "list" }],
+        }),
+      );
+      await waitFor(() => budget.activeCount("test-user") === 1);
+
+      // msg-2 parks (queued) — won't resolve until msg-1 finishes.
+      const p2 = postChat(
+        app,
+        chatBody({
+          background: true,
+          messageId: "msg-2",
+          thread_id: "thread-2",
+          messages: [{ role: "user", content: "create" }],
+        }),
+      );
+
+      // msg-3: queue full → immediate 503, no phantom ledger row.
+      const res3 = await postChat(
+        app,
+        chatBody({
+          background: true,
+          messageId: "msg-3",
+          thread_id: "thread-3",
+          messages: [{ role: "user", content: "delete" }],
+        }),
+      );
+      assert.equal(res3.status, 503);
+      assert.deepEqual(await res3.json(), { error: "busy" });
+      assert.equal(res3.headers.get("retry-after"), "10");
+      assert.equal(ledger.getTaskByIntentKey("test-user", "msg-3"), null);
+
+      // Release msg-1 → promotes msg-2.
+      fake.releaseAll();
+      await waitFor(() => fake.calls.length === 2);
+      const res1 = await p1;
+      assert.equal(res1.status, 200);
+
+      // Release msg-2 → completes.
+      fake.releaseAll();
+      const res2 = await p2;
+      assert.equal(res2.status, 200);
+      await waitFor(() => budget.activeCount("test-user") === 0);
+    });
+
+    test("M1 in_flight duplicate releases the budget reservation", async (t) => {
+      const checkpointStore = fakeCheckpointStore();
+      const pins = new CredentialPinStore();
+      const ledger = makeLedger();
+      const budget = createBudgetManager({ maxConcurrentPerUser: 2 });
+      const fake = makeFakeJobRunner([
+        {
+          status: "in_flight",
+          taskId: "task-1",
+          threadId: "thr-1",
+        },
+        {
+          status: "in_flight",
+          taskId: "task-2",
+          threadId: "thr-2",
+        },
+      ]);
+      const { app } = await makeApp(t, {
+        checkpointStore,
+        pins,
+        ledger,
+        budget,
+        jobRunner: fake as unknown as JobRunner,
+      });
+
+      const [res1, res2] = await Promise.all([
+        postChat(
+          app,
+          chatBody({
+            background: true,
+            messageId: "msg-1",
+            thread_id: "thread-1",
+            messages: [{ role: "user", content: "alpha" }],
+          }),
+        ),
+        postChat(
+          app,
+          chatBody({
+            background: true,
+            messageId: "msg-2",
+            thread_id: "thread-2",
+            messages: [{ role: "user", content: "beta" }],
+          }),
+        ),
+      ]);
+      assert.equal(res1.status, 202);
+      assert.deepEqual(await res1.json(), {
+        status: "accepted",
+        taskId: "task-1",
+        threadId: "thr-1",
+      });
+      assert.equal(res2.status, 202);
+      assert.deepEqual(await res2.json(), {
+        status: "accepted",
+        taskId: "task-2",
+        threadId: "thr-2",
+      });
+
+      // Both reservations released despite the in_flight duplicate status.
+      assert.equal(budget.activeCount("test-user"), 0);
+    });
   });
 });

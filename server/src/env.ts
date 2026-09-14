@@ -25,8 +25,16 @@ const envSchema = z.object({
     .url("INFERENCE_URL must be an absolute URL of the OpenAI-compatible engine"),
   PORT: z.coerce.number().int().positive().default(17600),
   DB_PATH: z.string().default("./data/gateway.db"),
+  // Sustained / burst ceiling for `POST /v1/chat/completions`, applied
+  // PER-OWNER (the authenticated user id, not the API key) since Phase 4
+  // Wave A — a user with many keys cannot rotate keys to bypass the limit.
   INFERENCE_RATE_LIMIT: z.coerce.number().int().positive().default(60),
   INFERENCE_RATE_BURST: z.coerce.number().int().positive().default(20),
+  // Per-user concurrency budget (Phase 4, Wave A): max in-flight chat
+  // operations (sync streams + background jobs) and how many background
+  // admissions may queue per owner before rejection.
+  BUDGET_MAX_CONCURRENT: z.coerce.number().int().positive().default(2),
+  BUDGET_QUEUE_MAX: z.coerce.number().int().positive().default(3),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),

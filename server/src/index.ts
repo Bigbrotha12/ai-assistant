@@ -17,6 +17,8 @@ import { createModelsRoutes } from "./transport/models.ts";
 import { createChatRoutes } from "./transport/chat.ts";
 import type { JobModelRequestConfig } from "./transport/chat.ts";
 import { buildModel } from "./transport/model.ts";
+import { createBudgetManager } from "./middleware/budget.ts";
+import { createPerOwnerRateLimiter } from "./middleware/rate_limit.ts";
 
 const app = new Hono();
 
@@ -147,6 +149,19 @@ try {
 // an idempotent background job (async, `background: true`). The checkpoint
 // store is optional: if boot degraded (corrupt DB / wrong key), every run is
 // STATELESS and async delegation returns 503 background_unavailable.
+//
+// Phase 4, Wave A middleware (per-owner gates): the rate limiter reuses the
+// existing INFERENCE_RATE_LIMIT / INFERENCE_RATE_BURST knobs as PER-OWNER
+// values (the bucket key is the authenticated user id, not the API key), and
+// the budget caps concurrent in-flight chat operations per owner.
+const chatRateLimiter = createPerOwnerRateLimiter({
+  ratePerMinute: env.INFERENCE_RATE_LIMIT,
+  burst: env.INFERENCE_RATE_BURST,
+});
+const chatBudget = createBudgetManager({
+  maxConcurrentPerUser: env.BUDGET_MAX_CONCURRENT,
+  queueMaxPerUser: env.BUDGET_QUEUE_MAX,
+});
 app.route(
   "/v1",
   createChatRoutes({
@@ -158,6 +173,8 @@ app.route(
     pins: jobPins,
     threadLocks,
     trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+    rateLimiter: chatRateLimiter,
+    budget: chatBudget,
   }),
 );
 

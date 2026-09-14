@@ -7,7 +7,7 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
-import { inferenceLimiter, requireApiKey, unauthorized } from "../inference.ts";
+import { requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { createAgentGraph } from "../agents/graph.ts";
@@ -35,6 +35,13 @@ import type { PluginStore } from "../plugins/store.ts";
 import { isModelPlugin, isToolPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
+import { createBudgetManager } from "../middleware/budget.ts";
+import type { BudgetManager } from "../middleware/budget.ts";
+import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
+import type {
+  PerOwnerRateLimiter,
+  RateLimitResult,
+} from "../middleware/rate_limit.ts";
 import type { Ledger, TaskRow } from "../ledger.ts";
 import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
@@ -55,7 +62,7 @@ import type { BuildModelInput } from "./model.ts";
  *
  * FLOW (sync, per request):
  *   1. gateway auth (`verifyKey`) -> 401
- *   2. per-owner token bucket (`limiter`) -> 429
+ *   2. per-owner token bucket (`rateLimiter`) -> 429 rate_limited + Retry-After
  *   3. parse JSON body -> 400 on invalid JSON / missing model / empty messages
  *   4. resolve the model plugin from `body.model` (see MODEL SELECTION)
  *   5. extract + validate the plugin's credentials from `body.credentials`
@@ -151,7 +158,11 @@ import type { BuildModelInput } from "./model.ts";
  * ERROR MAPPING (pre-stream; flat `{"error": <code>}` for consistency with the
  * sibling plugin/checkpoint surfaces — the wire-spec §5.1 categories are noted):
  *   401 unauthorized              no/invalid gateway key (auth_error)
- *   429 rate_limited              per-owner limiter rejected (rate_limited)
+ *   429 rate_limited              per-owner rate limiter rejected (rate_limited)
+ *   429 busy                      per-user budget pool full — sync path
+ *                                 (concurrent-capacity, retryable)
+ *   503 busy                      per-user budget queue full — async path
+ *                                 (concurrent-capacity, retryable)
  *   400 invalid_request           invalid JSON; missing/unknown/non-model/
  *                                 non-streaming plugin; missing/empty messages
  *                                 (invalid_request_error)
@@ -185,8 +196,30 @@ export type ChatRoutesOptions = {
   threadLocks?: ThreadLockRegistry;
   /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
   verifyKey?: VerifyApiKeyFn;
-  /** Test seam; defaults to the per-owner `inferenceLimiter` token bucket. */
+  /**
+   * Per-owner rate limiter (Phase 4, Wave A). Returns a structured
+   * `{ allowed, retryAfterSeconds }`; a rejection -> `429 { error:
+   * "rate_limited" }` + `Retry-After`. Defaults to a per-owner token bucket
+   * (60/min, burst 20; `index.ts` wires the INFERENCE_RATE_LIMIT/BURST env).
+   * Takes precedence over the legacy `limiter` seam.
+   */
+  rateLimiter?: PerOwnerRateLimiter;
+  /**
+   * LEGACY test seam, superseded by `rateLimiter`. Kept so the existing chat
+   * tests (`limiter: () => true | false`) keep passing: when present AND
+   * `rateLimiter` is absent it is adapted into the per-owner path (a rejected
+   * key reports Retry-After = 1s).
+   */
   limiter?: RateLimiterFn;
+  /**
+   * Per-user concurrency budget (Phase 4, Wave A): caps in-flight sync streams
+   * + background jobs per owner through one shared pool. Pool full (sync) ->
+   * `429 { error: "busy" }` + `Retry-After`; queue full (async) -> `503
+   * { error: "busy" }` + `Retry-After`. Defaults to `createBudgetManager()`
+   * (2 concurrent, queue 3); `index.ts` wires env BUDGET_MAX_CONCURRENT /
+   * BUDGET_QUEUE_MAX.
+   */
+  budget?: BudgetManager;
   /** Test seam; defaults to the real model builder (transport/model.ts). */
   buildModel?: typeof buildModel;
   /**
@@ -225,14 +258,36 @@ type AgentGraph = ReturnType<typeof createAgentGraph>;
 
 export function createChatRoutes(opts: ChatRoutesOptions): Hono {
   const verifyKey = opts.verifyKey ?? requireApiKey;
-  const limiter = opts.limiter ?? inferenceLimiter;
+  // Phase 4 Wave A: the per-owner rate limiter replaces the old boolean gate.
+  // The legacy `limiter` seam is preserved for existing tests; an explicit
+  // `rateLimiter` wins, otherwise `limiter` is adapted into the per-owner
+  // path, otherwise a default per-owner bucket (60/min, burst 20) is built.
+  let rateLimiter: PerOwnerRateLimiter;
+  if (opts.rateLimiter) {
+    rateLimiter = opts.rateLimiter;
+  } else if (opts.limiter) {
+    const legacy = opts.limiter;
+    rateLimiter = {
+      check(owner: string): RateLimitResult {
+        return { allowed: legacy(owner), retryAfterSeconds: 1 };
+      },
+    };
+  } else {
+    rateLimiter = createPerOwnerRateLimiter();
+  }
+  const budget = opts.budget ?? createBudgetManager();
 
   const routes = new Hono();
 
   routes.post("/chat/completions", async (c) => {
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
-    if (!limiter(owner)) return c.json({ error: "rate_limited" }, 429);
+    const rate = rateLimiter.check(owner);
+    if (!rate.allowed) {
+      const res = c.json({ error: "rate_limited" }, 429);
+      res.headers.set("retry-after", String(rate.retryAfterSeconds));
+      return res;
+    }
 
     const body = await c.req.json().catch(() => null);
     if (!isRecord(body)) return c.json({ error: "invalid_request" }, 400);
@@ -248,9 +303,9 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
           400,
         );
       }
-      return handleBackground(c, owner, body, opts);
+      return handleBackground(c, owner, body, opts, budget);
     }
-    return handleSyncStream(c, owner, body, opts);
+    return handleSyncStream(c, owner, body, opts, budget);
   });
 
   return routes;
@@ -382,6 +437,7 @@ async function handleSyncStream(
   owner: string,
   body: Record<string, unknown>,
   opts: ChatRoutesOptions,
+  budget: BudgetManager,
 ): Promise<Response> {
   const resolved = resolveChatRequest(c, body, opts.registry);
   if (!resolved.ok) return resolved.response;
@@ -454,6 +510,14 @@ async function handleSyncStream(
     threadId !== undefined && checkpointStore !== undefined && lock !== undefined;
 
   if (lockable) {
+    // Phase 4 Wave A: reserve the per-user budget slot BEFORE the lock so a
+    // full pool rejects the request up front (429, no queue for sync) instead
+    // of blocking on the mutex with no capacity. Released together with the
+    // thread lock when the stream completes or is cancelled.
+    const reservation = budget.reserveSync(owner);
+    if (!reservation.ok) {
+      return busy(c, 429, reservation.retryAfterSeconds);
+    }
     // Acquire BEFORE the seed/resume read so the decision is made atomically
     // with the stream; released when the stream completes or is cancelled.
     const release = await lock.acquire(threadId);
@@ -462,6 +526,7 @@ async function handleSyncStream(
       if (released) return;
       released = true;
       release();
+      reservation.release();
     };
     try {
       const { input, streamOptions } = await computeThreadInput(
@@ -513,7 +578,22 @@ async function handleSyncStream(
     input = { messages: toLangChainMessages(rawMessages) };
     streamOptions = { version: "v2" };
   }
-  return buildStreamResponse(graph, input, streamOptions, modelId);
+  // Phase 4 Wave A: reserve the per-user slot at stream admission — after
+  // every pre-stream validation, so a rejected request never holds a slot —
+  // and release it on stream end / client cancel (via buildStreamResponse's
+  // `onRelease`). The reserve/release wrapper releases BEFORE rethrowing if
+  // stream construction throws, so a construction failure can never leak a
+  // reservation.
+  const reservation = budget.reserveSync(owner);
+  if (!reservation.ok) {
+    return busy(c, 429, reservation.retryAfterSeconds);
+  }
+  try {
+    return buildStreamResponse(graph, input, streamOptions, modelId, reservation.release);
+  } catch (err) {
+    reservation.release();
+    throw err;
+  }
 }
 
 /**
@@ -525,6 +605,7 @@ async function handleBackground(
   owner: string,
   body: Record<string, unknown>,
   opts: ChatRoutesOptions,
+  budget: BudgetManager,
 ): Promise<Response> {
   const { checkpointStore, jobRunner, ledger, pins } = opts;
   // The async path needs the runner, an owner-scoped ledger to admit against,
@@ -596,6 +677,19 @@ async function handleBackground(
     for (const pluginId of toolPlugins) pins.release(owner, pluginId);
   };
 
+  // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
+  // and thread marking, so a queue-full 503 leaves no phantom task row or
+  // thread_owner row (L5). A queued admission parks in the owner's bounded
+  // FIFO queue and waits (up to the budget's waitMs) for a free slot; the pool
+  // is shared with sync streams. Releasing after `runJob` returns (ANY result)
+  // mirrors the M1 pin-release pattern: a non-claimed duplicate
+  // (in_flight / already_terminal) must not hold a reservation either.
+  const reservation = await budget.reserveAsync(owner);
+  if (!reservation.ok) {
+    releasePins();
+    return busy(c, 503, reservation.retryAfterSeconds);
+  }
+
   let task: TaskRow;
   try {
     task = await getOrCreateTask(ledger, {
@@ -611,6 +705,7 @@ async function handleBackground(
   } catch (err) {
     console.error("chat: background task admission failed", err);
     releasePins();
+    reservation.release();
     return c.json({ error: "internal" }, 500);
   }
 
@@ -640,16 +735,19 @@ async function handleBackground(
     // throw before claim (ledger edge) leaves them — release here as a safety
     // net so an unexpected throw never leaks pins until the next sweep.
     releasePins();
+    reservation.release();
     return c.json({ error: "internal" }, 500);
   }
 
   // M1: for `in_flight` / `already_terminal` the runner returns BEFORE its
   // finally (it never claimed the job), so nobody else releases the pins the
   // transport minted at admission — release them here instead of leaking until
-  // a sweep.
+  // a sweep. The budget reservation, by contrast, is released for EVERY result
+  // (`runJob` is done — the queue admission it held is over).
   if (result.status === "in_flight" || result.status === "already_terminal") {
     releasePins();
   }
+  reservation.release();
 
   return mapRunJobResult(c, result);
 }
@@ -915,6 +1013,19 @@ function intentSpec(rawMessages: unknown[]): string {
     return trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed;
   }
   return "background chat request";
+}
+
+/**
+ * Phase 4 Wave A budget rejection: `429 { error: "busy" }` (sync — the user's
+ * concurrency pool is full) or `503 { error: "busy" }` (async — the background
+ * queue is full), always with a `Retry-After` header so the client knows when
+ * to retry. Deliberately DISTINCT from `rate_limited`: budget exhaustion is a
+ * concurrent-capacity signal, not a token-bucket signal.
+ */
+function busy(c: Context, status: 429 | 503, retryAfterSeconds: number): Response {
+  const res = c.json({ error: "busy" }, status);
+  res.headers.set("retry-after", String(retryAfterSeconds));
+  return res;
 }
 
 /** Pre-stream failures return JSON per §5.1 (never SSE). */
