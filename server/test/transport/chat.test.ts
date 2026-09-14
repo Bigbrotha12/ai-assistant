@@ -57,6 +57,9 @@ import { createPerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
 import type { PerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
 import { createBudgetManager } from "../../src/middleware/budget.ts";
 import type { BudgetManager } from "../../src/middleware/budget.ts";
+import { createToolResultCache } from "../../src/middleware/cache.ts";
+import type { ToolResultCache } from "../../src/middleware/cache.ts";
+import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
 
 /**
  * Wave C1 chat-transport tests. Everything is fake/in-memory: a real
@@ -102,6 +105,12 @@ function toolPlugin(): ToolPluginDefinition {
         name: "list_tasks",
         description: "List tasks",
         readOnly: true,
+        inputSchema: { type: "object" },
+      },
+      {
+        name: "create_task",
+        description: "Create a task",
+        readOnly: false,
         inputSchema: { type: "object" },
       },
     ],
@@ -334,6 +343,7 @@ type AppOptions = {
   pins?: CredentialPinStore;
   ledger?: Ledger;
   threadLocks?: ThreadLockRegistry;
+  toolCache?: ToolResultCache;
 };
 
 async function makeApp(
@@ -359,6 +369,7 @@ async function makeApp(
       pins: opts.pins,
       ledger: opts.ledger,
       threadLocks: opts.threadLocks,
+      toolCache: opts.toolCache,
       trustedHosts: [],
     }),
   );
@@ -1840,5 +1851,155 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
       // Both reservations released despite the in_flight duplicate status.
       assert.equal(budget.activeCount("test-user"), 0);
     });
+  });
+});
+
+describe("Phase 4, Wave B — sync path tool-result cache", () => {
+  /** A scripted model whose one generation emits a single tool call. */
+  function toolCallingModel(
+    recorded: BaseMessage[][],
+    toolName: string,
+    argsJson: string,
+  ): typeof buildModel {
+    return ((_input: BuildModelInput) =>
+      new RecordingChatModel(
+        [
+          [
+            {
+              content: "",
+              tool_call_chunks: [
+                { index: 0, id: "call_1", name: toolName, args: argsJson },
+              ],
+            },
+          ],
+          [{ content: "done" }],
+        ],
+        recorded,
+      )) as typeof buildModel;
+  }
+
+  test("a read-only tool call is cached across requests: the second identical request does not re-execute, and the redacted cached result still reaches the model's turn", async (t) => {
+    const recorded: BaseMessage[][] = [];
+    let handlerCalls = 0;
+    const toolCache = createToolResultCache();
+    const { app } = await makeApp(t, {
+      buildModel: toolCallingModel(recorded, "list_tasks", '{"projectId":"p1"}'),
+      toolCache,
+      toolHandler: {
+        async execute() {
+          handlerCalls += 1;
+          return JSON.stringify({
+            ok: true,
+            seq: handlerCalls,
+            token: "Bearer sk-secret123",
+          });
+        },
+      },
+    });
+
+    const body = (n: number) =>
+      chatBody({
+        messages: [{ role: "user", content: `list tasks #${n}` }],
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "tok-123" },
+        },
+      });
+
+    const res1 = await postChat(app, body(1));
+    assert.equal(res1.status, 200);
+    await res1.text();
+    const res2 = await postChat(app, body(2));
+    assert.equal(res2.status, 200);
+    const text2 = await res2.text();
+    assert.ok(text2.includes("data: [DONE]"), "the cached round-trip streams");
+
+    assert.equal(
+      handlerCalls,
+      1,
+      "the second request must not re-execute the read-only tool",
+    );
+    assert.equal(toolCache.size, 1, "exactly one entry cached");
+
+    // Each request produces two model turns; the SECOND turn of each carries
+    // the tool's ToolMessage. Both must hold the same REDACTED payload even
+    // though only the first request executed the backend.
+    const redacted = redactForCheckpoint(
+      JSON.stringify({ ok: true, seq: 1, token: "Bearer sk-secret123" }),
+    );
+    assert.equal(recorded.length, 4, "two requests x two turns each");
+    for (const turn of [recorded[1]!, recorded[3]!]) {
+      const toolMessages = turn.filter((m) => m.constructor.name === "ToolMessage");
+      assert.equal(toolMessages.length, 1, "the model saw exactly one ToolMessage");
+      const content = String(toolMessages[0]!.content);
+      assert.equal(content, redacted, "the served result is identical and redacted");
+      assert.ok(!content.includes("sk-secret123"), "no raw credential-shaped value leaks");
+    }
+  });
+
+  test("a mutating tool is never cached: identical requests re-execute and the cache stays empty", async (t) => {
+    const recorded: BaseMessage[][] = [];
+    let handlerCalls = 0;
+    const toolCache = createToolResultCache();
+    const { app } = await makeApp(t, {
+      buildModel: toolCallingModel(recorded, "create_task", '{"title":"x"}'),
+      toolCache,
+      toolHandler: {
+        async execute() {
+          handlerCalls += 1;
+          return JSON.stringify({ ok: true, seq: handlerCalls });
+        },
+      },
+    });
+
+    const body = chatBody({
+      messages: [{ role: "user", content: "create a task" }],
+      credentials: {
+        openrouter: { apiKey: "sk-test-123" },
+        vikunja: { apiKey: "tok-123" },
+      },
+    });
+    const res1 = await postChat(app, body);
+    assert.equal(res1.status, 200);
+    await res1.text();
+    const res2 = await postChat(app, body);
+    assert.equal(res2.status, 200);
+    await res2.text();
+
+    assert.equal(handlerCalls, 2, "a mutating tool always executes");
+    assert.equal(toolCache.size, 0, "mutating tool results are never cached");
+  });
+
+  test("a read-only call with NO tool credential still dedupes (stable empty-credential fingerprint)", async (t) => {
+    const recorded: BaseMessage[][] = [];
+    let handlerCalls = 0;
+    const toolCache = createToolResultCache();
+    const { app } = await makeApp(t, {
+      buildModel: toolCallingModel(recorded, "list_tasks", '{"projectId":"p1"}'),
+      toolCache,
+      toolHandler: {
+        async execute() {
+          handlerCalls += 1;
+          return JSON.stringify({ ok: true, seq: handlerCalls });
+        },
+      },
+    });
+
+    // vikunja's apiKey is REQUIRED by its spec, but the client simply does not
+    // supply it — the request must still succeed, and the read-only call still
+    // dedupes against the stable empty-credential fingerprint.
+    const body = chatBody({
+      messages: [{ role: "user", content: "list my tasks" }],
+      credentials: { openrouter: { apiKey: "sk-test-123" } },
+    });
+    const res1 = await postChat(app, body);
+    assert.equal(res1.status, 200);
+    await res1.text();
+    const res2 = await postChat(app, body);
+    assert.equal(res2.status, 200);
+    await res2.text();
+
+    assert.equal(handlerCalls, 1, "the second request was served from the cache");
+    assert.equal(toolCache.size, 1);
   });
 });

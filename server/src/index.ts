@@ -19,6 +19,7 @@ import type { JobModelRequestConfig } from "./transport/chat.ts";
 import { buildModel } from "./transport/model.ts";
 import { createBudgetManager } from "./middleware/budget.ts";
 import { createPerOwnerRateLimiter } from "./middleware/rate_limit.ts";
+import { createToolResultCache } from "./middleware/cache.ts";
 
 const app = new Hono();
 
@@ -81,6 +82,10 @@ if (checkpointStore) {
 let jobRunner: JobRunner | undefined;
 let jobPins: CredentialPinStore | undefined;
 const threadLocks = new ThreadLockRegistry();
+// Phase 4, Wave B: ONE in-memory tool-result cache shared by the sync
+// transport and every background job so the same read-only tool call is never
+// executed twice across either path.
+const toolCache = createToolResultCache();
 try {
   if (checkpointStore) {
     jobPins = new CredentialPinStore();
@@ -100,6 +105,9 @@ try {
       // Wave C2: one lock authority for every checkpoint-thread writer, shared
       // with the sync transport below.
       threadLocks,
+      // Phase 4, Wave B: the shared in-memory tool-result cache so a repeated
+      // read-only tool call is never executed twice across sync and async.
+      toolCache,
       // M1: periodic credential-pin GC. In-memory pins are released by the
       // runner's finally / the transport's non-claimed-path releases, but a
       // crash between admission and claim could still leak one; a periodic
@@ -172,6 +180,7 @@ app.route(
     jobRunner,
     pins: jobPins,
     threadLocks,
+    toolCache,
     trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
     rateLimiter: chatRateLimiter,
     budget: chatBudget,

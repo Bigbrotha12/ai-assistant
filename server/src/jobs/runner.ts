@@ -15,6 +15,8 @@ import {
 } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";
 import type { CredentialPinStore } from "../credentials/pins.ts";
+import { credentialFingerprint } from "../plugins/credential.ts";
+import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { Ledger } from "../ledger.ts";
 import type { TaskRow, TaskStatus } from "../ledger.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
@@ -369,6 +371,16 @@ export type JobRunnerDeps = {
   heartbeatIntervalMs?: number;
   /** Optional periodic pin GC. `dispose()` stops it. */
   sweepIntervalMs?: number;
+  /**
+   * Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the async
+   * tool handler so a repeated READ-ONLY tool call — same (owner, pluginId,
+   * pluginVersion, credentialFingerprint, tool, argsHash) — is served without
+   * re-executing the backend, even across different tasks/jobs. Mutating
+   * tools are never cached; the per-task ledger replay dedupe ALWAYS wins over
+   * this cache. Construct ONE instance in index.ts and share it with the sync
+   * transport.
+   */
+  toolCache?: ToolResultCache;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
 };
@@ -393,6 +405,21 @@ export type BindJobToolsOptions = {
   /** True for a fresh run; false in a replay/resume context where a mutating
    *  tool with no stored result must NOT be re-executed. */
   allowMutatingRetry: boolean;
+  /**
+   * Optional in-memory tool-result cache (Phase 4, Wave B): a READ-ONLY tool
+   * call that missed the ledger replay dedupe is served from here when
+   * (owner, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)
+   * match, without re-executing the backend. Mutating tools are never cached,
+   * and the ledger dedupe (`hasToolResult`) above always wins. The cache
+   * stores raw handler output; hits are redacted at serve time.
+   */
+  toolCache?: ToolResultCache;
+  /**
+   * Precomputed credential fingerprint per plugin (the pinned
+   * `CredentialPin.fingerprint` when available). Falls back to re-deriving it
+   * from the validated credentials — never from raw values in the key.
+   */
+  fingerprintsByPlugin?: Record<string, string>;
 };
 
 /**
@@ -466,6 +493,29 @@ function bindJobTool(
         );
         return step?.result ?? "";
       }
+      // Phase 4, Wave B: the in-memory tool-result cache sits AFTER the ledger
+      // replay dedupe (a stored step is always authoritative, never shadowed
+      // by a warm cache) and BEFORE the mutating-retry guard (read-only tools
+      // may be served from the cache even during a replay). Only read-only
+      // tools are cacheable; a hit returns the redacted cached result and
+      // SKIPS recordToolResult — the per-task ledger stays untouched for a
+      // cached serve.
+      const cache = opts.toolCache;
+      let cacheKey: ToolCacheKey | undefined;
+      if (cache && canRetryTool({ readOnly: toolDef.readOnly })) {
+        cacheKey = {
+          owner: opts.owner,
+          pluginId: plugin.id,
+          pluginVersion: plugin.version,
+          credentialFingerprint:
+            opts.fingerprintsByPlugin?.[plugin.id] ??
+            credentialFingerprint(credentials),
+          tool: toolDef.name,
+          argsHash: cache.argsHash(input as Record<string, unknown>),
+        };
+        const cached = cache.get(cacheKey);
+        if (cached !== undefined) return redactForCheckpoint(cached);
+      }
       if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
         throw new JobError(
           "tool_retry_forbidden",
@@ -481,6 +531,7 @@ function bindJobTool(
           credentials,
         ),
       );
+      if (cacheKey) cache?.set(cacheKey, result);
       recordToolResult(opts.ledger, {
         taskId: opts.taskId,
         owner: opts.owner,
@@ -623,9 +674,13 @@ export class JobRunner {
       // 5. Pin credentials per plugin. A missing/expired pin fails the job
       //    BEFORE any graph invoke.
       const credentialsByPlugin: Record<string, Record<string, string>> = {};
+      // Phase 4, Wave B: reuse the pin's precomputed credential fingerprint as
+      // the cache-key component (never re-derive, never store raw values).
+      const fingerprintsByPlugin: Record<string, string> = {};
       for (const pluginId of toolPlugins) {
         const pin = this.deps.pins.get(owner, pluginId);
         credentialsByPlugin[pluginId] = pin.credentials;
+        fingerprintsByPlugin[pluginId] = pin.fingerprint;
       }
 
       // 6. Build the agent with the real executor + replay dedupe. Replays
@@ -639,6 +694,8 @@ export class JobRunner {
         registry: this.deps.registry,
         handler,
         credentialsByPlugin,
+        fingerprintsByPlugin,
+        toolCache: this.deps.toolCache,
         ledger: this.deps.ledger,
         taskId: claimed.id,
         owner,

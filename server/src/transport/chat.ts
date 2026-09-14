@@ -19,11 +19,15 @@ import type {
   RunJobResult,
 } from "../jobs/runner.ts";
 import type { ThreadLockRegistry } from "../jobs/thread_lock.ts";
-import { getOrCreateTask } from "../credentials/idempotency.ts";
+import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
 import type { CredentialPinStore } from "../credentials/pins.ts";
-import { checkpointThreadId } from "../checkpoints/store.ts";
+import {
+  checkpointThreadId,
+  redactForCheckpoint,
+} from "../checkpoints/store.ts";
 import type { CheckpointStore } from "../checkpoints/store.ts";
 import {
+  credentialFingerprint,
   extractCredentialsFromBody,
   PluginCredentialError,
   validateCredentials,
@@ -34,6 +38,7 @@ import { PluginStoreError } from "../plugins/store.ts";
 import type { PluginStore } from "../plugins/store.ts";
 import { isModelPlugin, isToolPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
+import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
 import { createBudgetManager } from "../middleware/budget.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
@@ -229,6 +234,17 @@ export type ChatRoutesOptions = {
    * (H2) so a fake can assert them.
    */
   toolHandler?: ToolCallHandler;
+  /**
+   * Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the sync tool
+   * handler so a repeated READ-ONLY tool call — same (owner, pluginId,
+   * pluginVersion, credentialFingerprint, tool, argsHash) — is served without
+   * re-executing the backend. Mutating tools are never cached. The cache
+   * stores raw handler output; this transport redacts at serve time with
+   * `redactForCheckpoint` (idempotent), the same discipline the runner uses.
+   * Construct ONE instance in index.ts and share it with the job runner so a
+   * sync stream and a background job dedupe against the same cache.
+   */
+  toolCache?: ToolResultCache;
   /** Admin-trusted hosts for every outbound `validatedFetch` (model + tools). */
   trustedHosts?: readonly string[];
 };
@@ -487,9 +503,23 @@ async function handleSyncStream(
   // path's `bindJobTools` threading) so a tool backend that requires auth
   // receives the client's key on the SYNC path too.
   const toolCredentialsByPlugin = resolved.value.toolCredentialsByPlugin;
+  // Phase 4, Wave B: wrap the sync handler with the shared tool-result cache.
+  // Resolution failures degrade to a direct (uncached) execute — the cache is
+  // the tolerant fast path, never an error source on the stream.
+  const cachedHandler = withToolResultCache({
+    registry: opts.registry,
+    owner,
+    cache: opts.toolCache,
+    handler: toolHandler,
+  });
   const tools = bindPluginTools(opts.registry, {
     async execute(pluginId, toolName, args) {
-      return toolHandler.execute(pluginId, toolName, args, toolCredentialsByPlugin[pluginId]);
+      return cachedHandler.execute(
+        pluginId,
+        toolName,
+        args,
+        toolCredentialsByPlugin[pluginId],
+      );
     },
   });
   const base = createAgentGraph({ model, tools });
@@ -594,6 +624,76 @@ async function handleSyncStream(
     reservation.release();
     throw err;
   }
+}
+
+/**
+ * Phase 4, Wave B (sync seam): wrap a `ToolCallHandler` with the shared
+ * in-memory tool-result cache. A READ-ONLY tool call whose
+ * `(owner, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)`
+ * matches a live cache entry is served WITHOUT re-executing the backend;
+ * every other call executes and (for read-only tools) is cached. Mutating
+ * tools — gated by `canRetryTool`, the same predicate that guards checkpoint
+ * resume — always execute and are never cached.
+ *
+ * The wrapper is deliberately tolerant: when the plugin/tool cannot be
+ * resolved (plugin uninstalled mid-stream, unknown tool name) the call
+ * executes directly and is not cached — the cache never throws into the SSE
+ * stream. Plugin resolution is memoized PER REQUEST (one handler per stream),
+ * so the registry is not re-read for every tool invocation.
+ *
+ * The cache stores the RAW handler output; both hits and misses are redacted
+ * here with `redactForCheckpoint` (idempotent) before the result reaches the
+ * graph, matching the async runner's discipline.
+ */
+function withToolResultCache(opts: {
+  registry: PluginRegistry;
+  owner: string;
+  cache?: ToolResultCache;
+  handler: ToolCallHandler;
+}): ToolCallHandler {
+  const { registry, owner, cache, handler } = opts;
+  if (!cache) return handler;
+
+  type ToolCallMeta = { readOnly: boolean; version: string };
+  // Per-request memo: pluginId + toolName -> meta, or null when unresolvable.
+  const resolved = new Map<string, ToolCallMeta | null>();
+
+  return {
+    async execute(pluginId, toolName, args, credentials?) {
+      const lookup = `${pluginId}\u0000${toolName}`;
+      let meta: ToolCallMeta | null | undefined = resolved.get(lookup);
+      if (meta === undefined) {
+        meta = null;
+        try {
+          const plugin = registry.requirePlugin(pluginId);
+          if (isToolPlugin(plugin)) {
+            const toolDef = plugin.tools.find((t) => t.name === toolName);
+            if (toolDef) meta = { readOnly: toolDef.readOnly, version: plugin.version };
+          }
+        } catch {
+          meta = null; // unresolvable -> execute directly, never cache
+        }
+        resolved.set(lookup, meta);
+      }
+      const direct = () => handler.execute(pluginId, toolName, args, credentials);
+      if (meta === null || !canRetryTool({ readOnly: meta.readOnly })) {
+        return direct();
+      }
+      const key: ToolCacheKey = {
+        owner,
+        pluginId,
+        pluginVersion: meta.version,
+        credentialFingerprint: credentialFingerprint((credentials ?? {}) as Record<string, string>),
+        tool: toolName,
+        argsHash: cache.argsHash(args),
+      };
+      const hit = cache.get(key);
+      if (hit !== undefined) return redactForCheckpoint(hit);
+      const result = String(await direct());
+      cache.set(key, result);
+      return redactForCheckpoint(result);
+    },
+  };
 }
 
 /**

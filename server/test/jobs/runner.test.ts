@@ -36,6 +36,10 @@ import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolPluginDefinition, ModelPluginDefinition } from "../../src/plugins/types.ts";
+import { createToolResultCache } from "../../src/middleware/cache.ts";
+import type { ToolCacheKey } from "../../src/middleware/cache.ts";
+import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
+import { credentialFingerprint } from "../../src/plugins/credential.ts";
 
 /**
  * Wave C1 job-runner tests. Everything is fake/in-memory: a real Ledger on an
@@ -1372,6 +1376,240 @@ describe("ToolExecutor (real validatedFetch path)", () => {
       {},
       { apiKey: "k" },
     );
-    assert.equal(result, '{"ok":true}');
+assert.equal(result, '{"ok":true}');
+  });
+});
+
+describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", () => {
+  /** Raw (UNREDACTED) handler output containing a credential shape. */
+  const RAW_RESULT = '{"ok":true,"token":"Bearer sk-secret999"}';
+
+  /** Shared `calls` recording handler that ALSO returns a credential-shaped raw payload. */
+  function credentialHandler(calls: RecordedCall[]): ToolCallHandler {
+    return {
+      async execute(pluginId, toolName, args, credentials) {
+        calls.push({ pluginId, toolName, args, credentials });
+        return RAW_RESULT;
+      },
+    };
+  }
+
+  /**
+   * A buildModel factory returning a fresh scripted model per job (the 
+   * ScriptedChatModel's response queue is consumed per job, so each runJob call
+   * needs its own instance).
+   */
+  function modelFactory(toolName: string, callId: string, reply: string, args: Record<string, unknown>) {
+    return (_id: unknown, _config: unknown) =>
+      new ScriptedChatModel({
+        responses: [
+          toolCallMessage(toolName, args, callId),
+          new AIMessage(reply),
+        ],
+      });
+  }
+
+  test("a read-only tool is cached across runJob runs: the second job does not re-execute the handler and gets the redacted cached result", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const toolCache = createToolResultCache();
+    const checkpointer = new MemorySaver();
+    const calls: RecordedCall[] = [];
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        checkpointer,
+        toolCache,
+        buildModel: modelFactory("list_tasks", "call_ro_1", "done", { projectId: "p1" }),
+      }),
+    );
+
+    const r1 = await runner.runJob(
+      descriptor({
+        intentKey: "cache-a",
+        clientThreadId: "thr-cache-a",
+        toolHandler: credentialHandler(calls),
+      }),
+    );
+    assert.equal(r1.status, "succeeded");
+    assert.equal(calls.length, 1, "the first run executed the handler");
+
+    // The runner releases the tool pin in its finally; a second job must be
+    // re-pinned (mirrors the transport admitting a new background request).
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const r2 = await runner.runJob(
+      descriptor({
+        intentKey: "cache-b",
+        clientThreadId: "thr-cache-b",
+        toolHandler: credentialHandler(calls),
+      }),
+    );
+    assert.equal(r2.status, "succeeded");
+    assert.equal(calls.length, 1, "the second run served from the cache, not the handler");
+    assert.equal(toolCache.size, 1);
+
+    // The redacted cached result reached the second job's checkpoint state.
+    const state = await checkpointer.get({
+      configurable: {
+        thread_id: checkpointThreadId("user-1", "thr-cache-b"),
+      },
+    });
+    const messages = (state?.channel_values?.messages ?? []) as Array<{
+      content?: unknown;
+    }>;
+    const redacted = redactForCheckpoint(RAW_RESULT);
+    assert.ok(
+      messages.some((m) => String(m.content) === redacted),
+      "the second job's checkpoint contains the redacted cached result",
+    );
+  });
+
+  test("a mutating tool is never cached: identical runJob calls re-execute and cache stays empty", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const toolCache = createToolResultCache();
+    const calls: RecordedCall[] = [];
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        toolCache,
+        buildModel: modelFactory("create_task", "call_mut_1", "done", { title: "x" }),
+      }),
+    );
+
+    const r1 = await runner.runJob(
+      descriptor({
+        clientThreadId: "thr-mut-a",
+        toolHandler: credentialHandler(calls),
+      }),
+    );
+    assert.equal(r1.status, "succeeded");
+    assert.equal(calls.length, 1);
+    assert.equal(toolCache.size, 0, "mutating tool results are never cached");
+
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const r2 = await runner.runJob(
+      descriptor({
+        intentKey: "mut-2",
+        clientThreadId: "thr-mut-b",
+        toolHandler: credentialHandler(calls),
+      }),
+    );
+    assert.equal(r2.status, "succeeded");
+    assert.equal(calls.length, 2, "each mutating run always re-executes");
+  });
+
+  test("warm cache but ledger wins: a stored ledger step is served via dedupe even when the cache holds an entry (dedupe stays FIRST)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const toolCache = createToolResultCache();
+
+    const calls: RecordedCall[] = [];
+    const toolCallId = "call_dedupe_wins";
+    const checkpointer = new MemorySaver();
+    let seeded = false;
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }, toolCallId),
+        new AIMessage("done"),
+      ],
+      onGenerate: () => {
+        if (!seeded) {
+          seeded = true;
+          // Simulate a prior partial run that persisted this tool's result.
+          const task = ledger.listTasks("user-1")[0]!;
+          recordToolResult(ledger, {
+            taskId: task.id,
+            owner: "user-1",
+            fenceToken: task.fence_token,
+            toolCallId,
+            toolName: "list_tasks",
+            result: '{"from":"ledger"}',
+          });
+        }
+      },
+    });
+
+    // Pre-warm the cache with a DIFFERENT value for the same key.
+    const cacheKey: ToolCacheKey = {
+      owner: "user-1",
+      pluginId: "vikunja",
+      pluginVersion: "1.4.0",
+      credentialFingerprint: credentialFingerprint({ apiKey: "tok" }),
+      tool: "list_tasks",
+      argsHash: toolCache.argsHash({ projectId: "p1" }),
+    };
+    toolCache.set(cacheKey, RAW_RESULT);
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        checkpointer,
+        toolCache,
+        buildModel: () => model,
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({ toolHandler: credentialHandler(calls) }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(calls.length, 0, "neither the cache nor the ledger path called the handler");
+
+    const state = await checkpointer.get({
+      configurable: {
+        thread_id: checkpointThreadId("user-1", "thr-1"),
+      },
+    });
+    const messages = (state?.channel_values?.messages ?? []) as Array<{
+      content?: unknown;
+    }>;
+    assert.ok(
+      messages.some((m) => String(m.content).includes('"from":"ledger"')),
+      "the ledger's stored result is what reached graph state, not the cached value",
+    );
+    assert.ok(
+      !messages.some((m) => String(m.content).includes("sk-secret999")),
+      "the cache's raw (unredacted) value never reached graph state",
+    );
+  });
+
+  test("fingerprintsByPlugin uses the pin's precomputed fingerprint (credentialFingerprint not re-derived)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const toolCache = createToolResultCache();
+
+    const expectedFingerprint = credentialFingerprint({ apiKey: "tok" });
+    const recordedKeys: ToolCacheKey[] = [];
+    const originalSet = toolCache.set.bind(toolCache);
+    toolCache.set = (key: ToolCacheKey, result: string) => {
+      recordedKeys.push({ ...key });
+      originalSet(key, result);
+    };
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        toolCache,
+        buildModel: modelFactory("list_tasks", "call_fp", "done", { projectId: "p1" }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({ toolHandler: credentialHandler([]) }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(recordedKeys.length, 1, "cache was set exactly once");
+    assert.equal(
+      recordedKeys[0]!.credentialFingerprint,
+      expectedFingerprint,
+      "the cache key uses the pin's precomputed fingerprint",
+    );
   });
 });
