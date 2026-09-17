@@ -19,6 +19,8 @@ import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
 import { createAgentGraph } from "../../src/agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../../src/agents/compile.ts";
 import { HumanMessage } from "@langchain/core/messages";
+import { DynamicStructuredTool } from "@langchain/core/tools";
+import { jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
 import { checkpointThreadId } from "../../src/checkpoints/store.ts";
 import {
   JobError,
@@ -27,9 +29,15 @@ import {
   createJobRunner,
 } from "../../src/jobs/runner.ts";
 import type { JobRunner } from "../../src/jobs/runner.ts";
+import type { CredentialPinHandle } from "../../src/credentials/pins.ts";
 import { AsyncMutex } from "../../src/jobs/mutex.ts";
 import { Ledger, migrateLedger } from "../../src/ledger.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
+import { CredentialPinError } from "../../src/credentials/pins.ts";
+
+function isNotFound(e: unknown): boolean {
+  return e instanceof CredentialPinError && e.code === "pin_not_found";
+}
 import { recordToolResult } from "../../src/credentials/idempotency.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
@@ -38,6 +46,8 @@ import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolPluginDefinition, ModelPluginDefinition } from "../../src/plugins/types.ts";
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolCacheKey } from "../../src/middleware/cache.ts";
+import { createBudgetManager } from "../../src/middleware/budget.ts";
+import { createContextManager } from "../../src/middleware/context.ts";
 import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
 
@@ -95,18 +105,21 @@ function makeLedger() {
 type ScriptedOptions = {
   responses: BaseMessage[];
   onGenerate?: (call: number) => void | Promise<void>;
+  onGenerateMessages?: (messages: BaseMessage[]) => void;
 };
 
 /** Scripted model; `bindTools` carries the queue + hook into a bound copy. */
 class ScriptedChatModel extends BaseChatModel<BaseChatModelCallOptions> {
   private queue: BaseMessage[];
   private readonly onGenerate?: (call: number) => void | Promise<void>;
+  private readonly onGenerateMessages?: (messages: BaseMessage[]) => void;
   private calls = 0;
 
   constructor(options: ScriptedOptions) {
     super({});
     this.queue = [...options.responses];
     this.onGenerate = options.onGenerate;
+    this.onGenerateMessages = options.onGenerateMessages;
   }
 
   _llmType(): string {
@@ -117,12 +130,14 @@ class ScriptedChatModel extends BaseChatModel<BaseChatModelCallOptions> {
     const next = new ScriptedChatModel({
       responses: this.queue,
       onGenerate: this.onGenerate,
+      onGenerateMessages: this.onGenerateMessages,
     });
     return next.withConfig({ tools } as BaseChatModelCallOptions);
   }
 
-  async _generate(_messages: BaseMessage[]): Promise<ChatResult> {
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
     this.calls += 1;
+    this.onGenerateMessages?.(messages);
     await this.onGenerate?.(this.calls);
     const message =
       this.queue.shift() ?? new AIMessage("(scripted responses exhausted)");
@@ -956,6 +971,602 @@ describe("JobRunner.runJob", () => {
   });
 });
 
+describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () => {
+  test("two concurrent admissions on the same (owner, pluginId): first job's release must not kill the second job's pin", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    const firstPin = pins.pin("user-1", "vikunja", { apiKey: "tok-1" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model-1" });
+
+    const toolCallModel = (callId: string) =>
+      new ScriptedChatModel({
+        responses: [
+          toolCallMessage("list_tasks", { projectId: "p" }, callId),
+          new AIMessage("done"),
+        ],
+      });
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (_id, config) =>
+          toolCallModel(
+            (config as { intent?: string } | undefined)?.intent === "pin-b"
+              ? "call_nested"
+              : "call_outer",
+          ),
+      }),
+    );
+
+    let secondPin!: ReturnType<CredentialPinStore["pin"]>;
+    let observedSecondCredentials: unknown;
+    const first = runner.runJob(
+      descriptor({
+        intentKey: "pin-a",
+        clientThreadId: "thr-pin-a",
+        modelRequestConfig: { intent: "pin-a" },
+        toolHandler: {
+          async execute() {
+            secondPin = pins.pin("user-1", "vikunja", { apiKey: "tok-2" });
+            assert.notEqual(firstPin.handle, secondPin.handle, "each admission mints its own handle");
+            const second = await runner.runJob({
+              ...descriptor({
+                intentKey: "pin-b",
+                clientThreadId: "thr-pin-b",
+                modelRequestConfig: { intent: "pin-b" },
+                toolHandler: {
+                  async execute(_pluginId, _toolName, _args, creds) {
+                    observedSecondCredentials = creds;
+                    return '{"ok":true}';
+                  },
+                },
+              }),
+              pinHandles: {
+                vikunja: secondPin.handle,
+                openrouter: pins.get("user-1", "openrouter").handle,
+              },
+            });
+            assert.equal(second.status, "succeeded", "the nested admission completed with its own handle");
+            return JSON.stringify({ ok: true, toolName: "outer" });
+          },
+        },
+      }),
+    );
+    const r1 = await first;
+    assert.equal(r1.status, "succeeded");
+    assert.deepEqual(observedSecondCredentials, { apiKey: "tok-2" }, "the nested admission resolved its own pin, not the first job's");
+    assert.equal(
+      ledger.listSteps(r1.taskId).some((s) => s.action === "error:credentials_expired"),
+      false,
+    );
+    assert.throws(
+      () => pins.get("user-1", "vikunja", secondPin.handle),
+      isNotFound,
+      "the nested admission released only its own handle",
+    );
+  });
+
+  test("explicit pinHandles bypass handleless resolution: the descriptor pins only its own handles", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    const pin = pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const calls: RecordedCall[] = [];
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => new ScriptedChatModel({ responses: [toolCallMessage("list_tasks", { projectId: "p" }, "c1"), new AIMessage("done")] }),
+      }),
+    );
+    const pinHandles: Record<string, CredentialPinHandle> = {
+      vikunja: pin.handle,
+      openrouter: pins.get("user-1", "openrouter").handle,
+    };
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "handles-1",
+        clientThreadId: "thr-handles",
+        toolHandler: recordingHandler(calls),
+        pinHandles,
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(calls[0]?.credentials, { apiKey: "tok" });
+    assert.throws(
+      () => pins.get("user-1", "vikunja"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "the job's finally released the handle",
+    );
+  });
+
+  test("a stale handle at admission fails credentials_expired without invoking the graph", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    let pinNow = 1_000_000;
+    const pins = new CredentialPinStore({ maxLifetimeMs: 1000, now: () => pinNow });
+    const pin = pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const openrouterHandle = pins.pin("user-1", "openrouter", { apiKey: "sk-model" }).handle;
+    pinNow += 2000;
+
+    let invoked = false;
+    const model = new ScriptedChatModel({
+      responses: [new AIMessage("never")],
+      onGenerate: () => {
+        invoked = true;
+      },
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "stale-handle",
+        clientThreadId: "thr-stale",
+        pinHandles: { vikunja: pin.handle, openrouter: openrouterHandle },
+      }),
+    );
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "credentials_expired");
+    assert.equal(invoked, false, "no graph invoke with a stale handle");
+    assert.equal(ledger.getTask(result.taskId)?.status, "failed");
+  });
+
+  test("tool credential reads go through the handle at dispatch: a sibling admission's release cannot swap the running job's key", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok-mine" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const calls: RecordedCall[] = [];
+    let observedDuringRun: unknown;
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p" }, "call_handle"),
+        new AIMessage("done"),
+      ],
+      onGenerate: () => {
+        const sibling = pins.pin("user-1", "vikunja", { apiKey: "tok-sibling" });
+        pins.release("user-1", "vikunja", sibling.handle);
+        observedDuringRun = (pins.get("user-1", "vikunja").credentials);
+      },
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "swap-1",
+        clientThreadId: "thr-swap",
+        toolHandler: recordingHandler(calls),
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.deepEqual(observedDuringRun, { apiKey: "tok-mine" }, "the sibling churn never swapped the key");
+    assert.deepEqual(calls[0]?.credentials, { apiKey: "tok-mine" });
+  });
+
+  test("pin expiry at dispatch (inputFactory seam): a pin that dies mid-run fails credentials_expired, not a leaked tool call", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    let pinNow = 1_000_000;
+    const pins = new CredentialPinStore({ maxLifetimeMs: 1000, now: () => pinNow });
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const calls: RecordedCall[] = [];
+    const model = new ScriptedChatModel({
+      responses: [toolCallMessage("list_tasks", { projectId: "p" }, "call_exp"), new AIMessage("never")],
+      onGenerate: () => {
+        pinNow += 2000;
+      },
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "exp-1",
+        clientThreadId: "thr-exp",
+        toolHandler: recordingHandler(calls),
+        inputFactory: async () => {
+          pinNow += 2000;
+          return { messages: [new HumanMessage("go")] };
+        },
+      }),
+    );
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "credentials_expired");
+    assert.equal(calls.length, 0, "the expired pin must stop the tool dispatch");
+    assert.ok(
+      ledger.listSteps(result.taskId).some((s) => s.action === "error:credentials_expired"),
+    );
+  });
+
+  test("async seed runs inside the runner's thread lock: inputFactory observes graph + threadId and the model is built before it fires", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const events: string[] = [];
+    let modelBuilt = false;
+    const checkpointer = new MemorySaver();
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        checkpointer,
+        buildModel: () => {
+          modelBuilt = true;
+          return new ScriptedChatModel({ responses: [new AIMessage("ok")] });
+        },
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "seed-1",
+        clientThreadId: "thr-seed",
+        inputFactory: async ({ graph, threadId, isReplay, signal }) => {
+          events.push(`factory:${modelBuilt}:${threadId === checkpointThreadId("user-1", "thr-seed")}:${isReplay}:${!signal.aborted}`);
+          void graph;
+          return { messages: [new HumanMessage("factory input")] };
+        },
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(events[0], "factory:true:true:false:true");
+
+    const state = await checkpointer.get({
+      configurable: { thread_id: checkpointThreadId("user-1", "thr-seed") },
+    });
+    const messages = (state?.channel_values?.messages ?? []) as Array<{ content?: unknown }>;
+    assert.ok(
+      messages.some((m) => String(m.content) === "factory input"),
+      "the factory's input seeded the checkpoint",
+    );
+    assert.ok(
+      !messages.some((m) => String(m.content) === "seed-1"),
+      "the spec-based default input is NOT used when a factory is wired",
+    );
+  });
+
+  test("interrupted checkpoint recovery: a replay onto a thread with a pending interrupt re-invokes with null input (no duplicate user message)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const threadId = checkpointThreadId("user-1", "thr-resume");
+    const checkpointer = new MemorySaver();
+    const calls: RecordedCall[] = [];
+
+    // Stage an interrupted turn directly against the checkpointer: the model
+    // emits a tool call, the tool handler hangs until aborted — leaving
+    // `next: ["toolExecutor"]` on the thread's latest checkpoint.
+    let stagingGenerated = false;
+    const stagingModel = new ScriptedChatModel({
+      responses: [toolCallMessage("list_tasks", { projectId: "p" }, "call_interrupted")],
+      onGenerate: () => {
+        stagingGenerated = true;
+      },
+    });
+    const hangingTool = new DynamicStructuredTool({
+      name: "list_tasks",
+      description: "hangs until aborted",
+      schema: jsonSchemaToZod({
+        type: "object",
+        properties: { projectId: { type: "string" } },
+        required: ["projectId"],
+      }),
+      func: async () => {
+        await new Promise(() => {});
+        return "never";
+      },
+    });
+    const stagingGraph = compileGraphWithCheckpointer(
+      createAgentGraph({ model: stagingModel, tools: [hangingTool] }),
+      checkpointer,
+    );
+    const stagingAc = new AbortController();
+    const staged = stagingGraph.invoke(
+      { messages: [new HumanMessage("seed")] },
+      { configurable: { thread_id: threadId }, signal: stagingAc.signal },
+    );
+    await waitFor(() => stagingGenerated);
+    stagingAc.abort();
+    await staged.catch(() => {});
+    const stagedGraph = compileGraphWithCheckpointer(
+      createAgentGraph({ model: stagingModel, tools: [hangingTool] }),
+      checkpointer,
+    );
+    const stagedState = await stagedGraph.getState({ configurable: { thread_id: threadId } });
+    assert.equal(stagedState?.next?.[0], "toolExecutor", "the staged turn is interrupted mid-tool-round");
+
+    // Replay through the runner: a pending interrupt must resume with null
+    // input — the tool executes (via the runner's bound tools) and the turn
+    // completes WITHOUT appending a duplicate user message.
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        checkpointer,
+        buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("resumed")] }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "resume-1",
+        clientThreadId: "thr-resume",
+        toolHandler: recordingHandler(calls),
+        isReplay: true,
+        inputFactory: async () => {
+          throw new Error("inputFactory must NOT run when a pending interrupt exists");
+        },
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(calls.length, 1, "the interrupted tool call executed exactly once on resume");
+
+    const finalState = await stagedGraph.getState({ configurable: { thread_id: threadId } });
+    const messages = (finalState?.values?.messages ?? []) as Array<{ content?: unknown }>;
+    assert.equal(
+      messages.filter((m) => String(m.content) === "seed").length,
+      1,
+      "the replay must not append a duplicate user message",
+    );
+    assert.ok(
+      messages.some((m) => String(m.content) === "resumed"),
+      "the resumed turn completed with the model's final answer",
+    );
+  });
+
+  test("descriptor signal aborts the graph mid-run and fails the job", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const ac = new AbortController();
+    const model = new ScriptedChatModel({
+      responses: [toolCallMessage("list_tasks", { projectId: "p" }, "call_abort"), new AIMessage("never")],
+      onGenerate: () => {
+        ac.abort();
+      },
+    });
+    const calls: RecordedCall[] = [];
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "abort-1",
+        clientThreadId: "thr-abort",
+        signal: ac.signal,
+        toolHandler: recordingHandler(calls),
+      }),
+    );
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "task_conflict");
+    assert.equal(ledger.getTask(result.taskId)?.status, "failed");
+  });
+
+  test("fence loss stops tool dispatch: aborting the task mid-run makes the next tool call refuse to execute", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const task = ledger.createTask({ owner: "user-1", intentKey: "fence-1", spec: "{}" });
+    ledger.claimTask(task.id, "user-1");
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+
+    const calls: RecordedCall[] = [];
+    const checkpointer = new MemorySaver();
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p" }, "call_fence"),
+        new AIMessage("never"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { checkpointer, buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "fence-1",
+        clientThreadId: "thr-fence",
+        toolHandler: recordingHandler(calls),
+        isReplay: true,
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    void calls;
+  });
+});
+
+describe("JobRunner execution drain", () => {
+  for (const kind of ["model", "tool"] as const) {
+    for (const rejects of [false, true]) {
+      test(`cancellation retains lock, pins and budget until uncooperative ${kind} ${rejects ? "rejects" : "resolves"}`, async (t) => {
+        const { registry } = await makeRegistry(t);
+        const { ledger, scheduler } = makeLedger();
+        const pins = new CredentialPinStore();
+        const pinHandles = {
+          vikunja: pins.pin("user-1", "vikunja", { apiKey: "tok" }).handle,
+          openrouter: pins.pin("user-1", "openrouter", { apiKey: "model" }).handle,
+        };
+        const budget = createBudgetManager({ maxConcurrentPerUser: 1 });
+        const reservation = await budget.reserveAsync("user-1");
+        assert.ok(reservation.ok);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        let started = false;
+        let settled = false;
+        let returned = false;
+        let entered = false;
+        let modelCalls = 0;
+        const delayed = async () => {
+          started = true;
+          await gate;
+          settled = true;
+          if (rejects) throw new Error("delayed failure");
+        };
+        const ac = new AbortController();
+        const runner = createJobRunner(baseDeps(ledger, registry, pins, {
+          budget,
+          buildModel: () => new ScriptedChatModel({
+            responses: [
+              toolCallMessage("list_tasks", { projectId: "p" }, "drain-call"),
+              new AIMessage("done"),
+            ],
+            onGenerate: async () => {
+              modelCalls += 1;
+              if (kind === "model") await delayed();
+            },
+          }),
+        }));
+        const job = runner.runJob(descriptor({
+          pinHandles,
+          signal: ac.signal,
+          toolHandler: {
+            async execute() {
+              assert.equal(kind, "tool", "cancelled model must not dispatch tools");
+              await delayed();
+              return "done";
+            },
+          },
+        })).finally(() => {
+          returned = true;
+          reservation.release();
+        });
+        let waiter: Promise<void> | undefined;
+        try {
+          await waitFor(() => started);
+          const mutex = runner.mutexes.get(checkpointThreadId("user-1", "thr-1"));
+          assert.ok(mutex);
+          waiter = mutex.runExclusive(async () => { entered = true; });
+          ac.abort();
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          assert.equal(settled, false);
+          assert.equal(returned, false, "runJob must await actual execution");
+          assert.equal(entered, false, "the next thread writer must remain blocked");
+          assert.equal(mutex.isIdle, false);
+          assert.equal(budget.activeCount("user-1"), 1);
+          assert.equal(scheduler.count(), 1, "heartbeat stays alive during drain");
+          for (const [pluginId, handle] of Object.entries(pinHandles)) {
+            assert.equal(pins.get("user-1", pluginId, handle).handle, handle);
+          }
+          release();
+          const result = await job;
+          assert.equal(result.status, "failed");
+          await waiter;
+          assert.equal(entered, true);
+          assert.equal(settled, true);
+          assert.equal(modelCalls, 1);
+          assert.equal(scheduler.count(), 0);
+          assert.equal(budget.activeCount("user-1"), 0);
+          assert.equal(ledger.listSteps(result.taskId).some((step) => step.action === "tool:list_tasks"), false);
+          for (const [pluginId, handle] of Object.entries(pinHandles)) {
+            assert.throws(() => pins.get("user-1", pluginId, handle), isNotFound);
+          }
+        } finally {
+          release();
+          await job;
+          await waiter;
+          runner.dispose();
+        }
+      });
+    }
+  }
+
+  test("a failed parallel tool drains every uncooperative sibling before releasing lock and pins", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, scheduler } = makeLedger();
+    const pins = new CredentialPinStore();
+    const pinHandles = {
+      vikunja: pins.pin("user-1", "vikunja", { apiKey: "tok" }).handle,
+      openrouter: pins.pin("user-1", "openrouter", { apiKey: "model" }).handle,
+    };
+    const releases: Array<() => void> = [];
+    const gates = Array.from({ length: 3 }, () => new Promise<void>((resolve) => { releases.push(resolve); }));
+    const started = new Set<number>();
+    const signals: AbortSignal[] = [];
+    let returned = false;
+    let entered = false;
+    let modelCalls = 0;
+    const runner = createJobRunner(baseDeps(ledger, registry, pins, {
+      buildModel: () => new ScriptedChatModel({
+        responses: [new AIMessage({
+          content: "",
+          tool_calls: gates.map((_, i) => ({ name: "list_tasks", args: { projectId: String(i) }, id: `sibling-${i}`, type: "tool_call" })),
+        }), new AIMessage("never")],
+        onGenerate: () => { modelCalls += 1; },
+      }),
+    }));
+    const job = runner.runJob(descriptor({
+      pinHandles,
+      toolHandler: {
+        async execute(_pluginId, _toolName, args, _credentials, signal) {
+          const i = Number(args.projectId);
+          started.add(i);
+          assert.ok(signal);
+          signals.push(signal);
+          await gates[i];
+          if (i !== 1) throw new Error(`sibling failure ${i}`);
+          return "late result";
+        },
+      },
+    })).finally(() => { returned = true; });
+    let waiter: Promise<void> | undefined;
+    try {
+      await waitFor(() => started.size === 3);
+      const mutex = runner.mutexes.get(checkpointThreadId("user-1", "thr-1"));
+      assert.ok(mutex);
+      waiter = mutex.runExclusive(async () => { entered = true; });
+      releases[0]!();
+      await waitFor(() => returned || signals.every((signal) => signal.aborted));
+      const assertRetained = () => {
+        assert.equal(returned, false);
+        assert.equal(entered, false);
+        assert.equal(scheduler.count(), 1);
+        for (const [pluginId, handle] of Object.entries(pinHandles)) {
+          assert.equal(pins.get("user-1", pluginId, handle).handle, handle);
+        }
+      };
+      assertRetained();
+      releases[1]!();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assertRetained();
+      releases[2]!();
+      const result = await job;
+      assert.equal(result.status, "failed");
+      if (result.status === "failed") assert.match(result.error, /sibling failure 0/);
+      await waiter;
+      assert.equal(entered, true);
+      assert.equal(modelCalls, 1);
+      assert.equal(scheduler.count(), 0);
+      assert.equal(ledger.listSteps(result.taskId).some((step) => step.action === "tool:list_tasks"), false);
+      for (const [pluginId, handle] of Object.entries(pinHandles)) {
+        assert.throws(() => pins.get("user-1", pluginId, handle), isNotFound);
+      }
+    } finally {
+      releases.forEach((release) => release());
+      await job;
+      await waiter;
+      runner.dispose();
+    }
+  });
+});
+
 describe("JobRunner.resumeStuckJobs (restart loss)", () => {
   test("a stuck task with no pins fails credentials_expired and notifies", async (t) => {
     const { registry } = await makeRegistry(t);
@@ -1199,6 +1810,42 @@ describe("bindJobTools replay/retry rules", () => {
 });
 
 describe("ToolExecutor (real validatedFetch path)", () => {
+  for (const rejects of [false, true]) {
+    test(`non-ok response awaits body cancellation before throwing when cancellation ${rejects ? "rejects" : "resolves"}`, async (t) => {
+      const { registry } = await makeRegistry(t);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let cancelling = false;
+      let returned = false;
+      const response = new Response(new ReadableStream({
+        async cancel() {
+          cancelling = true;
+          await gate;
+          if (rejects) throw new Error("cancel failed");
+        },
+      }), { status: 503 });
+      const executor = new ToolExecutor({
+        registry,
+        getPinnedIps: () => [{ entryId: "vikunja-api", url: "https://vikunja.example.com", pinned: ["1.1.1.1"] }],
+        fetchFn: (async () => response) as typeof fetch,
+        lookup: fakeLookup(),
+        mode: "test",
+      });
+      const result = assert.rejects(
+        executor.execute("vikunja", "list_tasks", {}).finally(() => { returned = true; }),
+        (error: unknown) => error instanceof JobError && error.code === "job_failed" && /HTTP 503/.test(error.message),
+      );
+      try {
+        await waitFor(() => cancelling || returned);
+        assert.equal(cancelling, true);
+        assert.equal(returned, false);
+      } finally {
+        release();
+        await result;
+      }
+    });
+  }
+
   test("resolves pinned IPs, calls validatedFetch with credentials, and redacts the result", async (t) => {
     const { registry } = await makeRegistry(t);
     const spy: { count: number; url?: string; init?: RequestInit } = { count: 0 };
@@ -1611,5 +2258,249 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
       expectedFingerprint,
       "the cache key uses the pin's precomputed fingerprint",
     );
+  });
+});
+
+describe("JobRunner.runJob — context + budget integration (phase 4 review)", () => {
+  function modelFactory(toolName: string, callId: string, reply: string, args: Record<string, unknown>) {
+    return (_id: unknown, _config: unknown) =>
+      new ScriptedChatModel({
+        responses: [
+          toolCallMessage(toolName, args, callId),
+          new AIMessage(reply),
+        ],
+      });
+  }
+
+  test("budget gate: an exhausted per-owner model-call window fails the job budget_exhausted before the model runs", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+    const budget = createBudgetManager({ maxModelCallsPerWindow: 1 });
+
+    let modelCalls = 0;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        budget,
+        buildModel: () =>
+          new ScriptedChatModel({
+            responses: [new AIMessage("done")],
+            onGenerate: () => {
+              modelCalls += 1;
+            },
+          }),
+      }),
+    );
+
+    const first = await runner.runJob(descriptor({ intentKey: "budget-1", clientThreadId: "thr-budget-1" }));
+    assert.equal(first.status, "succeeded");
+    assert.equal(modelCalls, 1);
+
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+    const second = await runner.runJob(
+      descriptor({ intentKey: "budget-2", clientThreadId: "thr-budget-2" }),
+    );
+    if (second.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(second)}`);
+    }
+    assert.equal(second.code, "budget_exhausted");
+    assert.equal(modelCalls, 1, "the exhausted window must stop the model call");
+    assert.ok(
+      ledger.listSteps(second.taskId).some((s) => s.action === "error:budget_exhausted"),
+    );
+    assert.equal(ledger.getTask(second.taskId)?.status, "failed");
+  });
+
+  test("budget.beforeModelCall receives (owner, 'async') on every model round", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const observed: Array<[string, string]> = [];
+    const budget = {
+      reserveSync: () => ({ ok: true, release: () => {} }),
+      reserveAsync: () => Promise.resolve({ ok: true, release: () => {}, queued: false }),
+      activeCount: () => 0,
+      reserveModelCall: () => ({ ok: true, remaining: 1, resetAt: 0 }),
+      beforeModelCall: (owner: string, kind?: string) => {
+        observed.push([owner, kind ?? ""]);
+      },
+      modelCallCount: () => 0,
+    } as Parameters<typeof createJobRunner>[0]["budget"];
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        budget,
+        buildModel: modelFactory("list_tasks", "call_kind", "done", { projectId: "p" }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "kind-1",
+        clientThreadId: "thr-kind",
+        toolHandler: recordingHandler([]),
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(observed.length, 2, "one gate per model round (tool round + final answer)");
+    assert.ok(observed.every(([owner, kind]) => owner === "user-1" && kind === "async"));
+  });
+
+  test("context gate: prepareMessages truncation to the token limit runs before the model", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const contextManager = createContextManager({ limitTokens: 140 });
+    let sawMessages: unknown[] | undefined;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        contextManager,
+        buildModel: () =>
+          new ScriptedChatModel({
+            responses: [new AIMessage("done")],
+            onGenerateMessages: (messages) => {
+              sawMessages = messages;
+            },
+          }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "ctx-1",
+        clientThreadId: "thr-ctx",
+        input: {
+          messages: [
+            new HumanMessage("old message ".repeat(60)),
+            new HumanMessage("final question"),
+          ],
+        },
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.ok(sawMessages, "the model ran");
+    const contents = sawMessages!.map((m) => String((m as { content?: unknown }).content));
+    assert.ok(
+      contents.some((c) => c === "final question"),
+      "the latest user message must survive truncation",
+    );
+    assert.ok(
+      !contents.some((c) => c === "old message old message old message"),
+      "the oversized old message is truncated away by prepareMessages",
+    );
+  });
+
+  test("context gate: an oversized required tail (system + latest user) fails the job context_length_exceeded", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const contextManager = createContextManager({ limitTokens: 100 });
+    let modelCalls = 0;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        contextManager,
+        buildModel: () =>
+          new ScriptedChatModel({
+            responses: [new AIMessage("never")],
+            onGenerate: () => {
+              modelCalls += 1;
+            },
+          }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "ctx-over",
+        clientThreadId: "thr-ctx-over",
+        input: { messages: [new HumanMessage("x".repeat(600))] },
+      }),
+    );
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(result.code, "context_length_exceeded");
+    assert.equal(modelCalls, 0, "the oversized input must never reach the model");
+    assert.ok(
+      ledger.listSteps(result.taskId).some((s) => s.action === "error:context_length_exceeded"),
+    );
+    assert.equal(ledger.getTask(result.taskId)?.status, "failed");
+  });
+
+  test("maybeCompactAfterStream runs inside the SAME thread lock after a successful invoke (compacted marker latched)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const checkpointer = new MemorySaver();
+    const contextManager = createContextManager({ limitTokens: 200 });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        checkpointer,
+        contextManager,
+        buildModel: modelFactory("list_tasks", "call_compact", "done", { projectId: "p" }),
+      }),
+    );
+
+    const threadId = checkpointThreadId("user-1", "thr-compact");
+    const seedGraph = compileGraphWithCheckpointer(
+      createAgentGraph({ model: new ScriptedChatModel({ responses: [new AIMessage("seed")] }), tools: [] }),
+      checkpointer,
+    );
+    await seedGraph.invoke(
+      { messages: [new HumanMessage("x".repeat(1200))] },
+      { configurable: { thread_id: threadId } },
+    );
+
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "compact-1",
+        clientThreadId: "thr-compact",
+        input: { messages: [new HumanMessage("short")] },
+        toolHandler: recordingHandler([]),
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+
+    const state = await seedGraph.getState({ configurable: { thread_id: threadId } });
+    assert.equal(
+      (state.values as { compacted?: boolean }).compacted,
+      true,
+      "the post-invoke compaction latched the compacted marker on the job's thread",
+    );
+  });
+
+  test("no contextManager wired: jobs run without truncation or compaction (back-compat)", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: modelFactory("list_tasks", "call_plain", "done", { projectId: "p" }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "plain-1",
+        clientThreadId: "thr-plain",
+        input: { messages: [new HumanMessage("y".repeat(4000))] },
+        toolHandler: recordingHandler([]),
+      }),
+    );
+    assert.equal(result.status, "succeeded", "an oversized input without a contextManager must still run");
   });
 });

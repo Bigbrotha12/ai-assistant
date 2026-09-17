@@ -166,11 +166,97 @@ describe("credential pin store", () => {
   test("pin/get return copies — a caller mutating a returned pin cannot corrupt the store", () => {
     const { store } = makeStore();
     const pin = store.pin("u", "p", { apiKey: "orig" });
-    pin.credentials.apiKey = "tampered";
-    pin.expiresAt = 0;
+    assert.throws(
+      () => {
+        pin.credentials.apiKey = "tampered";
+      },
+      "the returned snapshot is frozen in place",
+    );
+    assert.throws(
+      () => {
+        pin.expiresAt = 0;
+      },
+      "every snapshot field is frozen",
+    );
 
     const got = store.get("u", "p");
     assert.deepEqual(got.credentials, { apiKey: "orig" });
     assert.ok(got.expiresAt > 0, "store's pin must be unaffected");
+  });
+
+  test("two admissions for the same (owner, pluginId) get distinct immutable handles and neither release kills the other", () => {
+    const { store } = makeStore();
+    const first = store.pin("user-1", "vikunja", { apiKey: "tok-a" });
+    const second = store.pin("user-1", "vikunja", { apiKey: "tok-b" });
+    assert.notEqual(first.handle, second.handle);
+
+    assert.equal(store.get("user-1", "vikunja", first.handle).credentials.apiKey, "tok-a");
+    assert.equal(store.get("user-1", "vikunja", second.handle).credentials.apiKey, "tok-b");
+
+    store.release("user-1", "vikunja", first.handle);
+    assert.throws(
+      () => store.get("user-1", "vikunja", first.handle),
+      isNotFound,
+      "the released handle is gone",
+    );
+    assert.equal(
+      store.get("user-1", "vikunja", second.handle).credentials.apiKey,
+      "tok-b",
+      "the sibling admission's pin survives the other's release",
+    );
+    assert.equal(
+      store.get("user-1", "vikunja").credentials.apiKey,
+      "tok-b",
+      "a handleless get resolves the surviving admission",
+    );
+
+    store.release("user-1", "vikunja", second.handle);
+    assert.throws(() => store.get("user-1", "vikunja"), isNotFound);
+  });
+
+  test("a handle is bound to its pluginId — a foreign pluginId + handle pair is a clean miss", () => {
+    const { store } = makeStore();
+    const pin = store.pin("user-1", "vikunja", { apiKey: "tok" });
+    store.pin("user-1", "mealie", { apiKey: "other" });
+    assert.throws(
+      () => store.get("user-1", "mealie", pin.handle),
+      isNotFound,
+      "a handle must never unlock another plugin's pin",
+    );
+  });
+
+  test("handleless release drops only the latest admission; earlier handles keep working", () => {
+    const { store } = makeStore();
+    const first = store.pin("user-1", "vikunja", { apiKey: "tok-a" });
+    store.pin("user-1", "vikunja", { apiKey: "tok-b" });
+    store.release("user-1", "vikunja");
+    assert.equal(store.get("user-1", "vikunja", first.handle).credentials.apiKey, "tok-a");
+  });
+
+  test("expiry is re-checked per handle at dispatch: one admission expiring does not kill the other", () => {
+    const { store, advance } = makeStore();
+    const first = store.pin("user-1", "vikunja", { apiKey: "tok-a" });
+    advance(600_000);
+    const second = store.pin("user-1", "vikunja", { apiKey: "tok-b" });
+    advance(600_000); // first is past the 15 min cap, second has 5 min left
+
+    assert.throws(() => store.get("user-1", "vikunja", first.handle), isExpired);
+    assert.equal(
+      store.get("user-1", "vikunja", second.handle).credentials.apiKey,
+      "tok-b",
+      "the younger admission is still dispatchable",
+    );
+  });
+
+  test("a returned pin cannot be mutated into unlocking tampered credentials", () => {
+    const { store } = makeStore();
+    const pin = store.pin("user-1", "vikunja", { apiKey: "real" });
+    assert.throws(
+      () => {
+        pin.credentials = { apiKey: "tampered" };
+      },
+      "the snapshot itself is frozen",
+    );
+    assert.equal(store.get("user-1", "vikunja", pin.handle).credentials.apiKey, "real");
   });
 });

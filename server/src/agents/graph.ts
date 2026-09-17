@@ -5,84 +5,70 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import type { RunnableConfig } from "@langchain/core/runnables";
 import type { StructuredToolInterface } from "@langchain/core/tools";
-import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
+import { Annotation, END, Overwrite, START, StateGraph } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { SUPERVISOR_PROMPT } from "./prompts.ts";
 
-/**
- * Supervisor-style agent graph (Phase 2 plan: `graph.ts`).
- *
- *   START → orchestrator ─(tool_calls)→ toolExecutor → orchestrator → ...
- *               └───────(no tool_calls)───────────────→ END
- *
- * - `orchestrator` calls the (tool-bound) chat model to decide the next
- *   action.
- * - `toolExecutor` runs any tool calls requested by the last AIMessage via a
- *   registry-backed `ToolNode`, feeding results back to the orchestrator.
- * - A max-iteration guard (`toolRounds` in state) bounds the orchestrator ↔
- *   toolExecutor loop so a model that never stops calling tools cannot loop
- *   forever.
- *
- * The graph is intentionally checkpointer-free: `createAgentGraph` is a pure
- * construction of nodes/edges, so Wave B1 can wrap the compiled graph with
- * `SqliteSaver` checkpointing and Phase 3's transport can stream it
- * (`streamEvents(..., { version: "v2" })`, which this compiled graph
- * supports). Context compaction (`context.ts`) is deferred to Phase 4 per the
- * plan and is out of scope here.
- */
-
-/** Default cap on orchestrator ↔ toolExecutor rounds before forced termination. */
 export const MAX_TOOL_ROUNDS = 5;
 
 export const AgentStateAnnotation = Annotation.Root({
-  /** Conversation history; appends, never overwrites. */
   messages: Annotation<BaseMessage[]>({
     reducer: (left, right) => left.concat(right),
     default: () => [],
   }),
-  /** Accumulator of raw tool executor outputs (string) for diagnostics/compaction. */
   toolResults: Annotation<string[]>({
     reducer: (left, right) => left.concat(right),
     default: () => [],
   }),
-  /** Number of completed tool-execution rounds; drives the max-iteration guard. */
   toolRounds: Annotation<number>({
     reducer: (left, right) => left + right,
     default: () => 0,
+  }),
+  compacted: Annotation<boolean>({
+    reducer: (left, right) => left || right,
+    default: () => false,
   }),
 });
 
 export type AgentState = typeof AgentStateAnnotation.State;
 export type AgentUpdate = typeof AgentStateAnnotation.Update;
 
+export type PrepareMessages = (
+  messages: BaseMessage[],
+  config: RunnableConfig,
+) => BaseMessage[] | Promise<BaseMessage[]>;
+
+export type BeforeModelCall = (
+  messages: BaseMessage[],
+  config: RunnableConfig,
+) => void | Promise<void>;
+
 export type AgentGraphDeps = {
-  /** Already-configured chat model (Phase 3 transport picks it from the request). */
   model: BaseChatModel;
-  /** Tools bound to the model (e.g. from `createAgent` in orchestrator.ts). */
   tools: StructuredToolInterface[];
-  /** Max tool rounds before the graph terminates a looping model. Default `MAX_TOOL_ROUNDS`. */
   maxIterations?: number;
+  prepareMessages?: PrepareMessages;
+  beforeModelCall?: BeforeModelCall;
 };
 
-/**
- * Build the supervisor agent graph. Pure construction — no checkpoints, no
- * side effects. Model and tools are dependency-injected so tests can pass a
- * fake model and Phase 3 can wire the real one.
- */
 export function createAgentGraph({
   model,
   tools,
   maxIterations = MAX_TOOL_ROUNDS,
+  prepareMessages,
+  beforeModelCall,
 }: AgentGraphDeps) {
+  if (!Number.isSafeInteger(maxIterations) || maxIterations < 0) {
+    throw new RangeError("maxIterations must be a non-negative safe integer");
+  }
   if (typeof model.bindTools !== "function") {
     throw new Error(
       "createAgentGraph: the provided chat model does not support bindTools; " +
         "a tool-capable model is required to run the supervisor agent",
     );
   }
-  // LOW: never hand a provider an empty tool array — a model with zero tools
-  // would be asked to decide between nothing. Log and run chat-only instead.
   const hasTools = tools.length > 0;
   if (!hasTools) {
     console.warn(
@@ -91,27 +77,37 @@ export function createAgentGraph({
     );
   }
   const modelWithTools = hasTools ? model.bindTools(tools) : model;
-  // M7: `handleToolErrors: false` — a tool failure must NOT become a ToolMessage
-  // (which the graph would feed back to the model and let the job complete
-  // `succeeded`). With the default `true` the runner's failJob path never sees
-  // the error; here it surfaces as a thrown error and the job is failed with a
-  // recorded error step.
   const toolNode = new ToolNode(tools, { handleToolErrors: false });
 
-  /** Decide the next action: emit an AIMessage (possibly with tool_calls). */
-  const orchestrator = async (state: AgentState): Promise<AgentUpdate> => {
-    const system = new SystemMessage(SUPERVISOR_PROMPT);
-    const response = await modelWithTools.invoke([system, ...state.messages]);
+  const orchestrator = async (
+    state: AgentState,
+    config: RunnableConfig,
+  ): Promise<AgentUpdate> => {
+    config.signal?.throwIfAborted();
+    if (state.toolRounds >= maxIterations) {
+      return { messages: [new AIMessage("Tool round limit reached. No further tools were run.")] };
+    }
+    const input = [new SystemMessage(SUPERVISOR_PROMPT), ...state.messages];
+    const messages = prepareMessages ? await prepareMessages(input, config) : input;
+    config.signal?.throwIfAborted();
+    await beforeModelCall?.(messages, config);
+    config.signal?.throwIfAborted();
+    const response = await modelWithTools.invoke(messages, config);
     return { messages: [response] };
   };
 
-  /** Execute requested tool calls; results become ToolMessages fed back to the loop. */
-  const toolExecutor = async (state: AgentState): Promise<AgentUpdate> => {
-    const result = await toolNode.invoke(state);
+  const toolExecutor = async (
+    state: AgentState,
+    config: RunnableConfig,
+  ): Promise<AgentUpdate> => {
+    config.signal?.throwIfAborted();
+    const result = await toolNode.invoke(state, config);
     const toolMessages = result.messages as BaseMessage[];
     const outputs = toolMessages
       .filter((message): message is ToolMessage => message instanceof ToolMessage)
-      .map((message) => String(message.content));
+      .map((message) => typeof message.content === "string"
+        ? message.content
+        : JSON.stringify(message.content));
     return {
       messages: toolMessages,
       toolRounds: 1,
@@ -119,7 +115,6 @@ export function createAgentGraph({
     };
   };
 
-  /** Route back to tools when tool_calls are pending and the loop budget remains. */
   const routeAfterOrchestrator = (
     state: AgentState,
   ): "toolExecutor" | typeof END => {
@@ -127,20 +122,20 @@ export function createAgentGraph({
     const hasToolCalls =
       lastMessage instanceof AIMessage &&
       (lastMessage.tool_calls?.length ?? 0) > 0;
-    if (hasToolCalls && state.toolRounds < maxIterations) return "toolExecutor";
+    if (hasToolCalls) return "toolExecutor";
     return END;
   };
 
-  const graph = new StateGraph(AgentStateAnnotation)
+  return new StateGraph(AgentStateAnnotation)
+    .addNode("startTurn", (): AgentUpdate => ({ toolRounds: new Overwrite(0) }))
     .addNode("orchestrator", orchestrator)
     .addNode("toolExecutor", toolExecutor)
-    .addEdge(START, "orchestrator")
+    .addEdge(START, "startTurn")
+    .addEdge("startTurn", "orchestrator")
     .addConditionalEdges("orchestrator", routeAfterOrchestrator, [
       "toolExecutor",
       END,
     ])
     .addEdge("toolExecutor", "orchestrator")
     .compile();
-
-  return graph;
 }

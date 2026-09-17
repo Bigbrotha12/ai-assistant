@@ -35,6 +35,12 @@ const envSchema = z.object({
   // admissions may queue per owner before rejection.
   BUDGET_MAX_CONCURRENT: z.coerce.number().int().positive().default(2),
   BUDGET_QUEUE_MAX: z.coerce.number().int().positive().default(3),
+  BUDGET_MODEL_CALL_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60),
+  BUDGET_MODEL_CALL_WINDOW_MS: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60_000),
+  CONTEXT_TOKEN_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(32_768),
+  WARMUP_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+  WARMUP_MAX_CONCURRENT: z.coerce.number().int().positive().max(2_147_483_647).default(2),
+  WARMUP_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).default(10_000),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),

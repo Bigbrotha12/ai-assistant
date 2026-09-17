@@ -7,7 +7,7 @@ import type { CheckpointStore } from "./checkpoints/store.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
 import { inferenceRoutes } from "./inference.ts";
-import { createJobRunner, JobError } from "./jobs/runner.ts";
+import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { ThreadLockRegistry } from "./jobs/thread_lock.ts";
 import { ledgerRoutes, ledger } from "./ledger.routes.ts";
@@ -20,8 +20,16 @@ import { buildModel } from "./transport/model.ts";
 import { createBudgetManager } from "./middleware/budget.ts";
 import { createPerOwnerRateLimiter } from "./middleware/rate_limit.ts";
 import { createToolResultCache } from "./middleware/cache.ts";
+import { createContextManager } from "./middleware/context.ts";
+import { createWarmupManager } from "./middleware/warmup.ts";
 
 const app = new Hono();
+let stopping = false;
+
+app.use(async (c, next) => {
+  if (stopping) return c.json({ error: "shutting_down" }, 503);
+  await next();
+});
 
 app.get("/api/auth/ok", (c) => c.json({ status: "ok" }));
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
@@ -86,6 +94,33 @@ const threadLocks = new ThreadLockRegistry();
 // transport and every background job so the same read-only tool call is never
 // executed twice across either path.
 const toolCache = createToolResultCache();
+const chatBudget = createBudgetManager({
+  maxConcurrentPerUser: env.BUDGET_MAX_CONCURRENT,
+  queueMaxPerUser: env.BUDGET_QUEUE_MAX,
+  maxModelCallsPerWindow: env.BUDGET_MODEL_CALL_LIMIT,
+  modelCallWindowMs: env.BUDGET_MODEL_CALL_WINDOW_MS,
+});
+const contextManager = createContextManager({
+  limitTokens: env.CONTEXT_TOKEN_LIMIT,
+  threadLocks,
+});
+const warmupExecutor = new ToolExecutor({
+  registry: pluginRegistry,
+  getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
+  trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+});
+const warmups = createWarmupManager({
+  enabled: env.WARMUP_ENABLED,
+  maxConcurrent: env.WARMUP_MAX_CONCURRENT,
+  timeoutMs: env.WARMUP_TIMEOUT_MS,
+  registry: pluginRegistry,
+  cache: toolCache,
+  budget: chatBudget,
+  createHandler: ({ signal }) => ({
+    execute: (pluginId, toolName, args, credentials) =>
+      warmupExecutor.execute(pluginId, toolName, args, credentials, signal),
+  }),
+});
 try {
   if (checkpointStore) {
     jobPins = new CredentialPinStore();
@@ -108,34 +143,30 @@ try {
       // Phase 4, Wave B: the shared in-memory tool-result cache so a repeated
       // read-only tool call is never executed twice across sync and async.
       toolCache,
+      budget: chatBudget,
+      contextManager,
       // M1: periodic credential-pin GC. In-memory pins are released by the
       // runner's finally / the transport's non-claimed-path releases, but a
       // crash between admission and claim could still leak one; a periodic
       // sweep bounds that window instead of relying on the release paths alone.
       sweepIntervalMs: 60_000,
-      // The model-build seam (Wave C2): the async path pins the model-plugin
-      // credential at admission; this closure resolves the owner-scoped pin and
-      // builds the model exactly like the sync path (same plugin + request
-      // overrides + trusted-hosts SSRF policy). The request config carries the
-      // owner + overrides — never credential values (pins are the only channel).
-      buildModel: (modelPluginId, requestConfig) => {
+      buildModel: (modelPluginId, requestConfig, context) => {
+        context.signal.throwIfAborted();
+        context.assertActive();
         const cfg = requestConfig as JobModelRequestConfig | undefined;
-        if (!cfg || !jobPins) {
+        if (!context.credentials) {
           throw new JobError(
-            "plugin_unavailable",
-            "no pinned credential source is wired for background model builds",
+            "credentials_expired",
+            "no scoped model credentials available for background model builds",
           );
         }
-        // Throws `credentials_expired` when the pin is missing/expired (the
-        // runner maps it to a failed job before any graph invoke).
-        const pin = jobPins.get(cfg.owner, modelPluginId);
         return buildModel({
           registry: pluginRegistry,
           pluginStore,
           modelPluginId,
-          requestModel: cfg.requestModel,
-          requestParameters: cfg.requestParameters,
-          credentials: pin.credentials,
+          requestModel: cfg?.requestModel,
+          requestParameters: cfg?.requestParameters,
+          credentials: context.credentials,
           trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
         });
       },
@@ -148,6 +179,9 @@ try {
     console.warn("jobs: no checkpointer available; background jobs disabled");
   }
 } catch (err) {
+  jobRunner?.dispose();
+  jobRunner = undefined;
+  jobPins = undefined;
   console.warn("jobs: JobRunner unavailable; background jobs disabled:", err);
 }
 
@@ -166,10 +200,6 @@ const chatRateLimiter = createPerOwnerRateLimiter({
   ratePerMinute: env.INFERENCE_RATE_LIMIT,
   burst: env.INFERENCE_RATE_BURST,
 });
-const chatBudget = createBudgetManager({
-  maxConcurrentPerUser: env.BUDGET_MAX_CONCURRENT,
-  queueMaxPerUser: env.BUDGET_QUEUE_MAX,
-});
 app.route(
   "/v1",
   createChatRoutes({
@@ -184,6 +214,8 @@ app.route(
     trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
     rateLimiter: chatRateLimiter,
     budget: chatBudget,
+    contextManager,
+    warmups,
   }),
 );
 
@@ -197,6 +229,24 @@ app.get("/", (c) =>
   }),
 );
 
-serve({ fetch: app.fetch, port: env.PORT }, (info) => {
+const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
   console.log(`ai-assistant gateway listening on http://localhost:${info.port}`);
 });
+const cleanup = (name: string, dispose: () => void) => {
+  try {
+    dispose();
+  } catch {
+    console.error(`gateway: ${name} cleanup failed`);
+  }
+};
+const shutdown = () => {
+  if (stopping) return;
+  stopping = true;
+  cleanup("warmups", () => warmups.dispose());
+  cleanup("jobs", () => jobRunner?.dispose());
+  cleanup("plugin watcher", () => pluginRegistry.disposeWatch());
+  cleanup("tool cache", () => toolCache.dispose());
+  cleanup("server", () => server.close());
+};
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);

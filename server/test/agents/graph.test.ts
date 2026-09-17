@@ -23,6 +23,15 @@ import type { ChatResult } from "@langchain/core/outputs";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
+import { MemorySaver, Overwrite } from "@langchain/langgraph";
+import { compileGraphWithCheckpointer } from "../../src/agents/compile.ts";
+import { createCheckpointStore } from "../../src/checkpoints/store.ts";
+import { SUPERVISOR_PROMPT } from "../../src/agents/prompts.ts";
+import {
+  ContextBudgetError,
+  createContextManager,
+  estimateMessagesTokens,
+} from "../../src/middleware/context.ts";
 import { createAgentGraph, MAX_TOOL_ROUNDS } from "../../src/agents/graph.ts";
 import { createAgent, jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
 import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
@@ -198,6 +207,200 @@ describe("agent graph — supervisor loop", () => {
       /backend exploded/,
       "the tool error must propagate instead of becoming a ToolMessage",
     );
+  });
+});
+
+describe("agent graph Phase 4 state and dispatch", () => {
+  test("new input resets tool rounds and termination leaves every call matched", async () => {
+    const saver = new MemorySaver();
+    const model = new ScriptedChatModel({
+      responses: Array.from({ length: 6 }, () => toolCallMessage("list_tasks", { projectId: "p1" })),
+    });
+    const graph = compileGraphWithCheckpointer(
+      createAgentGraph({ model, tools: [listTasksTool()], maxIterations: 1 }), saver,
+    );
+    const config = { configurable: { thread_id: "round-reset" } };
+    for (let turn = 0; turn < 3; turn++) {
+      const result = await graph.invoke({ messages: [new HumanMessage(`turn ${turn}`)] }, config);
+      assert.equal(result.toolRounds, 1);
+      const calls = result.messages.flatMap((message) => message instanceof AIMessage ? message.tool_calls ?? [] : []);
+      const results = result.messages.filter((message) => message instanceof ToolMessage);
+      assert.equal(calls.length, turn + 1);
+      assert.deepEqual(calls.map((call) => call.id), results.map((message) => message.tool_call_id));
+      assert.match(String(result.messages.at(-1)?.content), /Tool round limit reached/);
+    }
+  });
+
+  test("null recovery preserves the checkpointed counter without another dispatch", async () => {
+    const saver = new MemorySaver();
+    let dispatches = 0;
+    const base = createAgentGraph({
+      model: new ScriptedChatModel({ responses: [toolCallMessage("list_tasks", { projectId: "p1" })] }),
+      tools: [listTasksTool()],
+      maxIterations: 1,
+      beforeModelCall: () => { dispatches++; },
+    });
+    const interrupted = base.builder.compile({ checkpointer: saver, interruptAfter: ["toolExecutor"] });
+    const config = { configurable: { thread_id: "recover-rounds" } };
+    await interrupted.invoke({ messages: [new HumanMessage("go")] }, config);
+    const pending = await interrupted.getState(config);
+    assert.deepEqual(pending.next, ["orchestrator"]);
+    assert.equal(pending.values.toolRounds, 1);
+    const recovered = compileGraphWithCheckpointer(base, saver);
+    const result = await recovered.invoke(null, config);
+    assert.equal(result.toolRounds, 1);
+    assert.equal(dispatches, 1);
+    assert.match(String(result.messages.at(-1)?.content), /Tool round limit reached/);
+  });
+
+  test("context preparation bounds every tool loop and resumed turn even after compaction", async () => {
+    const limitTokens = Math.ceil(SUPERVISOR_PROMPT.length / 4) + 100;
+    const context = createContextManager({ limitTokens });
+    const dispatches: BaseMessage[][] = [];
+    const graph = compileGraphWithCheckpointer(createAgentGraph({
+      model: new ScriptedChatModel({ responses: Array.from({ length: 16 }, (_, i) =>
+        i % 2 === 0 ? toolCallMessage("list_tasks", { projectId: "p".repeat(2000) }) : new AIMessage("answer".repeat(1000))),
+      }),
+      tools: [listTasksTool()],
+      prepareMessages: context.prepareMessages,
+      beforeModelCall: (messages) => {
+        assert.equal(messages[0]?.content, SUPERVISOR_PROMPT);
+        assert.ok(estimateMessagesTokens(messages) <= limitTokens);
+        dispatches.push(messages);
+      },
+    }), new MemorySaver());
+    const config = { configurable: { thread_id: "bounded-growth" } };
+    for (let turn = 0; turn < 8; turn++) {
+      await graph.invoke({ messages: [new HumanMessage(`turn ${turn}`)] }, config);
+      await context.maybeCompactAfterStream({
+        graph, owner: "owner", clientThreadId: "growth", threadId: "bounded-growth", lockHeld: true,
+      });
+      assert.equal((await graph.getState(config)).values.compacted, true);
+    }
+    assert.equal(dispatches.length, 16);
+    assert.ok(estimateMessagesTokens((await graph.getState(config)).values.messages) > limitTokens);
+  });
+
+  test("compaction persists once through SQLite reopen and later growth stays request-bounded", async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), "context-checkpoint-"));
+    const options = { dbPath: join(dir, "context.db"), dbKey: "12".repeat(32) };
+    let store = await createCheckpointStore(options);
+    t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
+    const context = createContextManager({ limitTokens: 100 });
+    const makeGraph = () => compileGraphWithCheckpointer(createAgentGraph({
+      model: new ScriptedChatModel({ responses: [new AIMessage("done")] }), tools: [listTasksTool()],
+    }), store.checkpointer);
+    let graph = makeGraph();
+    const config = { configurable: { thread_id: "durable-context" } };
+    await graph.invoke({ messages: [new HumanMessage("old".repeat(1000)), new AIMessage("old answer"), new HumanMessage("live")] }, config);
+    const before = await graph.getState(config);
+    await context.maybeCompactAfterStream({ graph, owner: "owner", clientThreadId: "client", threadId: "durable-context", lockHeld: true });
+    const compacted = await graph.getState(config);
+    assert.equal(compacted.values.compacted, true);
+    assert.equal(compacted.values.messages.length, 2);
+    assert.deepEqual(compacted.next, []);
+    assert.notEqual(compacted.config.configurable?.checkpoint_id, before.config.configurable?.checkpoint_id);
+    assert.ok(compacted.metadata?.parents);
+    assert.equal(compacted.metadata?.source, "update");
+    await store.close();
+    store = await createCheckpointStore(options);
+    graph = makeGraph();
+    assert.equal((await graph.getState(config)).values.compacted, true);
+    await graph.invoke({ messages: [new HumanMessage("new"), new AIMessage("growth".repeat(1000))] }, config);
+    const grown = await graph.getState(config);
+    await context.maybeCompactAfterStream({ graph, owner: "owner", clientThreadId: "client", threadId: "durable-context", lockHeld: true });
+    assert.equal((await graph.getState(config)).config.configurable?.checkpoint_id, grown.config.configurable?.checkpoint_id);
+    assert.ok(estimateMessagesTokens(await context.prepareMessages(grown.values.messages, {})) <= 100);
+    assert.ok(estimateMessagesTokens(grown.values.messages) > 100);
+  });
+
+  test("preparation failure and dispatch budget failure stop before model invocation", async () => {
+    let dispatches = 0;
+    const context = createContextManager({ limitTokens: 1 });
+    const graph = createAgentGraph({
+      model: new ScriptedChatModel({ responses: [new AIMessage("must not run")] }),
+      tools: [listTasksTool()],
+      prepareMessages: context.prepareMessages,
+      beforeModelCall: () => { dispatches++; },
+    });
+    await assert.rejects(graph.invoke({ messages: [new HumanMessage("oversize")] }), ContextBudgetError);
+    assert.equal(dispatches, 0);
+    const budgeted = createAgentGraph({
+      model: new ScriptedChatModel({ responses: [new AIMessage("must not run")] }),
+      tools: [listTasksTool()],
+      beforeModelCall: () => { throw new Error("dispatch budget exhausted"); },
+    });
+    await assert.rejects(budgeted.invoke({ messages: [new HumanMessage("hi")] }), /dispatch budget exhausted/);
+  });
+
+  test("runnable signal and metadata reach preparation, dispatch, model and tools", async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    class ConfigModel extends ScriptedChatModel {
+      override bindTools(_tools: StructuredToolInterface[]) { return this; }
+      override async _generate(messages: BaseMessage[], options: this["ParsedCallOptions"]): Promise<ChatResult> {
+        assert.ok(options.signal);
+        assert.equal(options.signal.aborted, false);
+        calls.push("model");
+        return super._generate(messages, options);
+      }
+    }
+    const tool = new DynamicStructuredTool({
+      name: "list_tasks", description: "test", schema: z.object({ projectId: z.string() }),
+      func: async (_args, _runManager, config) => {
+        assert.ok(config?.signal);
+        assert.equal(config.metadata?.request, "test-request");
+        calls.push("tool");
+        return "ok";
+      },
+    });
+    const graph = createAgentGraph({
+      model: new ConfigModel({ responses: [toolCallMessage("list_tasks", { projectId: "p1" }), new AIMessage("done")] }),
+      tools: [tool],
+      prepareMessages: (messages, config) => {
+        assert.ok(config.signal);
+        assert.equal(config.metadata?.request, "test-request");
+        calls.push("prepare");
+        return messages;
+      },
+      beforeModelCall: (_messages, config) => {
+        assert.ok(config.signal);
+        assert.equal(config.metadata?.request, "test-request");
+        calls.push("budget");
+      },
+    });
+    await graph.invoke({ messages: [new HumanMessage("go")] }, {
+      signal: controller.signal, metadata: { request: "test-request" },
+    });
+    assert.deepEqual(calls, ["prepare", "budget", "model", "tool", "prepare", "budget", "model"]);
+  });
+
+  test("abort during preparation prevents dispatch", async () => {
+    const controller = new AbortController();
+    let dispatches = 0;
+    const graph = createAgentGraph({
+      model: new ScriptedChatModel({ responses: [new AIMessage("never")] }),
+      tools: [listTasksTool()],
+      prepareMessages: (messages) => { controller.abort(new Error("cancelled")); return messages; },
+      beforeModelCall: () => { dispatches++; },
+    });
+    await assert.rejects(graph.invoke({ messages: [new HumanMessage("go")] }, { signal: controller.signal }), /cancelled|Abort/);
+    assert.equal(dispatches, 0);
+  });
+
+  test("graph-supported message replacement preserves unrelated state", async () => {
+    const graph = compileGraphWithCheckpointer(createAgentGraph({
+      model: new ScriptedChatModel({ responses: [new AIMessage("done")] }), tools: [listTasksTool()],
+    }), new MemorySaver());
+    const config = { configurable: { thread_id: "overwrite" } };
+    await graph.invoke({ messages: [new HumanMessage("old")], toolResults: ["diagnostic"] }, config);
+    await graph.updateState(config, { messages: new Overwrite([new HumanMessage("kept")]), compacted: true }, "orchestrator");
+    const state = await graph.getState(config);
+    assert.equal(state.values.messages.length, 1);
+    assert.equal(state.values.messages[0].content, "kept");
+    assert.deepEqual(state.values.toolResults, ["diagnostic"]);
+    assert.equal(state.values.compacted, true);
+    assert.deepEqual(state.next, []);
   });
 });
 

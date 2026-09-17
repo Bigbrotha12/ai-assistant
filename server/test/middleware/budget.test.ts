@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createBudgetManager } from "../../src/middleware/budget.ts";
+import { BudgetExhaustedError, createBudgetManager } from "../../src/middleware/budget.ts";
 import type {
   AsyncReservation,
   BudgetClearTimeout,
@@ -41,6 +41,80 @@ function createFakeClock() {
     ids: () => [...timers.keys()],
   };
 }
+
+describe("model dispatch budget", () => {
+  it("shares one counter across sync, async, vision, compaction and warmup dispatches", () => {
+    const budget = createBudgetManager({ maxModelCallsPerWindow: 5, now: () => 100 });
+    for (const kind of ["sync", "async", "vision", "compaction", "warmup"] as const) {
+      budget.beforeModelCall("user", kind);
+    }
+    assert.equal(budget.modelCallCount("user"), 5);
+    assert.deepEqual(budget.reserveModelCall("user", "vision"), {
+      ok: false, code: "budget_exhausted", retryAfterSeconds: 60, resetAt: 60_100,
+    });
+    assert.equal(budget.modelCallCount("user"), 5);
+    assert.equal(budget.reserveModelCall("other").ok, true);
+  });
+
+  it("reserves synchronously before concurrent dispatches and fails explicitly mid-job", async () => {
+    const budget = createBudgetManager({ maxModelCallsPerWindow: 2 });
+    let dispatched = 0;
+    const dispatch = async () => {
+      budget.beforeModelCall("user", "async");
+      dispatched += 1;
+      await Promise.resolve();
+    };
+    const results = await Promise.allSettled([dispatch(), dispatch(), dispatch()]);
+    assert.equal(dispatched, 2);
+    assert.equal(results[2]?.status, "rejected");
+    assert.throws(() => budget.beforeModelCall("user"), (error: unknown) => {
+      assert.ok(error instanceof BudgetExhaustedError);
+      assert.equal(error.code, "budget_exhausted");
+      assert.ok(error.retryAfterSeconds > 0);
+      return true;
+    });
+  });
+
+  it("resets at the fixed owner window boundary with rounded Retry-After", () => {
+    let now = 500;
+    const budget = createBudgetManager({ maxModelCallsPerWindow: 1, modelCallWindowMs: 1500, now: () => now });
+    assert.deepEqual(budget.reserveModelCall("user"), { ok: true, remaining: 0, resetAt: 2000 });
+    now = 999;
+    assert.deepEqual(budget.reserveModelCall("user"), {
+      ok: false, code: "budget_exhausted", retryAfterSeconds: 2, resetAt: 2000,
+    });
+    now = 1999;
+    assert.equal(budget.modelCallCount("user"), 1);
+    now = 2000;
+    assert.equal(budget.modelCallCount("user"), 0);
+    assert.deepEqual(budget.reserveModelCall("user"), { ok: true, remaining: 0, resetAt: 3500 });
+  });
+
+  it("does not charge admission or refund dispatched failures when concurrency releases", async () => {
+    const budget = createBudgetManager({ maxModelCallsPerWindow: 1 });
+    const sync = claimed(budget.reserveSync("user"));
+    const async = claimed(await budget.reserveAsync("user"));
+    assert.equal(budget.modelCallCount("user"), 0);
+    await assert.rejects(async () => {
+      budget.beforeModelCall("user");
+      throw new Error("provider failed");
+    }, /provider failed/);
+    sync.release();
+    async.release();
+    assert.equal(budget.activeCount("user"), 0);
+    assert.equal(budget.reserveModelCall("user").ok, false);
+  });
+
+  it("validates call limits, windows and attribution", () => {
+    for (const value of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => createBudgetManager({ maxModelCallsPerWindow: value }));
+      assert.throws(() => createBudgetManager({ modelCallWindowMs: value }));
+    }
+    const budget = createBudgetManager();
+    assert.throws(() => budget.beforeModelCall(" "), /requires an owner/);
+    assert.equal(budget.modelCallCount("unknown"), 0);
+  });
+});
 
 describe("createBudgetManager", () => {
   it("reserveSync caps concurrent slots per owner and reports Retry-After when full", () => {

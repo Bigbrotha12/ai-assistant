@@ -1,5 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { redactForCheckpoint } from "../checkpoints/store.ts";
+import { BudgetExhaustedError } from "../middleware/budget.ts";
+import { ContextBudgetError } from "../middleware/context.ts";
+
+function exhaustionCode(error: unknown): string | undefined {
+  return error instanceof BudgetExhaustedError || error instanceof ContextBudgetError
+    ? error.code
+    : undefined;
+}
 
 /**
  * OpenAI-compatible SSE adapter (Phase 3, Wave A).
@@ -330,7 +338,7 @@ export async function* toOpenAiSse(
 
       case "on_chat_model_error":
       case "on_llm_error": {
-        yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_MODEL);
+        yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_MODEL, exhaustionCode(event.data.error));
         yield DONE_FRAME;
         terminated = true;
         return;
@@ -349,7 +357,7 @@ export async function* toOpenAiSse(
 
       case "on_chain_error": {
         if (event.run_id === rootRunId) {
-          yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_SERVER);
+          yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_SERVER, exhaustionCode(event.data.error));
           yield DONE_FRAME;
           terminated = true;
           return;
@@ -392,7 +400,7 @@ export async function* toOpenAiSse(
   // terminator was never emitted, surface the failure as a root chain error
   // envelope so the stream still terminates per I4 / §5.2.
   if (!terminated && lastError !== undefined) {
-    yield errorFrame(redact(errorMessage(lastError)), ERROR_TYPE_SERVER);
+    yield errorFrame(redact(errorMessage(lastError)), ERROR_TYPE_SERVER, exhaustionCode(lastError));
     yield DONE_FRAME;
     terminated = true;
   }

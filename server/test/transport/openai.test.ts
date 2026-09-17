@@ -12,7 +12,8 @@ import type { ChatResult } from "@langchain/core/outputs";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
-import { createAgentGraph } from "../../src/agents/graph.ts";
+import { END, START, StateGraph } from "@langchain/langgraph";
+import { AgentStateAnnotation, createAgentGraph } from "../../src/agents/graph.ts";
 import {
   DONE_FRAME,
   errorFrame,
@@ -200,14 +201,20 @@ describe("transport — §7 golden fixtures (byte-exact)", () => {
         ],
       ],
     });
-    // maxIterations: 0 → an orchestrator that returns tool calls routes to END
-    // instead of the tool executor, so the run terminates on the tool-call turn.
-    const graph = createAgentGraph({ model, tools: [], maxIterations: 0 });
-    const frames = await collectFrames(graph, {
-      modelId: "gpt-4o",
-      created: 1726080060,
-      id: "chatcmpl-002",
-    });
+    const graph = new StateGraph(AgentStateAnnotation)
+      .addNode("orchestrator", async (state, config) => ({
+        messages: [await model.invoke(state.messages, config)],
+      }))
+      .addEdge(START, "orchestrator")
+      .addEdge("orchestrator", END)
+      .compile();
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(
+      graph.streamEvents({ messages: [new HumanMessage("hi")] }, { version: "v2" }),
+      { modelId: "gpt-4o", created: 1726080060, id: "chatcmpl-002" },
+    )) {
+      frames.push(frame);
+    }
 
     assert.equal(frames.join(""), GOLDEN_7_2);
     assert.equal(countOccurrences(frames.join(""), "data: [DONE]"), 1);

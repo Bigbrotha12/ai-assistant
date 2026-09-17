@@ -132,6 +132,7 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
   }
 
   const configuration = {
+    maxRetries: 0,
     baseURL: plugin.inference.endpoint,
     fetch: createValidatedFetchAdapter({
       trustedHosts: input.trustedHosts,
@@ -149,6 +150,7 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
     model: input.requestModel ?? plugin.inference.defaultModel,
     apiKey: input.credentials.apiKey,
     streaming: true,
+    maxRetries: 0,
     configuration,
   } as unknown as ChatOpenAIFields;
 

@@ -60,6 +60,13 @@ import type { BudgetManager } from "../../src/middleware/budget.ts";
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolResultCache } from "../../src/middleware/cache.ts";
 import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
+import { createContextManager, estimateMessagesTokens } from "../../src/middleware/context.ts";
+import type { ContextManager } from "../../src/middleware/context.ts";
+import { createWarmupManager } from "../../src/middleware/warmup.ts";
+import type { WarmupManager } from "../../src/middleware/warmup.ts";
+import { JobRunner as RealJobRunner } from "../../src/jobs/runner.ts";
+import { SUPERVISOR_PROMPT } from "../../src/agents/prompts.ts";
+import { SystemMessage } from "@langchain/core/messages";
 
 /**
  * Wave C1 chat-transport tests. Everything is fake/in-memory: a real
@@ -344,6 +351,8 @@ type AppOptions = {
   ledger?: Ledger;
   threadLocks?: ThreadLockRegistry;
   toolCache?: ToolResultCache;
+  contextManager?: ContextManager;
+  warmups?: WarmupManager;
 };
 
 async function makeApp(
@@ -370,6 +379,8 @@ async function makeApp(
       ledger: opts.ledger,
       threadLocks: opts.threadLocks,
       toolCache: opts.toolCache,
+      contextManager: opts.contextManager,
+      warmups: opts.warmups,
       trustedHosts: [],
     }),
   );
@@ -580,8 +591,15 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.deepEqual(d.toolPlugins, ["vikunja"]);
     const requestConfig = d.modelRequestConfig as JobModelRequestConfig;
     assert.equal(requestConfig.owner, "test-user");
-    const input = d.input as { messages: BaseMessage[] };
-    assert.equal(input.messages.length, 1, "fresh thread seeds from client history");
+    assert.equal(typeof d.inputFactory, "function", "execution re-evaluates the seed under the runner lock");
+    assert.equal(d.input, undefined, "no stale seed is shipped in the descriptor");
+    const seed = await d.inputFactory!({
+      graph: {} as never,
+      threadId: checkpointThreadId("test-user", "thread-1"),
+      isReplay: false,
+      signal: new AbortController().signal,
+    }) as { messages: BaseMessage[] };
+    assert.equal(seed.messages.length, 1, "fresh thread seeds from client history");
 
     // Model + tool credentials are pinned for the job (the runner resolves them).
     assert.deepEqual(pins.get("test-user", "openrouter").credentials, {
@@ -829,6 +847,8 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       { code: "tool_retry_forbidden", status: 409 },
       { code: "plugin_unavailable", status: 502 },
       { code: "job_failed", status: 500 },
+      { code: "budget_exhausted", status: 429 },
+      { code: "context_length_exceeded", status: 400 },
     ];
     for (const { code, status } of cases) {
       const fake = makeFakeJobRunner([
@@ -1374,6 +1394,30 @@ describe("transport/model.ts — model construction + SSRF fetch seam", () => {
     assert.equal(String(result.content), "hello from fake provider");
   });
 
+  test("provider failures never retry outside dispatch admission", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, registry } = await makeEnv(dir);
+    let attempts = 0;
+    const model = buildModel({
+      registry,
+      pluginStore: store,
+      modelPluginId: "openrouter",
+      credentials: { apiKey: "test-provider-key" },
+      requestParameters: { maxRetries: 9 },
+      lookup: fakeLookup(),
+      mode: "test",
+      fetchFn: async () => {
+        attempts++;
+        return new Response(JSON.stringify({ error: { message: "temporarily unavailable" } }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    await assert.rejects(model.invoke([new HumanMessage("hi")]));
+    assert.equal(attempts, 1);
+  });
+
   test("buildModel resolves requestModel over the plugin defaultModel", async (t) => {
     const dir = await makeTempDir(t);
     const { store, registry } = await makeEnv(dir);
@@ -1707,14 +1751,11 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
       await entered;
       assert.equal(budget.activeCount("test-user"), 1);
 
-      // Cancel the body reader — onRelease fires via ReadableStream.cancel().
       await res.body?.cancel();
-      assert.equal(budget.activeCount("test-user"), 0);
+      assert.equal(budget.activeCount("test-user"), 1, "cancel must not release before execution settles");
 
-      // The gate-unblock lets the blocked generator finish so the test does
-      // not leak a pending stream chain; give it one tick to unwind.
       releaseGate();
-      await new Promise<void>((r) => setTimeout(r, 10));
+      await waitFor(() => budget.activeCount("test-user") === 0);
 
       const res2 = await postChat(app, chatBody());
       assert.equal(res2.status, 200);
@@ -2001,5 +2042,272 @@ describe("Phase 4, Wave B — sync path tool-result cache", () => {
 
     assert.equal(handlerCalls, 1, "the second request was served from the cache");
     assert.equal(toolCache.size, 1);
+  });
+});
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function toolTurns(): Array<Array<Record<string, unknown>>> {
+  return [
+    [{ content: "", tool_call_chunks: [{ index: 0, id: "call_1", name: "list_tasks", args: "{}" }] }],
+    [{ content: "done" }],
+  ];
+}
+
+describe("transport integration regressions", () => {
+  test("cancel during a delayed model holds the thread lock and prevents tool dispatch", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const threadLocks = new ThreadLockRegistry();
+    const budget = createBudgetManager();
+    const active = { current: 0, max: 0 };
+    const recorded: BaseMessage[][] = [];
+    let calls = 0;
+    let builds = 0;
+    const { app } = await makeApp(t, {
+      checkpointStore, threadLocks, budget,
+      buildModel: (() => new SlowScriptedChatModel({
+        turns: builds++ === 0 ? toolTurns() : [[{ content: "second" }]],
+        recordedInputs: recorded, delayMs: 100, active,
+      })) as typeof buildModel,
+      toolHandler: { async execute() { calls++; return "[]"; } },
+    });
+    const first = await postChat(app, chatBody({ thread_id: "cancel-model" }));
+    await waitFor(() => active.current === 1);
+    await first.body!.cancel();
+    assert.equal(budget.activeCount("test-user"), 1);
+    assert.equal(threadLocks.mutexes.size, 1);
+    let secondStarted = false;
+    const second = postChat(app, chatBody({ thread_id: "cancel-model" })).then((response) => {
+      secondStarted = true;
+      return response;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(secondStarted, false);
+    await (await second).text();
+    assert.equal(active.max, 1);
+    assert.equal(calls, 0);
+    assert.equal(budget.activeCount("test-user"), 0);
+    assert.equal(threadLocks.mutexes.size, 0);
+    const config = { configurable: { thread_id: checkpointThreadId("test-user", "cancel-model") } };
+    const checkpoint = await checkpointStore.checkpointer.get(config);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal((await checkpointStore.checkpointer.get(config))?.id, checkpoint?.id);
+  });
+
+  test("cancel during a delayed tool forwards abort and holds admission until the side effect settles", async (t) => {
+    const gate = deferred();
+    t.after(() => gate.resolve());
+    const checkpointStore = fakeCheckpointStore();
+    const threadLocks = new ThreadLockRegistry();
+    const budget = createBudgetManager();
+    const recorded: BaseMessage[][] = [];
+    let signal: AbortSignal | undefined;
+    let toolActive = false;
+    let writes = 0;
+    let builds = 0;
+    let overlap = false;
+    const { app } = await makeApp(t, {
+      checkpointStore, threadLocks, budget,
+      buildModel: (() => new RecordingChatModel(builds++ === 0 ? toolTurns() : [[{ content: "second" }]], recorded)) as typeof buildModel,
+      toolHandler: {
+        async execute(_pluginId, _toolName, _args, _credentials, abortSignal?: AbortSignal) {
+          signal = abortSignal;
+          toolActive = true;
+          await gate.promise;
+          writes++;
+          toolActive = false;
+          return "[]";
+        },
+      },
+      contextManager: {
+        truncateSeed: (messages) => messages,
+        prepareMessages(messages) { overlap ||= toolActive; return messages; },
+        async maybeCompactAfterStream() {},
+      },
+    });
+    const first = await postChat(app, chatBody({ thread_id: "cancel-tool" }));
+    await waitFor(() => toolActive);
+    await first.body!.cancel();
+    assert.equal(signal?.aborted, true);
+    assert.equal(budget.activeCount("test-user"), 1);
+    let admitted = false;
+    const second = postChat(app, chatBody({ thread_id: "cancel-tool" })).then((response) => {
+      admitted = true;
+      return response;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(admitted, false);
+    assert.equal(writes, 0);
+    gate.resolve();
+    await (await second).text();
+    assert.equal(writes, 1);
+    assert.equal(overlap, false);
+    assert.equal(recorded.length, 2, "cancelled run never dispatches its second model turn");
+    assert.equal(budget.activeCount("test-user"), 0);
+    assert.equal(threadLocks.mutexes.size, 0);
+  });
+
+  test("every model dispatch prepares context and consumes budget; exhaustion has an explicit SSE code", async (t) => {
+    const budget = createBudgetManager({ maxModelCallsPerWindow: 1 });
+    const recorded: BaseMessage[][] = [];
+    let prepared = 0;
+    const { app } = await makeApp(t, {
+      budget,
+      buildModel: (() => new RecordingChatModel(toolTurns(), recorded)) as typeof buildModel,
+      toolHandler: { async execute() { return "[]"; } },
+      contextManager: {
+        truncateSeed: (messages) => messages,
+        prepareMessages(messages) { prepared++; return messages; },
+        async maybeCompactAfterStream() {},
+      },
+    });
+    const frames = parseFrames(await (await postChat(app, chatBody())).text());
+    assert.equal(prepared, 2);
+    assert.equal(recorded.length, 1);
+    assert.equal(budget.modelCallCount("test-user"), 1);
+    const errors = frames.filter((frame) => frame?.error);
+    assert.equal(errors.length, 1);
+    assert.equal((errors[0]!.error as { code: string }).code, "budget_exhausted");
+    assert.equal(frames.filter((frame) => frame === null).length, 1);
+    assert.equal(budget.activeCount("test-user"), 0);
+  });
+
+  test("context bounds include the supervisor on every resumed and tool round; compaction receives the graph", async (t) => {
+    const threadLocks = new ThreadLockRegistry();
+    const limitTokens = estimateMessagesTokens([new SystemMessage(SUPERVISOR_PROMPT)]) + 100;
+    const context = createContextManager({ limitTokens, threadLocks });
+    const recorded: BaseMessage[][] = [];
+    let compactions = 0;
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(), threadLocks,
+      contextManager: {
+        ...context,
+        async maybeCompactAfterStream(args) {
+          assert.ok(args.graph);
+          assert.equal(args.checkpointer, undefined);
+          assert.equal(args.lockHeld, true);
+          compactions++;
+          await context.maybeCompactAfterStream(args);
+        },
+      },
+      buildModel: (() => new RecordingChatModel(toolTurns(), recorded)) as typeof buildModel,
+      toolHandler: { async execute() { return "x".repeat(2000); } },
+    });
+    for (const content of ["first", "second"]) {
+      const response = await postChat(app, chatBody({ thread_id: "context", messages: [{ role: "user", content }] }));
+      const frames = parseFrames(await response.text());
+      assert.equal(frames.some((frame) => frame?.error), false);
+    }
+    assert.equal(recorded.length, 4);
+    assert.equal(compactions, 2);
+    for (const messages of recorded) assert.ok(estimateMessagesTokens(messages) <= limitTokens);
+    assert.ok(recorded[2]!.some((message) => message.content === "second"));
+  });
+
+  test("context exhaustion is explicit before streaming and when the supervisor exceeds the limit", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "unused" }]]);
+    const { app } = await makeApp(t, {
+      buildModel: fake.buildModelFn,
+      contextManager: createContextManager({ limitTokens: 2 }),
+    });
+    const rejected = await postChat(app, chatBody({ messages: [{ role: "user", content: "too long to fit" }] }));
+    assert.equal(rejected.status, 400);
+    assert.equal((await rejected.json() as { error: string }).error, "context_length_exceeded");
+    const streamed = await postChat(app, chatBody({ messages: [{ role: "user", content: "hi" }] }));
+    const errors = parseFrames(await streamed.text()).filter((frame) => frame?.error);
+    assert.equal((errors[0]!.error as { code: string }).code, "context_length_exceeded");
+    assert.equal(fake.recordedInputs.length, 0);
+  });
+
+  test("background inputFactory re-reads after another writer seeds the thread while awaiting the runner lock", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const threadLocks = new ThreadLockRegistry();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const recorded: BaseMessage[][] = [];
+    const env = await makeEnv(await makeTempDir(t));
+    const runner = new RealJobRunner({
+      ledger, pins, registry: env.registry, checkpointer: checkpointStore.checkpointer,
+      threadLocks, buildModel: () => new RecordingChatModel([], recorded),
+    });
+    t.after(() => runner.dispose());
+    const { app } = await makeApp(t, { checkpointStore, threadLocks, pins, ledger, jobRunner: runner });
+    const threadId = checkpointThreadId("test-user", "seed-race");
+    const unlock = await threadLocks.acquire(threadId);
+    t.after(unlock);
+    const response = postChat(app, chatBody({
+      background: true, messageId: "seed-race", thread_id: "seed-race",
+      messages: [{ role: "user", content: "stale history" }, { role: "assistant", content: "stale reply" }, { role: "user", content: "new turn" }],
+    }));
+    await waitFor(() => ledger.getTaskByIntentKey("test-user", "seed-race")?.status === "running");
+    const seed = await makeApp(t, {
+      checkpointStore,
+      buildModel: makeFakeBuildModel([[{ content: "checkpoint reply" }]]).buildModelFn,
+    });
+    await (await postChat(seed.app, chatBody({ thread_id: "seed-race", messages: [{ role: "user", content: "checkpoint history" }] }))).text();
+    unlock();
+    assert.equal((await response).status, 200);
+    const contents = recorded[0]!.map((message) => message.content);
+    assert.ok(contents.includes("checkpoint history"));
+    assert.ok(contents.includes("new turn"));
+    assert.equal(contents.includes("stale history"), false);
+    assert.equal(contents.includes("stale reply"), false);
+  });
+
+  test("duplicate and rejected admissions release only their exact pins", async (t) => {
+    for (const reject of [false, true]) {
+      const pins = new CredentialPinStore();
+      const modelPin = pins.pin("test-user", "openrouter", { apiKey: "original-model" });
+      const toolPin = pins.pin("test-user", "vikunja", { apiKey: "original-tool" });
+      const budget = createBudgetManager({ maxConcurrentPerUser: 1, queueMaxPerUser: 0 });
+      const held = reject ? budget.reserveSync("test-user") : undefined;
+      const runner = makeFakeJobRunner([{ status: "in_flight", taskId: "duplicate", threadId: "thread" }]);
+      const { app } = await makeApp(t, {
+        pins, budget, checkpointStore: fakeCheckpointStore(), ledger: makeLedger(), jobRunner: runner as unknown as JobRunner,
+      });
+      const response = await postChat(app, chatBody({ background: true, messageId: "duplicate", credentials: {
+        openrouter: { apiKey: "replacement-model" }, vikunja: { apiKey: "replacement-tool" },
+      } }));
+      assert.equal(response.status, reject ? 503 : 202);
+      assert.equal(pins.get("test-user", "openrouter").handle, modelPin.handle);
+      assert.equal(pins.get("test-user", "vikunja").handle, toolPin.handle);
+      if (!reject) {
+        const handles = runner.calls[0]!.pinHandles!;
+        assert.notEqual(handles.openrouter, modelPin.handle);
+        assert.throws(() => pins.get("test-user", "openrouter", handles.openrouter));
+      }
+      if (held?.ok) held.release();
+    }
+  });
+
+  test("warmups use bound read-only credentials only for admitted requests and remain disabled by default", async (t) => {
+    for (const enabled of [false, true]) {
+      const env = await makeEnv(await makeTempDir(t));
+      const budget = createBudgetManager();
+      const calls: Array<{ plugin: string; tool: string; credentials: unknown }> = [];
+      const warmups = createWarmupManager({
+        enabled, registry: env.registry, cache: createToolResultCache(), budget,
+        createHandler: () => ({ async execute(plugin, tool, _args, credentials) {
+          calls.push({ plugin, tool, credentials });
+          return "[]";
+        } }),
+      });
+      t.after(() => warmups.dispose());
+      const { app } = await makeApp(t, { warmups, budget, buildModel: makeFakeBuildModel([[{ content: "ok" }]]).buildModelFn });
+      const body = chatBody({ credentials: { openrouter: { apiKey: "model-key" }, vikunja: { apiKey: "tool-key" } } });
+      assert.equal((await postChat(app, { ...body, messages: [] })).status, 400);
+      assert.equal(calls.length, 0);
+      const held = [budget.reserveSync("test-user"), budget.reserveSync("test-user")];
+      assert.equal((await postChat(app, body)).status, 429);
+      assert.equal(calls.length, 0);
+      for (const slot of held) if (slot.ok) slot.release();
+      await (await postChat(app, body)).text();
+      await waitFor(() => warmups.activeCount === 0);
+      assert.deepEqual(calls, enabled ? [{ plugin: "vikunja", tool: "list_tasks", credentials: { apiKey: "tool-key" } }] : []);
+    }
   });
 });

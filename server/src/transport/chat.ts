@@ -7,20 +7,21 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
-import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
 import type {
   JobErrorCode,
+  JobToolHandler,
   JobRunner,
   RunJobResult,
 } from "../jobs/runner.ts";
 import type { ThreadLockRegistry } from "../jobs/thread_lock.ts";
 import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
-import type { CredentialPinStore } from "../credentials/pins.ts";
+import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import {
   checkpointThreadId,
   redactForCheckpoint,
@@ -40,8 +41,13 @@ import { isModelPlugin, isToolPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
-import { createBudgetManager } from "../middleware/budget.ts";
+import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
+import { ContextBudgetError } from "../middleware/context.ts";
+import type { WarmupManager } from "../middleware/warmup.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
+import type {
+  ContextManager,
+} from "../middleware/context.ts";
 import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
 import type {
   PerOwnerRateLimiter,
@@ -199,6 +205,13 @@ export type ChatRoutesOptions = {
    * streams serialize against every other writer on the same checkpoint thread.
    */
   threadLocks?: ThreadLockRegistry;
+  /**
+   * Conversation context manager (Phase 4, Wave C). Applies deterministic
+   * pair-aware truncation to fresh seeds and best-effort post-turn compaction
+   * to resumed threads (see middleware/context.ts). Constructed in index.ts
+   * with the shared threadLocks + the checkpoint store's checkpointer.
+   */
+  contextManager?: ContextManager;
   /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
   verifyKey?: VerifyApiKeyFn;
   /**
@@ -233,7 +246,8 @@ export type ChatRoutesOptions = {
    * supplied, the transport still injects each call's per-plugin credentials
    * (H2) so a fake can assert them.
    */
-  toolHandler?: ToolCallHandler;
+  toolHandler?: JobToolHandler;
+  warmups?: WarmupManager;
   /**
    * Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the sync tool
    * handler so a repeated READ-ONLY tool call — same (owner, pluginId,
@@ -268,6 +282,72 @@ export type JobModelRequestConfig = {
 };
 
 type StreamOptions = { version: "v2"; configurable?: Record<string, unknown> };
+
+type StreamExecution = ReturnType<typeof createStreamExecution>;
+
+function createStreamExecution(requestSignal: AbortSignal) {
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, requestSignal]);
+  const pending = new Set<Promise<unknown>>();
+  return {
+    signal,
+    abort: () => controller.abort(),
+    async track<T>(run: () => Promise<T>): Promise<T> {
+      signal.throwIfAborted();
+      const work = Promise.resolve().then(() => {
+        signal.throwIfAborted();
+        return run();
+      });
+      pending.add(work);
+      try {
+        return await work;
+      } finally {
+        pending.delete(work);
+      }
+    },
+    async settle() {
+      while (pending.size) await Promise.allSettled([...pending]);
+    },
+  };
+}
+
+function trackModelExecution(model: BaseChatModel, execution: StreamExecution): void {
+  const seen = new WeakSet<object>();
+  const wrap = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
+    seen.add(candidate);
+    if (!(candidate instanceof BaseChatModel)) {
+      if ("bound" in candidate) wrap(candidate.bound);
+      return;
+    }
+    const generate = candidate._generate.bind(candidate);
+    candidate._generate = (...args) => execution.track(() => generate(...args));
+    const chunks = candidate._streamResponseChunks.bind(candidate);
+    if (candidate._streamResponseChunks !== BaseChatModel.prototype._streamResponseChunks) {
+      candidate._streamResponseChunks = async function* (...args) {
+        let finish!: () => void;
+        const done = new Promise<void>((resolve) => { finish = resolve; });
+        const tracked = execution.track(() => done);
+        try {
+          execution.signal.throwIfAborted();
+          yield* chunks(...args);
+        } finally {
+          finish();
+          await tracked;
+        }
+      };
+    }
+    const bind = candidate.bindTools?.bind(candidate);
+    if (bind) {
+      candidate.bindTools = (...args) => {
+        const bound = bind(...args);
+        wrap(bound);
+        return bound;
+      };
+    }
+  };
+  wrap(model);
+}
 
 /** The compiled agent graph the sync path streams (createAgentGraph's type). */
 type AgentGraph = ReturnType<typeof createAgentGraph>;
@@ -512,17 +592,33 @@ async function handleSyncStream(
     cache: opts.toolCache,
     handler: toolHandler,
   });
+  const execution = createStreamExecution(c.req.raw.signal);
+  trackModelExecution(model, execution);
   const tools = bindPluginTools(opts.registry, {
     async execute(pluginId, toolName, args) {
-      return cachedHandler.execute(
-        pluginId,
-        toolName,
-        args,
-        toolCredentialsByPlugin[pluginId],
-      );
+      execution.signal.throwIfAborted();
+      return execution.track(async () => {
+        const result = await cachedHandler.execute(
+          pluginId,
+          toolName,
+          args,
+          toolCredentialsByPlugin[pluginId],
+          execution.signal,
+        );
+        execution.signal.throwIfAborted();
+        return result;
+      });
     },
   });
-  const base = createAgentGraph({ model, tools });
+  const base = createAgentGraph({
+    model,
+    tools,
+    prepareMessages: opts.contextManager?.prepareMessages,
+    beforeModelCall: () => {
+      execution.signal.throwIfAborted();
+      budget.beforeModelCall(owner, "sync");
+    },
+  });
   // H1: compile with the checkpointer ONLY for a threaded (checkpointed) run.
   // A stateless run (no `thread_id`) streams WITHOUT `configurable.thread_id`;
   // running that through a checkpointer would throw `Missing "thread_id"` on
@@ -559,27 +655,46 @@ async function handleSyncStream(
       reservation.release();
     };
     try {
+      execution.signal.throwIfAborted();
       const { input, streamOptions } = await computeThreadInput(
         checkpointStore,
         threadId,
         rawMessages,
+        opts.contextManager,
       );
       checkpointStore.touchThread(owner, threadId);
+      // Wave C: alongside the existing post-stream checkpoint-diagnostics
+      // check, run best-effort compaction when a context manager is wired.
+      // verifyCheckpointUnmoved runs inline (it catches internally); the
+      // compaction call is a sibling — both run INSIDE the held lock (before
+      // releaseOnce in the stream's finally), so the lockHeld: true flag
+      // prevents the compactor from re-acquiring (AsyncMutex is not reentrant).
+      const afterStream = async (): Promise<void> => {
+        await verifyCheckpointUnmoved(checkpointStore, threadId, graph);
+        await opts.contextManager?.maybeCompactAfterStream({
+          owner,
+          clientThreadId: clientThreadId!,
+          threadId,
+          graph,
+          lockHeld: true,
+        });
+      };
+      scheduleWarmups(opts, owner, toolCredentialsByPlugin);
       return buildStreamResponse(
         graph,
         input,
         streamOptions,
         modelId,
+        execution,
         releaseOnce,
-        () => verifyCheckpointUnmoved(checkpointStore, threadId, graph),
+        afterStream,
       );
     } catch (err) {
       releaseOnce();
       if (isResumeConflict(err)) {
         return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
       }
-      console.error("chat: locked stream setup failed", err);
-      return c.json({ error: "internal" }, 500);
+      return preStreamError(c, err);
     }
   }
 
@@ -587,12 +702,14 @@ async function handleSyncStream(
   // serialization beyond the checkpointer itself.
   let input: Record<string, unknown>;
   let streamOptions: StreamOptions;
+  let afterStream: (() => Promise<void>) | undefined;
   if (threadId !== undefined && checkpointStore) {
     try {
       const computed = await computeThreadInput(
         checkpointStore,
         threadId,
         rawMessages,
+        opts.contextManager,
       );
       input = computed.input;
       streamOptions = computed.streamOptions;
@@ -600,13 +717,31 @@ async function handleSyncStream(
       if (isResumeConflict(err)) {
         return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
       }
-      console.error("chat: threaded stream setup failed", err);
-      return c.json({ error: "internal" }, 500);
+      return preStreamError(c, err);
     }
     checkpointStore.touchThread(owner, threadId);
+    // Phase 4 Wave C: wire compaction onto the non-lockable threaded branch.
+    // No ThreadLockRegistry is available here, so maybeCompactAfterStream
+    // acquires the thread lock internally (if threadLocks is present via the
+    // context manager) or runs lock-free.
+    afterStream = (): Promise<void> =>
+      opts.contextManager?.maybeCompactAfterStream({
+        owner,
+        clientThreadId: clientThreadId!,
+        threadId,
+        graph,
+      }) ?? Promise.resolve();
   } else {
-    input = { messages: toLangChainMessages(rawMessages) };
-    streamOptions = { version: "v2" };
+    // Stateless (no thread_id or no checkpoint store): apply pair-aware
+    // truncation to a fresh seed so an oversized client history never
+    // overflows the model context. Truncation is pure (no checkpointer).
+    try {
+      const msgs = toLangChainMessages(rawMessages);
+      input = { messages: opts.contextManager?.truncateSeed(msgs) ?? msgs };
+      streamOptions = { version: "v2" };
+    } catch (err) {
+      return preStreamError(c, err);
+    }
   }
   // Phase 4 Wave A: reserve the per-user slot at stream admission — after
   // every pre-stream validation, so a rejected request never holds a slot —
@@ -619,7 +754,16 @@ async function handleSyncStream(
     return busy(c, 429, reservation.retryAfterSeconds);
   }
   try {
-    return buildStreamResponse(graph, input, streamOptions, modelId, reservation.release);
+    scheduleWarmups(opts, owner, toolCredentialsByPlugin);
+    return buildStreamResponse(
+      graph,
+      input,
+      streamOptions,
+      modelId,
+      execution,
+      reservation.release,
+      afterStream,
+    );
   } catch (err) {
     reservation.release();
     throw err;
@@ -649,8 +793,8 @@ function withToolResultCache(opts: {
   registry: PluginRegistry;
   owner: string;
   cache?: ToolResultCache;
-  handler: ToolCallHandler;
-}): ToolCallHandler {
+  handler: JobToolHandler;
+}): JobToolHandler {
   const { registry, owner, cache, handler } = opts;
   if (!cache) return handler;
 
@@ -659,7 +803,8 @@ function withToolResultCache(opts: {
   const resolved = new Map<string, ToolCallMeta | null>();
 
   return {
-    async execute(pluginId, toolName, args, credentials?) {
+    async execute(pluginId, toolName, args, credentials?, signal?) {
+      signal?.throwIfAborted();
       const lookup = `${pluginId}\u0000${toolName}`;
       let meta: ToolCallMeta | null | undefined = resolved.get(lookup);
       if (meta === undefined) {
@@ -675,7 +820,7 @@ function withToolResultCache(opts: {
         }
         resolved.set(lookup, meta);
       }
-      const direct = () => handler.execute(pluginId, toolName, args, credentials);
+      const direct = () => handler.execute(pluginId, toolName, args, credentials, signal);
       if (meta === null || !canRetryTool({ readOnly: meta.readOnly })) {
         return direct();
       }
@@ -690,6 +835,7 @@ function withToolResultCache(opts: {
       const hit = cache.get(key);
       if (hit !== undefined) return redactForCheckpoint(hit);
       const result = String(await direct());
+      signal?.throwIfAborted();
       cache.set(key, result);
       return redactForCheckpoint(result);
     },
@@ -752,16 +898,13 @@ async function handleBackground(
   // admission — a conflict leaves nothing behind. L5: `touchThread` is
   // deferred until after every validation so a rejected request never writes a
   // phantom thread_owner row.
-  let input: Record<string, unknown>;
   try {
-    const computed = await computeThreadInput(checkpointStore, threadId, rawMessages);
-    input = computed.input;
+    await computeThreadInput(checkpointStore, threadId, rawMessages, opts.contextManager);
   } catch (err) {
     if (isResumeConflict(err)) {
       return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
     }
-    console.error("chat: background checkpoint probe failed", err);
-    return c.json({ error: "internal" }, 500);
+    return preStreamError(c, err);
   }
 
   // Validate + pin tool credentials first (atomic: all-or-nothing), then the
@@ -770,11 +913,13 @@ async function handleBackground(
   const pinnedTools = pinToolPlugins(c, body, opts.registry, pins, owner);
   if (!pinnedTools.ok) return pinnedTools.response;
   const toolPlugins = pinnedTools.toolPlugins;
-  pins.pin(owner, modelPluginId, credentials);
+  const pinHandles = pinnedTools.pinHandles;
+  pinHandles[modelPluginId] = pins.pin(owner, modelPluginId, credentials).handle;
 
   const releasePins = (): void => {
-    pins.release(owner, modelPluginId);
-    for (const pluginId of toolPlugins) pins.release(owner, pluginId);
+    for (const [pluginId, handle] of Object.entries(pinHandles)) {
+      pins.release(owner, pluginId, handle);
+    }
   };
 
   // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
@@ -827,7 +972,15 @@ async function handleBackground(
         requestModel,
         requestParameters,
       } satisfies JobModelRequestConfig,
-      input,
+      pinHandles,
+      inputFactory: async ({ threadId: lockedThreadId, signal }) => {
+        signal.throwIfAborted();
+        const computed = await computeThreadInput(
+          checkpointStore, lockedThreadId, rawMessages, opts.contextManager,
+        );
+        signal.throwIfAborted();
+        return computed.input;
+      },
     });
   } catch (err) {
     console.error("chat: background runJob threw", err);
@@ -839,15 +992,11 @@ async function handleBackground(
     return c.json({ error: "internal" }, 500);
   }
 
-  // M1: for `in_flight` / `already_terminal` the runner returns BEFORE its
-  // finally (it never claimed the job), so nobody else releases the pins the
-  // transport minted at admission — release them here instead of leaking until
-  // a sweep. The budget reservation, by contrast, is released for EVERY result
-  // (`runJob` is done — the queue admission it held is over).
-  if (result.status === "in_flight" || result.status === "already_terminal") {
-    releasePins();
-  }
+  if (result.status === "in_flight" || result.status === "already_terminal") releasePins();
   reservation.release();
+  if (result.status === "succeeded") {
+    scheduleWarmups(opts, owner, resolved.value.toolCredentialsByPlugin);
+  }
 
   return mapRunJobResult(c, result);
 }
@@ -894,7 +1043,7 @@ function pinToolPlugins(
   registry: PluginRegistry,
   pins: CredentialPinStore,
   owner: string,
-): { ok: true; toolPlugins: string[] } | { ok: false; response: Response } {
+): { ok: true; toolPlugins: string[]; pinHandles: Record<string, CredentialPinHandle> } | { ok: false; response: Response } {
   let validated: Record<string, Record<string, string>>;
   try {
     validated = collectToolCredentials(body, registry);
@@ -904,14 +1053,17 @@ function pinToolPlugins(
     }
     return { ok: false, response: c.json({ error: "internal" }, 500) };
   }
+  const pinHandles: Record<string, CredentialPinHandle> = {};
   for (const [pluginId, credentials] of Object.entries(validated)) {
-    pins.pin(owner, pluginId, credentials);
+    pinHandles[pluginId] = pins.pin(owner, pluginId, credentials).handle;
   }
-  return { ok: true, toolPlugins: Object.keys(validated) };
+  return { ok: true, toolPlugins: Object.keys(validated), pinHandles };
 }
 
 /** `JobErrorCode` -> HTTP status for a failed background job. */
-const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 401 | 409 | 502 | 500> = {
+const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 400 | 401 | 409 | 429 | 502 | 500> = {
+  budget_exhausted: 429,
+  context_length_exceeded: 400,
   credentials_expired: 401,
   task_conflict: 409,
   tool_retry_forbidden: 409,
@@ -995,6 +1147,7 @@ async function computeThreadInput(
   checkpointStore: CheckpointStore,
   threadId: string,
   rawMessages: unknown[],
+  contextManager?: ContextManager,
 ): Promise<{ input: Record<string, unknown>; streamOptions: StreamOptions }> {
   const checkpoint = await checkpointStore.checkpointer.get({
     configurable: { thread_id: threadId },
@@ -1009,8 +1162,14 @@ async function computeThreadInput(
       streamOptions: { version: "v2", configurable: { thread_id: threadId } },
     };
   }
+  // Seed path: the full client history becomes the initial checkpoint.
+  // Apply pair-aware truncation (contextManager.truncateSeed) so an oversized
+  // seed never overflows the model context even when post-turn compaction
+  // cannot run (deterministic fallback per the approved plan, Layer 2).
+  const msgs = toLangChainMessages(rawMessages);
+  const truncated = contextManager?.truncateSeed(msgs) ?? msgs;
   return {
-    input: { messages: toLangChainMessages(rawMessages) },
+    input: { messages: truncated },
     streamOptions: { version: "v2", configurable: { thread_id: threadId } },
   };
 }
@@ -1025,35 +1184,46 @@ function buildStreamResponse(
   input: Record<string, unknown>,
   streamOptions: StreamOptions,
   modelId: string,
+  execution: StreamExecution,
   onRelease?: () => void,
   onAfterStream?: () => void | Promise<void>,
 ): Response {
-  const events = graph.streamEvents(input, streamOptions);
+  const events = graph.streamEvents(input, { ...streamOptions, signal: execution.signal });
   const sse = toOpenAiSse(events, { modelId });
   const encoder = new TextEncoder();
+  let cancelled = false;
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        for await (const frame of sse) {
-          controller.enqueue(encoder.encode(frame));
-        }
-        if (onAfterStream) {
-          try {
-            await onAfterStream();
-          } catch (err) {
-            console.warn("chat: post-stream checkpoint check failed", err);
+    start(controller) {
+      return (async () => {
+        let errored = false;
+        try {
+          for await (const frame of sse) {
+            if (!cancelled && !execution.signal.aborted) controller.enqueue(encoder.encode(frame));
           }
+          await execution.settle();
+          if (!execution.signal.aborted && onAfterStream) {
+            try {
+              await onAfterStream();
+            } catch {
+              console.warn("chat: post-stream checkpoint check failed");
+            }
+          }
+        } catch (err) {
+          if (!cancelled && !execution.signal.aborted) {
+            errored = true;
+            controller.error(err);
+          }
+        } finally {
+          execution.abort();
+          await execution.settle();
+          onRelease?.();
+          if (!cancelled && !errored) controller.close();
         }
-      } catch (err) {
-        console.error("chat: SSE stream error", err);
-        controller.error(err);
-      } finally {
-        onRelease?.();
-        controller.close();
-      }
+      })();
     },
     cancel() {
-      onRelease?.();
+      cancelled = true;
+      execution.abort();
     },
   });
   return new Response(stream, {
@@ -1122,6 +1292,28 @@ function intentSpec(rawMessages: unknown[]): string {
  * to retry. Deliberately DISTINCT from `rate_limited`: budget exhaustion is a
  * concurrent-capacity signal, not a token-bucket signal.
  */
+function scheduleWarmups(
+  opts: ChatRoutesOptions,
+  owner: string,
+  credentialsByPlugin: Record<string, Record<string, string>>,
+): void {
+  if (!opts.warmups) return;
+  try {
+    for (const [pluginId, toolName] of [["vikunja", "list_tasks"], ["mealie", "search_recipes"], ["spiel", "search_media"]] as const) {
+      const credentials = credentialsByPlugin[pluginId];
+      if (!credentials) continue;
+      const plugin = opts.registry.listInstalledPlugins().find((candidate) => candidate.id === pluginId);
+      if (!plugin || !isToolPlugin(plugin)) continue;
+      const tool = plugin.tools.find((candidate) => candidate.name === toolName);
+      if (!tool?.readOnly || tool.inputSchema.required?.length) continue;
+      const admission = opts.warmups.schedule({ owner, pluginId, tool: toolName, args: {}, credentials: { ...credentials } });
+      if (admission.ok) void admission.done.catch(() => {});
+    }
+  } catch {
+    console.warn("chat: warmup scheduling skipped");
+  }
+}
+
 function busy(c: Context, status: 429 | 503, retryAfterSeconds: number): Response {
   const res = c.json({ error: "busy" }, status);
   res.headers.set("retry-after", String(retryAfterSeconds));
@@ -1130,6 +1322,14 @@ function busy(c: Context, status: 429 | 503, retryAfterSeconds: number): Respons
 
 /** Pre-stream failures return JSON per §5.1 (never SSE). */
 function preStreamError(c: Context, err: unknown): Response {
+  if (err instanceof ContextBudgetError) {
+    return c.json({ error: err.code, message: err.message }, 400);
+  }
+  if (err instanceof BudgetExhaustedError) {
+    const response = c.json({ error: err.code, message: err.message }, 429);
+    response.headers.set("retry-after", String(err.retryAfterSeconds));
+    return response;
+  }
   if (err instanceof ModelBuildError) {
     if (err.code === "missing_credentials") {
       return c.json({ error: "invalid_credentials" }, 400);

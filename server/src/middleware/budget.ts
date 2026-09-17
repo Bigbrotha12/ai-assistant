@@ -41,16 +41,37 @@ export type AsyncReservation =
   | { ok: true; release: () => void; queued: boolean }
   | { ok: false; retryAfterSeconds: number };
 
+export type ModelCallKind = "sync" | "async" | "vision" | "compaction" | "warmup";
+
+export type ModelCallReservation =
+  | { ok: true; remaining: number; resetAt: number }
+  | { ok: false; code: "budget_exhausted"; retryAfterSeconds: number; resetAt: number };
+
+export class BudgetExhaustedError extends Error {
+  readonly code = "budget_exhausted";
+
+  constructor(readonly retryAfterSeconds: number, readonly resetAt: number) {
+    super("LLM call budget exhausted");
+    this.name = "BudgetExhaustedError";
+  }
+}
+
 export type BudgetManager = {
   reserveSync(owner: string): SyncReservation;
   reserveAsync(owner: string): Promise<AsyncReservation>;
   activeCount(owner: string): number;
+  reserveModelCall(owner: string, kind?: ModelCallKind): ModelCallReservation;
+  beforeModelCall(owner: string, kind?: ModelCallKind): void;
+  modelCallCount(owner: string): number;
 };
 
 export type BudgetSetTimeout = (handler: () => void, timeout?: number) => unknown;
 export type BudgetClearTimeout = (handle: unknown) => void;
 
 export type BudgetManagerOptions = {
+  maxModelCallsPerWindow?: number;
+  modelCallWindowMs?: number;
+  now?: () => number;
   /** In-flight cap per owner (sync streams + async jobs share the pool). Default 2. */
   maxConcurrentPerUser?: number;
   /** How many async reservations may wait (per owner) before rejection. Default 3. */
@@ -66,6 +87,8 @@ export type BudgetManagerOptions = {
 const DEFAULT_MAX_CONCURRENT = 2;
 const DEFAULT_QUEUE_MAX = 3;
 const DEFAULT_WAIT_MS = 10_000;
+export const DEFAULT_MODEL_CALL_LIMIT = 60;
+export const DEFAULT_MODEL_CALL_WINDOW_MS = 60_000;
 
 type OwnerState = {
   active: number;
@@ -88,6 +111,53 @@ export function createBudgetManager(opts: BudgetManagerOptions = {}): BudgetMana
       globalThis.clearTimeout(handle as Parameters<typeof globalThis.clearTimeout>[0]);
     });
   const retryAfterSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+
+  const maxModelCalls = opts.maxModelCallsPerWindow ?? DEFAULT_MODEL_CALL_LIMIT;
+  const windowMs = opts.modelCallWindowMs ?? DEFAULT_MODEL_CALL_WINDOW_MS;
+  for (const [name, value] of Object.entries({ maxModelCalls, windowMs })) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`createBudgetManager: ${name} must be a positive safe integer`);
+    }
+  }
+  const now = opts.now ?? Date.now;
+  const calls = new Map<string, { count: number; resetAt: number }>();
+  let nextSweep = 0;
+  const currentCalls = (owner: string) => {
+    const time = now();
+    if (time >= nextSweep) {
+      for (const [key, value] of calls) {
+        if (time >= value.resetAt) calls.delete(key);
+      }
+      nextSweep = time + windowMs;
+    }
+    const entry = calls.get(owner);
+    if (entry && time >= entry.resetAt) {
+      calls.delete(owner);
+      return undefined;
+    }
+    return entry;
+  };
+  const reserveModelCall = (
+    owner: string,
+    _kind: ModelCallKind = "sync",
+  ): ModelCallReservation => {
+    if (!owner.trim()) throw new Error("Model call budget requires an owner");
+    let entry = currentCalls(owner);
+    if (!entry) {
+      entry = { count: 0, resetAt: now() + windowMs };
+      calls.set(owner, entry);
+    }
+    if (entry.count >= maxModelCalls) {
+      return {
+        ok: false,
+        code: "budget_exhausted",
+        retryAfterSeconds: Math.max(1, Math.ceil((entry.resetAt - now()) / 1000)),
+        resetAt: entry.resetAt,
+      };
+    }
+    entry.count += 1;
+    return { ok: true, remaining: maxModelCalls - entry.count, resetAt: entry.resetAt };
+  };
 
   const records = new Map<string, OwnerState>();
 
@@ -164,6 +234,16 @@ export function createBudgetManager(opts: BudgetManagerOptions = {}): BudgetMana
   };
 
   return {
+    reserveModelCall,
+    beforeModelCall(owner, kind) {
+      const reservation = reserveModelCall(owner, kind);
+      if (!reservation.ok) {
+        throw new BudgetExhaustedError(reservation.retryAfterSeconds, reservation.resetAt);
+      }
+    },
+    modelCallCount(owner) {
+      return currentCalls(owner)?.count ?? 0;
+    },
     reserveSync(owner: string): SyncReservation {
       const st = ensureState(owner);
       if (st.active < maxConcurrentPerUser) {

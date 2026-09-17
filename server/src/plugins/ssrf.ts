@@ -1,5 +1,6 @@
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
+import { Agent, buildConnector } from "undici";
 import { URL } from "node:url";
 import type { LookupAddress } from "node:dns";
 
@@ -30,12 +31,6 @@ import type { LookupAddress } from "node:dns";
  *  5. Redirects — outbound callers MUST pass REDIRECT_POLICY (`redirect:
  *     "manual"`) and treat ANY 3xx response as failure (isRedirectStatus).
  *
- * Single assembly point: `validatedFetch` is the ONLY sanctioned way to make
- * an outbound call (resolve → validate EVERY record → connect, redirects
- * refused). Callers must never raw-fetch a plugin-provided URL; see the
- * validatedFetch docstring for the exact contract and residual risk.
- *
- * This module is dependency-free (Node built-ins only).
  */
 
 export type Mode = "production" | "development" | "test";
@@ -359,6 +354,23 @@ export type LookupFn = (
 
 const defaultLookup: LookupFn = (hostname, options) => lookup(hostname, options);
 
+function buildPinnedLookup(expectedHost: string, pinned: readonly string[]): LookupFunction {
+  const records = pinned.map((address) => ({ address, family: isIP(address) }));
+  return (hostname, options, callback) => {
+    const family = options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : options.family;
+    const matches = records.filter((record) => !family || record.family === family);
+    if (normalizeHostname(hostname) !== expectedHost || matches.length === 0) {
+      callback(new SsrfValidationError("DNS_RESOLUTION_FAILED", "no validated address for connection"), "");
+      return;
+    }
+    if (options.all) {
+      callback(null, matches.map((record) => ({ ...record })));
+    } else {
+      callback(null, matches[0]!.address, matches[0]!.family);
+    }
+  };
+}
+
 export type ResolveOptions = {
   trustedHosts?: readonly string[];
   /** Injectable A/AAAA resolver; defaults to node:dns/promises lookup. */
@@ -413,6 +425,13 @@ export async function resolveAndValidateHost(
   const hostTrusted = isTrustedHost(normalized, trustedHosts);
   const pinned: string[] = [];
   for (const record of resolved) {
+    const family = isIP(record.address);
+    if (family === 0 || family !== record.family) {
+      throw new SsrfValidationError(
+        "DNS_RESOLUTION_FAILED",
+        `${normalized} resolved to an invalid address record`,
+      );
+    }
     if (!hostTrusted && !isIpAllowed(record.address, { trustedHosts })) {
       throw new SsrfValidationError(
         "DNS_REBINDING",
@@ -513,41 +532,9 @@ export type ValidatedFetchOptions = {
   trustedHosts?: readonly string[];
   /** Injectable A/AAAA resolver; defaults to node:dns/promises lookup. */
   lookup?: LookupFn;
-  /**
-   * Injectable fetch implementation; defaults to `globalThis.fetch`. Tests
-   * stub this so validatedFetch never touches the network. The stub is
-   * invoked with the ORIGINAL validated URL and `redirect: "manual"`.
-   */
   fetchFn?: typeof fetch;
 };
 
-/**
- * THE single sanctioned outbound-call entry point for plugin/LLM requests
- * (Phase 2/3). Callers MUST use this — or explicitly re-implement every step
- * below — and must never raw-fetch a plugin-provided URL.
- *
- * Enforced, in order (fail-closed at each step):
- *
- *  1. Static validation — scheme (https: in production; `allowHttp: true` +
- *     production throws) and literal-IP ranges (validateStaticUrl).
- *  2. DNS — resolve ALL A/AAAA records and validate EVERY one; any disallowed
- *     record aborts the call (resolveAndValidateHost, DNS_REBINDING).
- *  3. Connect — the fetch is issued in the SAME tick against the just-validated
- *     hostname, with `redirect: "manual"` (REDIRECT_POLICY), so no 3xx can be
- *     silently pursued.
- *  4. Response — ANY 3xx status throws `SsrfValidationError` (REDIRECT_REFUSED);
- *     only a non-redirect response is returned.
- *
- * DNS-rebinding note (honest exposure): we cannot hard-pin the connection. The
- * global fetch API re-resolves the hostname at connect time, and connecting to
- * the validated IP with a rewritten URL + Host header would break HTTPS SNI /
- * certificate validation. So pinning is enforced as validate-then-connect in
- * the same tick: the record was resolved and validated immediately before the
- * connection, shrinking the rebind window (record changes between our lookup
- * and undici's) to near-zero — but not provably zero. If hard pinning is ever
- * required, swap `fetchFn` for an undici Agent with a per-host pinned
- * connect.lookup.
- */
 export async function validatedFetch(
   url: string,
   init: RequestInit = {},
@@ -557,20 +544,48 @@ export async function validatedFetch(
   const allowHttp = opts.allowHttp ?? mode !== "production";
 
   const parsed = validateStaticUrl(url, { mode, allowHttp, trustedHosts: opts.trustedHosts });
-  await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
+  const pinned = await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
     trustedHosts: opts.trustedHosts,
     lookup: opts.lookup,
   });
 
-  const fetchFn = opts.fetchFn ?? globalThis.fetch;
-  const response = await fetchFn(url, { ...init, redirect: "manual" });
-
-  if (isRedirectStatus(response.status)) {
-    throw new SsrfValidationError(
-      "REDIRECT_REFUSED",
-      `redirect (${response.status}) refused for ${parsed.hostname}; outbound plugin/LLM ` +
-        "calls never follow redirects",
-    );
+  const hostname = normalizeHostname(parsed.hostname);
+  const connect = buildConnector({
+    lookup: buildPinnedLookup(hostname, pinned),
+    rejectUnauthorized: true,
+    autoSelectFamily: true,
+  });
+  const agent = new Agent({
+    connect(options, callback) {
+      if (
+        normalizeHostname(options.hostname) !== hostname ||
+        options.protocol !== parsed.protocol ||
+        Number(options.port || (options.protocol === "https:" ? 443 : 80)) !==
+          Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80)) ||
+        options.httpSocket
+      ) {
+        callback(new SsrfValidationError("DISALLOWED_HOST", "unexpected connection destination"), null);
+        return;
+      }
+      connect({ ...options, servername: isIP(hostname) ? undefined : parsed.hostname }, callback);
+    },
+  });
+  try {
+    const fetchFn = opts.fetchFn ?? globalThis.fetch;
+    const requestInit = { ...init, redirect: "manual" as const, dispatcher: agent };
+    const response = await fetchFn(url, requestInit as unknown as RequestInit);
+    if (isRedirectStatus(response.status)) {
+      void response.body?.cancel().catch(() => {});
+      throw new SsrfValidationError(
+        "REDIRECT_REFUSED",
+        `redirect (${response.status}) refused for ${parsed.hostname}; outbound plugin/LLM ` +
+          "calls never follow redirects",
+      );
+    }
+    void agent.close().catch(() => agent.destroy()).catch(() => {});
+    return response;
+  } catch (error) {
+    await agent.destroy().catch(() => {});
+    throw error;
   }
-  return response;
 }

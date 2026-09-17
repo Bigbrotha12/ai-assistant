@@ -486,21 +486,13 @@ describe("resolveAndValidateHost (DNS rebinding defense)", () => {
     );
   });
 
-  test("resolves a real public host and returns valid pinned IPs", async (t) => {
-    let pinned: string[];
-    try {
-      // Real network lookup via node:dns/promises. If the environment has no
-      // network, the lookup throws and the test is skipped rather than failed
-      // (decided over mocking because injected-lookup tests above already
-      // cover the rebinding paths deterministically).
-      pinned = await resolveAndValidateHost("example.com");
-    } catch (err) {
-      if (err instanceof SsrfValidationError && err.code === "DNS_RESOLUTION_FAILED") {
-        t.skip("no network in this environment");
-        return;
-      }
-      throw err;
-    }
+  test("returns valid pinned IPs from an injected public-host resolver", async () => {
+    const pinned = await resolveAndValidateHost("example.com", {
+      lookup: async () => [
+        { address: "1.1.1.1", family: 4 },
+        { address: "2606:4700:4700::1111", family: 6 },
+      ],
+    });
     assert.ok(pinned.length > 0, "expected at least one A/AAAA record");
     for (const ip of pinned) {
       assert.notEqual(isIP(ip), 0, `${ip} should be a real IP`);

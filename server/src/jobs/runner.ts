@@ -1,5 +1,5 @@
 import { HumanMessage } from "@langchain/core/messages";
-import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import type { BaseCheckpointSaver, CompiledStateGraph } from "@langchain/langgraph";
 import { createAgentGraph } from "../agents/graph.ts";
@@ -14,9 +14,13 @@ import {
   recordToolResult,
 } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";
-import type { CredentialPinStore } from "../credentials/pins.ts";
+import type { CredentialPin, CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
+import type { BudgetManager } from "../middleware/budget.ts";
+import type { ContextManager } from "../middleware/context.ts";
+import { BudgetExhaustedError } from "../middleware/budget.ts";
+import { ContextBudgetError } from "../middleware/context.ts";
 import type { Ledger } from "../ledger.ts";
 import type { TaskRow, TaskStatus } from "../ledger.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
@@ -101,7 +105,9 @@ export type JobErrorCode =
   | "task_conflict"
   | "plugin_unavailable"
   | "job_failed"
-  | "tool_retry_forbidden";
+  | "tool_retry_forbidden"
+  | "budget_exhausted"
+  | "context_length_exceeded";
 
 /** Raised by the job runner / tool executor. Never carries credential values. */
 export class JobError extends Error {
@@ -205,7 +211,9 @@ export class ToolExecutor implements ToolCallHandler {
     toolName: string,
     args: Record<string, unknown>,
     credentials?: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<string> {
+    signal?.throwIfAborted();
     const pinned = this.opts.getPinnedIps(pluginId);
     if (!pinned || pinned.length === 0) {
       throw new JobError(
@@ -217,10 +225,12 @@ export class ToolExecutor implements ToolCallHandler {
     const resolveEndpoint =
       this.opts.resolveEndpoint ?? DEFAULT_ENDPOINT_RESOLVER;
     const url = await resolveEndpoint(pluginId, toolName, args, pinned);
+    signal?.throwIfAborted();
     const response = await validatedFetch(
       url,
       {
         method: "POST",
+        signal,
         headers: {
           "content-type": "application/json",
           ...buildAuthHeader(credentials),
@@ -237,7 +247,8 @@ export class ToolExecutor implements ToolCallHandler {
         trustedHosts: this.opts.trustedHosts,
       },
     );
-    if (response.status >= 300) {
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       throw new JobError(
         "job_failed",
         `tool '${toolName}' of plugin '${pluginId}' failed with HTTP ${response.status}`,
@@ -258,7 +269,29 @@ export const noopNotificationHook: NotificationHook = {
   notifyJobComplete() {},
 };
 
+export type JobInput = Record<string, unknown> | null;
+
+export type JobInputFactory = (context: {
+  graph: AnyCompiledGraph;
+  threadId: string;
+  isReplay: boolean;
+  signal: AbortSignal;
+}) => JobInput | Promise<JobInput>;
+
+export type JobToolHandler = {
+  execute(
+    pluginId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    credentials?: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<string>;
+};
+
 export type JobDescriptor = {
+  pinHandles?: Readonly<Record<string, CredentialPinHandle>>;
+  inputFactory?: JobInputFactory;
+  signal?: AbortSignal;
   /** API-key referenceId; every ledger/pin/checkpoint operation is owner-scoped. */
   owner: string;
   /** Client idempotency key (messageId) — maps to exactly ONE task. */
@@ -277,9 +310,9 @@ export type JobDescriptor = {
   /** Provider request config forwarded to `buildModel`. */
   modelRequestConfig?: unknown;
   /** Override the real executor (tests use a recording fake). */
-  toolHandler?: ToolCallHandler;
+  toolHandler?: JobToolHandler;
   /** Invoke input; defaults to `{ messages: [new HumanMessage(spec)] }`. */
-  input?: Record<string, unknown>;
+  input?: JobInput;
   /**
    * True when this run is a REPLAY (a resumed stuck task, a restart, or any
    * caller re-running a previously-started job). Replays bind tools with
@@ -337,6 +370,11 @@ export type JobRunnerDeps = {
   buildModel?: (
     modelPluginId: string,
     requestConfig: unknown,
+    context: {
+      credentials?: Record<string, string>;
+      signal: AbortSignal;
+      assertActive: () => void;
+    },
   ) => Promise<BaseChatModel> | BaseChatModel;
   /** Restart-loss re-pin seam (Phase 5 credential vault). */
   credentialSource?: CredentialSource;
@@ -371,8 +409,7 @@ export type JobRunnerDeps = {
   heartbeatIntervalMs?: number;
   /** Optional periodic pin GC. `dispose()` stops it. */
   sweepIntervalMs?: number;
-  /**
-   * Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the async
+  /** Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the async
    * tool handler so a repeated READ-ONLY tool call — same (owner, pluginId,
    * pluginVersion, credentialFingerprint, tool, argsHash) — is served without
    * re-executing the backend, even across different tasks/jobs. Mutating
@@ -381,6 +418,20 @@ export type JobRunnerDeps = {
    * transport.
    */
   toolCache?: ToolResultCache;
+  /**
+   * Context manager (Phase 4, Wave C). When supplied, `prepareMessages`
+   * truncates every model round pair-aware to the configured token limit and
+   * `maybeCompactAfterStream` runs INSIDE the held thread lock after a
+   * successful invoke. Absent → no truncation, no compaction.
+   */
+  contextManager?: ContextManager;
+  /**
+   * Budget manager (Phase 4, Wave A). When supplied, every model dispatch
+   * (after fence/pin checks) consumes one `beforeModelCall(owner, "async")`
+   * slot; an exhausted window fails the job `budget_exhausted`. Absent →
+   * no per-owner model-call budget.
+   */
+  budget?: BudgetManager;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
 };
@@ -396,8 +447,11 @@ function isConflict(e: unknown): boolean {
 
 export type BindJobToolsOptions = {
   registry: PluginRegistry;
-  handler: ToolCallHandler;
+  handler: JobToolHandler;
   credentialsByPlugin: Record<string, Record<string, string>>;
+  getCredentials?: (pluginId: string) => CredentialPin;
+  assertActive?: () => void;
+  signal?: AbortSignal;
   ledger: Ledger;
   taskId: string;
   owner: string;
@@ -441,7 +495,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
   const tools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
   for (const plugin of opts.registry.listInstalledPlugins()) {
-    if (!isToolPlugin(plugin)) continue;
+    if (!isToolPlugin(plugin) || !Object.hasOwn(opts.credentialsByPlugin, plugin.id)) continue;
     const credentials = opts.credentialsByPlugin[plugin.id] ?? {};
     for (const toolDef of plugin.tools) {
       if (seen.has(toolDef.name)) {
@@ -468,16 +522,41 @@ function bindJobTool(
     description: toolDef.description,
     schema: jsonSchemaToZod(toolDef.inputSchema),
     func: async (input, _runManager, config) => {
+      const assertActive = () => {
+        opts.signal?.throwIfAborted();
+        config?.signal?.throwIfAborted();
+        const task = opts.ledger.getTask(opts.taskId, opts.owner);
+        if (!task || task.status !== "running" || task.fence_token !== opts.fenceToken) {
+          throw new JobError("task_conflict", "background job no longer holds a running task fence");
+        }
+        opts.assertActive?.();
+      };
+      assertActive();
+      const pin = opts.getCredentials?.(plugin.id);
+      const invocationCredentials = pin?.credentials ?? { ...credentials };
+      const signal = opts.signal && config?.signal
+        ? AbortSignal.any([opts.signal, config.signal])
+        : opts.signal ?? config?.signal;
+      const execute = async () => {
+        assertActive();
+        const result = await opts.handler.execute(
+          plugin.id,
+          toolDef.name,
+          input as Record<string, unknown>,
+          invocationCredentials,
+          signal,
+        );
+        assertActive();
+        return result;
+      };
       const toolCallId = (
         config as { toolCall?: { id?: string } } | undefined
       )?.toolCall?.id;
       if (!toolCallId) {
-        return opts.handler.execute(
-          plugin.id,
-          toolDef.name,
-          input as Record<string, unknown>,
-          credentials,
-        );
+        if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
+          throw new JobError("tool_retry_forbidden", "cannot replay a mutating tool without a stored result");
+        }
+        return execute();
       }
       if (
         hasToolResult(opts.ledger, {
@@ -508,8 +587,8 @@ function bindJobTool(
           pluginId: plugin.id,
           pluginVersion: plugin.version,
           credentialFingerprint:
-            opts.fingerprintsByPlugin?.[plugin.id] ??
-            credentialFingerprint(credentials),
+            pin?.fingerprint ?? opts.fingerprintsByPlugin?.[plugin.id] ??
+            credentialFingerprint(invocationCredentials),
           tool: toolDef.name,
           argsHash: cache.argsHash(input as Record<string, unknown>),
         };
@@ -523,14 +602,7 @@ function bindJobTool(
             "no stored result; refusing to re-execute a possibly-applied side effect",
         );
       }
-      const result = String(
-        await opts.handler.execute(
-          plugin.id,
-          toolDef.name,
-          input as Record<string, unknown>,
-          credentials,
-        ),
-      );
+      const result = String(await execute());
       if (cacheKey) cache?.set(cacheKey, result);
       recordToolResult(opts.ledger, {
         taskId: opts.taskId,
@@ -545,11 +617,77 @@ function bindJobTool(
   });
 }
 
+function createJobExecution(signal: AbortSignal) {
+  const pending = new Set<Promise<unknown>>();
+  return {
+    signal,
+    async track<T>(run: () => Promise<T>): Promise<T> {
+      signal.throwIfAborted();
+      const work = Promise.resolve().then(() => {
+        signal.throwIfAborted();
+        return run();
+      });
+      pending.add(work);
+      try {
+        return await work;
+      } finally {
+        pending.delete(work);
+      }
+    },
+    async settle(): Promise<void> {
+      while (pending.size) await Promise.allSettled([...pending]);
+    },
+  };
+}
+
+function trackJobModelExecution(
+  model: BaseChatModel,
+  execution: ReturnType<typeof createJobExecution>,
+): void {
+  const seen = new WeakSet<object>();
+  const wrap = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
+    seen.add(candidate);
+    if (!(candidate instanceof BaseChatModel)) {
+      if ("bound" in candidate) wrap(candidate.bound);
+      return;
+    }
+    const generate = candidate._generate.bind(candidate);
+    candidate._generate = (...args) => execution.track(() => generate(...args));
+    const chunks = candidate._streamResponseChunks.bind(candidate);
+    if (candidate._streamResponseChunks !== BaseChatModel.prototype._streamResponseChunks) {
+      candidate._streamResponseChunks = async function* (...args) {
+        let finish!: () => void;
+        const done = new Promise<void>((resolve) => { finish = resolve; });
+        const tracked = execution.track(() => done);
+        try {
+          execution.signal.throwIfAborted();
+          yield* chunks(...args);
+        } finally {
+          finish();
+          await tracked;
+        }
+      };
+    }
+    const bind = candidate.bindTools?.bind(candidate);
+    if (bind) {
+      candidate.bindTools = (...args) => {
+        const bound = bind(...args);
+        wrap(bound);
+        return bound;
+      };
+    }
+  };
+  wrap(model);
+}
+
 export class JobRunner {
   private readonly threadLocks: ThreadLockRegistry;
   private readonly deps: JobRunnerDeps;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
+  private readonly pinUsers = new Map<CredentialPinHandle, number>();
+  private readonly controllers = new Set<AbortController>();
 
   constructor(deps: JobRunnerDeps) {
     this.deps = deps;
@@ -589,6 +727,40 @@ export class JobRunner {
    * double-executes the graph.
    */
   async runJob(descriptor: JobDescriptor): Promise<RunJobResult> {
+    const pinHandles: Record<string, CredentialPinHandle> = { ...descriptor.pinHandles };
+    let pinError: unknown;
+    if (descriptor.pinHandles === undefined) {
+      for (const pluginId of new Set([...descriptor.toolPlugins, descriptor.modelPluginId])) {
+        try {
+          pinHandles[pluginId] = this.deps.pins.get(descriptor.owner, pluginId).handle;
+        } catch (error) {
+          if (descriptor.toolPlugins.includes(pluginId) ||
+              !(error instanceof CredentialPinError && error.code === "pin_not_found")) {
+            pinError ??= error;
+          }
+        }
+      }
+    }
+    for (const handle of new Set(Object.values(pinHandles))) {
+      this.pinUsers.set(handle, (this.pinUsers.get(handle) ?? 0) + 1);
+    }
+    try {
+      return await this.runAdmittedJob({ ...descriptor, toolPlugins: [...descriptor.toolPlugins], pinHandles }, pinError);
+    } finally {
+      for (const [pluginId, handle] of Object.entries(pinHandles)) {
+        const users = (this.pinUsers.get(handle) ?? 1) - 1;
+        if (users > 0) {
+          this.pinUsers.set(handle, users);
+        } else {
+          this.pinUsers.delete(handle);
+          this.deps.pins.release(descriptor.owner, pluginId, handle);
+        }
+      }
+      this.sweepPins();
+    }
+  }
+
+  private async runAdmittedJob(descriptor: JobDescriptor, pinError?: unknown): Promise<RunJobResult> {
     const { owner, intentKey, spec, clientThreadId, toolPlugins } = descriptor;
     // The checkpoint thread key is the owner-bound hash of the RAW client
     // thread id (checkpoints/store.ts): an unguessable, owner-scoped key.
@@ -660,14 +832,37 @@ export class JobRunner {
     //    (H2) fails the job cleanly with an error step + pin release instead
     //    of orphaning the task as `running` forever. Stopped in the finally.
     let heartbeat: { stop(): void } | undefined;
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    const signal = descriptor.signal
+      ? AbortSignal.any([descriptor.signal, controller.signal])
+      : controller.signal;
+    const assertActive = () => {
+      if (this.disposed) controller.abort(new JobError("task_conflict", "job runner disposed"));
+      const current = this.deps.ledger.getTask(claimed.id, owner);
+      if (!current || current.status !== "running" || current.fence_token !== fenceToken) {
+        controller.abort(new JobError("task_conflict", "background job lost its running task fence"));
+      }
+      signal.throwIfAborted();
+    };
+    const getCredentials = (pluginId: string) => {
+      assertActive();
+      const handle = descriptor.pinHandles?.[pluginId];
+      if (handle === undefined) {
+        throw new JobError("credentials_expired", `no admitted credential pin for plugin '${pluginId}'`);
+      }
+      return this.deps.pins.get(owner, pluginId, handle);
+    };
 
     try {
+      if (pinError) throw pinError;
+      assertActive();
       heartbeat = this.deps.ledger.startHeartbeat(claimed.id, owner, fenceToken, {
         ...(this.deps.heartbeatIntervalMs
           ? { intervalMs: this.deps.heartbeatIntervalMs }
           : {}),
-        onError: (err) => {
-          console.warn(`[jobs] heartbeat error for task ${claimed.id}:`, err);
+        onError: () => {
+          controller.abort(new JobError("task_conflict", "background job heartbeat failed"));
         },
       });
 
@@ -678,7 +873,7 @@ export class JobRunner {
       // the cache-key component (never re-derive, never store raw values).
       const fingerprintsByPlugin: Record<string, string> = {};
       for (const pluginId of toolPlugins) {
-        const pin = this.deps.pins.get(owner, pluginId);
+        const pin = getCredentials(pluginId);
         credentialsByPlugin[pluginId] = pin.credentials;
         fingerprintsByPlugin[pluginId] = pin.fingerprint;
       }
@@ -687,13 +882,36 @@ export class JobRunner {
       //    bind with `allowMutatingRetry: false` (H3): a mutating tool with no
       //    stored result throws `tool_retry_forbidden` rather than re-applying
       //    a side effect the crashed run may already have executed.
-      const model = await this.resolveModel(descriptor);
+      const assertDispatch = () => {
+        assertActive();
+        for (const pluginId of Object.keys(descriptor.pinHandles ?? {})) getCredentials(pluginId);
+      };
+      const beforeModelCall = (messages: unknown) => {
+        void messages;
+        assertDispatch();
+        this.deps.budget?.beforeModelCall(owner, "async");
+      };
+      const model = await this.resolveModel(descriptor, {
+        credentials: descriptor.pinHandles?.[descriptor.modelPluginId]
+          ? getCredentials(descriptor.modelPluginId).credentials
+          : undefined,
+        signal,
+        assertActive: assertDispatch,
+      });
+      assertDispatch();
+      const execution = createJobExecution(signal);
+      trackJobModelExecution(model, execution);
       const executor = this.deps.executor ?? this.createDefaultExecutor();
       const handler = descriptor.toolHandler ?? executor;
       const tools = bindJobTools({
         registry: this.deps.registry,
-        handler,
+        handler: {
+          execute: (...args) => execution.track(() => handler.execute(...args)),
+        },
         credentialsByPlugin,
+        getCredentials,
+        assertActive,
+        signal,
         fingerprintsByPlugin,
         toolCache: this.deps.toolCache,
         ledger: this.deps.ledger,
@@ -703,7 +921,12 @@ export class JobRunner {
         allowMutatingRetry: !replaying,
       });
       const graph = compileGraphWithCheckpointer(
-        createAgentGraph({ model, tools }),
+        createAgentGraph({
+          model,
+          tools,
+          beforeModelCall,
+          prepareMessages: this.deps.contextManager?.prepareMessages,
+        }),
         this.deps.checkpointer,
       );
 
@@ -712,11 +935,43 @@ export class JobRunner {
       //    can resolve ownership. The mutex is the SHARED ThreadLockRegistry
       //    when the transport supplied one (Wave C2): a sync stream and a
       //    background job on the same thread serialize against each other.
-      const input = descriptor.input ?? { messages: [new HumanMessage(spec)] };
       this.deps.touchThread?.(owner, threadId);
-      const result = await this.threadLocks.runExclusive(threadId, () =>
-        this.invokeWithCheckpointLock(graph, threadId, input),
-      );
+      const result = await this.threadLocks.runExclusive(threadId, async () => {
+        try {
+          assertDispatch();
+          let input: JobInput;
+          const state = replaying
+            ? await graph.getState({ configurable: { thread_id: threadId } })
+            : undefined;
+          if (state?.next?.length) {
+            input = null;
+          } else if (descriptor.inputFactory) {
+            input = await descriptor.inputFactory({ graph, threadId, isReplay: replaying, signal });
+          } else {
+            input = descriptor.input === undefined
+              ? { messages: [new HumanMessage(spec)] }
+              : descriptor.input;
+          }
+          assertDispatch();
+          const invokeResult = await this.invokeWithCheckpointLock(graph, threadId, input, signal, assertDispatch);
+          await execution.settle();
+          assertDispatch();
+          await this.deps.contextManager?.maybeCompactAfterStream({
+            graph,
+            owner,
+            clientThreadId,
+            threadId,
+            lockHeld: true,
+          });
+          return invokeResult;
+        } catch (error) {
+          controller.abort(error);
+          throw error;
+        } finally {
+          await execution.settle();
+        }
+      });
+      assertActive();
 
       // 8. Success.
       this.safeComplete(claimed.id, owner, fenceToken, "succeeded");
@@ -732,18 +987,8 @@ export class JobRunner {
       return this.failJob(claimed, owner, fenceToken, threadId, code, errorMessageOf(e));
     } finally {
       heartbeat?.stop();
-      // Release the tool-plugin pins AND the model-plugin pin (Wave C2). The
-      // model pin is minted by the transport at admission; the runner owns its
-      // lifecycle for the duration of the job. A duplicate (`in_flight`) /
-      // terminal re-submit returns BEFORE this try, so the original job's
-      // finally is the single release point — never a concurrent racer's.
-      for (const pluginId of toolPlugins) {
-        this.deps.pins.release(owner, pluginId);
-      }
-      if (descriptor.modelPluginId !== "") {
-        this.deps.pins.release(owner, descriptor.modelPluginId);
-      }
-      this.sweepPins();
+      controller.abort();
+      this.controllers.delete(controller);
     }
   }
 
@@ -838,6 +1083,9 @@ export class JobRunner {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const controller of this.controllers) {
+      controller.abort(new JobError("task_conflict", "job runner disposed"));
+    }
     if (this.sweepTimer) {
       const clearInterval =
         this.deps.clearInterval ?? globalThis.clearInterval.bind(globalThis);
@@ -881,7 +1129,10 @@ export class JobRunner {
     return null;
   }
 
-  private async resolveModel(descriptor: JobDescriptor): Promise<BaseChatModel> {
+  private async resolveModel(
+    descriptor: JobDescriptor,
+    context: Parameters<NonNullable<JobRunnerDeps["buildModel"]>>[2],
+  ): Promise<BaseChatModel> {
     // M2: an empty model-plugin id means the resumer could not identify the
     // model the original job used. Fail `plugin_unavailable` — the honest,
     // correct code — NOT `credentials_expired`, which a pin-store miss on an
@@ -904,6 +1155,7 @@ export class JobRunner {
     return this.deps.buildModel(
       descriptor.modelPluginId,
       descriptor.modelRequestConfig,
+      context,
     );
   }
 
@@ -932,12 +1184,17 @@ export class JobRunner {
   private async invokeWithCheckpointLock(
     graph: AnyCompiledGraph,
     threadId: string,
-    input: Record<string, unknown>,
+    input: JobInput,
+    signal: AbortSignal,
+    assertActive: () => void,
   ): Promise<any> {
     const beforeId = await this.readCheckpointId(threadId);
+    assertActive();
     const result = await graph.invoke(input, {
       configurable: { thread_id: threadId },
+      signal,
     });
+    assertActive();
     const ownFinalId = await this.readOwnFinalCheckpointId(graph, threadId);
     const currentId = await this.readCheckpointId(threadId);
     if (
@@ -951,9 +1208,10 @@ export class JobRunner {
           `(${ownFinalId} -> ${currentId}); re-reading state and re-evaluating ` +
           "once with the original input",
       );
+      assertActive();
       return graph.invoke(
         input,
-        { configurable: { thread_id: threadId } },
+        { configurable: { thread_id: threadId }, signal },
       );
     }
     return result;
@@ -993,7 +1251,9 @@ export class JobRunner {
     to: "succeeded" | "failed" | "cancelled" | "awaiting_review",
   ): void {
     const current = this.deps.ledger.getTask(taskId, owner);
-    if (!current || current.fence_token !== fenceToken) return;
+    if (!current || current.status !== "running" || current.fence_token !== fenceToken) {
+      throw new JobError("task_conflict", "background job cannot complete without its running task fence");
+    }
     this.deps.ledger.completeTask(taskId, owner, to);
   }
 
@@ -1009,7 +1269,7 @@ export class JobRunner {
     const redacted = redactForCheckpoint(message);
     try {
       const current = this.deps.ledger.getTask(claimed.id, owner);
-      if (current && current.fence_token === fenceToken) {
+      if (current?.status === "running" && current.fence_token === fenceToken) {
         this.deps.ledger.appendStep(
           claimed.id,
           owner,
@@ -1071,7 +1331,10 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 
 function jobErrorCodeOf(e: unknown): JobErrorCode {
   if (e instanceof JobError) return e.code;
+  if (e instanceof BudgetExhaustedError) return "budget_exhausted";
+  if (e instanceof ContextBudgetError) return "context_length_exceeded";
   if (e instanceof CredentialPinError) return "credentials_expired";
+  if (e instanceof Error && e.name === "AbortError") return "task_conflict";
   return "job_failed";
 }
 
