@@ -54,6 +54,7 @@ export type StreamEvent = {
 };
 
 export type ToOpenAiSseOptions = {
+  onOutcome?: (outcome: "succeeded" | "failed") => void;
   /** Model name echoed on the first chunk (request value or server default). */
   modelId?: string;
   /** Epoch seconds echoed on the first chunk. Defaults to `Date.now() / 1000`. */
@@ -338,6 +339,7 @@ export async function* toOpenAiSse(
 
       case "on_chat_model_error":
       case "on_llm_error": {
+        opts.onOutcome?.("failed");
         yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_MODEL, exhaustionCode(event.data.error));
         yield DONE_FRAME;
         terminated = true;
@@ -345,6 +347,7 @@ export async function* toOpenAiSse(
       }
 
       case "on_tool_error": {
+        opts.onOutcome?.("failed");
         yield errorFrame(
           redact(errorMessage(event.data.error)),
           ERROR_TYPE_TOOL,
@@ -357,6 +360,7 @@ export async function* toOpenAiSse(
 
       case "on_chain_error": {
         if (event.run_id === rootRunId) {
+          opts.onOutcome?.("failed");
           yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_SERVER, exhaustionCode(event.data.error));
           yield DONE_FRAME;
           terminated = true;

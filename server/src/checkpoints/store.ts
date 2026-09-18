@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { coerceMessageLikeToMessage } from "@langchain/core/messages";
+import type { BaseMessage, MessageContent } from "@langchain/core/messages";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
@@ -98,6 +100,13 @@ const CHECKPOINT_MIGRATIONS: readonly Migration[] = [
         ON thread_owner (owner, updated_ts);
     `);
   },
+  (db) => {
+    db.exec(`
+      ALTER TABLE thread_owner ADD COLUMN public_id TEXT;
+      CREATE UNIQUE INDEX thread_owner_public_idx ON thread_owner(owner, public_id);
+      CREATE TABLE deleted_thread (thread_id TEXT PRIMARY KEY, owner TEXT NOT NULL);
+    `);
+  },
 ];
 
 export const CURRENT_CHECKPOINT_VERSION = CHECKPOINT_MIGRATIONS.length;
@@ -135,8 +144,41 @@ export function checkpointThreadId(
   return createHash("sha256").update(userId + clientThreadId).digest("hex");
 }
 
+export type HistoryMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: MessageContent;
+  tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
+  tool_call_id?: string;
+};
+
+export async function readThreadMessages(store: CheckpointStore, threadId: string): Promise<HistoryMessage[] | undefined> {
+  const checkpoint = await store.checkpointer.get({ configurable: { thread_id: threadId } });
+  if (!checkpoint) return undefined;
+  const messages = checkpoint.channel_values.messages;
+  if (!Array.isArray(messages)) return [];
+  return messages.map((raw) => {
+    const message: BaseMessage = coerceMessageLikeToMessage(raw);
+    const type = message.getType();
+    const role = type === "human" ? "user" : type === "ai" ? "assistant" : type;
+    if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
+      throw new Error("unsupported_checkpoint_message");
+    }
+    const result: HistoryMessage = { role: role as HistoryMessage["role"], content: message.content };
+    if (role === "assistant" && "tool_calls" in message && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      result.tool_calls = message.tool_calls.map((call) => ({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.args) },
+      }));
+    }
+    if (role === "tool" && "tool_call_id" in message) result.tool_call_id = String(message.tool_call_id);
+    return result;
+  });
+}
+
 export type ThreadRecord = {
   threadId: string;
+  publicId?: string | null;
   owner: string;
   createdAt: number;
   updatedAt: number;
@@ -161,7 +203,8 @@ export type CheckpointStore = {
    * Upserts; `lastError` is the most recent per-thread error the transport
    * wants surfaced in the list view (nullable).
    */
-  touchThread(owner: string, threadId: string, lastError?: string | null): void;
+  touchThread(owner: string, threadId: string, lastError?: string | null, publicId?: string): void;
+  isDeleted?(threadId: string): boolean;
   /** Reads thread metadata by (hashed) thread id; `undefined` if unknown. */
   getThread(threadId: string): ThreadRecord | undefined;
   /** Owner-scoped thread list, newest-updated first. Cross-owner rows are
@@ -295,24 +338,49 @@ class CheckpointStoreImpl implements CheckpointStore {
     }
   }
 
-  touchThread(owner: string, threadId: string, lastError: string | null = null): void {
+  isDeleted(threadId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM deleted_thread WHERE thread_id = ?").get(threadId);
+  }
+
+  touchThread(owner: string, threadId: string, lastError: string | null = null, publicId?: string): void {
+    if (this.isDeleted(threadId)) throw new Error("thread_deleted");
+    const existing = this.getThread(threadId);
+    if (existing && existing.owner !== owner) {
+      throw new Error("thread_mapping_conflict");
+    }
+    // An existing NON-NULL public_id that differs from the caller's is a
+    // cross-id hijack attempt. A NULL public_id is a legacy internal-only
+    // thread: the first managed writer ADOPTS it (the public id is claimed
+    // and the thread becomes recoverable).
+    if (
+      publicId !== undefined &&
+      existing &&
+      existing.publicId !== null &&
+      existing.publicId !== publicId
+    ) {
+      throw new Error("thread_mapping_conflict");
+    }
+    if (publicId !== undefined && checkpointThreadId(owner, publicId) !== threadId) {
+      throw new Error("thread_mapping_conflict");
+    }
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO thread_owner (thread_id, owner, created_ts, updated_ts, last_error)
-         VALUES (@threadId, @owner, @now, @now, @lastError)
+        `INSERT INTO thread_owner (thread_id, owner, created_ts, updated_ts, last_error, public_id)
+         VALUES (@threadId, @owner, @now, @now, @lastError, @publicId)
          ON CONFLICT(thread_id) DO UPDATE SET
            owner      = excluded.owner,
            updated_ts = excluded.updated_ts,
-           last_error = excluded.last_error`,
+           last_error = excluded.last_error,
+           public_id  = COALESCE(thread_owner.public_id, excluded.public_id)`,
       )
-      .run({ threadId, owner, now, lastError });
+      .run({ threadId, owner, now, lastError, publicId: publicId ?? null });
   }
 
   getThread(threadId: string): ThreadRecord | undefined {
     const row = this.db
       .prepare(
-        `SELECT thread_id, owner, created_ts, updated_ts, last_error
+        `SELECT thread_id, owner, created_ts, updated_ts, last_error, public_id
          FROM thread_owner WHERE thread_id = ?`,
       )
       .get(threadId) as ThreadRow | undefined;
@@ -325,7 +393,7 @@ class CheckpointStoreImpl implements CheckpointStore {
     // rows are filtered by the WHERE clause.
     const rows = this.db
       .prepare(
-        `SELECT t.thread_id, t.owner, t.created_ts, t.updated_ts, t.last_error,
+        `SELECT t.thread_id, t.owner, t.created_ts, t.updated_ts, t.last_error, t.public_id,
                 (SELECT COUNT(*) FROM checkpoints c
                   WHERE c.thread_id = t.thread_id) AS message_count
          FROM thread_owner t
@@ -344,6 +412,7 @@ class CheckpointStoreImpl implements CheckpointStore {
         .prepare("DELETE FROM thread_owner WHERE thread_id = ? AND owner = ?")
         .run(threadId, owner);
       if (res.changes === 0) return false;
+      this.db.prepare("INSERT OR IGNORE INTO deleted_thread (thread_id, owner) VALUES (?, ?)").run(threadId, owner);
       // Cascade: remove the thread's checkpoint/writes rows. Mirrors
       // SqliteSaver.deleteThread (checkpoints + writes in one transaction).
       this.db.prepare("DELETE FROM checkpoints WHERE thread_id = ?").run(threadId);
@@ -360,6 +429,7 @@ class CheckpointStoreImpl implements CheckpointStore {
       const delCheckpoints = this.db.prepare("DELETE FROM checkpoints WHERE thread_id = ?");
       const delWrites = this.db.prepare("DELETE FROM writes WHERE thread_id = ?");
       for (const { thread_id } of rows) {
+        this.db.prepare("INSERT OR IGNORE INTO deleted_thread (thread_id, owner) VALUES (?, ?)").run(thread_id, owner);
         delCheckpoints.run(thread_id);
         delWrites.run(thread_id);
       }
@@ -372,6 +442,7 @@ class CheckpointStoreImpl implements CheckpointStore {
 
 type ThreadRow = {
   thread_id: string;
+  public_id: string | null;
   owner: string;
   created_ts: number;
   updated_ts: number;
@@ -381,6 +452,7 @@ type ThreadRow = {
 function toThreadRecord(row: ThreadRow): ThreadRecord {
   return {
     threadId: row.thread_id,
+    publicId: row.public_id,
     owner: row.owner,
     createdAt: row.created_ts,
     updatedAt: row.updated_ts,

@@ -70,6 +70,27 @@ const envSchema = z.object({
       );
       return CHECKPOINT_DEV_DEFAULT_KEY;
     }),
+  // ntfy push-notification server base URL (e.g. `https://ntfy.example.com`).
+  // Empty (the default) = push notifications disabled; the /api/notify
+  // provisioning endpoints remain available regardless.
+  NOTIFY_BASE_URL: z
+    .string()
+    .default("")
+    .superRefine((value, ctx) => {
+      if (value === "") return;
+      try {
+        const url = new URL(value);
+        if (url.protocol !== "http:" && url.protocol !== "https:") {
+          throw new Error(`unsupported protocol '${url.protocol}'`);
+        }
+      } catch {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "NOTIFY_BASE_URL must be an absolute http(s) URL or empty to disable notifications",
+        });
+      }
+    }),
   PLUGINS_STORE_PATH: z.string().default("./data/plugins.json"),
   PLUGINS_TRUSTED_HOSTS: z
     .string()

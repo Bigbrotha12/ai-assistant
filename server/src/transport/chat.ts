@@ -8,6 +8,7 @@ import {
 } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+
 import { requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { createAgentGraph } from "../agents/graph.ts";
@@ -21,6 +22,8 @@ import type {
 } from "../jobs/runner.ts";
 import type { ThreadLockRegistry } from "../jobs/thread_lock.ts";
 import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
+import { admitManagedTurn, inspectManagedTurn, prepareManagedTurn } from "../credentials/managed_admission.ts";
+import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import {
   checkpointThreadId,
@@ -422,6 +425,9 @@ type ResolvedChat = {
   rawMessages: unknown[];
   requestParameters: Record<string, unknown>;
   clientThreadId: string | undefined;
+  managed: boolean;
+  managedMessageId: string | undefined;
+  enabledPlugins: string[] | undefined;
 };
 
 function resolveChatRequest(
@@ -452,8 +458,17 @@ function resolveChatRequest(
 
   let credentials: Record<string, string>;
   try {
-    const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials);
-    credentials = validateCredentials(plugin.credentials, input, modelPluginId);
+    // Model plugins also let the non-secret `baseUrlEntry` routing field
+    // through (it selects a base-URL instance from the plugin's allowlisted
+    // `baseUrls`); it rides the validated credentials so buildModel can resolve
+    // it against the allowlist (an unknown/blank id falls back to the
+    // plugin's inference endpoint).
+    const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, {
+      isModel: true,
+    });
+    credentials = validateCredentials(plugin.credentials, input, modelPluginId, {
+      isModel: true,
+    });
   } catch (err) {
     if (err instanceof PluginCredentialError) {
       return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
@@ -478,6 +493,37 @@ function resolveChatRequest(
   }
 
   const rawMessages = Array.isArray(body["messages"]) ? body["messages"] : [];
+
+  // Managed mode is an explicit, opt-in contract (Phase 5 remediation). It
+  // requires a messageId (the idempotency key), MAY carry thread_id, and
+  // always requires a checkpoint store: a managed run is never stateless, so
+  // a degraded boot is a 503, not a silent stateless fallback.
+  const conversationMode = body["conversation_mode"];
+  let managed = false;
+  let managedMessageId: string | undefined;
+  if (conversationMode !== undefined) {
+    if (conversationMode !== "managed") {
+      return {
+        ok: false,
+        response: c.json(
+          { error: "invalid_request", message: "conversation_mode must be 'managed'" },
+          400,
+        ),
+      };
+    }
+    managed = true;
+    const rawMessageId = typeof body["messageId"] === "string" ? body["messageId"].trim() : "";
+    if (rawMessageId === "") {
+      return {
+        ok: false,
+        response: c.json(
+          { error: "invalid_request", message: "messageId required for managed conversations" },
+          400,
+        ),
+      };
+    }
+    managedMessageId = rawMessageId;
+  }
   if (rawMessages.length === 0) {
     return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
   }
@@ -508,6 +554,29 @@ function resolveChatRequest(
       ? body["thread_id"]
       : undefined;
 
+  // Per-user tool selection (explicit opt-in). `enabled_plugins` present ->
+  // bind ONLY the listed installed tool plugins; absent -> legacy behavior
+  // (every installed tool plugin is bound). Credentials for an enabled plugin
+  // that happen to be missing do NOT disable it (the model may never call the
+  // tool; an explicitly invalid value is still a 400 below).
+  let enabledPlugins: string[] | undefined;
+  const rawEnabled = body["enabled_plugins"];
+  if (rawEnabled !== undefined) {
+    if (
+      !Array.isArray(rawEnabled) ||
+      rawEnabled.some((id) => typeof id !== "string" || id.trim() === "")
+    ) {
+      return {
+        ok: false,
+        response: c.json(
+          { error: "invalid_request", message: "enabled_plugins must be an array of plugin ids" },
+          400,
+        ),
+      };
+    }
+    enabledPlugins = [...new Set(rawEnabled.map((id) => String(id).trim()))];
+  }
+
   return {
     ok: true,
     value: {
@@ -519,6 +588,9 @@ function resolveChatRequest(
       rawMessages,
       requestParameters,
       clientThreadId,
+      managed,
+      managedMessageId,
+      enabledPlugins,
     },
   };
 }
@@ -549,9 +621,35 @@ async function handleSyncStream(
 
   const buildModelFn = opts.buildModel ?? buildModel;
   const checkpointStore = opts.checkpointStore;
+  const { managed, managedMessageId } = resolved.value;
+  // Managed mode is fail-closed: without a checkpoint store there is no
+  // durable conversation to seed or resume, so the request is a 503 rather
+  // than a silent stateless run.
+  if (managed && (!checkpointStore || !opts.ledger || !opts.threadLocks)) {
+    return c.json(
+      { error: "managed_unavailable", message: "managed conversations require the checkpoint store" },
+      503,
+    );
+  }
+  // Effective client thread id: managed mode generates a public UUID when the
+  // client did not supply one, so the response can always name the thread.
+  let managedTask: TaskRow | undefined;
+  if (managed) {
+    const existing = opts.ledger!.getTaskByIntentKey(owner, managedMessageId!);
+    const publicId = existing?.worker ?? clientThreadId;
+    if (publicId && checkpointStore!.isDeleted?.(checkpointThreadId(owner, publicId))) {
+      return deletedThreadResponse(c, publicId);
+    }
+    managedTask = await prepareManagedTurn(opts.ledger!, {
+      owner, messageId: managedMessageId!, spec: intentSpec(rawMessages), clientThreadId,
+    });
+    const duplicate = inspectManagedTurn(managedTask, clientThreadId);
+    if (duplicate) return managedDuplicateResponse(c, duplicate);
+  }
+  const effectiveClientThreadId = managedTask?.worker ?? clientThreadId;
   const threadId =
-    clientThreadId !== undefined && checkpointStore
-      ? checkpointThreadId(owner, clientThreadId)
+    effectiveClientThreadId !== undefined && checkpointStore
+      ? checkpointThreadId(owner, effectiveClientThreadId)
       : undefined;
 
   // Build the agent: model from the plugin + request, real ToolExecutor
@@ -609,7 +707,7 @@ async function handleSyncStream(
         return result;
       });
     },
-  });
+  }, resolved.value.enabledPlugins);
   const base = createAgentGraph({
     model,
     tools,
@@ -636,6 +734,12 @@ async function handleSyncStream(
     threadId !== undefined && checkpointStore !== undefined && lock !== undefined;
 
   if (lockable) {
+    // Managed mode: admit the turn against the shared ledger BEFORE the
+    // seed/resume read, so a retried (owner, messageId) can never run twice.
+    // The admission happens INSIDE the thread lock, so two concurrent sends
+    // on the same thread serialize before either reads the checkpoint.
+    let managedAdmission: ManagedAdmission | undefined;
+    let stopHeartbeat: (() => void) | undefined;
     // Phase 4 Wave A: reserve the per-user budget slot BEFORE the lock so a
     // full pool rejects the request up front (429, no queue for sync) instead
     // of blocking on the mutex with no capacity. Released together with the
@@ -651,19 +755,35 @@ async function handleSyncStream(
     const releaseOnce = () => {
       if (released) return;
       released = true;
+      stopHeartbeat?.();
       release();
       reservation.release();
     };
     try {
       execution.signal.throwIfAborted();
-      const { input, streamOptions } = await computeThreadInput(
+      if (managedTask) {
+        if (checkpointStore.isDeleted?.(threadId)) {
+          releaseOnce();
+          return deletedThreadResponse(c, effectiveClientThreadId!);
+        }
+        const duplicate = inspectManagedTurn(opts.ledger!.getTask(managedTask.id, owner)!, clientThreadId);
+        if (duplicate) {
+          releaseOnce();
+          return managedDuplicateResponse(c, duplicate);
+        }
+      }
+      const { input, streamOptions, state } = await computeThreadInput(
         checkpointStore,
         threadId,
         rawMessages,
         opts.contextManager,
       );
-      checkpointStore.touchThread(owner, threadId);
-      // Wave C: alongside the existing post-stream checkpoint-diagnostics
+      checkpointStore.touchThread(
+        owner,
+        threadId,
+        null,
+        managed ? effectiveClientThreadId! : undefined,
+      );      // Wave C: alongside the existing post-stream checkpoint-diagnostics
       // check, run best-effort compaction when a context manager is wired.
       // verifyCheckpointUnmoved runs inline (it catches internally); the
       // compaction call is a sibling — both run INSIDE the held lock (before
@@ -679,8 +799,21 @@ async function handleSyncStream(
           lockHeld: true,
         });
       };
+      execution.signal.throwIfAborted();
+      if (managedTask) {
+        const admission = admitManagedTurn(opts.ledger!, managedTask);
+        if (admission.kind !== "admitted") {
+          releaseOnce();
+          return managedDuplicateResponse(c, admission);
+        }
+        managedAdmission = admission;
+        stopHeartbeat = opts.ledger!.startHeartbeat(admission.task.id, owner, admission.task.fence_token, {
+          onError: () => execution.abort(),
+        }).stop;
+      }
+      execution.signal.throwIfAborted();
       scheduleWarmups(opts, owner, toolCredentialsByPlugin);
-      return buildStreamResponse(
+      const stream = buildStreamResponse(
         graph,
         input,
         streamOptions,
@@ -688,14 +821,38 @@ async function handleSyncStream(
         execution,
         releaseOnce,
         afterStream,
+        managedAdmission ? (outcome) => {
+          opts.ledger!.completeTask(managedAdmission!.task.id, owner, outcome, managedAdmission!.task.fence_token);
+        } : undefined,
       );
+      if (managed) {
+        stream.headers.set("x-thread-id", effectiveClientThreadId!);
+        stream.headers.set(
+          "x-conversation-state",
+          state === "resumed" ? "resumed" : state === "recreated" ? "recreated" : "seeded",
+        );
+      }
+      return stream;
     } catch (err) {
       releaseOnce();
       if (isResumeConflict(err)) {
         return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
       }
+      if (isReseedRequired(err)) {
+        return c.json({ error: "reseed_required", reason: "checkpoint_missing", threadId }, 409);
+      }
       return preStreamError(c, err);
     }
+  }
+
+  // Managed mode REQUIRES the serialized path (dedupe + seed/resume under the
+  // shared lock). Without thread locks the run cannot honor the contract, so
+  // it is a 503 — never a silent lock-free managed run.
+  if (managed) {
+    return c.json(
+      { error: "managed_unavailable", message: "managed conversations require the shared thread locks" },
+      503,
+    );
   }
 
   // Stateless, or no shared lock wired (existing C1 behavior): no per-thread
@@ -716,6 +873,9 @@ async function handleSyncStream(
     } catch (err) {
       if (isResumeConflict(err)) {
         return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
+      }
+      if (isReseedRequired(err)) {
+        return c.json({ error: "reseed_required", reason: "checkpoint_missing", threadId }, 409);
       }
       return preStreamError(c, err);
     }
@@ -843,6 +1003,36 @@ function withToolResultCache(opts: {
 }
 
 /**
+ * Wrap a managed stream's lifecycle against the ledger: the admission is
+ * claimed synchronously, so the transport (not the runner) completes the task
+ * on stream success and fails it on stream error/cancel, using the fence
+ * token the claim minted. A cancelled stream completes the task `cancelled`
+ * (a later retry with the SAME messageId is a clean already_terminal, not a
+ * stuck-resume); an errored stream completes it `failed`. A mid-stream SSE
+ * error envelope does NOT abort the HTTP 200, so the ledger follows the
+ * stream's honest terminal state.
+ */
+function deletedThreadResponse(c: Context, threadId: string): Response {
+  c.header("x-conversation-state", "reseed_required");
+  c.header("cache-control", "no-store");
+  return c.json({ error: "reseed_required", reason: "thread_deleted", threadId }, 409);
+}
+
+function managedDuplicateResponse(c: Context, admission: ManagedAdmission): Response {
+  const { task } = admission;
+  if (task.worker) c.header("x-thread-id", task.worker);
+  c.header("x-conversation-state", "resumed");
+  const identity = { taskId: task.id, threadId: task.worker };
+  if (admission.kind === "thread_conflict") {
+    return c.json({ error: "message_thread_conflict", ...identity }, 409);
+  }
+  if (admission.kind === "in_flight") {
+    return c.json({ error: "conversation_in_flight", ...identity }, 409);
+  }
+  return c.json({ status: "already_completed", terminalStatus: task.status, ...identity }, 200);
+}
+
+/**
  * Wave C2 async delegation. See the module doc (ASYNC DELEGATION) for the
  * step-by-step contract and IDEMPOTENCY for the `messageId` key.
  */
@@ -869,6 +1059,7 @@ async function handleBackground(
     rawMessages,
     requestParameters,
     clientThreadId,
+    managed,
   } = resolved.value;
 
   // Idempotency key: the client generates `messageId` once per send and reuses
@@ -890,6 +1081,29 @@ async function handleBackground(
   const clientThread = clientThreadId ?? messageId;
   const threadId = checkpointThreadId(owner, clientThread);
 
+  // Snapshot whether this thread was ALREADY known (owner->thread mapping row
+  // present) BEFORE this request admits/touches it. The admission-time
+  // `touchThread` (below) makes the thread "known" to EVERY later reader, so
+  // without this snapshot the job's own deferred `inputFactory` would see a
+  // mapping row it just created and mis-report `reseed_required` for a fresh
+  // seed. The snapshot is threaded into `computeThreadInput` (which re-reads
+  // the CHECKPOINTER live in every case).
+  const knownBefore = (await checkpointStore.getThread(threadId)) !== undefined;
+
+  // Idempotent retry (Wave C2 IDEMPOTENCY): a request whose (owner, messageId)
+  // already has a ledger task is a re-submit of an admitted job, NOT a fresh
+  // seed. De-dupe BEFORE the seed/resume gate: a running task -> 409
+  // `conversation_in_flight`, a terminal task -> 200 `already_completed`
+  // (mirrors the sync managed path via `inspectManagedTurn` /
+  // `managedDuplicateResponse`). A queued task falls through — the runner owns
+  // the claim race (in_flight vs. claim) — but its known-mapping/no-checkpoint
+  // state must not trip the `reseed_required` gate either (see below).
+  const existing = ledger.getTaskByIntentKey(owner, messageId);
+  if (existing) {
+    const duplicate = inspectManagedTurn(existing, clientThread);
+    if (duplicate) return managedDuplicateResponse(c, duplicate);
+  }
+
   // Seed/resume input (mirrors the sync path): a fresh thread gets the client's
   // full history; an existing checkpoint gets only the last user message. M3:
   // a RESUME whose last client message is NOT a user message is a conflict
@@ -899,18 +1113,28 @@ async function handleBackground(
   // deferred until after every validation so a rejected request never writes a
   // phantom thread_owner row.
   try {
-    await computeThreadInput(checkpointStore, threadId, rawMessages, opts.contextManager);
+    await computeThreadInput(checkpointStore, threadId, rawMessages, opts.contextManager, knownBefore);
   } catch (err) {
     if (isResumeConflict(err)) {
       return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
     }
-    return preStreamError(c, err);
+    // A retry of an admitted (queued/stuck) task legitimately has a mapping
+    // row (written by the first admit) with no checkpoint yet — the runner
+    // claims/terminates it, so `reseed_required` does not apply here.
+    if (isReseedRequired(err)) {
+      if (!existing) {
+        return c.json({ error: "reseed_required", reason: "checkpoint_missing", threadId }, 409);
+      }
+    } else {
+      return preStreamError(c, err);
+    }
   }
 
   // Validate + pin tool credentials first (atomic: all-or-nothing), then the
   // model credential. Any validation failure -> 400 before admission, and no
-  // pin is left behind.
-  const pinnedTools = pinToolPlugins(c, body, opts.registry, pins, owner);
+  // pin is left behind. `enabled_plugins` (when present) limits BOTH the
+  // pinned set and the bound tool set to the selected plugins.
+  const pinnedTools = pinToolPlugins(c, body, opts.registry, pins, owner, resolved.value.enabledPlugins);
   if (!pinnedTools.ok) return pinnedTools.response;
   const toolPlugins = pinnedTools.toolPlugins;
   const pinHandles = pinnedTools.pinHandles;
@@ -954,10 +1178,16 @@ async function handleBackground(
     return c.json({ error: "internal" }, 500);
   }
 
-  // L5: every validation (credentials, resume-conflict, admission) has passed;
-  // only now record the owner->thread mapping.
-  checkpointStore.touchThread(owner, threadId);
-
+  // L5: the owner->thread mapping is recorded only once the job actually runs,
+  // inside the inputFactory (RIGHT before the graph invoke, under the thread
+  // lock the runner holds). Recording it here at admission would make the
+  // thread "known" to every concurrent writer BEFORE any checkpoint exists, so
+  // a sync request racing the parked job on the same thread would be rejected
+  // as `reseed_required` (a mapping row must never signal "already seeded" —
+  // see the module doc). The public id is recorded on managed requests so the
+  // thread is listable/recoverable via /v1/threads; a legacy (stateless-
+  // threaded) background request keeps a null mapping and stays safely
+  // invisible to the public surface.
   let result: RunJobResult;
   try {
     result = await jobRunner.runJob({
@@ -976,9 +1206,10 @@ async function handleBackground(
       inputFactory: async ({ threadId: lockedThreadId, signal }) => {
         signal.throwIfAborted();
         const computed = await computeThreadInput(
-          checkpointStore, lockedThreadId, rawMessages, opts.contextManager,
+          checkpointStore, lockedThreadId, rawMessages, opts.contextManager, knownBefore,
         );
         signal.throwIfAborted();
+        checkpointStore.touchThread(owner, lockedThreadId, null, managed ? clientThread : undefined);
         return computed.input;
       },
     });
@@ -1043,6 +1274,7 @@ function pinToolPlugins(
   registry: PluginRegistry,
   pins: CredentialPinStore,
   owner: string,
+  enabledPlugins?: readonly string[],
 ): { ok: true; toolPlugins: string[]; pinHandles: Record<string, CredentialPinHandle> } | { ok: false; response: Response } {
   let validated: Record<string, Record<string, string>>;
   try {
@@ -1053,11 +1285,14 @@ function pinToolPlugins(
     }
     return { ok: false, response: c.json({ error: "internal" }, 500) };
   }
+  const selected = enabledPlugins === undefined
+    ? Object.keys(validated)
+    : Object.keys(validated).filter((pluginId) => enabledPlugins.includes(pluginId));
   const pinHandles: Record<string, CredentialPinHandle> = {};
-  for (const [pluginId, credentials] of Object.entries(validated)) {
-    pinHandles[pluginId] = pins.pin(owner, pluginId, credentials).handle;
+  for (const pluginId of selected) {
+    pinHandles[pluginId] = pins.pin(owner, pluginId, validated[pluginId]!).handle;
   }
-  return { ok: true, toolPlugins: Object.keys(validated), pinHandles };
+  return { ok: true, toolPlugins: selected, pinHandles };
 }
 
 /** `JobErrorCode` -> HTTP status for a failed background job. */
@@ -1120,6 +1355,23 @@ function isResumeConflict(err: unknown): boolean {
 }
 
 /**
+ * Raised when a KNOWN thread (owner->thread mapping row present) has no
+ * checkpoint AND the client is carrying no prior history to re-seed from.
+ * A fresh checkpoint cannot be minted silently without losing prior context,
+ * so this forces the explicit `reseed_required` round-trip (409).
+ */
+class ReseedRequiredError extends Error {
+  constructor() {
+    super("known thread has no checkpoint and no client history to re-seed from");
+    this.name = "ReseedRequiredError";
+  }
+}
+
+function isReseedRequired(err: unknown): boolean {
+  return err instanceof ReseedRequiredError;
+}
+
+/**
  * True when the client's LAST message on a resumed thread is a `user` message.
  * A resume whose last message is an assistant/tool message cannot be seeded
  * with a user turn (M3) — see `computeThreadInput`.
@@ -1131,6 +1383,16 @@ function lastMessageIsUser(messages: unknown[]): boolean {
 }
 
 /**
+ * True when the client is carrying prior conversation context (more than the
+ * single current user turn). Distinguishes a `recreated` re-seed (the client
+ * has history to restore) from a `reseed_required` round-trip (no history to
+ * restore — a silent fresh checkpoint would drop prior context).
+ */
+function hasClientHistory(rawMessages: unknown[]): boolean {
+  return rawMessages.length > 1;
+}
+
+/**
  * The seed/resume input for a thread: a fresh thread gets the client's full
  * history; an existing checkpoint gets ONLY the last user message. Callers
  * record the owner->thread mapping (`touchThread`) AFTER validation so a
@@ -1139,16 +1401,21 @@ function lastMessageIsUser(messages: unknown[]): boolean {
  * M3: when a checkpoint EXISTS and the client's last message is NOT a user
  * message, the resume cannot be seeded (returning `{ messages: [] }` would
  * re-run the checkpointed state and re-execute a pending tool call). That is a
- * `ResumeConflictError` (409) rather than silent mis-seeding. A fresh thread
- * (no checkpoint) keeps accepting whatever the client seeds with — an initial
- * seed may legitimately be just system+user.
+ * `ResumeConflictError` (409) rather than silent mis-seeding.
+ *
+ * No-checkpoint states: a fresh thread (no owner->thread mapping row) seeds
+ * from the client's full history ("seeded"). A KNOWN thread whose checkpoint
+ * is gone is a recreation: with prior client history it re-seeds ("recreated");
+ * without it it must not silently mint an empty checkpoint, so it throws
+ * `ReseedRequiredError` (409 "reseed_required") for an explicit round-trip.
  */
 async function computeThreadInput(
   checkpointStore: CheckpointStore,
   threadId: string,
   rawMessages: unknown[],
   contextManager?: ContextManager,
-): Promise<{ input: Record<string, unknown>; streamOptions: StreamOptions }> {
+  knownBefore?: boolean,
+): Promise<{ input: Record<string, unknown>; streamOptions: StreamOptions; state: "seeded" | "resumed" | "recreated" }> {
   const checkpoint = await checkpointStore.checkpointer.get({
     configurable: { thread_id: threadId },
   });
@@ -1160,17 +1427,42 @@ async function computeThreadInput(
     return {
       input: { messages: lastUser ? [lastUser] : [] },
       streamOptions: { version: "v2", configurable: { thread_id: threadId } },
+      state: "resumed",
     };
   }
-  // Seed path: the full client history becomes the initial checkpoint.
+  // No checkpoint. A KNOWN thread (owner->thread mapping row present) whose
+  // checkpoint is gone is NOT a brand-new seed: it is a recreation. When the
+  // client is carrying prior history we re-seed from it (state "recreated");
+  // when it is not, we must not silently mint a fresh empty checkpoint, so we
+  // force the explicit reseed round-trip (409 "reseed_required") — never
+  // silent context loss. A brand-new thread (no mapping row) seeds fresh.
   // Apply pair-aware truncation (contextManager.truncateSeed) so an oversized
   // seed never overflows the model context even when post-turn compaction
   // cannot run (deterministic fallback per the approved plan, Layer 2).
   const msgs = toLangChainMessages(rawMessages);
   const truncated = contextManager?.truncateSeed(msgs) ?? msgs;
+  // A caller that admits the thread AFTER validation supplies its pre-admission
+  // snapshot (`knownBefore`) so the owner->thread mapping row it writes via
+  // `touchThread` cannot retroactively flip this request into a "known thread"
+  // (and thus a false `reseed_required`). Only a `true` snapshot short-circuits
+  // the live read: a `false` snapshot (mapping absent at admission) falls
+  // through to the live read, since a concurrent same-thread writer may have
+  // created the mapping row by the time this runs (making the thread known).
+  const known = knownBefore === true ? true : await checkpointStore.getThread(threadId);
+  if (known) {
+    if (!hasClientHistory(rawMessages)) {
+      throw new ReseedRequiredError();
+    }
+    return {
+      input: { messages: truncated },
+      streamOptions: { version: "v2", configurable: { thread_id: threadId } },
+      state: "recreated",
+    };
+  }
   return {
     input: { messages: truncated },
     streamOptions: { version: "v2", configurable: { thread_id: threadId } },
+    state: "seeded",
   };
 }
 
@@ -1187,11 +1479,33 @@ function buildStreamResponse(
   execution: StreamExecution,
   onRelease?: () => void,
   onAfterStream?: () => void | Promise<void>,
+  onOutcome?: (outcome: "succeeded" | "failed" | "cancelled") => void,
 ): Response {
   const events = graph.streamEvents(input, { ...streamOptions, signal: execution.signal });
-  const sse = toOpenAiSse(events, { modelId });
+  let streamFailed = false;
+  const sse = toOpenAiSse(events, {
+    modelId,
+    onOutcome: (outcome) => {
+      if (outcome === "failed") streamFailed = true;
+    },
+  });
   const encoder = new TextEncoder();
   let cancelled = false;
+  let finalized = false;
+  const finalize = () => {
+    // Report the stream's honest terminal state exactly once: a mid-stream
+    // SSE error frame marks `failed`, a client cancellation / abort marks
+    // `cancelled`, anything else that ran to completion is `succeeded`.
+    if (finalized) return;
+    finalized = true;
+    if (cancelled || execution.signal.aborted) {
+      onOutcome?.("cancelled");
+    } else if (streamFailed) {
+      onOutcome?.("failed");
+    } else {
+      onOutcome?.("succeeded");
+    }
+  };
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       return (async () => {
@@ -1201,6 +1515,7 @@ function buildStreamResponse(
             if (!cancelled && !execution.signal.aborted) controller.enqueue(encoder.encode(frame));
           }
           await execution.settle();
+          finalize();
           if (!execution.signal.aborted && onAfterStream) {
             try {
               await onAfterStream();
@@ -1216,6 +1531,7 @@ function buildStreamResponse(
         } finally {
           execution.abort();
           await execution.settle();
+          finalize();
           onRelease?.();
           if (!cancelled && !errored) controller.close();
         }

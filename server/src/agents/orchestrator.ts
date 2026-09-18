@@ -76,11 +76,14 @@ export const createOrchestrator = createAgent;
 export function bindPluginTools(
   registry: PluginRegistry,
   toolHandler: ToolCallHandler,
+  enabledPlugins?: readonly string[],
 ): DynamicStructuredTool[] {
   const tools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
+  const enabled = enabledPlugins === undefined ? null : new Set(enabledPlugins);
   for (const plugin of registry.listInstalledPlugins()) {
     if (!isToolPlugin(plugin)) continue;
+    if (enabled !== null && !enabled.has(plugin.id)) continue;
     for (const toolDef of plugin.tools) {
       if (seen.has(toolDef.name)) {
         console.warn(

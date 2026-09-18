@@ -177,6 +177,52 @@ void main() {
     },
   );
 
+  test(
+    'a recreated turn is accepted as a success and keeps the mapped thread',
+    () async {
+      final first = await service.sendTurn(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      // The next turn hits a known thread whose checkpoint was lost; the server
+      // re-seeds from the client's history and reports state "recreated".
+      respondWith = (request) async => ManagedTurnResult(
+        threadId: request.conversationPublicId!,
+        state: 'recreated',
+        result: const ChatResult(
+          content: 'recreated reply',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
+      );
+      final outcome = await service.sendTurn(
+        'c1',
+        history: const [
+          Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+          Message(
+            id: 'm2',
+            role: MessageRole.assistant,
+            content: 'local reply',
+          ),
+        ],
+        userText: 'second',
+      );
+      // "recreated" is a success (not an error): the same thread is retained.
+      expect(outcome.state, 'recreated');
+      expect(outcome.threadId, first.threadId);
+      expect(await repo.mappedThread('c1'), first.threadId);
+      // Local history is the seed history + the new assistant reply.
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages.last.content, 'recreated reply');
+    },
+  );
+
   test('duplicate inflight 409 throws ManagedTurnError with thread id, keeps '
       'pending row for explicit retry', () async {
     respondWith = (request) {

@@ -116,6 +116,8 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     WARMUP_MAX_CONCURRENT: 1,
     WARMUP_TIMEOUT_MS: 1000,
     PLUGINS_TRUSTED_HOSTS: ["tasks.example.test"],
+    CHECKPOINT_DB_KEY: "test-checkpoint-key",
+    NOTIFY_BASE_URL: "",
   };
   const modules: Record<string, Record<string, unknown>> = {
     "@hono/node-server": {

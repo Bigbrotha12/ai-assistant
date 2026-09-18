@@ -849,6 +849,7 @@ export class Ledger {
     taskId: string,
     owner: string,
     to: Exclude<TaskStatus, "queued" | "running" | "stuck">,
+    fenceToken?: string,
   ): TaskRow {
     if (
       to !== "succeeded" &&
@@ -861,6 +862,7 @@ export class Ledger {
     const task = this.getTask(taskId);
     if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     this.requireOwnership(task, owner);
+    this.requireFence(task, fenceToken);
     this.setStatus(taskId, task.status, to);
     const row = this.getTask(taskId);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);

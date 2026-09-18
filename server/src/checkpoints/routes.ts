@@ -1,7 +1,9 @@
 import { Hono } from "hono";
 import { requireApiKey, unauthorized } from "../inference.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
+import { checkpointThreadId, readThreadMessages } from "./store.ts";
 import type { CheckpointStore } from "./store.ts";
+import { ThreadLockRegistry } from "../jobs/thread_lock.ts";
 
 /**
  * Conversation checkpoint HTTP surface (Phase 2, Wave B1), mounted under `/v1`.
@@ -29,12 +31,14 @@ export type { VerifyApiKeyFn };
 
 export type CheckpointRoutesOptions = {
   store: CheckpointStore;
+  threadLocks?: ThreadLockRegistry;
   /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 
 export function createCheckpointRoutes(opts: CheckpointRoutesOptions): Hono {
   const { store } = opts;
+  const locks = opts.threadLocks ?? new ThreadLockRegistry();
   const verifyKey = opts.verifyKey ?? requireApiKey;
 
   const routes = new Hono();
@@ -44,14 +48,29 @@ export function createCheckpointRoutes(opts: CheckpointRoutesOptions): Hono {
   routes.get("/threads", async (c) => {
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
-    return c.json({ threads: store.listThreads(owner) });
+    const threads = await Promise.all(store.listThreads(owner).filter((row) => row.publicId).map(async (row) => ({
+      threadId: row.publicId!,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      lastError: row.lastError,
+      messageCount: (await readThreadMessages(store, row.threadId) ?? []).length,
+    })));
+    c.header("cache-control", "no-store");
+    return c.json({ threads });
   });
 
   // Per-user GC: deletes ALL of the caller's threads (and their checkpoints).
   routes.delete("/threads", async (c) => {
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
-    return c.json({ deleted: store.deleteThreadsForOwner(owner) });
+    const rows = store.listThreads(owner);
+    let deleted = 0;
+    for (const row of rows) {
+      await locks.runExclusive(row.threadId, async () => {
+        if (store.deleteThread(owner, row.threadId)) deleted++;
+      });
+    }
+    return c.json({ deleted });
   });
 
   // Conversation delete. Owner-scoped: another user's thread is a 404, never a
@@ -59,9 +78,33 @@ export function createCheckpointRoutes(opts: CheckpointRoutesOptions): Hono {
   routes.delete("/threads/:threadId", async (c) => {
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
-    const deleted = store.deleteThread(owner, c.req.param("threadId"));
-    if (!deleted) return c.json({ error: "not_found" }, 404);
-    return c.json({ status: "ok" });
+    const publicId = c.req.param("threadId");
+    const threadId = checkpointThreadId(owner, publicId);
+    return locks.runExclusive(threadId, async () => {
+      const row = store.getThread(threadId);
+      if (row?.owner !== owner || (row.publicId !== undefined && row.publicId !== null && row.publicId !== publicId) || !store.deleteThread(owner, threadId)) {
+        return c.json({ error: "not_found" }, 404);
+      }
+      return c.json({ status: "ok" });
+    });
+  });
+
+  routes.get("/threads/:threadId", async (c) => {
+    const owner = await verifyKey(c);
+    if (!owner) return unauthorized(c);
+    const publicId = c.req.param("threadId");
+    const threadId = checkpointThreadId(owner, publicId);
+    return locks.runExclusive(threadId, async () => {
+      const row = store.getThread(threadId);
+      if (row?.owner !== owner || row.publicId !== publicId) return c.json({ error: "not_found" }, 404);
+      const messages = await readThreadMessages(store, threadId);
+      c.header("cache-control", "no-store");
+      if (!messages) {
+        c.header("x-conversation-state", "reseed_required");
+        return c.json({ error: "reseed_required", threadId: publicId }, 409);
+      }
+      return c.json({ threadId: publicId, messages });
+    });
   });
 
   return routes;

@@ -116,6 +116,36 @@ describe("validateCredentials", () => {
     assert.deepEqual(out, { apiKey: "sk-a" });
   });
 
+  test("model plugin passes baseUrlEntry through as a routing field", () => {
+    const out = validateCredentials(
+      requiredSpec,
+      { apiKey: "sk-a", baseUrlEntry: "us-east" },
+      "p",
+      { isModel: true },
+    );
+    assert.deepEqual(out, { apiKey: "sk-a", baseUrlEntry: "us-east" });
+  });
+
+  test("model plugin with blank baseUrlEntry drops it (treated as absent)", () => {
+    assert.deepEqual(
+      validateCredentials(requiredSpec, { apiKey: "sk-a", baseUrlEntry: "   " }, "p", { isModel: true }),
+      { apiKey: "sk-a" },
+    );
+    assert.deepEqual(
+      validateCredentials(requiredSpec, { apiKey: "sk-a", baseUrlEntry: "" }, "p", { isModel: true }),
+      { apiKey: "sk-a" },
+    );
+  });
+
+  test("non-model plugin still drops baseUrlEntry", () => {
+    const out = validateCredentials(
+      requiredSpec,
+      { apiKey: "sk-a", baseUrlEntry: "us-east" },
+      "p",
+    );
+    assert.deepEqual(out, { apiKey: "sk-a" });
+  });
+
   test("optional field absent is fine; present is trimmed", () => {
     assert.deepEqual(validateCredentials(optionalSpec, {}, "p"), {});
     assert.deepEqual(
@@ -198,6 +228,25 @@ describe("extractCredentialsFromBody", () => {
   test("spec-scoped extraction drops references the spec does not define", () => {
     const body = {
       credentials: { m: { apiKey: "sk-1", futureField: "sneaky" } },
+    };
+    assert.deepEqual(extractCredentialsFromBody(body, "m", requiredSpec), {
+      apiKey: "sk-1",
+    });
+  });
+
+  test("model plugin passes baseUrlEntry through extraction (routing field)", () => {
+    const body = {
+      credentials: { m: { apiKey: "sk-1", baseUrlEntry: "us-east", other: "x" } },
+    };
+    assert.deepEqual(
+      extractCredentialsFromBody(body, "m", requiredSpec, { isModel: true }),
+      { apiKey: "sk-1", baseUrlEntry: "us-east" },
+    );
+  });
+
+  test("tool plugin keeps dropping baseUrlEntry at extraction", () => {
+    const body = {
+      credentials: { m: { apiKey: "sk-1", baseUrlEntry: "us-east" } },
     };
     assert.deepEqual(extractCredentialsFromBody(body, "m", requiredSpec), {
       apiKey: "sk-1",

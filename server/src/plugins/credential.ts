@@ -102,6 +102,12 @@ const INVALID_KEY_MATERIAL = /[\x00-\x1f\x7f\s]/;
  *   Applies to every credential field — all are key material.
  * - Values are trimmed; the returned object contains ONLY the fields the spec
  *   declares — unknown/extra input fields are never echoed.
+ * - A MODEL plugin (`options.isModel`) may also carry `baseUrlEntry`, a ROUTING
+ *   field (not a credential secret) that selects a base-URL instance from the
+ *   plugin's allowlisted `baseUrls` (docs/backend-langchain-plan.md §329-335).
+ *   It is passed through untrimmed-validated here — resolved against the
+ *   allowlist only at model build time; a blank entry counts as absent, and it
+ *   never receives the key-material check above.
  *
  * Callers pass the returned object to the single outbound call and discard it.
  */
@@ -109,37 +115,46 @@ export function validateCredentials(
   spec: CredentialSpec | undefined,
   input: RequestCredentialInput,
   pluginId: string,
+  options?: { isModel?: boolean },
 ): Record<string, string> {
-  const references = specReferences(spec);
-  if (references.length === 0) return {};
-
   const validated: Record<string, string> = {};
-  for (const reference of references) {
-    const descriptor = spec![reference]!;
-    const trimmed = input[reference]?.trim() ?? "";
+  const references = specReferences(spec);
+  if (references.length > 0) {
+    for (const reference of references) {
+      const descriptor = spec![reference]!;
+      const trimmed = input[reference]?.trim() ?? "";
 
-    if (trimmed === "") {
-      if (descriptor.required) {
+      if (trimmed === "") {
+        if (descriptor.required) {
+          throw new PluginCredentialError(
+            "MISSING_CREDENTIAL",
+            pluginId,
+            `plugin '${pluginId}' requires credential '${reference}'; none was supplied`,
+          );
+        }
+        continue; // optional field absent (whitespace-only counts as absent)
+      }
+
+      if (INVALID_KEY_MATERIAL.test(trimmed)) {
         throw new PluginCredentialError(
-          "MISSING_CREDENTIAL",
+          "INVALID_CREDENTIAL_FORMAT",
           pluginId,
-          `plugin '${pluginId}' requires credential '${reference}'; none was supplied`,
+          `credential '${reference}' for plugin '${pluginId}' must not contain ` +
+            "control characters, whitespace or newlines; refusing to forward a " +
+            "header/log-injection hazard",
         );
       }
-      continue; // optional field absent (whitespace-only counts as absent)
-    }
 
-    if (INVALID_KEY_MATERIAL.test(trimmed)) {
-      throw new PluginCredentialError(
-        "INVALID_CREDENTIAL_FORMAT",
-        pluginId,
-        `credential '${reference}' for plugin '${pluginId}' must not contain ` +
-          "control characters, whitespace or newlines; refusing to forward a " +
-          "header/log-injection hazard",
-      );
+      validated[reference] = trimmed;
     }
+  }
 
-    validated[reference] = trimmed;
+  // Routing pass-through for model plugins: `baseUrlEntry` is not key
+  // material, so no `INVALID_KEY_MATERIAL` gate — the plugin's `baseUrls`
+  // allowlist is the authority, applied at model build time (transport/model.ts).
+  if (options?.isModel && typeof input["baseUrlEntry"] === "string") {
+    const baseUrlEntry = input["baseUrlEntry"].trim();
+    if (baseUrlEntry !== "") validated["baseUrlEntry"] = baseUrlEntry;
   }
   return validated;
 }
@@ -156,11 +171,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * provided, references the spec does not define are dropped at the source
  * (the server only consumes shapes it knows). Raw values are NOT trimmed or
  * validated here; `validateCredentials` does that.
+ *
+ * One exception: a MODEL plugin (`options.isModel`) also lets the non-secret
+ * `baseUrlEntry` routing field through wholesale (it is never in the
+ * credential spec — it selects a base-URL instance from the plugin's
+ * allowlisted `baseUrls`). Tool plugins always drop it. Resolution happens at
+ * model build time, so no validation or trimming happens here beyond the
+ * existing string check.
  */
 export function extractCredentialsFromBody(
   body: unknown,
   pluginId: string,
   spec?: CredentialSpec,
+  options?: { isModel?: boolean },
 ): RequestCredentialInput {
   if (!isRecord(body)) return {};
   const credentialsField = body["credentials"];
@@ -173,7 +196,12 @@ export function extractCredentialsFromBody(
   for (const [reference, value] of Object.entries(perPlugin)) {
     if (typeof value !== "string") continue;
     const typedReference = reference as keyof CredentialSpec;
-    if (references.length > 0 && !references.includes(typedReference)) continue;
+    if (references.length > 0 && !references.includes(typedReference)) {
+      // `baseUrlEntry` is a routing field, not a credential secret: keep it
+      // for model plugins (validation lets it through and resolution happens
+      // at model build), drop it for tool plugins.
+      if (!(options?.isModel && reference === "baseUrlEntry")) continue;
+    }
     out[reference] = value;
   }
   return out;

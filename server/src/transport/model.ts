@@ -131,9 +131,24 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
     );
   }
 
+  // The client may select a base-URL instance from the plugin's allowlisted
+  // `baseUrls` via the non-secret `baseUrlEntry` routing credential (the
+  // per-plugin `{ apiKey, baseUrlEntry }` contract, docs/backend-langchain-plan.md
+  // §329-335). Resolve the id against the plugin's OWN allowlist; an
+  // unknown/blank id — e.g. a stale client selection after the admin rotated
+  // the plugin — FALLS BACK to `plugin.inference.endpoint` rather than
+  // failing. A client can never supply an arbitrary URL: only ids present in
+  // the server-side allowlist may select an endpoint.
+  const baseUrlEntry = input.credentials["baseUrlEntry"];
+  const selectedEntry =
+    typeof baseUrlEntry === "string" && baseUrlEntry.trim() !== ""
+      ? plugin.baseUrls?.find((candidate) => candidate.id === baseUrlEntry.trim())
+      : undefined;
+  const baseURL = selectedEntry?.url ?? plugin.inference.endpoint;
+
   const configuration = {
     maxRetries: 0,
-    baseURL: plugin.inference.endpoint,
+    baseURL,
     fetch: createValidatedFetchAdapter({
       trustedHosts: input.trustedHosts,
       lookup: input.lookup,

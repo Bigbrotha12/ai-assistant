@@ -37,7 +37,9 @@ class _CaptureAdapter implements HttpClientAdapter {
     return ResponseBody.fromString(
       jsonEncode(body),
       statusCode,
-      headers: const {'content-type': ['application/json']},
+      headers: const {
+        'content-type': ['application/json'],
+      },
     );
   }
 
@@ -46,24 +48,44 @@ class _CaptureAdapter implements HttpClientAdapter {
 }
 
 void main() {
+  test(
+    'missing or malformed user id never falls back to email or key id',
+    () async {
+      for (final id in [null, '', '  ', 123]) {
+        final adapter = _CaptureAdapter(
+          body: {
+            'token': 'session',
+            'id': 'key-id',
+            'user': {'email': 'user@example.com', 'id': id},
+          },
+        );
+        final dio = Dio()..httpClientAdapter = adapter;
+        final session = await _client(dio)
+            .signIn(email: 'user@example.com', password: 'test');
+        expect(session.ownerId, isNull);
+        expect(session.backendOrigin, _base);
+      }
+    },
+  );
+
   group('signUp', () {
     test('posts name/email/password and parses the session token', () async {
       final adapter = _CaptureAdapter(
         body: {
           'token': 'tok-123',
-          'user': {'email': 'a@b.c'},
+          'id': 'not-the-owner',
+          'user': {'email': 'a@b.c', 'id': 'owner-123'},
         },
       );
       final dio = Dio()..httpClientAdapter = adapter;
 
-      final session = await _client(dio).signUp(
-        name: 'Ada',
-        email: 'a@b.c',
-        password: 'p@ss',
-      );
+      final session = await _client(dio)
+          .signUp(name: 'Ada', email: 'a@b.c', password: 'p@ss');
 
       expect(session.token, 'tok-123');
       expect(session.email, 'a@b.c');
+      expect(session.ownerId, 'owner-123');
+      expect(session.backendOrigin, _base);
 
       final req = adapter.requests.single;
       expect(req.path, '$_base/api/auth/sign-up/email');
@@ -83,11 +105,8 @@ void main() {
         }),
       );
 
-      final session = await _client(dio).signUp(
-        name: 'Ada',
-        email: 'a@b.c',
-        password: 'p@ss',
-      );
+      final session = await _client(dio)
+          .signUp(name: 'Ada', email: 'a@b.c', password: 'p@ss');
 
       expect(session.token, 'tok');
       expect(session.email, 'a@b.c');
@@ -116,8 +135,7 @@ void main() {
       await expectLater(
         _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
         throwsA(
-          isA<AuthServerError>()
-              .having((e) => e.statusCode, 'statusCode', 500),
+          isA<AuthServerError>().having((e) => e.statusCode, 'statusCode', 500),
         ),
       );
     });
@@ -133,10 +151,8 @@ void main() {
       );
       final dio = Dio()..httpClientAdapter = adapter;
 
-      final session = await _client(dio).signIn(
-        email: 'a@b.c',
-        password: 'p@ss',
-      );
+      final session = await _client(dio)
+          .signIn(email: 'a@b.c', password: 'p@ss');
 
       expect(session.token, 'session-xyz');
 
@@ -276,8 +292,7 @@ void main() {
       final adapter = _CaptureAdapter(body: {'success': true});
       final dio = Dio()..httpClientAdapter = adapter;
 
-      await _client(dio)
-          .revokeApiKey(sessionToken: 'tok-3', keyId: 'key-9');
+      await _client(dio).revokeApiKey(sessionToken: 'tok-3', keyId: 'key-9');
 
       final req = adapter.requests.single;
       expect(req.path, '$_base/api/auth/api-key/delete');
@@ -301,8 +316,9 @@ void main() {
 
     test('maps a timeout to AuthNetworkError', () async {
       final dio = Dio()
-        ..httpClientAdapter =
-            _FailingAdapter(DioExceptionType.connectionTimeout);
+        ..httpClientAdapter = _FailingAdapter(
+          DioExceptionType.connectionTimeout,
+        );
       final client = _client(dio);
 
       await expectLater(

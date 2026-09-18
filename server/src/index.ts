@@ -11,6 +11,9 @@ import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { ThreadLockRegistry } from "./jobs/thread_lock.ts";
 import { ledgerRoutes, ledger } from "./ledger.routes.ts";
+import { createNtfyNotificationHook } from "./notify/hook.ts";
+import { createNotifyRoutes } from "./notify/routes.ts";
+import { NotifyStore } from "./notify/store.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createModelsRoutes } from "./transport/models.ts";
@@ -35,6 +38,14 @@ app.get("/api/auth/ok", (c) => c.json({ status: "ok" }));
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 app.route("/v1", inferenceRoutes);
 app.route("/ledger", ledgerRoutes);
+
+// ntfy push-notification provisioning (plan §Notifications): the topic +
+// access token are encrypted at rest with the CHECKPOINT_DB_KEY secret; the
+// NOTIFY_BASE_URL env var (empty = disabled) will gate the push hook when it
+// lands. The store lazy-loads, so a corrupt notify file degrades provision
+// 500s rather than taking down the gateway (mirrors the checkpoint guard).
+const notifyStore = new NotifyStore({ key: env.CHECKPOINT_DB_KEY });
+app.route("/api/notify", createNotifyRoutes({ store: notifyStore }));
 
 const { registry: pluginRegistry, store: pluginStore } = createPluginWiring();
 await pluginStore.load();
@@ -79,17 +90,12 @@ try {
     err,
   );
 }
-if (checkpointStore) {
-  app.route("/v1", createCheckpointRoutes({ store: checkpointStore }));
-}
-
-// Phase 3, Wave C2: the async background path and the sync stream share ONE
-// per-thread lock registry and ONE credential pin store. The chat transport
-// needs both, so the job runner (which owns the pin lifecycle) is constructed
-// BEFORE the chat routes are mounted.
 let jobRunner: JobRunner | undefined;
 let jobPins: CredentialPinStore | undefined;
 const threadLocks = new ThreadLockRegistry();
+if (checkpointStore) {
+  app.route("/v1", createCheckpointRoutes({ store: checkpointStore, threadLocks }));
+}
 // Phase 4, Wave B: ONE in-memory tool-result cache shared by the sync
 // transport and every background job so the same read-only tool call is never
 // executed twice across either path.
@@ -137,6 +143,12 @@ try {
       trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
       // M1: record owner→thread metadata so the /v1/threads surface works.
       touchThread: checkpointStore.touchThread.bind(checkpointStore),
+      // ntfy push: the real hook behind the runner's DI seam. Empty
+      // NOTIFY_BASE_URL (the default) makes it a silent no-op.
+      notification: createNtfyNotificationHook({
+        store: notifyStore,
+        baseUrl: env.NOTIFY_BASE_URL,
+      }),
       // Wave C2: one lock authority for every checkpoint-thread writer, shared
       // with the sync transport below.
       threadLocks,

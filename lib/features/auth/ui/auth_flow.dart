@@ -47,6 +47,9 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
   }
 
   Future<void> _submit() async {
+    if (_submitting) return;
+    final credentialsNotifier = ref.read(authCredentialsProvider.notifier);
+    final authEpoch = credentialsNotifier.captureEpoch();
     final email = _emailController.text.trim();
     final password = _passwordController.text;
     if (email.isEmpty || password.isEmpty) {
@@ -75,14 +78,18 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
       // before reporting success to the caller. The key record id and session
       // token are stored alongside so the app can revoke the key later.
       final minted = await auth.mintApiKey(sessionToken: session.token);
-      await ref.read(authCredentialsProvider.notifier).save(
-            AuthCredentials(
-              apiKey: minted.key,
-              email: session.email,
-              keyId: minted.id,
-              sessionToken: session.token,
-            ),
-          );
+      if (!mounted) return;
+      await credentialsNotifier.save(
+        AuthCredentials(
+          apiKey: minted.key,
+          email: session.email,
+          keyId: minted.id,
+          sessionToken: session.token,
+          ownerId: session.ownerId,
+          backendOrigin: session.backendOrigin,
+        ),
+        expectedEpoch: authEpoch,
+      );
       if (!mounted) return;
       widget.onSuccess(session);
       setState(() => _submitting = false);
@@ -96,18 +103,18 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
       if (!mounted) return;
       setState(() {
         _submitting = false;
-        _error = 'Something went wrong: $e';
+        _error = 'Could not finish signing in. Try again.';
       });
     }
   }
 
   static String _authErrorText(AuthApiError e) => switch (e) {
-        AuthInvalidCredentials() => 'Incorrect email or password',
-        AuthEmailTaken() => 'An account already exists for this email',
-        AuthUnauthorized() => 'This session was rejected. Try signing in again.',
-        AuthNetworkError() => 'Could not reach the server. Check your connection.',
-        AuthServerError() => 'Server error: ${e.message}',
-      };
+    AuthInvalidCredentials() => 'Incorrect email or password',
+    AuthEmailTaken() => 'An account already exists for this email',
+    AuthUnauthorized() => 'This session was rejected. Try signing in again.',
+    AuthNetworkError() => 'Could not reach the server. Check your connection.',
+    AuthServerError() => 'Server error: ${e.message}',
+  };
 
   @override
   Widget build(BuildContext context) {

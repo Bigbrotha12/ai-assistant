@@ -165,27 +165,53 @@ async function makeEnv(
  */
 function fakeCheckpointStore(): CheckpointStore {
   const checkpointer = new MemorySaver();
-  const threads = new Map<string, { owner: string; lastError: string | null }>();
+  const threads = new Map<string, { owner: string; lastError: string | null; publicId?: string | null; deleted?: boolean }>();
   return {
     checkpointer,
     async close() {},
-    touchThread(owner, threadId, lastError = null) {
-      threads.set(threadId, { owner, lastError });
+    touchThread(owner, threadId, lastError = null, publicId) {
+      if (threads.get(threadId)?.deleted) throw new Error("thread_deleted");
+      const existing = threads.get(threadId);
+      if (existing && existing.owner !== owner) throw new Error("thread_mapping_conflict");
+      if (publicId !== undefined && existing && existing.publicId !== publicId) {
+        throw new Error("thread_mapping_conflict");
+      }
+      threads.set(threadId, { owner, lastError, publicId: publicId ?? existing?.publicId ?? null });
     },
     getThread(threadId) {
       const t = threads.get(threadId);
       return t
-        ? { threadId, owner: t.owner, createdAt: 0, updatedAt: 0, lastError: t.lastError }
+        ? { threadId, publicId: t.publicId, owner: t.owner, createdAt: 0, updatedAt: 0, lastError: t.lastError }
         : undefined;
     },
-    listThreads() {
-      return [];
+    listThreads(owner) {
+      return [...threads.entries()]
+        .filter(([, t]) => t.owner === owner)
+        .map(([threadId, t]) => ({
+          threadId,
+          publicId: t.publicId,
+          owner: t.owner,
+          createdAt: 0,
+          updatedAt: 0,
+          lastError: t.lastError,
+          messageCount: 0,
+        }));
     },
-    deleteThread() {
-      return false;
+    deleteThread(owner, threadId) {
+      const t = threads.get(threadId);
+      if (!t || t.owner !== owner) return false;
+      threads.set(threadId, { ...t, deleted: true });
+      return true;
     },
-    deleteThreadsForOwner() {
-      return 0;
+    deleteThreadsForOwner(owner) {
+      let n = 0;
+      for (const [threadId, t] of threads) {
+        if (t.owner === owner) {
+          threads.set(threadId, { ...t, deleted: true });
+          n++;
+        }
+      }
+      return n;
     },
   };
 }
@@ -1009,6 +1035,60 @@ describe("POST /v1/chat/completions — happy path (stateless)", () => {
     assert.equal(fake.calls[0]!.requestModel, undefined);
   });
 
+  test("body.credentials.baseUrlEntry threads through to the buildModel seam for model plugins", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "hi" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
+
+    const res = await postChat(app, chatBody({
+      credentials: { openrouter: { apiKey: "sk-test-123", baseUrlEntry: "openrouter-api" } },
+    }));
+    assert.equal(res.status, 200);
+    await res.text();
+
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0]!.credentials.apiKey, "sk-test-123");
+    assert.equal(fake.calls[0]!.credentials.baseUrlEntry, "openrouter-api");
+  });
+
+  test("a baseUrlEntry sent to a TOOL plugin is dropped (never reaches a tool credential set)", async (t) => {
+    // Tool plugins' credential sets must stay spec-only: a routing field that
+    // only makes sense for model plugins is stripped at extraction + validation.
+    const fake = makeFakeBuildModel([
+      [
+        {
+          content: "",
+          tool_call_chunks: [
+            { index: 0, id: "call_1", name: "list_tasks", args: '{"projectId":"p1"}' },
+          ],
+        },
+      ],
+      [{ content: "done" }],
+    ]);
+    const collect: string[] = [];
+    const { app } = await makeApp(t, {
+      buildModel: fake.buildModelFn,
+      toolHandler: {
+        async execute(_pluginId, _tool, _args, credentials) {
+          collect.push(JSON.stringify(credentials ?? null));
+          return "handled";
+        },
+      },
+    });
+
+    const res = await postChat(app, chatBody({
+      credentials: {
+        openrouter: { apiKey: "sk-test-123", baseUrlEntry: "openrouter-api" },
+        vikunja: { apiKey: "tok-vikunja", baseUrlEntry: "vikunja-api" },
+      },
+    }));
+    assert.equal(res.status, 200);
+    await res.text();
+
+    assert.equal(fake.calls[0]!.credentials.baseUrlEntry, "openrouter-api");
+    assert.equal(collect.length, 1, "the tool handler executed once");
+    assert.deepEqual(JSON.parse(collect[0]!), { apiKey: "tok-vikunja" });
+  });
+
   test("legacy fields tolerated (chat_template_kwargs/enable_thinking); temperature/max_tokens forwarded", async (t) => {
     const fake = makeFakeBuildModel([[{ content: "hi" }]]);
     const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
@@ -1232,6 +1312,50 @@ describe("POST /v1/chat/completions — seed/resume with a checkpoint store", ()
     );
   });
 
+  test("resumed: client-supplied history is ignored — only the last user message is appended", async (t) => {
+    const fake = makeFakeBuildModel([
+      [{ content: "First reply" }],
+      [{ content: "Second reply" }],
+    ]);
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
+
+    // Seed the thread so a checkpoint exists.
+    const res1 = await postChat(
+      app,
+      chatBody({
+        thread_id: "resume-history",
+        messages: [{ role: "user", content: "first" }],
+      }),
+    );
+    assert.equal(res1.status, 200);
+    await res1.text();
+
+    // Resume carrying the FULL client history, with a TAMPERED assistant turn
+    // so any leak of client-supplied history into the model input is visible.
+    const res2 = await postChat(
+      app,
+      chatBody({
+        thread_id: "resume-history",
+        messages: [
+          { role: "user", content: "first" },
+          { role: "assistant", content: "tampered-by-client" },
+          { role: "user", content: "new" },
+        ],
+      }),
+    );
+    assert.equal(res2.status, 200);
+    const text2 = await res2.text();
+    assert.ok(text2.includes("data: [DONE]"), "resume call streams");
+
+    const resumeTurn = fake.recordedInputs[1]!;
+    assert.deepEqual(
+      contentsOf(resumeTurn),
+      ["first", "First reply", "new"],
+      "resume = checkpointed state + ONLY the last user message (client history ignored)",
+    );
+  });
+
   test("distinct owners map to distinct threads (owner-scoped hashing)", async (t) => {
     const fake = makeFakeBuildModel([
       [{ content: "A reply" }],
@@ -1334,6 +1458,287 @@ describe("POST /v1/chat/completions — seed/resume with a checkpoint store", ()
   });
 });
 
+describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", () => {
+  test("managed with no thread_id generates a public UUID and returns it via x-thread-id", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const ledger = makeLedger();
+    const checkpointStore = fakeCheckpointStore();
+    const threadLocks = new ThreadLockRegistry();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      ledger,
+      threadLocks,
+      buildModel: fake.buildModelFn,
+    });
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        messageId: "msg-1",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(text.includes("data: [DONE]"));
+    const threadId = res.headers.get("x-thread-id");
+    assert.ok(threadId, "x-thread-id header present");
+    assert.match(threadId!, /^[0-9a-f-]{36}$/, "generated thread id is a UUID");
+    assert.equal(res.headers.get("x-conversation-state"), "seeded");
+    // The ledger records the turn so a retry is deduped.
+    const task = ledger.getTaskByIntentKey("test-user", "msg-1");
+    assert.ok(task);
+    assert.equal(task!.status, "succeeded");
+  });
+
+  test("client-supplied thread_id is honored and echoed back", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const ledger = makeLedger();
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      ledger,
+      threadLocks: new ThreadLockRegistry(),
+      buildModel: fake.buildModelFn,
+    });
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        messageId: "msg-1",
+        thread_id: "11111111-2222-3333-4444-555555555555",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    );
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(res.headers.get("x-thread-id"), "11111111-2222-3333-4444-555555555555");
+    assert.equal(res.headers.get("x-conversation-state"), "seeded");
+  });
+
+  test("retry with the SAME messageId after success returns already_completed, never a second run", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "only reply" }]]);
+    const ledger = makeLedger();
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      ledger,
+      threadLocks: new ThreadLockRegistry(),
+      buildModel: fake.buildModelFn,
+    });
+    const body = chatBody({
+      conversation_mode: "managed",
+      messageId: "msg-1",
+      thread_id: "22222222-2222-3333-4444-555555555555",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    const res1 = await postChat(app, body);
+    assert.equal(res1.status, 200);
+    await res1.text();
+
+    const res2 = await postChat(app, body);
+    assert.equal(res2.status, 200);
+    const json = (await res2.json()) as { status: string; taskId: string };
+    assert.equal(json.status, "already_completed");
+    assert.equal(fake.recordedInputs.length, 1, "the model ran exactly once");
+  });
+
+  test("recreated: a known thread with a missing checkpoint re-seeds from client history", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const ledger = makeLedger();
+    const checkpointStore = fakeCheckpointStore();
+    const threadLocks = new ThreadLockRegistry();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      ledger,
+      threadLocks,
+      buildModel: fake.buildModelFn,
+    });
+    // A KNOWN thread whose checkpoint is gone: the owner->thread mapping row
+    // exists but no checkpoint does (e.g. the first stream failed before the
+    // checkpointer wrote). Simulate by touching the mapping row directly.
+    const publicId = "44444444-2222-3333-4444-555555555555";
+    checkpointStore.touchThread(
+      "test-user",
+      checkpointThreadId("test-user", publicId),
+      null,
+      publicId,
+    );
+
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        messageId: "msg-recreate",
+        thread_id: publicId,
+        messages: [
+          { role: "user", content: "first" },
+          { role: "user", content: "second" },
+        ],
+      }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(text.includes("data: [DONE]"));
+    assert.equal(res.headers.get("x-thread-id"), publicId);
+    assert.equal(res.headers.get("x-conversation-state"), "recreated");
+    // A recreation re-seeds from the FULL client history, not just the last turn.
+    assert.deepEqual(contentsOf(fake.recordedInputs[0]!), ["first", "second"]);
+  });
+
+  test("reseed_required: a known thread with a missing checkpoint and no client history → 409", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const ledger = makeLedger();
+    const checkpointStore = fakeCheckpointStore();
+    const threadLocks = new ThreadLockRegistry();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      ledger,
+      threadLocks,
+      buildModel: fake.buildModelFn,
+    });
+    const publicId = "55555555-2222-3333-4444-555555555555";
+    checkpointStore.touchThread(
+      "test-user",
+      checkpointThreadId("test-user", publicId),
+      null,
+      publicId,
+    );
+
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        messageId: "msg-reseed",
+        thread_id: publicId,
+        messages: [{ role: "user", content: "only" }],
+      }),
+    );
+    assert.equal(res.status, 409);
+    const json = (await res.json()) as { error: string; reason?: string };
+    assert.equal(json.error, "reseed_required");
+    assert.equal(json.reason, "checkpoint_missing");
+  });
+
+  test("managed without messageId → 400 invalid_request", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const { app } = await makeApp(t, {
+      checkpointStore: fakeCheckpointStore(),
+      ledger: makeLedger(),
+      threadLocks: new ThreadLockRegistry(),
+      buildModel: fake.buildModelFn,
+    });
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    );
+    assert.equal(res.status, 400);
+    assert.equal((await res.json() as { error: string }).error, "invalid_request");
+  });
+
+  test("managed without a checkpoint store → 503 managed_unavailable (never silent stateless)", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const { app } = await makeApp(t, {
+      ledger: makeLedger(),
+      threadLocks: new ThreadLockRegistry(),
+      buildModel: fake.buildModelFn,
+    });
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        messageId: "msg-1",
+        thread_id: "33333333-2222-3333-4444-555555555555",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    );
+    assert.equal(res.status, 503);
+    assert.equal((await res.json() as { error: string }).error, "managed_unavailable");
+  });
+
+  test("a non-managed conversation_mode value → 400 invalid_request", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
+    const res = await postChat(
+      app,
+      chatBody({ conversation_mode: "wild", messages: [{ role: "user", content: "hi" }] }),
+    );
+    assert.equal(res.status, 400);
+  });
+
+  test("structured image content (vision SSE shape) is accepted on the same endpoint", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "image described" }]]);
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      threadLocks: new ThreadLockRegistry(),
+      buildModel: fake.buildModelFn,
+    });
+    const res = await postChat(
+      app,
+      chatBody({
+        thread_id: "44444444-2222-3333-4444-555555555555",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Describe this image." },
+              { type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA" } },
+            ],
+          },
+        ],
+      }),
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(text.includes("data: [DONE]"), "vision content streams on the same SSE endpoint");
+  });
+
+  test("enabled_plugins limits which tool plugins are bound (absent preserves legacy)", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "ok" }], [{ content: "ok again" }]]);
+    const checkpointStore = fakeCheckpointStore();
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      threadLocks: new ThreadLockRegistry(),
+      buildModel: fake.buildModelFn,
+    });
+
+    // Absent enabled_plugins: legacy behavior (no 400, request streams).
+    const legacy = await postChat(
+      app,
+      chatBody({ thread_id: "sel-1", messages: [{ role: "user", content: "hi" }] }),
+    );
+    assert.equal(legacy.status, 200);
+    await legacy.text();
+
+    // Present and valid: streams normally.
+    const selected = await postChat(
+      app,
+      chatBody({
+        thread_id: "sel-2",
+        enabled_plugins: ["vikunja"],
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+    assert.equal(selected.status, 200);
+    await selected.text();
+
+    // Present but malformed: 400 invalid_request.
+    const malformed = await postChat(
+      app,
+      chatBody({
+        thread_id: "sel-3",
+        enabled_plugins: "vikunja",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+    assert.equal(malformed.status, 400);
+  });
+});
+
 describe("transport/model.ts — model construction + SSRF fetch seam", () => {
   test("buildModel wires configuration.baseURL + a validatedFetch-backed fetch (never the global fetch)", async (t) => {
     const dir = await makeTempDir(t);
@@ -1350,6 +1755,67 @@ describe("transport/model.ts — model construction + SSRF fetch seam", () => {
     assert.equal(clientConfig.baseURL, "https://openrouter.ai/api/v1");
     assert.equal(typeof clientConfig.fetch, "function");
     assert.notEqual(clientConfig.fetch, globalThis.fetch, "raw global fetch is never used");
+  });
+
+  test("buildModel resolves a baseUrlEntry credential against the plugin's allowlisted baseUrls", async (t) => {
+    const dir = await makeTempDir(t);
+    // Two allowlisted base-URL instances for the same host; the client picks
+    // one by id (the server-side allowlist is the only endpoint authority).
+    const provider = openRouterPlugin();
+    provider.baseUrls = [
+      { id: "default", url: "https://openrouter.ai/api/v1", label: "Default" },
+      { id: "alt", url: "https://openrouter.ai/api/v2", label: "Alt" },
+    ];
+    const store = new PluginStore({
+      storePath: join(dir, "plugins.json"),
+      trustedHosts: [],
+      builtinPlugins: [provider, toolPlugin()],
+      manifests: [],
+      lookup: fakeLookup(),
+    });
+    await store.load();
+    const model = buildModel({
+      registry: new PluginRegistry(store),
+      pluginStore: store,
+      modelPluginId: "openrouter",
+      credentials: { apiKey: "sk-test", baseUrlEntry: "alt" },
+    });
+    const clientConfig = (
+      model as unknown as { clientConfig: { baseURL?: string } }
+    ).clientConfig;
+    assert.equal(clientConfig.baseURL, "https://openrouter.ai/api/v2");
+  });
+
+  test("buildModel with an unknown baseUrlEntry id falls back to plugin.inference.endpoint", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, registry } = await makeEnv(dir);
+    // A stale client selection (rotated allowlist) must never fail the build
+    // and must never accept the raw value as a URL.
+    const model = buildModel({
+      registry,
+      pluginStore: store,
+      modelPluginId: "openrouter",
+      credentials: { apiKey: "sk-test", baseUrlEntry: "stale-id" },
+    });
+    const clientConfig = (
+      model as unknown as { clientConfig: { baseURL?: string } }
+    ).clientConfig;
+    assert.equal(clientConfig.baseURL, "https://openrouter.ai/api/v1");
+  });
+
+  test("buildModel with a blank baseUrlEntry falls back to plugin.inference.endpoint", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, registry } = await makeEnv(dir);
+    const model = buildModel({
+      registry,
+      pluginStore: store,
+      modelPluginId: "openrouter",
+      credentials: { apiKey: "sk-test", baseUrlEntry: "   " },
+    });
+    const clientConfig = (
+      model as unknown as { clientConfig: { baseURL?: string } }
+    ).clientConfig;
+    assert.equal(clientConfig.baseURL, "https://openrouter.ai/api/v1");
   });
 
   test("M5: a real model.invoke actually invokes the validatedFetch-backed custom fetch (the SSRF seam is live)", async (t) => {
@@ -2256,6 +2722,62 @@ describe("transport integration regressions", () => {
     assert.ok(contents.includes("new turn"));
     assert.equal(contents.includes("stale history"), false);
     assert.equal(contents.includes("stale reply"), false);
+  });
+
+  test("background inputFactory re-reads after a false admission snapshot: a mapping row created by a concurrent writer between admission and inputFactory yields a recreated turn, not a stale seed", async (t) => {
+    // The admission-time snapshot (getThread call 1) and the pre-admission
+    // validation re-read (call 2) both miss; the mapping row materialises only
+    // by the time the deferred inputFactory computes the seed (call 3+),
+    // mimicking a concurrent same-thread writer racing admission.
+    let reads = 0;
+    const checkpointStore: CheckpointStore = {
+      checkpointer: new MemorySaver(),
+      async close() {},
+      touchThread() {},
+      getThread(threadId) {
+        reads++;
+        if (reads < 3) return undefined;
+        return { threadId, publicId: null, owner: "test-user", createdAt: 0, updatedAt: 0, lastError: null };
+      },
+      listThreads: () => [],
+      deleteThread: () => false,
+      deleteThreadsForOwner: () => 0,
+    };
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([
+      { status: "succeeded", taskId: "task-1", threadId: "thr-1" },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+    });
+    // Single user turn: no client history — a "recreated" (known) thread with a
+    // missing checkpoint must force the reseed round-trip (reseed_required)
+    // rather than silently seed.
+    const res = await postChat(app, chatBody({
+      background: true, messageId: "mapping-race", thread_id: "mapping-race",
+      messages: [{ role: "user", content: "hello" }],
+    }));
+    assert.equal(res.status, 200, "admission validation saw no mapping and seeded");
+    const d = fake.calls[0]!;
+    const seedContext = {
+      graph: {} as never,
+      threadId: checkpointThreadId("test-user", "mapping-race"),
+      isReplay: false,
+      signal: new AbortController().signal,
+    };
+    // The stale `false` snapshot must NOT suppress the live re-read: now that
+    // the concurrent writer's mapping row exists, the turn is recreated
+    // (reseed_required), never a fresh seed.
+    await assert.rejects(
+      async () => d.inputFactory!(seedContext),
+      { name: "ReseedRequiredError" },
+      "known thread with no checkpoint and no client history forces reseed_required",
+    );
+    assert.equal(reads, 3, "snapshot + validation + one inputFactory live read");
   });
 
   test("duplicate and rejected admissions release only their exact pins", async (t) => {

@@ -1,6 +1,53 @@
+import 'dart:convert';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../../../core/secure_storage.dart';
+
+String? normalizeBackendOrigin(String? value) {
+  final uri = Uri.tryParse(value?.trim() ?? '');
+  if (uri == null ||
+      !const {'http', 'https'}.contains(uri.scheme) ||
+      uri.host.isEmpty ||
+      uri.userInfo.isNotEmpty ||
+      uri.hasQuery ||
+      uri.hasFragment ||
+      uri.port <= 0 ||
+      uri.port > 65535) {
+    return null;
+  }
+  return uri.origin;
+}
+
+class AuthAccountScope {
+  AuthAccountScope._(this.backendOrigin, this.ownerId);
+
+  static AuthAccountScope? fromIdentity({
+    required String? backendOrigin,
+    required String? ownerId,
+  }) {
+    final origin = normalizeBackendOrigin(backendOrigin);
+    if (origin == null || ownerId == null || ownerId.trim().isEmpty) {
+      return null;
+    }
+    return AuthAccountScope._(origin, ownerId);
+  }
+
+  final String backendOrigin;
+  final String ownerId;
+
+  String get storageId =>
+      base64Url.encode(utf8.encode(jsonEncode([backendOrigin, ownerId])));
+
+  @override
+  bool operator ==(Object other) =>
+      other is AuthAccountScope &&
+      other.backendOrigin == backendOrigin &&
+      other.ownerId == ownerId;
+
+  @override
+  int get hashCode => Object.hash(backendOrigin, ownerId);
+}
 
 /// Persisted authentication credentials for the app.
 ///
@@ -15,6 +62,8 @@ class AuthCredentials {
     this.email,
     this.keyId,
     this.sessionToken,
+    this.ownerId,
+    this.backendOrigin,
   });
 
   /// The full API key string. Stored exactly as returned by the mint endpoint
@@ -31,6 +80,13 @@ class AuthCredentials {
   /// The better-auth session token used to mint [apiKey], when kept. Lets the
   /// app revoke the key or sign out the session on the server later.
   final String? sessionToken;
+  final String? ownerId;
+  final String? backendOrigin;
+
+  AuthAccountScope? get accountScope => AuthAccountScope.fromIdentity(
+    backendOrigin: backendOrigin,
+    ownerId: ownerId,
+  );
 
   @override
   bool operator ==(Object other) =>
@@ -38,10 +94,13 @@ class AuthCredentials {
       other.apiKey == apiKey &&
       other.email == email &&
       other.keyId == keyId &&
-      other.sessionToken == sessionToken;
+      other.sessionToken == sessionToken &&
+      other.ownerId == ownerId &&
+      other.backendOrigin == backendOrigin;
 
   @override
-  int get hashCode => Object.hash(apiKey, email, keyId, sessionToken);
+  int get hashCode =>
+      Object.hash(apiKey, email, keyId, sessionToken, ownerId, backendOrigin);
 }
 
 /// Persistence for [AuthCredentials].
@@ -63,12 +122,14 @@ class SecureAuthCredentialsStore implements AuthCredentialsStore {
   /// is used whose iOS keychain items are scoped to this device
   /// (`first_unlock_this_device`) so they never sync across devices.
   SecureAuthCredentialsStore({FlutterSecureStorage? storage})
-      : _storage = storage ?? defaultSecureStorage();
+    : _storage = storage ?? defaultSecureStorage();
 
   static const _kApiKey = 'auth_api_key';
   static const _kEmail = 'auth_email';
   static const _kKeyId = 'auth_key_id';
   static const _kSessionToken = 'auth_session_token';
+  static const _kOwnerId = 'auth_owner_id';
+  static const _kBackendOrigin = 'auth_backend_origin';
 
   final FlutterSecureStorage _storage;
 
@@ -81,7 +142,11 @@ class SecureAuthCredentialsStore implements AuthCredentialsStore {
     final email = await _storage.read(key: _kEmail);
     final keyId = await _storage.read(key: _kKeyId);
     final sessionToken = await _storage.read(key: _kSessionToken);
+    final ownerId = await _storage.read(key: _kOwnerId);
+    final backendOrigin = await _storage.read(key: _kBackendOrigin);
     return AuthCredentials(
+      ownerId: ownerId == null || ownerId.trim().isEmpty ? null : ownerId,
+      backendOrigin: normalizeBackendOrigin(backendOrigin),
       apiKey: apiKey,
       email: email == null || email.trim().isEmpty ? null : email,
       keyId: keyId == null || keyId.trim().isEmpty ? null : keyId,
@@ -93,11 +158,21 @@ class SecureAuthCredentialsStore implements AuthCredentialsStore {
 
   @override
   Future<void> save(AuthCredentials credentials) async {
+    await _storage.delete(key: _kOwnerId);
+    await _storage.delete(key: _kBackendOrigin);
     // The key must be stored exactly as returned; never trim it.
     await _storage.write(key: _kApiKey, value: credentials.apiKey);
     await _writeTrimmedOrDelete(_kEmail, credentials.email);
     await _writeTrimmedOrDelete(_kKeyId, credentials.keyId);
     await _writeTrimmedOrDelete(_kSessionToken, credentials.sessionToken);
+    final origin = normalizeBackendOrigin(credentials.backendOrigin);
+    if (origin != null) {
+      await _storage.write(key: _kBackendOrigin, value: origin);
+    }
+    final ownerId = credentials.ownerId;
+    if (ownerId != null && ownerId.trim().isNotEmpty) {
+      await _storage.write(key: _kOwnerId, value: ownerId);
+    }
   }
 
   /// Writes [value] under [key] when non-blank, otherwise removes the stored
@@ -113,6 +188,8 @@ class SecureAuthCredentialsStore implements AuthCredentialsStore {
 
   @override
   Future<void> clear() async {
+    await _storage.delete(key: _kOwnerId);
+    await _storage.delete(key: _kBackendOrigin);
     await _storage.delete(key: _kApiKey);
     await _storage.delete(key: _kEmail);
     await _storage.delete(key: _kKeyId);

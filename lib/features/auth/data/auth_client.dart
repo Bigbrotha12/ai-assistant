@@ -1,10 +1,19 @@
 import 'package:dio/dio.dart';
 
 import '../../../core/http/dio_errors.dart';
+import 'auth_credentials_store.dart';
 
 /// A successful email sign-up/sign-in result from the backend.
 class AuthSession {
-  const AuthSession({required this.token, required this.email});
+  const AuthSession({
+    required this.token,
+    required this.email,
+    this.ownerId,
+    this.backendOrigin,
+  });
+
+  final String? ownerId;
+  final String? backendOrigin;
 
   /// The session token (better-auth `token` field). Sent as
   /// `Authorization: Bearer <token>` on authenticated endpoints.
@@ -77,10 +86,7 @@ abstract interface class AuthClient {
   });
 
   /// Signs in an existing account and returns an authenticated session.
-  Future<AuthSession> signIn({
-    required String email,
-    required String password,
-  });
+  Future<AuthSession> signIn({required String email, required String password});
 
   /// Signs out, revoking [sessionToken] on the server.
   Future<void> signOut({required String sessionToken});
@@ -108,8 +114,7 @@ abstract interface class AuthClient {
 ///   - `POST /api/auth/api-key/create` (bearer session token)
 ///   - `POST /api/auth/api-key/delete` (bearer session token; body {keyId})
 class BetterAuthClient implements AuthClient {
-  BetterAuthClient({required this.baseUrl, Dio? dio})
-      : _dio = dio ?? Dio();
+  BetterAuthClient({required this.baseUrl, Dio? dio}) : _dio = dio ?? Dio();
 
   /// The auth base URL, e.g. `http://192.168.1.5:17600` (the gateway origin;
   /// it hosts account services only — inference never routes here). No
@@ -225,12 +230,14 @@ class BetterAuthClient implements AuthClient {
     if (token is! String || token.isEmpty) {
       throw const AuthServerError('malformed sign-in response');
     }
-    final email = data?['user'] is Map<String, dynamic>
-        ? (data!['user'] as Map<String, dynamic>)['email']
-        : data?['email'];
+    final user = data?['user'];
+    final email = user is Map<String, dynamic> ? user['email'] : data?['email'];
+    final ownerId = user is Map<String, dynamic> ? user['id'] : null;
     return AuthSession(
       token: token,
       email: email is String ? email : '',
+      ownerId: ownerId is String && ownerId.trim().isNotEmpty ? ownerId : null,
+      backendOrigin: normalizeBackendOrigin(baseUrl),
     );
   }
 
