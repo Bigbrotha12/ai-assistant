@@ -64,6 +64,7 @@ export type PluginSummary = {
     maxTokens?: number;
     visionCapable: boolean;
     skillCount: number;
+    mcpServers?: { name: string }[];
   };
 };
 
@@ -253,6 +254,9 @@ function summarizePlugin(plugin: PluginDefinition, installed: boolean): PluginSu
       visionCapable: plugin.inference?.visionCapable ?? false,
       skillCount: plugin.skills?.length ?? 0,
     };
+    if (plugin.mcpServers) {
+      summary.agent!.mcpServers = plugin.mcpServers.map((s) => ({ name: s.name }));
+    }
   }
   return summary;
 }

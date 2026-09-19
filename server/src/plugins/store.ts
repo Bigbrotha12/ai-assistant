@@ -10,6 +10,7 @@ import {
 import { dirname } from "node:path";
 import {
   CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
+  isAgentPlugin,
   isModelPlugin,
   isToolPlugin,
   pluginDefinitionSchema,
@@ -23,11 +24,17 @@ import type {
   ToolPluginDefinition,
 } from "./types.ts";
 import {
-  resolveAndValidateHost,
+  NODE_ENV,
   SsrfValidationError,
+  resolveAndValidateHost,
   validateStaticUrl,
 } from "./ssrf.ts";
-import type { LookupFn } from "./ssrf.ts";
+import type { LookupFn, Mode } from "./ssrf.ts";
+
+const HEADER_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+const DANGEROUS_HEADERS = new Set([
+  'content-type', 'accept', 'host', 'transfer-encoding', 'connection', 'cookie', 'set-cookie',
+]);
 
 /**
  * `PluginStore` persists which tool-plugin manifests an admin has installed
@@ -96,6 +103,11 @@ export type PluginStoreOptions = {
    * `node:dns/promises`; tests inject a mapping so no network is needed.
    */
   lookup?: LookupFn;
+  /**
+   * Override NODE_ENV for SSRF validation. Defaults to the process NODE_ENV.
+   * Pass "production" to enforce https-only at validation time.
+   */
+  mode?: Mode;
 };
 
 function emptyStore(): PluginStoreConfig {
@@ -120,6 +132,7 @@ export class PluginStore {
   private readonly builtinPlugins: readonly PluginDefinition[];
   private readonly manifests: readonly ToolPluginDefinition[];
   private readonly lookup?: LookupFn;
+  private readonly mode: Mode;
   /**
    * Validated, pinned IPs per plugin, populated whenever a plugin's URLs pass
    * SSRF validation (install and store load/reload). Phase 2/3 outbound-call
@@ -137,6 +150,7 @@ export class PluginStore {
     this.builtinPlugins = opts.builtinPlugins;
     this.manifests = opts.manifests;
     this.lookup = opts.lookup;
+    this.mode = opts.mode ?? NODE_ENV;
     this.assertUniqueIds();
   }
 
@@ -304,6 +318,8 @@ export class PluginStore {
 
     const validated = await this.validateAllowedUrls(manifest);
 
+    const mcpValidated = await this.validateMcpUrls(manifest);
+
     // Re-validate against the plugin schema so unknown keys — including any
     // smuggled credential VALUES — are stripped before the definition reaches
     // disk or memory.
@@ -318,6 +334,9 @@ export class PluginStore {
     }
     this.config!.plugins.push(definition);
     this.pinnedUrls.set(manifest.id, validated);
+    for (const entry of mcpValidated) {
+      this.pinnedUrls.set(`${manifest.id}:${entry.entryId}`, [entry]);
+    }
     await this.save();
   }
 
@@ -343,6 +362,11 @@ export class PluginStore {
     }
     this.config!.plugins.splice(index, 1);
     this.pinnedUrls.delete(pluginId);
+    for (const key of this.pinnedUrls.keys()) {
+      if (key.startsWith(`${pluginId}:mcp:`)) {
+        this.pinnedUrls.delete(key);
+      }
+    }
     await this.save();
   }
 
@@ -388,6 +412,56 @@ export class PluginStore {
     return entries;
   }
 
+  private mcpEntries(plugin: PluginDefinition): Array<{ id: string; url: string }> {
+    if (!isAgentPlugin(plugin)) return [];
+    return (plugin.mcpServers ?? []).map((server) => ({
+      id: `mcp:${server.name}`,
+      url: server.url,
+    }));
+  }
+
+  private async validateMcpUrls(
+    plugin: PluginDefinition,
+  ): Promise<Array<{ entryId: string; url: string; pinned: string[] }>> {
+    if (!isAgentPlugin(plugin)) return [];
+    const servers = plugin.mcpServers ?? [];
+    for (const server of servers) {
+      if (server.headers) {
+        this.validateMcpHeaders(plugin.id, server.name, server.headers);
+      }
+    }
+    return this.validateUrlEntries(plugin.id, this.mcpEntries(plugin), "MCP server URLs");
+  }
+
+  private validateMcpHeaders(
+    pluginId: string,
+    serverName: string,
+    headers: Record<string, string>,
+  ): void {
+    for (const name of Object.keys(headers)) {
+      if (name === "") {
+        throw new PluginStoreError(
+          "SSRF_REJECTED",
+          `plugin '${pluginId}' MCP server '${serverName}' has an empty header name`,
+        );
+      }
+      if (!HEADER_NAME_RE.test(name)) {
+        throw new PluginStoreError(
+          "SSRF_REJECTED",
+          `plugin '${pluginId}' MCP server '${serverName}' header '${name}' contains invalid characters; ` +
+            "header names may only contain a-z, A-Z, 0-9, underscore, and hyphen",
+        );
+      }
+      if (DANGEROUS_HEADERS.has(name.toLowerCase())) {
+        throw new PluginStoreError(
+          "SSRF_REJECTED",
+          `plugin '${pluginId}' MCP server '${serverName}' header '${name}' is a known-dangerous override ` +
+            "and is rejected",
+        );
+      }
+    }
+  }
+
   /**
    * Install-time SSRF gate: every allowlisted URL is statically + DNS-validated.
    * Returns per-entry pinned IPs (never discarded — it is the only place that
@@ -410,12 +484,13 @@ export class PluginStore {
   private async validateUrlEntries(
     pluginId: string,
     entries: Array<{ id: string; url: string }>,
+    context: string = "baseUrls",
   ): Promise<Array<{ entryId: string; url: string; pinned: string[] }>> {
     const failures: string[] = [];
     const validated: Array<{ entryId: string; url: string; pinned: string[] }> = [];
     for (const entry of entries) {
       try {
-        validateStaticUrl(entry.url, { trustedHosts: this.trustedHosts });
+        validateStaticUrl(entry.url, { trustedHosts: this.trustedHosts, mode: this.mode });
         const { hostname } = new URL(entry.url);
         const pinned = await resolveAndValidateHost(hostname, {
           trustedHosts: this.trustedHosts,
@@ -433,7 +508,7 @@ export class PluginStore {
     if (failures.length > 0) {
       throw new PluginStoreError(
         "SSRF_REJECTED",
-        `plugin '${pluginId}' baseUrls are not SSRF-safe under the configured trusted hosts:\n${failures.join("\n")}\n` +
+        `plugin '${pluginId}' ${context} are not SSRF-safe under the configured trusted hosts:\n${failures.join("\n")}\n` +
           `list any legitimately-internal hosts in PLUGINS_TRUSTED_HOSTS`,
       );
     }
@@ -454,6 +529,10 @@ export class PluginStore {
       try {
         const validated = await this.validateUrlEntries(plugin.id, this.urlEntries(plugin));
         this.pinnedUrls.set(plugin.id, validated);
+        const mcpValidated = await this.validateMcpUrls(plugin);
+        for (const entry of mcpValidated) {
+          this.pinnedUrls.set(`${plugin.id}:${entry.entryId}`, [entry]);
+        }
       } catch (err) {
         if (err instanceof PluginStoreError && err.code === "SSRF_REJECTED") {
           failures.push(`  ${err.message}`);
@@ -482,6 +561,13 @@ export class PluginStore {
     pluginId: string,
   ): Array<{ entryId: string; url: string; pinned: string[] }> | undefined {
     return this.pinnedUrls.get(pluginId);
+  }
+
+  hasMcpPins(pluginId: string): boolean {
+    for (const key of this.pinnedUrls.keys()) {
+      if (key.startsWith(`${pluginId}:mcp:`)) return true;
+    }
+    return false;
   }
 
   /**

@@ -134,6 +134,11 @@ export const agentPluginDefinitionSchema = z.object({
     }).optional(),
     baseUrls: z.array(baseUrlAllowlistEntrySchema).optional(),
     credentials: credentialSpecSchema.optional(),
+    mcpServers: z.array(z.object({
+      name: pluginIdSchema,
+      url: z.string().url("must be an absolute URL"),
+      headers: z.record(z.string(), z.string()).optional(),
+    })).optional(),
   });
 
 export const pluginDefinitionSchema = z.discriminatedUnion("type", [
@@ -242,6 +247,7 @@ export interface AgentPluginDefinition extends PluginDefinition {
   inference?: { temperature?: number; maxTokens?: number; visionCapable: boolean };
   baseUrls?: BaseUrlAllowlistEntry[];
   credentials?: CredentialSpec;
+  mcpServers?: { name: string; url: string; headers?: Record<string, string> }[];
 }
 
 export interface ToolDefinition {

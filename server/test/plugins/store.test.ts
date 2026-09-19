@@ -11,6 +11,7 @@ import {
   PluginSchemaError,
 } from "../../src/plugins/types.ts";
 import type {
+  AgentPluginDefinition,
   ModelPluginDefinition,
   PluginStoreConfig,
   ToolPluginDefinition,
@@ -81,11 +82,28 @@ function mealieManifest(): ToolPluginDefinition {
   };
 }
 
+function agentManifest(
+  overrides: Partial<AgentPluginDefinition> = {},
+): AgentPluginDefinition {
+  return {
+    id: "custom-agent",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "agent",
+    name: "Custom Agent",
+    description: "A custom agent plugin",
+    systemPrompt: "You are a helpful assistant",
+    ...overrides,
+  };
+}
+
 const DNS: Record<string, LookupAddress[]> = {
   "vikunja.example.com": [{ address: "1.1.1.1", family: 4 }],
   "mealie.example.com": [{ address: "1.1.1.1", family: 4 }],
   "openrouter.ai": [{ address: "1.1.1.1", family: 4 }],
   "vikunja.local": [{ address: "10.0.0.5", family: 4 }],
+  "mcp.example.com": [{ address: "1.1.1.1", family: 4 }],
+  "mcp-private.local": [{ address: "10.0.0.5", family: 4 }],
 };
 
 function fakeLookup(
@@ -110,6 +128,7 @@ async function makeStore(
     builtinPlugins: readonly ModelPluginDefinition[];
     manifests: readonly ToolPluginDefinition[];
     lookup: LookupFn;
+    mode: "production" | "development" | "test";
   }> = {},
 ): Promise<{ store: PluginStore; storePath: string }> {
   const storePath = join(dir, "plugins.json");
@@ -119,6 +138,7 @@ async function makeStore(
     builtinPlugins: opts.builtinPlugins ?? [openRouterBuiltin()],
     manifests: opts.manifests ?? [vikunjaManifest(), mealieManifest()],
     lookup: opts.lookup ?? fakeLookup(),
+    mode: opts.mode,
   });
   await store.load();
   return { store, storePath };
@@ -545,6 +565,161 @@ describe("PluginStore pinned-IP retention (Fix 1)", () => {
 
     await store.uninstall("vikunja");
     assert.equal(store.getPinnedIps("vikunja"), undefined);
+  });
+});
+
+describe("PluginStore MCP server SSRF validation", () => {
+  test("installing an agent plugin with valid mcpServers passes", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [agentManifest({
+        mcpServers: [{ name: "mcp-public", url: "https://mcp.example.com" }],
+      }) as unknown as ToolPluginDefinition],
+    });
+    await store.install("custom-agent");
+    assert.ok(store.getPlugin("custom-agent"));
+    const pin = store.getPinnedIps("custom-agent:mcp:mcp-public");
+    assert.ok(pin, "MCP pin must be retained");
+    assert.deepEqual(pin, [
+      { entryId: "mcp:mcp-public", url: "https://mcp.example.com", pinned: ["1.1.1.1"] },
+    ]);
+  });
+
+  test("MCP URL pointing to a private IP is rejected", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [agentManifest({
+        mcpServers: [{ name: "mcp-private", url: "http://mcp-private.local" }],
+      }) as unknown as ToolPluginDefinition],
+    });
+    await assert.rejects(
+      store.install("custom-agent"),
+      (e: unknown) =>
+        e instanceof PluginStoreError && e.code === "SSRF_REJECTED",
+    );
+    assert.equal(store.getPlugin("custom-agent"), undefined);
+  });
+
+  test("http: MCP URL is rejected in production mode", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [agentManifest({
+        mcpServers: [{ name: "mcp-http", url: "http://mcp.example.com" }],
+      }) as unknown as ToolPluginDefinition],
+      mode: "production",
+    });
+    await assert.rejects(
+      store.install("custom-agent"),
+      (e: unknown) =>
+        e instanceof PluginStoreError && e.code === "SSRF_REJECTED",
+    );
+    assert.equal(store.getPlugin("custom-agent"), undefined);
+  });
+
+  test("reload() re-validates MCP URLs same as baseUrls", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir, {
+      manifests: [agentManifest({
+        mcpServers: [{ name: "mcp-public", url: "https://mcp.example.com" }],
+      }) as unknown as ToolPluginDefinition],
+    });
+    await store.install("custom-agent");
+    assert.ok(store.getPlugin("custom-agent"));
+
+    // Hand-edit the store with a bad MCP URL
+    await writeFile(
+      storePath,
+      JSON.stringify({
+        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
+        plugins: [agentManifest({
+          mcpServers: [{ name: "mcp-private", url: "http://10.0.0.5" }],
+        })],
+      } satisfies PluginStoreConfig),
+      "utf8",
+    );
+    await assert.rejects(
+      store.reload(),
+      (e: unknown) =>
+        e instanceof PluginStoreError && e.code === "SSRF_REJECTED",
+    );
+    // Last known-good config stays in force
+    assert.ok(store.getPlugin("custom-agent"));
+  });
+
+  test("no mcpServers triggers no MCP validation", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [agentManifest() as unknown as ToolPluginDefinition],
+    });
+    await store.install("custom-agent");
+    assert.ok(store.getPlugin("custom-agent"));
+    // No MCP pins should exist
+    assert.equal(store.hasMcpPins("custom-agent"), false);
+  });
+});
+
+describe("PluginStore MCP header validation", () => {
+  function headerManifest(headers: Record<string, string> | undefined): ToolPluginDefinition {
+    return agentManifest({
+      mcpServers: [{ name: "mcp-hdrs", url: "https://mcp.example.com", headers }],
+    }) as unknown as ToolPluginDefinition;
+  }
+
+  test("valid header name 'X-Api-Key' is allowed", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [headerManifest({ "X-Api-Key": "test123" })],
+    });
+    await store.install("custom-agent");
+    assert.ok(store.getPlugin("custom-agent"));
+  });
+
+  test("header name with colon 'Bad:Header' is rejected", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [headerManifest({ "Bad:Header": "val" })],
+    });
+    await assert.rejects(
+      store.install("custom-agent"),
+      (e: unknown) =>
+        e instanceof PluginStoreError && e.code === "SSRF_REJECTED" && e.message.includes("invalid characters"),
+    );
+    assert.equal(store.getPlugin("custom-agent"), undefined);
+  });
+
+  test("header name 'Content-Type' is rejected (dangerous override)", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [headerManifest({ "Content-Type": "text/plain" })],
+    });
+    await assert.rejects(
+      store.install("custom-agent"),
+      (e: unknown) =>
+        e instanceof PluginStoreError && e.code === "SSRF_REJECTED" && e.message.includes("dangerous override"),
+    );
+    assert.equal(store.getPlugin("custom-agent"), undefined);
+  });
+
+  test("empty header name '' is rejected", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [headerManifest({ "": "val" })],
+    });
+    await assert.rejects(
+      store.install("custom-agent"),
+      (e: unknown) =>
+        e instanceof PluginStoreError && e.code === "SSRF_REJECTED" && e.message.includes("empty header name"),
+    );
+    assert.equal(store.getPlugin("custom-agent"), undefined);
+  });
+
+  test("no headers passes validation (no-op)", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir, {
+      manifests: [headerManifest(undefined)],
+    });
+    await store.install("custom-agent");
+    assert.ok(store.getPlugin("custom-agent"));
   });
 });
 

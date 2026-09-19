@@ -8,9 +8,11 @@ import {
 } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { DynamicStructuredTool } from "@langchain/core/tools";
 
 import { requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
+import { bindMcpServers } from "../agents/mcp.ts";
 import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
@@ -41,6 +43,7 @@ import type { PluginRegistry } from "../plugins/registry.ts";
 import { PluginStoreError } from "../plugins/store.ts";
 import type { PluginStore } from "../plugins/store.ts";
 import { isAgentPlugin, isModelPlugin, isToolPlugin } from "../plugins/types.ts";
+import { composeAgentPrompt } from "../agents/skills.ts";
 import type { AgentPluginDefinition, ModelPluginDefinition } from "../plugins/types.ts";
 import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
@@ -432,6 +435,7 @@ type ResolvedChat = {
     systemPrompt: string;
     toolGrants?: { pluginId: string; required: boolean }[];
     inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
+    mcpServers?: { name: string; url: string; headers?: Record<string, string> }[];
   };
 };
 
@@ -684,9 +688,10 @@ function resolveChatRequest(
     }
 
     agentOverride = {
-      systemPrompt: agentPlugin.systemPrompt,
+      systemPrompt: composeAgentPrompt(agentPlugin.systemPrompt, agentPlugin.skills),
       toolGrants: agentPlugin.tools,
       inference: agentPlugin.inference,
+      mcpServers: agentPlugin.mcpServers,
     };
   }
 
@@ -806,7 +811,7 @@ async function handleSyncStream(
   });
   const execution = createStreamExecution(c.req.raw.signal);
   trackModelExecution(model, execution);
-  const tools = bindPluginTools(opts.registry, {
+  const pluginTools = bindPluginTools(opts.registry, {
     async execute(pluginId, toolName, args) {
       execution.signal.throwIfAborted();
       return execution.track(async () => {
@@ -822,6 +827,25 @@ async function handleSyncStream(
       });
     },
   }, resolved.value.enabledPlugins);
+  const mcpTools = resolved.value.agentOverride?.mcpServers
+    ? await bindMcpServers(resolved.value.agentOverride.mcpServers, undefined, {
+        signal: execution.signal,
+        trustedHosts: opts.trustedHosts,
+      })
+    : [];
+  const allTools: DynamicStructuredTool[] = [];
+  const seen = new Set<string>();
+  for (const t of [...pluginTools, ...mcpTools]) {
+    if (seen.has(t.name)) {
+      if (mcpTools.includes(t)) {
+        console.warn(`[chat] tool '${t.name}' defined by both a plugin and an MCP server; skipping MCP version`);
+      }
+      continue;
+    }
+    seen.add(t.name);
+    allTools.push(t);
+  }
+  const tools = allTools;
   const base = createAgentGraph({
     model,
     tools,
@@ -1318,6 +1342,7 @@ async function handleBackground(
         requestParameters,
       } satisfies JobModelRequestConfig,
       systemPrompt: resolved.value.agentOverride?.systemPrompt,
+      mcpServers: resolved.value.agentOverride?.mcpServers,
       pinHandles,
       inputFactory: async ({ threadId: lockedThreadId, signal }) => {
         signal.throwIfAborted();

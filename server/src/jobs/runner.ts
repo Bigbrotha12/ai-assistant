@@ -4,6 +4,7 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import type { BaseCheckpointSaver, CompiledStateGraph } from "@langchain/langgraph";
 import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
+import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
 import { jsonSchemaToZod } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { checkpointThreadId, redactForCheckpoint } from "../checkpoints/store.ts";
@@ -324,6 +325,8 @@ export type JobDescriptor = {
    * replay regardless of this flag.
    */
   isReplay?: boolean;
+  /** MCP server configurations bound alongside plugin tools (agent override). */
+  mcpServers?: McpServerConfig[];
 };
 
 export type RunJobResult =
@@ -922,10 +925,28 @@ export class JobRunner {
         fenceToken,
         allowMutatingRetry: !replaying,
       });
+      const mcpTools = descriptor.mcpServers
+        ? await bindMcpServers(descriptor.mcpServers, undefined, {
+            signal,
+            trustedHosts: this.deps.trustedHosts,
+          })
+        : [];
+      const allTools: DynamicStructuredTool[] = [];
+      const seen = new Set<string>();
+      for (const t of [...tools, ...mcpTools]) {
+        if (seen.has(t.name)) {
+          if (mcpTools.includes(t)) {
+            console.warn(`[jobs] tool '${t.name}' defined by both a plugin and an MCP server; skipping MCP version`);
+          }
+          continue;
+        }
+        seen.add(t.name);
+        allTools.push(t);
+      }
       const graph = compileGraphWithCheckpointer(
         createAgentGraph({
           model,
-          tools,
+          tools: allTools,
           systemPrompt: descriptor.systemPrompt,
           beforeModelCall,
           prepareMessages: this.deps.contextManager?.prepareMessages,
