@@ -14,6 +14,7 @@ import '../data/pcm_analysis.dart';
 import '../data/screen_wake_lock.dart';
 import '../data/sentence_splitter.dart';
 import '../data/speech_text_filter.dart';
+import '../data/speech_text_normalizer.dart';
 import '../data/stt_engine.dart';
 import '../data/tts_engine.dart';
 
@@ -188,6 +189,11 @@ final class VoiceController {
   /// cut one utterance's audio with the next.
   Future<void> _turnTail = Future.value();
 
+  /// Serialises wake-lock mutation so an `enable()` racing a `disable()`
+  /// (e.g. [startConversation] concurrent with [enterBackground]) cannot leave
+  /// the device on while backgrounded or asleep while connected.
+  Future<void> _wakeLockTail = Future.value();
+
   /// Bumped on teardown ([endConversation] / [dispose]) and on interrupt
   /// ([interrupt]); queued turns check their captured epoch at each stage and
   /// bail when it moved on.
@@ -253,6 +259,14 @@ final class VoiceController {
   /// the interjection-still-playing instrumentation.
   DateTime? _lastInterjectionAt;
 
+  /// True between [enterBackground] and [exitBackground]: the app is not
+  /// visible, so the speak queue holds its utterances instead of playing them
+  /// and no new playback starts. The in-flight LLM turn is NOT cancelled —
+  /// its reply completes in the background and queues for [exitBackground] to
+  /// speak. Recording/playback/focus teardown still happens ([enterBackground]),
+  /// so nothing leaks audio while the app is hidden.
+  bool _isBackgrounded = false;
+
   VoiceConversationState _state = VoiceConversationState.initial();
   final StreamController<VoiceConversationState> _stateController =
       StreamController<VoiceConversationState>.broadcast();
@@ -276,7 +290,7 @@ final class VoiceController {
     // Keep the screen on for the conversation's lifetime so a long LLM wait
     // or TTS reply cannot let the idle timer blank the display (finishing the
     // speech has no background-audio permission).
-    await screenWakeLock?.enable();
+    await _setWakeLock(true);
   }
 
   /// Ends the current conversation session and deactivates the mic.
@@ -310,7 +324,90 @@ final class VoiceController {
     clearTurnFields();
     _update(_state.copyWith(isConnected: false, isAiSpeaking: false, isSpeaking: false, status: null));
     // Conversation over: let the screen fall asleep again.
-    await screenWakeLock?.disable();
+    await _setWakeLock(false);
+  }
+
+  /// Whether the app is currently suspended in the background —
+  /// [enterBackground] ran without a matching [exitBackground].
+  bool get isBackgrounded => _isBackgrounded;
+
+  /// Suspends the conversation when the app moves to the background WITHOUT
+  /// cancelling the in-flight LLM turn: mic, playback, and the wake lock are
+  /// released so nothing leaks while the app is not visible, but the stream
+  /// keeps running. Completed sentences accumulate in the speak queue and the
+  /// final reply fires [onTranscript] as usual; the queued audio waits for
+  /// [exitBackground] to be spoken. Idempotent.
+  ///
+  /// Each leg re-checks [_isBackgrounded]: the pipeline's lifecycle tail
+  /// bounds this transition, so a straggling continuation can resume AFTER a
+  /// foreground already ran [exitBackground]. A destructive step (stopping
+  /// playback, dropping the wake lock) must never land on a resumed session —
+  /// it would truncate the reply the resumed drain is streaming and leave the
+  /// screen asleep mid-conversation.
+  Future<void> enterBackground() async {
+    if (_disposed || _isBackgrounded) return;
+    _isBackgrounded = true;
+    if (_state.isRecording) {
+      await stopRecording();
+    }
+    if (!_isBackgrounded) return;
+    try {
+      await playback.stop();
+    } catch (_) {
+      // Best-effort stop.
+    }
+    if (!_isBackgrounded) return;
+    // Screen is off; a held wake lock must not keep the device above idle
+    // while backgrounded.
+    await _setWakeLock(false);
+  }
+
+  /// Resumes a backgrounded conversation: the queued reply (accumulated while
+  /// the app was not visible) starts playing — playback re-acquires audio
+  /// focus — and the wake lock is restored for the connected session.
+  /// Idempotent.
+  Future<void> exitBackground() async {
+    if (!_isBackgrounded) return;
+    _isBackgrounded = false;
+    // Restart the drain BEFORE any platform await: a hung wake-lock channel
+    // must not hold the queued reply hostage (a wedged resume would otherwise
+    // leave it unplayed until the next lifecycle event — and exitBackground is
+    // a no-op then, so it would be unplayed until the app restarts).
+    if (_speakQueue.isNotEmpty && _drainFuture == null) {
+      _drainEpoch = _turnEpoch;
+      _drainFuture = _drainSpeakQueue();
+    }
+    // Symmetric to enterBackground: a newer background that ran while this
+    // resume was suspended (straggling continuation past the tail's bound)
+    // must not have its teardown undone by a stale wake-lock enable.
+    if (_state.isConnected && !_isBackgrounded) {
+      await _setWakeLock(true);
+    }
+  }
+
+  /// Upper bound on a single wake-lock platform call. A hung disable must not
+  /// wedge the FIFO behind it and strand the screen off while connected (every
+  /// later mutation — the resume's enable, [dispose]'s disable — would queue
+  /// behind it forever). Mirrors the bounded-await convention used elsewhere
+  /// (cf. [interrupt]'s playback stop).
+  static const _wakeLockOpTimeout = Duration(seconds: 2);
+
+  /// Applies a wake-lock change behind the serialisation tail, so concurrent
+  /// callers (a tap racing a lifecycle transition) cannot interleave their
+  /// platform calls out of order. Each op is bounded so a hung platform call
+  /// advances the chain instead of wedging every later caller. Errors are
+  /// swallowed: keeping the screen on is best-effort and a platform failure
+  /// must never crash a lifecycle or teardown path.
+  Future<void> _setWakeLock(bool enabled) {
+    final action =
+        enabled ? screenWakeLock?.enable() : screenWakeLock?.disable();
+    if (action == null) return Future<void>.value();
+    final next = _wakeLockTail.then(
+      (_) => action.timeout(_wakeLockOpTimeout),
+    );
+    final safe = next.catchError((Object _) {});
+    _wakeLockTail = safe;
+    return safe;
   }
 
   /// Starts capturing microphone audio for on-device STT. No-op when already
@@ -698,6 +795,10 @@ final class VoiceController {
   /// one — the stale drain would drop the new sentences when it woke.
   void _enqueue(_SpeakItem item) {
     _speakQueue.add(item);
+    // While backgrounded the drain is suspended by design (the reply is held
+    // for the next foreground, see exitBackground); starting one here would
+    // immediately break and churn without consuming the queue.
+    if (_isBackgrounded) return;
     if (_drainFuture == null || _drainEpoch != _turnEpoch) {
       _drainEpoch = _turnEpoch;
       _drainFuture = _drainSpeakQueue();
@@ -717,7 +818,11 @@ final class VoiceController {
   /// empty (code blocks, stage directions) are skipped, matching the old
   /// whole-reply behaviour.
   void _enqueueText(String raw) {
-    final speakable = SpeechTextFilter.stripNonSpeechTags(raw).trim();
+    // Filter stage tags first, then normalise the remnants for speech (€5 →
+    // "5 euros", e.g. → "for example", emoji dropped). The transcript keeps
+    // the raw text; only the spoken audio is rewritten.
+    final speakable =
+        SpeechTextNormalizer.normalizeForSpeech(SpeechTextFilter.stripNonSpeechTags(raw)).trim();
     if (speakable.isEmpty) {
       if (kDebugMode) {
         debugPrint('VoiceController: sentence skipped (nothing speakable)');
@@ -857,6 +962,12 @@ final class VoiceController {
         // items synchronously; anything here belongs to a newer turn and is
         // the newer drain's business.
         if (epoch != _turnEpoch) break;
+        // The app is backgrounded: suspend WITHOUT consuming the queue. No
+        // playback may start on a hidden surface, and the sentences accumulate
+        // for [exitBackground], which restarts the drain and speaks them on
+        // resume. No epoch bump here — the in-flight turn keeps its identity
+        // so its reply still lands in this queue.
+        if (_isBackgrounded) break;
         // An OS interruption halts the queue WITHOUT consuming it: the rest
         // of the reply resumes after [resumeAfterInterruption] instead of
         // being lost.
@@ -922,6 +1033,14 @@ final class VoiceController {
           // Pre-built PCM item: a stale prefetch is meaningless.
           prefetchedItem = null;
           prefetchedPcm = null;
+        }
+        // The app backgrounded while this sentence was being synthesised:
+        // the loop-top break above cannot cover this window, and playback
+        // would re-acquire audio focus on a hidden surface. Requeue the
+        // utterance and break so it resumes on the next foreground.
+        if (_isBackgrounded) {
+          _speakQueue.insert(0, item);
+          break;
         }
         if (pcm == null || pcm.isEmpty) {
           item.result?.complete(const []);
@@ -1141,10 +1260,17 @@ final class VoiceController {
     // after the session ended, or from a disposed controller (isConnected
     // stays true after dispose — the flag is the only reliable guard).
     if (_disposed || _state.isPaused || !_state.isConnected) return const [];
+    // While backgrounded the queue drains are suspended and the utterance
+    // would never be spoken, so resolve immediately instead of hanging the
+    // caller on the item's completer until the next foreground.
+    if (_isBackgrounded) return const [];
     try {
       // LLM replies can carry stage directions ("(humming)",
-      // "[BLANK_AUDIO]"); the TTS engine must speak only real text.
-      final speakable = SpeechTextFilter.stripNonSpeechTags(text).trim();
+      // "[BLANK_AUDIO]"); the TTS engine must speak only real text. Symbols
+      // are normalised for speech the same way as queued reply sentences.
+      final speakable = SpeechTextNormalizer.normalizeForSpeech(
+        SpeechTextFilter.stripNonSpeechTags(text),
+      ).trim();
       if (speakable.isEmpty) {
         if (kDebugMode) {
           debugPrint('VoiceController: TTS skipped (nothing speakable)');
@@ -1314,6 +1440,6 @@ final class VoiceController {
     await playback.stop();
     // Release any held wake lock so a disposed controller never leaves the
     // screen forced on.
-    await screenWakeLock?.disable();
+    await _setWakeLock(false);
   }
 }

@@ -47,6 +47,24 @@ final voiceCapturePipelineProvider =
 class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
   static int _buildCount = 0;
 
+  /// Serialises lifecycle transitions in DISPATCH order. Background and
+  /// foreground events can fire back-to-back (a pause→resume flick), and each
+  /// handler awaits several platform calls before it takes effect; without a
+  /// tail a foreground arriving mid-background-teardown would run first, be
+  /// swallowed by the still-pending `enterBackground`, and strand the session
+  /// backgrounded while the app is visible. The last event to arrive must win.
+  Future<void> _lifecycleTail = Future.value();
+
+  /// Upper bound on a single lifecycle transition. Platform teardown calls
+  /// (mic stop, playback stop, focus, wake lock) are unguarded awaits; if one
+  /// hangs, the tail must keep advancing so the transition that wins is the
+  /// last event the OS dispatched — mirroring the codebase's convention of
+  /// bounding every platform await (cf. `interrupt()`). A straggler from the
+  /// timed-out transition cannot re-flip the flag afterwards: `enterBackground`
+  /// / `exitBackground` set `_isBackgrounded` synchronously at entry, before
+  /// any platform await, so they are never re-entered by a stale continuation.
+  static const _lifecycleTransitionTimeout = Duration(seconds: 2);
+
   @override
   VoiceCapturePipeline build() {
     _buildCount++;
@@ -94,10 +112,47 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
     return pipeline;
   }
 
-  /// Tears down recording and playback and ends the text conversation when
-  /// the app moves to the background. Voice calls are short-lived; dropping
-  /// the session on background is the conservative, audio-safe choice.
-  Future<void> _handleBackground() async {
+  /// Suspends recording and playback when the app moves to the background but
+  /// KEEPS the in-flight LLM turn alive: inference completes in the background
+  /// and its reply queues (persisted via onTranscript) for playback on the next
+  /// foreground. The audio-safe parts of a full teardown still happen — mic,
+  /// player, and focus are all released so nothing leaks while not visible.
+  Future<void> _handleBackground() => _enqueueLifecycleTransition(
+        _applyBackground,
+        'background',
+      );
+
+  /// Resumes a backgrounded session on foreground: any reply held while the
+  /// app was hidden starts playing (playback re-acquires focus), and a
+  /// session left paused by an OS audio interruption is resumed. The
+  /// conversation itself stays connected across the background period.
+  Future<void> _handleForeground() => _enqueueLifecycleTransition(
+        _applyForeground,
+        'foreground',
+      );
+
+  /// Queues a lifecycle transition behind any still-running one so the last
+  /// event to arrive takes effect last. Each transition is bounded so a hung
+  /// platform teardown can never wedge the whole chain (and with it every
+  /// subsequent event). Errors — including the bound's [TimeoutException] —
+  /// are swallowed: lifecycle transitions are best-effort teardown, and the
+  /// observer fires them intentionally unawaited.
+  Future<void> _enqueueLifecycleTransition(
+    Future<void> Function() action,
+    String name,
+  ) {
+    final next = _lifecycleTail.then(
+      (_) => action().timeout(_lifecycleTransitionTimeout),
+    );
+    _lifecycleTail = next.catchError((Object error, StackTrace stack) {
+      if (kDebugMode) {
+        debugPrint('Pipeline: $name transition failed: $error');
+      }
+    });
+    return _lifecycleTail;
+  }
+
+  Future<void> _applyBackground() async {
     if (kDebugMode) {
       debugPrint('Pipeline: app → background (recording=${state.isRecording})');
     }
@@ -107,19 +162,35 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
     final pipeline = state;
     final controller = ref.read(voiceControllerProvider);
     final session = ref.read(audioSessionManagerProvider);
+    // Flag the controller backgrounded FIRST: enterBackground sets
+    // `_isBackgrounded` synchronously before its own platform awaits, so a
+    // later leg (or a straggling timed-out continuation) can never re-enter it
+    // and re-strand the session after a foreground has cleared the flag. Each
+    // remaining leg is also gated on the flag: a straggler resuming past the
+    // tail's bound must not stop the mic or yank focus off a reply the
+    // resumed drain is already streaming.
+    await controller.enterBackground();
+    // The pipeline stop is NOT gated on the flag: it is idempotent, and if the
+    // straggler parked inside enterBackground past the tail's bound it MUST
+    // still cancel the mic subscription/VAD — otherwise the mic records (and
+    // can fire a phantom turn) for the whole background period and beyond. Its
+    // own focus abandon is already guarded by `isAiSpeaking`, and the resumed
+    // drain re-requests focus anyway.
     if (pipeline.isRecording) {
       await pipeline.stopRecording();
     }
-    await controller.endConversation();
-    // endConversation stops playback but owns no focus; a reply playing at
-    // this moment would otherwise leak the audio focus for the app session.
-    await session.abandonAudioFocus();
+    // enterBackground stops playback but owns no focus; a reply that was
+    // playing at this moment would otherwise leak the audio focus for the app
+    // session. Unlike the mic stop, yanking focus off a reply the resumed
+    // drain is already streaming is a real harm, so gate it on the flag.
+    if (controller.isBackgrounded) {
+      await session.abandonAudioFocus();
+    }
   }
 
-  /// Resets the session to idle on foreground. Deliberately does not
-  /// auto-reconnect — the user re-taps the mic to rejoin.
-  Future<void> _handleForeground() async {
+  Future<void> _applyForeground() async {
     final controller = ref.read(voiceControllerProvider);
+    await controller.exitBackground();
     if (controller.state.isPaused) {
       await controller.resumeAfterInterruption();
     }
