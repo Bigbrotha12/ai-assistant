@@ -44,6 +44,24 @@ final pluginRegistryClientProvider = Provider.autoDispose<PluginRegistryClient>(
   },
 );
 
+final skillsCatalogProvider = FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+  final auth = ref.watch(authCredentialsProvider).requireValue!;
+  final client = ref.watch(pluginRegistryClientProvider);
+  return client.fetchSkills(gatewayKey: auth.apiKey);
+});
+
+final mcpsCatalogProvider = FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+  final auth = ref.watch(authCredentialsProvider).requireValue!;
+  final client = ref.watch(pluginRegistryClientProvider);
+  return client.fetchMcps(gatewayKey: auth.apiKey);
+});
+
+final agentTemplatesProvider = FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+  final auth = ref.watch(authCredentialsProvider).requireValue!;
+  final client = ref.watch(pluginRegistryClientProvider);
+  return client.fetchAgentTemplates(gatewayKey: auth.apiKey);
+});
+
 class PluginCatalog {
   PluginCatalog(this.plugins, List<PluginModelDto> models, List<AgentDto> agents)
     : models = List.unmodifiable(

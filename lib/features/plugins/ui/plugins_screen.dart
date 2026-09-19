@@ -3,10 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../settings/data/settings_providers.dart';
+import '../data/agent_config.dart';
 import '../data/plugin_catalog_providers.dart';
 import '../data/plugin_credentials_providers.dart';
 import '../data/plugin_credentials_store.dart';
 import '../data/plugin_dto.dart';
+import 'agent_editor_screen.dart';
 
 const _defaultBaseUrlEntry = '__default__';
 
@@ -110,6 +112,10 @@ class _PluginList extends ConsumerWidget {
     final modelIds = catalog.models.map((model) => model.id).toSet();
     final selected = configuration.selectedModel;
     final selectedAgent = configuration.selectedAgent;
+    final templates = ref.watch(agentTemplatesProvider);
+    final customAgents = configuration.plugins.entries
+        .where((e) => e.value.agent != null && e.value.agent!.kind == AgentKind.custom)
+        .toList();
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -138,13 +144,89 @@ class _PluginList extends ConsumerWidget {
           ),
         const SizedBox(height: 16),
         Text('Agents', style: Theme.of(context).textTheme.titleMedium),
-        if (catalog.agents.isEmpty)
+        if (catalog.agents.isEmpty &&
+            (templates.value == null || templates.requireValue.isEmpty) &&
+            customAgents.isEmpty)
           const Text(
             'No agents available. Ask your administrator to install an agent plugin.',
           ),
-        for (final agent in catalog.agents)
-          _agentTile(context, agent, selectedAgent == agent.id, configuration),
-        const SizedBox(height: 16),
+        if (catalog.agents.isNotEmpty) ...[
+          Text('Installed agent plugins:',
+              style: Theme.of(context).textTheme.titleSmall),
+          for (final agent in catalog.agents)
+            _agentTile(context, agent, selectedAgent == agent.id, configuration),
+          const SizedBox(height: 12),
+        ],
+        if (templates.isLoading)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 8),
+            child: Text('Loading agent templates...'),
+          )
+        else if (templates.hasError)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 8),
+            child: Text('Could not load agent templates.'),
+          )
+        else if (templates.value != null && templates.requireValue.isNotEmpty) ...[
+          Text('Templates:',
+              style: Theme.of(context).textTheme.titleSmall),
+          for (final template in templates.requireValue)
+            _templateTile(
+              context, template, selectedAgent == template['id'],
+              onSelect: () async {
+                try {
+                  await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(template['id'] as String?);
+                } catch (_) {
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Could not select template.')),
+                  );
+                }
+              },
+              onDeselect: () async {
+                try {
+                  await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(null);
+                } catch (_) {
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Could not deselect template.')),
+                  );
+                }
+              },
+            ),
+          const SizedBox(height: 12),
+        ],
+        if (customAgents.isNotEmpty) ...[
+          Text('Custom agents:',
+              style: Theme.of(context).textTheme.titleSmall),
+          for (final entry in customAgents)
+            _customAgentTile(
+              context, entry.key, entry.value.agent!,
+              selectedAgent == entry.key,
+              onEdit: () => _openEditAgentEditor(context, entry.key, entry.value.agent!),
+              onDelete: () async {
+                try {
+                  await ref.read(scopedPluginCredentialsProvider).removePlugin(entry.key);
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Removed agent "${entry.value.agent!.name.isNotEmpty ? entry.value.agent!.name : entry.key}"')),
+                  );
+                } catch (_) {
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Could not remove agent.')),
+                  );
+                }
+              },
+            ),
+          const SizedBox(height: 12),
+        ],
+        OutlinedButton.icon(
+          onPressed: () => _openNewAgentEditor(context),
+          icon: const Icon(Icons.add),
+          label: const Text('New Agent'),
+        ),
+        const SizedBox(height: 12),
         Text('Tools', style: Theme.of(context).textTheme.titleMedium),
         for (final plugin in catalog.plugins.where(
           (plugin) => plugin.type == 'tool',
@@ -197,6 +279,131 @@ class _PluginList extends ConsumerWidget {
         onTap: () => _openAgentEditor(context, agent, configuration),
       );
 
+  Widget _templateTile(
+    BuildContext context,
+    Map<String, dynamic> template,
+    bool isSelected, {
+    VoidCallback? onSelect,
+    VoidCallback? onDeselect,
+  }) {
+    final id = template['id'] as String? ?? '';
+    final name = template['name'] as String? ?? id;
+    final description = template['description'] as String? ?? '';
+    final modelRef = template['defaultModel'] as String?;
+    final toolCount = template['toolGrants'] is List ? (template['toolGrants'] as List).length : 0;
+    final skillCount = template['skillCount'] as int? ?? 0;
+    final mcpCount = (template['mcpNames'] as List?)?.length ?? 0;
+    return ListTile(
+      key: ValueKey('template-$id'),
+      title: Text(name),
+      subtitle: Text(
+        isSelected
+            ? 'Selected for this account'
+            : description,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (skillCount > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Chip(
+                label: Text('$skillCount skills'),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          if (mcpCount > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Chip(
+                label: Text('$mcpCount MCP'),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          if (toolCount > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Chip(
+                label: Text('$toolCount tools'),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          if (modelRef != null)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Chip(
+                label: Text(modelRef, style: const TextStyle(fontSize: 10)),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          if (isSelected)
+            TextButton(onPressed: onDeselect, child: const Text('Deselect'))
+          else
+            TextButton(onPressed: onSelect, child: const Text('Select')),
+        ],
+      ),
+    );
+  }
+
+  Widget _customAgentTile(
+    BuildContext context,
+    String pluginId,
+    AgentConfig agent,
+    bool isSelected, {
+    VoidCallback? onEdit,
+    VoidCallback? onDelete,
+  }) =>
+      ListTile(
+        key: ValueKey('custom-$pluginId'),
+        title: Row(
+          children: [
+            Text(agent.name.isNotEmpty ? agent.name : pluginId),
+            const SizedBox(width: 8),
+            Chip(
+              label: const Text('Custom'),
+              visualDensity: VisualDensity.compact,
+              backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+            ),
+          ],
+        ),
+        subtitle: Text(
+          isSelected
+              ? 'Selected for this account'
+              : (agent.description ?? 'No description'),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (agent.skills.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Chip(
+                  label: Text('${agent.skills.length} skills'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            if (agent.mcpServers.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Chip(
+                  label: Text('${agent.mcpServers.length} MCP'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            if (isSelected)
+              TextButton(onPressed: onEdit, child: const Text('Edit'))
+            else ...[
+              TextButton(onPressed: onEdit, child: const Text('Edit')),
+              TextButton(onPressed: onDelete, child: const Text('Delete')),
+            ],
+          ],
+        ),
+      );
+
   void _openAgentEditor(
     BuildContext context,
     AgentDto agent,
@@ -212,6 +419,22 @@ class _PluginList extends ConsumerWidget {
             configuration: configuration,
           ),
         ),
+      ),
+    );
+  }
+
+  void _openNewAgentEditor(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const AgentEditorScreen(),
+      ),
+    );
+  }
+
+  void _openEditAgentEditor(BuildContext context, String pluginId, AgentConfig agent) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => AgentEditorScreen(existing: agent),
       ),
     );
   }

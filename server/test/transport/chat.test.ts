@@ -38,6 +38,7 @@ import type {
 } from "../../src/plugins/types.ts";
 import { createChatRoutes } from "../../src/transport/chat.ts";
 import { toLangChainMessages } from "../../src/transport/chat.ts";
+import type { Catalogs, ResolvedAgentDef } from "../../src/catalog/index.ts";
 import type { JobModelRequestConfig } from "../../src/transport/chat.ts";
 import {
   buildModel,
@@ -398,6 +399,30 @@ type AppOptions = {
   warmups?: WarmupManager;
 };
 
+/**
+ * Build catalogs from extraPlugins so agent resolution via template id works.
+ */
+function buildCatalogs(extraPlugins?: PluginDefinition[]): Catalogs {
+  const agentDefs: ResolvedAgentDef[] = [];
+  for (const p of extraPlugins ?? []) {
+    if (p.type === "agent") {
+      const agent = p as AgentPluginDefinition;
+      agentDefs.push({
+        id: agent.id,
+        name: agent.name,
+        description: agent.description,
+        systemPrompt: agent.systemPrompt,
+        skills: (agent.skills ?? []).map(s => ({ id: s.id, title: s.title, content: s.content })),
+        mcpServers: (agent.mcpServers ?? []).map(s => ({ name: s.name, url: s.url, headers: s.headers })),
+        tools: (agent.tools ?? []).map(t => ({ pluginId: t.pluginId, required: t.required })),
+        modelRef: agent.modelRef,
+        inference: agent.inference,
+      });
+    }
+  }
+  return { skills: [], mcps: [], agents: agentDefs };
+}
+
 async function makeApp(
   t: TestContext,
   opts: AppOptions = {},
@@ -426,6 +451,7 @@ async function makeApp(
       contextManager: opts.contextManager,
       warmups: opts.warmups,
       trustedHosts: [],
+      catalogs: buildCatalogs(extraPlugins),
     }),
   );
   return { app, store, registry };
@@ -2912,14 +2938,18 @@ describe("POST /v1/chat/completions — agent resolution (Wave 1, Step 4)", () =
     const { app } = await makeApp(t, {}, [agentPlugin()]);
     const res = await postChat(app, chatBody({ agent: "does-not-exist" }));
     assert.equal(res.status, 400);
-    assert.deepEqual(await res.json(), { error: "invalid_request" });
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+    assert.match(String(json.message ?? ""), /template_not_found/, "response mentions template_not_found");
   });
 
   test("non-agent plugin id in agent field → 400 invalid_request", async (t) => {
     const { app } = await makeApp(t, {}, [agentPlugin()]);
     const res = await postChat(app, chatBody({ agent: "vikunja" }));
     assert.equal(res.status, 400);
-    assert.deepEqual(await res.json(), { error: "invalid_request" });
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+    assert.match(String(json.message ?? ""), /template_not_found/, "response mentions template_not_found");
   });
 
   test("agent with empty tools array: no tool plugins bind", async (t) => {

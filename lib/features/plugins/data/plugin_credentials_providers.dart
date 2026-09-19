@@ -4,6 +4,7 @@ import '../../auth/data/auth_client_provider.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/data/auth_credentials_store.dart';
 import '../../settings/data/settings_providers.dart';
+import 'agent_config.dart';
 import 'plugin_credentials_store.dart';
 
 final pluginCredentialsStoreProvider = Provider<PluginCredentialsStore>(
@@ -47,11 +48,17 @@ class PluginCredentialsEpoch extends Notifier<int> {
 }
 
 final pluginCredentialsProvider =
-    FutureProvider.autoDispose<PluginAccountConfiguration>((ref) {
-      ref.watch(pluginCredentialsEpochProvider);
-      final scope = ref.watch(pluginAccountScopeProvider);
-      return ref.watch(pluginCredentialsStoreProvider).load(scope);
-    });
+    FutureProvider.autoDispose<PluginAccountConfiguration>((ref) async {
+  ref.watch(pluginCredentialsEpochProvider);
+  final scope = ref.watch(pluginAccountScopeProvider);
+  final store = ref.watch(pluginCredentialsStoreProvider);
+  var config = await store.load(scope);
+  if (config.plugins.isEmpty) {
+    await store.ensureDefaultAgent(scope);
+    config = await store.load(scope);
+  }
+  return config;
+});
 
 final selectedModelProvider = Provider<String?>((ref) {
   return ref.watch(pluginCredentialsProvider).value?.selectedModel;
@@ -119,6 +126,9 @@ class ScopedPluginCredentials {
 
   Future<void> setSelectedAgent(String? id) =>
       _write(() => _store.setSelectedAgent(scope, id));
+
+  Future<void> setAgentConfig(String pluginId, AgentConfig config) =>
+      _write(() => _store.setAgentConfig(scope, pluginId, config));
 
   Future<void> removePlugin(String pluginId) =>
       _write(() => _store.removePlugin(scope, pluginId));

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { z } from "zod";
 import {
   AIMessage,
   HumanMessage,
@@ -42,9 +43,10 @@ import { PluginRegistryError } from "../plugins/registry.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { PluginStoreError } from "../plugins/store.ts";
 import type { PluginStore } from "../plugins/store.ts";
-import { isAgentPlugin, isModelPlugin, isToolPlugin } from "../plugins/types.ts";
+import { isModelPlugin, isToolPlugin, pluginIdSchema } from "../plugins/types.ts";
 import { composeAgentPrompt } from "../agents/skills.ts";
-import type { AgentPluginDefinition, ModelPluginDefinition } from "../plugins/types.ts";
+import type { ModelPluginDefinition } from "../plugins/types.ts";
+import type { Catalogs, ResolvedAgentDef } from "../catalog/index.ts";
 import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
 import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
@@ -63,6 +65,24 @@ import type { Ledger, TaskRow } from "../ledger.ts";
 import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
+
+const customAgentSpecSchema = z.object({
+  name: z.string().max(100).optional(),
+  description: z.string().max(300).optional(),
+  systemPrompt: z.string().max(8000).optional(),
+  skills: z.array(pluginIdSchema).max(50).optional(),
+  mcpServers: z.array(z.object({ name: pluginIdSchema }).strict()).max(20).optional(),
+  tools: z.array(z.object({
+    pluginId: pluginIdSchema,
+    required: z.boolean().default(false),
+  }).strict()).max(100).optional(),
+  modelRef: pluginIdSchema.optional(),
+  inference: z.object({
+    temperature: z.number().optional(),
+    maxTokens: z.number().int().positive().max(200000).optional(),
+    visionCapable: z.boolean().default(false),
+  }).strict().optional(),
+}).strict();
 
 /**
  * OpenAI-compatible `POST /v1/chat/completions` transport (Phase 3, Waves C1/C2).
@@ -267,6 +287,8 @@ export type ChatRoutesOptions = {
   toolCache?: ToolResultCache;
   /** Admin-trusted hosts for every outbound `validatedFetch` (model + tools). */
   trustedHosts?: readonly string[];
+  /** Agent template catalog (plumbing for Step 6 agent override resolution). */
+  catalogs?: Catalogs;
 };
 
 /**
@@ -439,10 +461,11 @@ type ResolvedChat = {
   };
 };
 
-function resolveChatRequest(
+export function resolveChatRequest(
   c: Context,
   body: Record<string, unknown>,
   registry: PluginRegistry,
+  catalogs: Catalogs,
 ): { ok: true; value: ResolvedChat } | { ok: false; response: Response } {
   const selection = resolveModelSelection(body);
   if (!selection) return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
@@ -586,31 +609,99 @@ function resolveChatRequest(
     enabledPlugins = [...new Set(rawEnabled.map((id) => String(id).trim()))];
   }
 
-  // Agent resolution (Step 4, Wave 1): optional `agent` field overrides model,
-  // tools, and system prompt.
+  // Agent resolution: body.agent = string (template id) | object (custom spec)
   let agentOverride: ResolvedChat["agentOverride"] = undefined;
-  const rawAgentId = typeof body["agent"] === "string" ? body["agent"].trim() : "";
-  if (rawAgentId !== "") {
-    let agentPlugin: AgentPluginDefinition;
-    try {
-      const resolved = registry.requirePlugin(rawAgentId);
-      if (!isAgentPlugin(resolved)) {
-        return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+  const rawAgent = body["agent"];
+  if (rawAgent !== undefined) {
+    let resolvedAgentDef: ResolvedAgentDef;
+
+    if (typeof rawAgent === "string") {
+      // Template reference
+      const templateId = rawAgent.trim();
+      if (templateId === "") {
+        return { ok: false, response: c.json({ error: "invalid_request", message: "agent template id must not be empty" }, 400) };
       }
-      agentPlugin = resolved;
-    } catch (err) {
-      if (err instanceof PluginRegistryError) {
-        return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+      const template = catalogs.agents.find(a => a.id === templateId);
+      if (!template) {
+        return { ok: false, response: c.json({ error: "invalid_request", message: `template_not_found: ${templateId}` }, 400) };
       }
-      if (err instanceof PluginStoreError && err.code === "NOT_LOADED") {
-        return { ok: false, response: c.json({ error: "inference_unavailable" }, 502) };
+      resolvedAgentDef = template;
+    } else if (typeof rawAgent === "object" && rawAgent !== null && !Array.isArray(rawAgent)) {
+      // Custom spec — validate with strict schema
+      const parseResult = customAgentSpecSchema.safeParse(rawAgent);
+      if (!parseResult.success) {
+        return { ok: false, response: c.json({ error: "invalid_request", message: `invalid agent spec: ${parseResult.error.issues.map(i => i.message).join("; ")}` }, 400) };
       }
-      return { ok: false, response: c.json({ error: "internal" }, 500) };
+      const spec = parseResult.data;
+
+      // Resolve skills: ids → content from catalog
+      const resolvedSkills: { id: string; title: string; content: string }[] = [];
+      for (const skillId of spec.skills ?? []) {
+        const entry = catalogs.skills.find(s => s.id === skillId);
+        if (entry) {
+          resolvedSkills.push({ id: entry.id, title: entry.title, content: entry.content });
+        } else {
+          console.warn(`[chat] custom agent: skill '${skillId}' not found in catalog; skipping`);
+        }
+      }
+
+      // Resolve MCP servers: names → url/headers from catalog
+      const resolvedMcp: { name: string; url: string; headers?: Record<string, string> }[] = [];
+      for (const mcpRef of spec.mcpServers ?? []) {
+        const entry = catalogs.mcps.find(m => m.name === mcpRef.name);
+        if (entry) {
+          resolvedMcp.push({ name: entry.name, url: entry.url, headers: entry.headers });
+        } else {
+          console.warn(`[chat] custom agent: MCP server '${mcpRef.name}' not found in catalog; skipping`);
+        }
+      }
+
+      // Resolve tools: validate installed + credentials
+      let resolvedTools: { pluginId: string; required: boolean }[] | undefined;
+      if (spec.tools !== undefined) {
+        resolvedTools = [];
+        for (const grant of spec.tools) {
+          try {
+            const plugin = registry.requirePlugin(grant.pluginId);
+            if (!isToolPlugin(plugin)) {
+              if (grant.required) {
+                return { ok: false, response: c.json({ error: "invalid_credentials", message: `tool '${grant.pluginId}' is not a tool plugin` }, 400) };
+              }
+              console.warn(`[chat] custom agent: '${grant.pluginId}' is not a tool plugin; skipping`);
+              continue;
+            }
+            resolvedTools.push(grant);
+          } catch (e) {
+            if (e instanceof PluginRegistryError || e instanceof PluginStoreError) {
+              if (grant.required) {
+                return { ok: false, response: c.json({ error: "invalid_credentials", message: `tool '${grant.pluginId}' not installed or unavailable` }, 400) };
+              }
+              console.warn(`[chat] custom agent: tool '${grant.pluginId}' not installed; skipping`);
+              continue;
+            }
+            throw e;
+          }
+        }
+      }
+
+      resolvedAgentDef = {
+        id: spec.modelRef ?? "custom",
+        name: spec.name ?? "Custom Agent",
+        description: spec.description ?? "",
+        systemPrompt: spec.systemPrompt,
+        skills: resolvedSkills,
+        mcpServers: resolvedMcp,
+        tools: resolvedTools,
+        modelRef: spec.modelRef,
+        inference: spec.inference,
+      };
+    } else {
+      return { ok: false, response: c.json({ error: "invalid_request", message: "agent must be a string (template id) or an object (custom spec)" }, 400) };
     }
 
-    // Override model plugin if agent has modelRef
-    if (agentPlugin.modelRef) {
-      modelPluginId = agentPlugin.modelRef;
+    // Override model if agent has modelRef
+    if (resolvedAgentDef.modelRef) {
+      modelPluginId = resolvedAgentDef.modelRef;
       requestModel = undefined;
       try {
         const resolved = registry.requirePlugin(modelPluginId);
@@ -630,12 +721,8 @@ function resolveChatRequest(
 
       // Re-resolve credentials for the new model plugin
       try {
-        const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, {
-          isModel: true,
-        });
-        credentials = validateCredentials(plugin.credentials, input, modelPluginId, {
-          isModel: true,
-        });
+        const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, { isModel: true });
+        credentials = validateCredentials(plugin.credentials, input, modelPluginId, { isModel: true });
       } catch (err) {
         if (err instanceof PluginCredentialError) {
           return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
@@ -644,54 +731,59 @@ function resolveChatRequest(
       }
     }
 
-    // Merge inference overrides into requestParameters
-    if (agentPlugin.inference) {
-      if (agentPlugin.inference.temperature !== undefined) {
-        requestParameters["temperature"] = agentPlugin.inference.temperature;
+    // Merge inference overrides
+    if (resolvedAgentDef.inference) {
+      if (resolvedAgentDef.inference.temperature !== undefined) {
+        requestParameters["temperature"] = resolvedAgentDef.inference.temperature;
       }
-      if (agentPlugin.inference.maxTokens !== undefined) {
-        requestParameters["maxTokens"] = agentPlugin.inference.maxTokens;
+      if (resolvedAgentDef.inference.maxTokens !== undefined) {
+        requestParameters["maxTokens"] = resolvedAgentDef.inference.maxTokens;
       }
-      if (agentPlugin.inference.visionCapable !== undefined) {
-        requestParameters["visionCapable"] = agentPlugin.inference.visionCapable;
+      if (resolvedAgentDef.inference.visionCapable !== undefined) {
+        requestParameters["visionCapable"] = resolvedAgentDef.inference.visionCapable;
       }
     }
 
-    // Tool scoping: agent grants are exclusive when defined
-    if (agentPlugin.tools !== undefined) {
-      const agentToolIds = agentPlugin.tools.map((t) => t.pluginId);
-      if (enabledPlugins !== undefined) {
-        const agentSet = new Set(agentToolIds);
-        enabledPlugins = enabledPlugins.filter((id) => agentSet.has(id));
-      } else {
-        enabledPlugins = [...new Set(agentToolIds)];
-      }
+    // Tool scoping: agent grants override enabledPlugins exclusively
+    if (resolvedAgentDef.tools && resolvedAgentDef.tools.length > 0) {
+      enabledPlugins = [...new Set(resolvedAgentDef.tools.map((t) => t.pluginId))];
 
       // Validate required tool grants have credentials
-      for (const grant of agentPlugin.tools) {
-        if (grant.required) {
-          const toolCreds = toolCredentialsByPlugin[grant.pluginId];
-          if (!toolCreds || !toolCreds["apiKey"] || toolCreds["apiKey"].trim() === "") {
-            return {
-              ok: false,
-              response: c.json(
-                {
-                  error: "invalid_credentials",
-                  message: `required tool plugin '${grant.pluginId}' is missing credentials for this agent`,
-                },
-                400,
-              ),
-            };
+      for (const grant of resolvedAgentDef.tools) {
+        if (!grant.required) continue;
+        const plugin = registry.requirePlugin(grant.pluginId);
+        if (!isToolPlugin(plugin)) continue;
+        const spec = plugin.credentials;
+        if (spec?.apiKey?.required) {
+          const input = extractCredentialsFromBody(body, grant.pluginId, spec, { isModel: false });
+          try {
+            validateCredentials(spec, input, grant.pluginId, { isModel: false });
+          } catch {
+            return { ok: false, response: c.json({
+              error: "invalid_credentials",
+              message: `required tool '${grant.pluginId}' is missing credentials`,
+            }, 400) };
           }
         }
       }
+    } else if (resolvedAgentDef.tools !== undefined) {
+      // Empty tools array = no tool plugins allowed (explicit exclusion)
+      enabledPlugins = [];
     }
+    // If tools is absent/undefined on the spec (or for template without tools),
+    // do NOT override enabledPlugins (keep user's selections)
+
+    // Compose system prompt
+    const systemPrompt = composeAgentPrompt(
+      resolvedAgentDef.systemPrompt ?? "",
+      resolvedAgentDef.skills,
+    );
 
     agentOverride = {
-      systemPrompt: composeAgentPrompt(agentPlugin.systemPrompt, agentPlugin.skills),
-      toolGrants: agentPlugin.tools,
-      inference: agentPlugin.inference,
-      mcpServers: agentPlugin.mcpServers,
+      systemPrompt,
+      toolGrants: resolvedAgentDef.tools,
+      inference: resolvedAgentDef.inference,
+      mcpServers: resolvedAgentDef.mcpServers,
     };
   }
 
@@ -726,7 +818,7 @@ async function handleSyncStream(
   opts: ChatRoutesOptions,
   budget: BudgetManager,
 ): Promise<Response> {
-  const resolved = resolveChatRequest(c, body, opts.registry);
+  const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
   const {
     modelPluginId,
@@ -1189,7 +1281,7 @@ async function handleBackground(
     return c.json({ error: "background_unavailable" }, 503);
   }
 
-  const resolved = resolveChatRequest(c, body, opts.registry);
+  const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
   const {
     modelPluginId,

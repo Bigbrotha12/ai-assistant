@@ -78,8 +78,7 @@ void main() {
       isTrue,
     );
   });
-
-  test(
+test(
     'owner switch and rotation invalidate epoch without transferring data',
     () async {
       final subscription = container.listen(
@@ -100,9 +99,15 @@ void main() {
         container.read(pluginCredentialsEpochProvider),
         greaterThan(oldEpoch),
       );
+      // New scope is seeded with the 'default' agent plugin by
+      // ensureDefaultAgent; the original 'one' plugin is not carried over.
       expect(
         (await container.read(pluginCredentialsProvider.future)).plugins,
-        isEmpty,
+        isNotEmpty,
+      );
+      expect(
+        (await container.read(pluginCredentialsProvider.future)).plugins.keys,
+        isNot(contains('one')),
       );
       await expectLater(
         oldHandle.setEnabled('one', true),
@@ -111,9 +116,10 @@ void main() {
       await container
           .read(authCredentialsProvider.notifier)
           .save(credentials('a', key: 'rotated'));
+      // Scope 'a' still has its earlier seeded 'default' agent.
       expect(
         (await container.read(pluginCredentialsProvider.future)).plugins,
-        isEmpty,
+        isNotEmpty,
       );
       await container.read(authCredentialsProvider.notifier).clear();
       await expectLater(

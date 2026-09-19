@@ -4,6 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../../../core/secure_storage.dart';
 import '../../auth/data/auth_credentials_store.dart';
+import 'agent_config.dart';
 
 class PluginReauthenticationRequired implements Exception {
   const PluginReauthenticationRequired();
@@ -18,10 +19,12 @@ class PluginConfiguration {
   PluginConfiguration({
     Map<String, String> credentials = const {},
     this.enabled = false,
+    this.agent,
   }) : credentials = Map.unmodifiable(credentials);
 
   final Map<String, String> credentials;
   final bool enabled;
+  final AgentConfig? agent;
 }
 
 class PluginAccountConfiguration {
@@ -60,8 +63,11 @@ class PluginCredentialsStore {
     if (raw == null) return PluginAccountConfiguration();
     try {
       final data = jsonDecode(raw) as Map<String, dynamic>;
-      if (data['version'] != 1) throw const FormatException();
-      final plugins = (data['plugins'] as Map<String, dynamic>).map((
+      final version = data['version'] as int?;
+      if (version == null || version < 1 || version > 2) {
+        throw const FormatException();
+      }
+      final plugins = (data['plugins'] as Map<String, dynamic>?)?.map((
         id,
         value,
       ) {
@@ -69,11 +75,14 @@ class PluginCredentialsStore {
         return MapEntry(
           id,
           PluginConfiguration(
-            credentials: Map<String, String>.from(entry['credentials'] as Map),
-            enabled: entry['enabled'] as bool,
+            credentials: Map<String, String>.from(entry['credentials'] as Map? ?? {}),
+            enabled: entry['enabled'] as bool? ?? false,
+            agent: entry['agent'] != null
+                ? AgentConfig.fromJson(entry['agent'] as Map<String, dynamic>)
+                : null,
           ),
         );
-      });
+      }) ?? {};
       return PluginAccountConfiguration(
         plugins: plugins,
         selectedModel: data['selectedModel'] as String?,
@@ -90,11 +99,12 @@ class PluginCredentialsStore {
   ) => _storage.write(
     key: _key(scope),
     value: jsonEncode({
-      'version': 1,
+      'version': 2,
       'plugins': config.plugins.map(
         (id, value) => MapEntry(id, {
           'credentials': value.credentials,
           'enabled': value.enabled,
+          if (value.agent != null) 'agent': value.agent!.toJson(),
         }),
       ),
       'selectedModel': config.selectedModel,
@@ -112,7 +122,7 @@ class PluginCredentialsStore {
       scope,
       pluginId,
       (previous) =>
-          PluginConfiguration(credentials: snapshot, enabled: previous.enabled),
+          PluginConfiguration(credentials: snapshot, enabled: previous.enabled, agent: previous.agent),
     );
   }
 
@@ -126,6 +136,7 @@ class PluginCredentialsStore {
     (previous) => PluginConfiguration(
       credentials: previous.credentials,
       enabled: enabled,
+      agent: previous.agent,
     ),
   );
 
@@ -160,23 +171,23 @@ class PluginCredentialsStore {
           PluginAccountConfiguration(
             plugins: plugins,
             selectedModel: config.selectedModel,
-            selectedAgent: config.selectedAgent,
+            selectedAgent: config.selectedAgent == pluginId ? null : config.selectedAgent,
           ),
         );
       });
 
-Future<void> setSelectedModel(AuthAccountScope scope, String? model) =>
-    _serialized(() async {
-      final config = await _load(scope);
-      await _save(
-        scope,
-        PluginAccountConfiguration(
-          plugins: config.plugins,
-          selectedModel: model == null || model.trim().isEmpty ? null : model,
-          selectedAgent: config.selectedAgent,
-        ),
-      );
-    });
+  Future<void> setSelectedModel(AuthAccountScope scope, String? model) =>
+      _serialized(() async {
+        final config = await _load(scope);
+        await _save(
+          scope,
+          PluginAccountConfiguration(
+            plugins: config.plugins,
+            selectedModel: model == null || model.trim().isEmpty ? null : model,
+            selectedAgent: config.selectedAgent,
+          ),
+        );
+      });
 
   Future<void> setSelectedAgent(AuthAccountScope scope, String? id) =>
       _serialized(() async {
@@ -190,6 +201,31 @@ Future<void> setSelectedModel(AuthAccountScope scope, String? model) =>
           ),
         );
       });
+
+  Future<void> setAgentConfig(
+    AuthAccountScope scope,
+    String pluginId,
+    AgentConfig config,
+  ) => _updatePlugin(scope, pluginId, (previous) =>
+    PluginConfiguration(
+      credentials: previous.credentials,
+      enabled: previous.enabled,
+      agent: config,
+    ),
+  );
+
+  Future<void> ensureDefaultAgent(AuthAccountScope scope) => _serialized(() async {
+    final config = await _load(scope);
+    if (config.plugins.isNotEmpty) return;
+    await _save(scope, PluginAccountConfiguration(
+      plugins: {'default': PluginConfiguration(
+        enabled: true,
+        agent: AgentConfig(id: 'default', kind: AgentKind.template),
+      )},
+      selectedAgent: 'default',
+      selectedModel: config.selectedModel,
+    ));
+  });
 
   Future<void> clearScope(AuthAccountScope scope) =>
       _serialized(() => _storage.delete(key: _key(scope)));

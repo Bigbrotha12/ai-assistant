@@ -6,7 +6,7 @@ import { createCheckpointStore } from "./checkpoints/store.ts";
 import type { CheckpointStore } from "./checkpoints/store.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
-import { inferenceRoutes } from "./inference.ts";
+import { inferenceRoutes, requireApiKey } from "./inference.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { ThreadLockRegistry } from "./jobs/thread_lock.ts";
@@ -18,6 +18,8 @@ import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createModelsRoutes } from "./transport/models.ts";
 import { createAgentsRoutes } from "./transport/agents.ts";
+import { createSkillsRoutes } from "./transport/skills.ts";
+import { createMcpRoutes } from "./transport/mcps.ts";
 import { createChatRoutes } from "./transport/chat.ts";
 import type { JobModelRequestConfig } from "./transport/chat.ts";
 import { buildModel } from "./transport/model.ts";
@@ -26,6 +28,8 @@ import { createPerOwnerRateLimiter } from "./middleware/rate_limit.ts";
 import { createToolResultCache } from "./middleware/cache.ts";
 import { createContextManager } from "./middleware/context.ts";
 import { createWarmupManager } from "./middleware/warmup.ts";
+import { loadCatalogs } from "./catalog/index.ts";
+import type { Catalogs } from "./catalog/index.ts";
 
 const app = new Hono();
 let stopping = false;
@@ -50,6 +54,9 @@ app.route("/api/notify", createNotifyRoutes({ store: notifyStore }));
 
 const { registry: pluginRegistry, store: pluginStore } = createPluginWiring();
 await pluginStore.load();
+// Load catalogs (skills, mcps, agent templates) from CONFIG_DIR
+const configDir = process.env.CONFIG_DIR ?? "/config";
+const catalogs: Catalogs = await loadCatalogs(configDir, pluginStore);
 // Hot-reload on live plugins.json edits (fs.watch via the registry, wired in
 // production too so config changes apply without a restart). The registry
 // debounces, ignores the store's own atomic saves (self-write snapshot guard),
@@ -71,7 +78,12 @@ app.route("/v1", createModelsRoutes({ registry: pluginRegistry }));
 
 // Wave 1: `GET /v1/agents` lists installed agent plugins. Same security
 // contract as /v1/models — never leaks systemPrompt/skills content/endpoints.
-app.route("/v1", createAgentsRoutes({ registry: pluginRegistry }));
+app.route("/v1", createAgentsRoutes({ registry: pluginRegistry, catalogs }));
+
+// Wave 2: `GET /v1/skills` and `GET /v1/mcps` list catalog entries with
+// content redacted — never leaks skill content or MCP urls/headers.
+app.route("/v1", createSkillsRoutes({ catalogs, verifyKey: requireApiKey }));
+app.route("/v1", createMcpRoutes({ catalogs, verifyKey: requireApiKey }));
 
 // Durable, encrypted conversation checkpoints (Phase 2, Wave B1). The store
 // opens the SQLCipher-keyed SQLite file at CHECKPOINT_DB_PATH; the transport
@@ -222,6 +234,7 @@ app.route(
   createChatRoutes({
     registry: pluginRegistry,
     pluginStore,
+    catalogs,
     checkpointStore,
     ledger,
     jobRunner,

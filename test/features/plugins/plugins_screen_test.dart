@@ -190,7 +190,10 @@ void main() {
       expect(tester.widget<TextField>(field).obscureText, isTrue);
       await tester.enterText(field, 'fake-provider-key');
       await tester.pump();
-      expect((await store.load(account.accountScope!)).plugins, isEmpty);
+      expect(
+        (await store.load(account.accountScope!)).plugins.keys,
+        ['default'],
+      );
       await tester.tap(find.text('Save API key'));
       await tester.pumpAndSettle();
       expect(tester.widget<TextField>(field).controller!.text, isEmpty);
@@ -373,7 +376,10 @@ void main() {
       find.byKey(const ValueKey('plugin-baseurl-primary')),
       findsOneWidget,
     );
-    expect((await store.load(account.accountScope!)).plugins, isEmpty);
+    expect(
+      (await store.load(account.accountScope!)).plugins.keys,
+      ['default'],
+    );
     final primary = find.byKey(const ValueKey('plugin-baseurl-primary'));
     await tester.ensureVisible(primary);
     await tester.pumpAndSettle();
@@ -403,7 +409,7 @@ void main() {
     tester,
   ) async {
     await mount(tester);
-    expect(find.text('Test Agent'), findsOneWidget);
+    expect(find.text('Test Agent'), findsAtLeastNWidgets(1));
     await tester.tap(find.byKey(const ValueKey('agent-test-agent')));
     await tester.pumpAndSettle();
     expect(find.text('Configure agent'), findsOneWidget);

@@ -141,6 +141,41 @@ export const agentPluginDefinitionSchema = z.object({
     })).optional(),
   });
 
+export const templateAgentDefinitionSchema = z.object({
+  id: pluginIdSchema,
+  version: semverSchema,
+  schemaVersion: z.literal(CURRENT_PLUGIN_DEFINITION_SCHEMA_VERSION),
+  type: z.literal("agent"),
+  name: z.string().trim().min(1),
+  description: z.string().trim().min(1),
+  systemPrompt: z.string().optional(),
+  skills: z.array(z.object({ id: pluginIdSchema })).optional(),
+  mcpServers: z.array(z.object({ name: pluginIdSchema })).optional(),
+  tools: z.array(z.object({ pluginId: pluginIdSchema, required: z.boolean().default(false) })).optional(),
+  modelRef: pluginIdSchema.optional(),
+  inference: z.object({
+    temperature: z.number().optional(),
+    maxTokens: z.number().int().positive().optional(),
+    visionCapable: z.boolean().default(false),
+  }).optional(),
+  baseUrls: z.array(baseUrlAllowlistEntrySchema).optional(),
+  credentials: credentialSpecSchema.optional(),
+});
+
+export type TemplateAgentDefinition = z.infer<typeof templateAgentDefinitionSchema>;
+
+export type ResolvedAgentDef = {
+  id: string;
+  name: string;
+  description: string;
+  systemPrompt?: string;
+  skills: { id: string; title: string; content: string }[];
+  mcpServers: { name: string; url: string; headers?: Record<string, string> }[];
+  tools?: { pluginId: string; required: boolean }[];
+  modelRef?: string;
+  inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
+};
+
 export const pluginDefinitionSchema = z.discriminatedUnion("type", [
   toolPluginDefinitionSchema,
   modelPluginDefinitionSchema,

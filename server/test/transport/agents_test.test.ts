@@ -20,6 +20,7 @@ import type {
   ToolPluginDefinition,
 } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
+import type { Catalogs } from "../../src/catalog/index.ts";
 
 function defaultAgentPlugin(): AgentPluginDefinition {
   return {
@@ -111,11 +112,42 @@ async function makeApp(
 ): Promise<{ app: Hono; registry: PluginRegistry }> {
   const dir = await makeTempDir(t);
   const { registry } = await makeEnv(dir);
+
+  const catalogs: Catalogs = {
+    skills: [],
+    mcps: [],
+    agents: [
+      {
+        id: "default",
+        name: "Default",
+        description: "General-purpose assistant",
+        systemPrompt: "You are a helpful assistant.",
+        skills: [],
+        mcpServers: [],
+        tools: [],
+      },
+      {
+        id: "kitchen-copilot",
+        name: "Kitchen Copilot",
+        description: "Mealie recipe assistant",
+        systemPrompt: "You are a kitchen assistant.",
+        skills: [
+          { id: "recipes", title: "Recipes", content: "## Recipe tips\n..." },
+        ],
+        mcpServers: [],
+        tools: [{ pluginId: "mealie", required: true }],
+        modelRef: "open-router",
+        inference: { temperature: 0.3, maxTokens: 2048, visionCapable: true },
+      },
+    ],
+  };
+
   const app = new Hono();
   app.route(
     "/v1",
     createAgentsRoutes({
       registry,
+      catalogs,
       verifyKey: verifyKey ?? (async () => "test-user"),
     }),
   );
@@ -166,6 +198,9 @@ describe("agentListFromPlugins (pure)", () => {
     assert.equal(entry.maxTokens, 2048);
     assert.deepEqual(entry.toolGrants, [{ pluginId: "mealie", required: true }]);
     assert.equal(entry.skillCount, 1);
+    assert.deepEqual(entry.skillIds, ["recipes"]);
+    assert.deepEqual(entry.mcpNames, []);
+    assert.equal(entry.source, "plugin");
     assertNoUrlLeak(result, "result");
   });
 
@@ -180,6 +215,9 @@ describe("agentListFromPlugins (pure)", () => {
     assert.equal(entry.maxTokens, undefined);
     assert.deepEqual(entry.toolGrants, []);
     assert.equal(entry.skillCount, 0);
+    assert.deepEqual(entry.skillIds, []);
+    assert.deepEqual(entry.mcpNames, []);
+    assert.equal(entry.source, "plugin");
     assertNoUrlLeak(result, "result");
   });
 
@@ -228,15 +266,27 @@ describe("GET /v1/agents (HTTP)", () => {
     const defaultAgent = body.data.find((a) => a.id === "default")!;
     assert.equal(defaultAgent.visionCapable, false);
     assert.equal(defaultAgent.skillCount, 0);
+    assert.deepEqual(defaultAgent.skillIds, []);
+    assert.deepEqual(defaultAgent.mcpNames, []);
+    assert.equal(defaultAgent.source, "template");
     assert.deepEqual(defaultAgent.toolGrants, []);
 
     const copilot = body.data.find((a) => a.id === "kitchen-copilot")!;
     assert.equal(copilot.visionCapable, true);
     assert.equal(copilot.skillCount, 1);
+    assert.deepEqual(copilot.skillIds, ["recipes"]);
+    assert.deepEqual(copilot.mcpNames, []);
+    assert.equal(copilot.source, "template");
     assert.deepEqual(copilot.toolGrants, [{ pluginId: "mealie", required: true }]);
     assert.equal(copilot.defaultModel, "open-router");
     assert.equal(copilot.temperature, 0.3);
     assert.equal(copilot.maxTokens, 2048);
+
+    // Redaction invariants: systemPrompt and raw skill content must never leak
+    assert.equal(JSON.stringify(body).includes("systemPrompt"), false, "systemPrompt must not appear in serialized response");
+    assert.equal(JSON.stringify(body).includes("## Recipe tips"), false, "skill content must not appear in serialized response");
+    assert.equal(JSON.stringify(body).includes("You are a helpful assistant"), false);
+    assert.equal(JSON.stringify(body).includes("You are a kitchen assistant"), false);
 
     assert.equal(
       JSON.stringify(body).includes("https://"),
@@ -246,7 +296,7 @@ describe("GET /v1/agents (HTTP)", () => {
     assertNoUrlLeak(body, "body");
   });
 
-  test("empty registry -> 200 empty list (not an error)", async (t) => {
+  test("empty catalog -> 200 empty list (not an error)", async (t) => {
     const dir = await makeTempDir(t);
     const store = new PluginStore({
       storePath: join(dir, "plugins.json"),
@@ -260,7 +310,11 @@ describe("GET /v1/agents (HTTP)", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createAgentsRoutes({ registry, verifyKey: async () => "test-user" }),
+      createAgentsRoutes({
+        registry,
+        catalogs: { skills: [], mcps: [], agents: [] },
+        verifyKey: async () => "test-user",
+      }),
     );
 
     const res = await app.request("/v1/agents", { headers: auth });
@@ -268,7 +322,7 @@ describe("GET /v1/agents (HTTP)", () => {
     assert.deepEqual(await res.json(), { object: "list", data: [] });
   });
 
-  test("registry error -> 502 { error: inference_unavailable }", async (t) => {
+  test("serves from catalogs even with no registry plugins", async (t) => {
     const dir = await makeTempDir(t);
     const store = new PluginStore({
       storePath: join(dir, "plugins.json"),
@@ -277,16 +331,36 @@ describe("GET /v1/agents (HTTP)", () => {
       manifests: [],
       lookup: fakeLookup(),
     });
+    await store.load();
     const registry = new PluginRegistry(store);
     const app = new Hono();
     app.route(
       "/v1",
-      createAgentsRoutes({ registry, verifyKey: async () => "test-user" }),
+      createAgentsRoutes({
+        registry,
+        catalogs: {
+          skills: [],
+          mcps: [],
+          agents: [
+            {
+              id: "standalone",
+              name: "Standalone",
+              description: "From catalog only",
+              skills: [],
+              mcpServers: [],
+              tools: [],
+            },
+          ],
+        },
+        verifyKey: async () => "test-user",
+      }),
     );
 
     const res = await app.request("/v1/agents", { headers: auth });
-    assert.equal(res.status, 502);
-    assert.deepEqual(await res.json(), { error: "inference_unavailable" });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as AgentsListResponse;
+    assert.equal(body.data.length, 1);
+    assert.equal(body.data[0]!.id, "standalone");
   });
 
   test("401 { error: unauthorized } when the verifier returns null", async (t) => {
@@ -310,7 +384,38 @@ describe("GET /v1/agents — mount order", () => {
     app.route("/v1", inferenceRoutes);
     app.route(
       "/v1",
-      createAgentsRoutes({ registry, verifyKey: async () => "test-user" }),
+      createAgentsRoutes({
+        registry,
+        catalogs: {
+          skills: [],
+          mcps: [],
+          agents: [
+            {
+              id: "default",
+              name: "Default",
+              description: "General-purpose assistant",
+              systemPrompt: "You are a helpful assistant.",
+              skills: [],
+              mcpServers: [],
+              tools: [],
+            },
+            {
+              id: "kitchen-copilot",
+              name: "Kitchen Copilot",
+              description: "Mealie recipe assistant",
+              systemPrompt: "You are a kitchen assistant.",
+              skills: [
+                { id: "recipes", title: "Recipes", content: "## Recipe tips\n..." },
+              ],
+              mcpServers: [],
+              tools: [{ pluginId: "mealie", required: true }],
+              modelRef: "open-router",
+              inference: { temperature: 0.3, maxTokens: 2048, visionCapable: true },
+            },
+          ],
+        },
+        verifyKey: async () => "test-user",
+      }),
     );
 
     const res = await app.request("/v1/agents", { headers: auth });

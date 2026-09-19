@@ -27,14 +27,10 @@ import {
   NODE_ENV,
   SsrfValidationError,
   resolveAndValidateHost,
+  validateMcpHeaderName,
   validateStaticUrl,
 } from "./ssrf.ts";
 import type { LookupFn, Mode } from "./ssrf.ts";
-
-const HEADER_NAME_RE = /^[a-zA-Z0-9_-]+$/;
-const DANGEROUS_HEADERS = new Set([
-  'content-type', 'accept', 'host', 'transfer-encoding', 'connection', 'cookie', 'set-cookie',
-]);
 
 /**
  * `PluginStore` persists which tool-plugin manifests an admin has installed
@@ -445,19 +441,24 @@ export class PluginStore {
           `plugin '${pluginId}' MCP server '${serverName}' has an empty header name`,
         );
       }
-      if (!HEADER_NAME_RE.test(name)) {
-        throw new PluginStoreError(
-          "SSRF_REJECTED",
-          `plugin '${pluginId}' MCP server '${serverName}' header '${name}' contains invalid characters; ` +
-            "header names may only contain a-z, A-Z, 0-9, underscore, and hyphen",
-        );
-      }
-      if (DANGEROUS_HEADERS.has(name.toLowerCase())) {
-        throw new PluginStoreError(
-          "SSRF_REJECTED",
-          `plugin '${pluginId}' MCP server '${serverName}' header '${name}' is a known-dangerous override ` +
-            "and is rejected",
-        );
+      try {
+        validateMcpHeaderName(name);
+      } catch (e) {
+        if (e instanceof SsrfValidationError) {
+          if (e.message.includes("invalid characters")) {
+            throw new PluginStoreError(
+              "SSRF_REJECTED",
+              `plugin '${pluginId}' MCP server '${serverName}' header '${name}' contains invalid characters; ` +
+                "header names may only contain a-z, A-Z, 0-9, underscore, and hyphen",
+            );
+          }
+          throw new PluginStoreError(
+            "SSRF_REJECTED",
+            `plugin '${pluginId}' MCP server '${serverName}' header '${name}' is a known-dangerous override ` +
+              "and is rejected",
+          );
+        }
+        throw e;
       }
     }
   }

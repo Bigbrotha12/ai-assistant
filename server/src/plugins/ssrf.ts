@@ -462,6 +462,16 @@ export function isRedirectStatus(status: number): boolean {
   return status >= 300 && status < 400;
 }
 
+export const HEADER_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+export const DANGEROUS_HEADERS = new Set([
+  'content-type', 'accept', 'host', 'transfer-encoding', 'connection', 'cookie', 'set-cookie',
+]);
+
+export function validateMcpHeaderName(name: string): void {
+  if (!HEADER_NAME_RE.test(name)) throw new SsrfValidationError("INVALID_URL", `MCP header name '${name}' contains invalid characters`);
+  if (DANGEROUS_HEADERS.has(name.toLowerCase())) throw new SsrfValidationError("INVALID_URL", `MCP header name '${name}' is a reserved/dangerous header`);
+}
+
 /**
  * Hostname shape an entry may take: one or more RFC-style DNS labels separated
  * by dots, optionally prefixed with a single `*.` wildcard. Rejects uppercase

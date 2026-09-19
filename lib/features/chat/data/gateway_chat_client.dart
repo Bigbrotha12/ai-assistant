@@ -13,7 +13,7 @@ typedef CredentialResolver = Future<GatewayCredentials?> Function();
 class GatewayCredentials {
   final String gatewayKey;
   final String modelPluginId;
-  final String? agent;
+  final Object? agent;
   final Map<String, Map<String, String>> credentials;
 
   const GatewayCredentials({
@@ -108,7 +108,7 @@ class GatewayChatClient implements ChatClient {
 
     final body = <String, Object?>{
       'model': creds.modelPluginId,
-      if (creds.agent != null) 'agent': creds.agent!,
+      if (creds.agent != null) 'agent': creds.agent,
       'messages': [
         if (systemPrompt != null)
           _serializeMessage(
@@ -201,7 +201,7 @@ class GatewayChatClient implements ChatClient {
 
     final body = <String, Object?>{
       'model': creds.modelPluginId,
-      if (creds.agent != null) 'agent': creds.agent!,
+      if (creds.agent != null) 'agent': creds.agent,
       'messages': [
         if (systemPrompt != null)
           _serializeMessage(
