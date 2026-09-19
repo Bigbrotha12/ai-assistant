@@ -1,3 +1,8 @@
+/**
+ * Default skill token budget when a caller does not supply one. Production
+ * callers pass env.AGENT_SKILL_BUDGET_TOKENS; this constant is the module
+ * fallback (matches the env default).
+ */
 export const DEFAULT_SKILL_TOKEN_BUDGET = 6000;
 
 function estimateTokens(text: string): number {

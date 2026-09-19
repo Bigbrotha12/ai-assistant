@@ -55,7 +55,7 @@ app.route("/api/notify", createNotifyRoutes({ store: notifyStore }));
 const { registry: pluginRegistry, store: pluginStore } = createPluginWiring();
 await pluginStore.load();
 // Load catalogs (skills, mcps, agent templates) from CONFIG_DIR
-const configDir = process.env.CONFIG_DIR ?? "/config";
+const configDir = env.CONFIG_DIR;
 const catalogs: Catalogs = await loadCatalogs(configDir, pluginStore);
 // Hot-reload on live plugins.json edits (fs.watch via the registry, wired in
 // production too so config changes apply without a restart). The registry

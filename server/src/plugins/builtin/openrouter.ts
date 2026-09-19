@@ -3,6 +3,7 @@ import {
   pluginDefinitionSchema,
 } from "../types.ts";
 import type { ModelPluginDefinition } from "../types.ts";
+import { env } from "../../env.ts";
 
 /**
  * Builtin model plugins.
@@ -14,7 +15,15 @@ import type { ModelPluginDefinition } from "../types.ts";
  * user-supplied key, so it is the safe built-in default. Every other provider
  * — OpenAI/Anthropic included — must be added as an admin-installable
  * manifest/allowlist entry (Step 4's store), never as more builtin code.
+ *
+ * The endpoint + default model are env-configurable via
+ * DEFAULT_MODEL_PROVIDER_BASE_URL / DEFAULT_MODEL_PROVIDER_MODEL so a
+ * self-hosted operator can point the builtin at any OpenAI-compatible
+ * provider without editing code. Everything else is fixed.
  */
+const baseUrl = env.DEFAULT_MODEL_PROVIDER_BASE_URL;
+const defaultModel = env.DEFAULT_MODEL_PROVIDER_MODEL;
+
 const parsed = pluginDefinitionSchema.parse({
   id: "openrouter",
   version: "1.0.0",
@@ -24,8 +33,8 @@ const parsed = pluginDefinitionSchema.parse({
   description:
     "Single API for 400+ models — user supplies their own OpenRouter API key.",
   inference: {
-    endpoint: "https://openrouter.ai/api/v1",
-    defaultModel: "openrouter/auto",
+    endpoint: baseUrl,
+    defaultModel,
     tokenLimit: 131072,
     supportsStreaming: true,
     visionCapable: true,
@@ -34,13 +43,13 @@ const parsed = pluginDefinitionSchema.parse({
   baseUrls: [
     {
       id: "openrouter-default",
-      url: "https://openrouter.ai/api/v1",
-      label: "OpenRouter API (default)",
+      url: baseUrl,
+      label: "Default provider endpoint",
     },
   ],
   credentials: {
     // User-owned key; never persisted server-side.
-    apiKey: { label: "OpenRouter API key", required: true },
+    apiKey: { label: "Default provider API key", required: true },
   },
 });
 

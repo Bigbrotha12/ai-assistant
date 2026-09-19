@@ -13,7 +13,7 @@ config({ quiet: true });
  */
 const CHECKPOINT_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
 
-const envSchema = z.object({
+export const envSchema = z.object({
   BETTER_AUTH_SECRET: z
     .string()
     .min(32, "BETTER_AUTH_SECRET is required and must be at least 32 characters"),
@@ -22,6 +22,7 @@ const envSchema = z.object({
     .url("BETTER_AUTH_URL must be an absolute URL, e.g. http://localhost:17600"),
   PORT: z.coerce.number().int().positive().default(17600),
   DB_PATH: z.string().default("./data/gateway.db"),
+  CONFIG_DIR: z.string().default("/config"),
   // Sustained / burst ceiling for `POST /v1/chat/completions`, applied
   // PER-OWNER (the authenticated user id, not the API key) since Phase 4
   // Wave A — a user with many keys cannot rotate keys to bypass the limit.
@@ -35,6 +36,13 @@ const envSchema = z.object({
   BUDGET_MODEL_CALL_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60),
   BUDGET_MODEL_CALL_WINDOW_MS: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60_000),
   CONTEXT_TOKEN_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(32_768),
+  // Skill injection budget for composeAgentPrompt (chars/4 token heuristic).
+  AGENT_SKILL_BUDGET_TOKENS: z.coerce.number().int().positive().max(1_000_000).default(6000),
+  // Custom-agent spec guard rails (size caps in the request body schema).
+  AGENT_SPEC_MAX_SYSTEM_PROMPT: z.coerce.number().int().positive().default(8000),
+  AGENT_SPEC_MAX_SKILLS: z.coerce.number().int().positive().default(50),
+  AGENT_SPEC_MAX_MCPS: z.coerce.number().int().positive().default(20),
+  AGENT_SPEC_MAX_TOOLS: z.coerce.number().int().positive().default(100),
   WARMUP_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   WARMUP_MAX_CONCURRENT: z.coerce.number().int().positive().max(2_147_483_647).default(2),
   WARMUP_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).default(10_000),
@@ -98,6 +106,15 @@ const envSchema = z.object({
         .map((host) => host.trim())
         .filter((host) => host.length > 0),
     ),
+  // Default model plugin provider override — provider-agnostic. The builtin
+  // model plugin's endpoint + default model come from these (OpenRouter
+  // defaults), so a self-hosted operator can point at any OpenAI-compatible
+  // provider without editing code.
+  DEFAULT_MODEL_PROVIDER_BASE_URL: z
+    .string()
+    .url("DEFAULT_MODEL_PROVIDER_BASE_URL must be an absolute URL")
+    .default("https://openrouter.ai/api/v1"),
+  DEFAULT_MODEL_PROVIDER_MODEL: z.string().trim().min(1).default("openrouter/auto"),
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),

@@ -56,12 +56,12 @@ describe("openrouter builtin model plugin", () => {
     const entry = openRouterPlugin.baseUrls[0]!;
     assert.equal(entry.id, "openrouter-default");
     assert.equal(entry.url, "https://openrouter.ai/api/v1");
-    assert.equal(entry.label, "OpenRouter API (default)");
+    assert.equal(entry.label, "Default provider endpoint");
   });
 
   test("credentials require a user-owned api key", () => {
     assert.equal(openRouterPlugin.credentials?.apiKey.required, true);
-    assert.equal(openRouterPlugin.credentials?.apiKey.label, "OpenRouter API key");
+    assert.equal(openRouterPlugin.credentials?.apiKey.label, "Default provider API key");
   });
 });
 

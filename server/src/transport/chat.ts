@@ -11,6 +11,7 @@ import type { BaseMessage } from "@langchain/core/messages";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 
+import { env } from "../env.ts";
 import { requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers } from "../agents/mcp.ts";
@@ -66,16 +67,23 @@ import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
 
+const agentSpecCaps = {
+  systemPrompt: env.AGENT_SPEC_MAX_SYSTEM_PROMPT,
+  skills: env.AGENT_SPEC_MAX_SKILLS,
+  mcps: env.AGENT_SPEC_MAX_MCPS,
+  tools: env.AGENT_SPEC_MAX_TOOLS,
+};
+
 const customAgentSpecSchema = z.object({
   name: z.string().max(100).optional(),
   description: z.string().max(300).optional(),
-  systemPrompt: z.string().max(8000).optional(),
-  skills: z.array(pluginIdSchema).max(50).optional(),
-  mcpServers: z.array(z.object({ name: pluginIdSchema }).strict()).max(20).optional(),
+  systemPrompt: z.string().max(agentSpecCaps.systemPrompt).optional(),
+  skills: z.array(pluginIdSchema).max(agentSpecCaps.skills).optional(),
+  mcpServers: z.array(z.object({ name: pluginIdSchema }).strict()).max(agentSpecCaps.mcps).optional(),
   tools: z.array(z.object({
     pluginId: pluginIdSchema,
     required: z.boolean().default(false),
-  }).strict()).max(100).optional(),
+  }).strict()).max(agentSpecCaps.tools).optional(),
   modelRef: pluginIdSchema.optional(),
   inference: z.object({
     temperature: z.number().optional(),
@@ -777,6 +785,7 @@ export function resolveChatRequest(
     const systemPrompt = composeAgentPrompt(
       resolvedAgentDef.systemPrompt ?? "",
       resolvedAgentDef.skills,
+      env.AGENT_SKILL_BUDGET_TOKENS,
     );
 
     agentOverride = {
