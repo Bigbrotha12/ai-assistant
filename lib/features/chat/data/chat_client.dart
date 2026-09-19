@@ -6,24 +6,6 @@ import './message_model.dart';
 import '../../../core/http/dio_errors.dart';
 import './sse.dart';
 
-/// Structured event from the LLM stream.
-sealed class ChatEvent {}
-
-/// A content delta (thinking already stripped by the SSE parser).
-class ChatContentEvent extends ChatEvent {
-  ChatContentEvent(this.text);
-
-  final String text;
-}
-
-/// Terminal event signalling the end of the stream.
-class ChatDoneEvent extends ChatEvent {
-  ChatDoneEvent(this.finishReason);
-
-  /// 'stop' | 'tool_calls' | null (clean EOF without an explicit reason).
-  final String? finishReason;
-}
-
 /// The fully-assembled result of a chat completion turn.
 class ChatResult {
   const ChatResult({
@@ -61,14 +43,6 @@ class ChatServerError extends ChatApiError {
   const ChatServerError(super.message, {this.statusCode});
 
   final int? statusCode;
-}
-
-/// HTTP 401 from the configured inference API (the `LLM_*` dart-defines, see
-/// AGENTS.md): the compile-time `LLM_API_KEY` was rejected/revoked. NOT the
-/// gateway minted-key rejection — re-authenticating with the gateway cannot
-/// fix it; the app must ship a valid build-time key.
-class InferenceAuthError extends ChatServerError {
-  const InferenceAuthError(super.message) : super(statusCode: 401);
 }
 
 /// The server sent an error envelope inside the stream.
@@ -128,10 +102,9 @@ abstract interface class ChatClient {
   });
 }
 
-/// OpenAI-compatible chat completions client against the configured external
-/// inference API (e.g. a LibreChat agents endpoint). Inference never routes
-/// through the gateway (see [chatApiClientProvider]); requests go straight to
-/// `$baseUrl/chat/completions` SSE streams.
+/// OpenAI-compatible chat completions client. Phase 4-era; replaced by
+/// [GatewayChatClient] for new inference (the LangChain gateway). Kept for
+/// reference; no active consumers.
 class ChatApiClient implements ChatClient {
   ChatApiClient({
     required this.baseUrl,
@@ -387,7 +360,7 @@ class ChatApiClient implements ChatClient {
                   ?.call(delta.index, acc.name ?? '', delta.argsFragment);
             }
           case SseEventType.done:
-            finishReason = event.finishReason;
+            if (event.finishReason != null) finishReason = event.finishReason;
           case SseEventType.error:
             throw ChatStreamError(event.error ?? 'stream error');
         }
@@ -495,17 +468,8 @@ class ChatApiClient implements ChatClient {
     }
   }
 
-  /// A non-2xx status from the inference API. A 401 names the source
-  /// explicitly: it is the build-time `LLM_API_KEY` being rejected, not the
-  /// gateway stored key, so it must not drive the gateway re-auth affordance.
+  /// A non-2xx status from the inference API.
   Never _serverStatusError(int? status, {String? message}) {
-    if (status == 401) {
-      throw InferenceAuthError(
-        message ??
-            'Inference API key rejected (401). Rebuild the app with a valid '
-                'LLM_API_KEY dart-define.',
-      );
-    }
     throw ChatServerError(message ?? 'HTTP $status', statusCode: status);
   }
 
@@ -523,12 +487,8 @@ class ChatApiClient implements ChatClient {
   }
 }
 
-/// True when [error] is the gateway minted-key rejection that the gateway
-/// re-auth flow can remedy. A plain [ChatServerError] 401 qualifies; an
-/// [InferenceAuthError] (the inference API rejecting the build-time
-/// `LLM_API_KEY`) does NOT — rebuilding with a valid define is the only fix,
-/// so the chat and voice UIs surface its message instead of the re-auth card.
+/// True when [error] is a gateway key rejection that the re-auth flow can
+/// remedy — a [ChatServerError] with 401 from the gateway.
 bool isAuthRequiredError(Object error) =>
     error is ChatServerError &&
-    error.statusCode == 401 &&
-    error is! InferenceAuthError;
+    error.statusCode == 401;

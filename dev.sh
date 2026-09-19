@@ -169,11 +169,8 @@ if grep -q '^BETTER_AUTH_SECRET=replace-me-with-at-least-32-random-characters' .
   echo "Generated BETTER_AUTH_SECRET in server/.env."
 fi
 
-# 3) Ensure the dev defaults for BETTER_AUTH_URL / INFERENCE_URL when missing
-#    or blank (the gateway refuses to boot on a missing/blank URL).
-#    INFERENCE_URL targets the llama.cpp inference proxy (port 9090 = Qwen3-14B);
-#    see ~/Documents/homelab/podman/queues. --dart-define overrides are applied
-#    to flutter run below; a custom INFERENCE_URL may be set in server/.env.
+# 3) Ensure the BETTER_AUTH_URL dev default when missing or blank
+#    (the gateway refuses to boot on a missing/blank URL).
 ensure_env_default() {
   local key="$1" default="$2"
   if ! grep -q "^${key}=.*[^[:space:]]" .env; then
@@ -187,7 +184,6 @@ ensure_env_default() {
   fi
 }
 ensure_env_default "BETTER_AUTH_URL" "http://${HOST_FQDN}:17600"
-ensure_env_default "INFERENCE_URL" "http://localhost:9090"
 
 # 4) npm install (only if node_modules is missing).
 if [ ! -d node_modules ]; then
@@ -237,25 +233,6 @@ if [ "$HEALTHY" -ne 1 ]; then
   exit 1
 fi
 echo "Gateway is healthy: $(curl -fsS "$HEALTH_URL")"
-
-# Note if the inference engine is unreachable (needed for chat, not auth).
-# INFERENCE_URL is read from server/.env (the editable source of truth; default
-# is the llama.cpp proxy port 9090 = Qwen3-14B, see ~/Documents/homelab/podman/
-# queues). The proxy binds its port only when the podman queues stack is running.
-# We probe the TCP port: the proxy routes every path to llama, so an HTTP GET
-# would block waiting on inference — a bare port check is the safe, non-blocking
-# signal.
-INFERENCE_URL="${INFERENCE_URL:-$(grep -E '^INFERENCE_URL=' ".env" | head -n1 | cut -d= -f2-)}"
-INFERENCE_URL="${INFERENCE_URL:-http://localhost:9090}"
-INFERENCE_PORT="$(printf '%s' "$INFERENCE_URL" | sed -E 's#^https?://[^:/]+:?([0-9]*).*#\1#')"
-INFERENCE_PORT="${INFERENCE_PORT:-9090}"
-if ! (exec 3<>"/dev/tcp/localhost/$INFERENCE_PORT") 2>/dev/null; then
-  echo "warning: inference proxy ($INFERENCE_URL) is not reachable."
-  echo "         Start it with: cd ~/Documents/homelab/podman/queues && podman-compose up -d --build"
-  echo "         Auth / sign-up still work; chat will fail until it is up."
-else
-  exec 3>&- 2>/dev/null
-fi
 
 # ---------------------------------------------------------------------------
 # Run flutter against the local dev backend
@@ -316,9 +293,16 @@ case "$FLUTTER_DEVICE" in
         sleep 2
         "$ADB_BIN" connect "$FLUTTER_DEVICE" || true
       else
-        echo "warning: wireless adb target $FLUTTER_DEVICE is not connected and no USB device is attached."
-        echo "         After a phone reboot, plug in USB once — this script will re-enable TCP mode."
-        echo "         Or re-enable Wireless debugging on the phone and update FLUTTER_DEVICE."
+        # Wireless-only (no USB attached): nothing to re-enable TCP mode on, so
+        # try to reach the already-active wireless adb session directly.
+        "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
+        if "$ADB_BIN" devices 2>/dev/null | grep -q "^$FLUTTER_DEVICE[[:space:]]"; then
+          echo "Connected to wireless adb target $FLUTTER_DEVICE."
+        else
+          echo "warning: wireless adb target $FLUTTER_DEVICE is not connected and no USB device is attached."
+          echo "         After a phone reboot, plug in USB once — this script will re-enable TCP mode."
+          echo "         Or re-enable Wireless debugging on the phone and update FLUTTER_DEVICE."
+        fi
       fi
     fi
     ;;
@@ -327,9 +311,6 @@ esac
 "$FLUTTER_BIN" run \
   -d "$FLUTTER_DEVICE" \
   --dart-define=HOST_FQDN="$HOST_FQDN" \
-  ${LLM_BASE_URL:+--dart-define=LLM_BASE_URL="$LLM_BASE_URL"} \
-  ${LLM_MODEL:+--dart-define=LLM_MODEL="$LLM_MODEL"} \
-  ${LLM_API_KEY:+--dart-define=LLM_API_KEY="$LLM_API_KEY"} \
   "${EXTRA_ARGS[@]}" &
 FLUTTER_PID=$!
 

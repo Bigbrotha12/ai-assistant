@@ -9,6 +9,8 @@ class Conversations extends Table {
   DateTimeColumn get createdAt => dateTime()();
   DateTimeColumn get updatedAt => dateTime()();
   IntColumn get messageCount => integer().withDefault(const Constant(0))();
+  TextColumn get scopeKey => text().nullable()();
+  TextColumn get publicThreadId => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {id};
@@ -40,9 +42,11 @@ class Messages extends Table {
 @DataClassName('FileRow')
 class Files extends Table {
   TextColumn get id => text()();
-  TextColumn get conversationId => text()
-      .nullable()
-      .references(Conversations, #id, onDelete: KeyAction.cascade)();
+  TextColumn get conversationId => text().nullable().references(
+    Conversations,
+    #id,
+    onDelete: KeyAction.cascade,
+  )();
   TextColumn get serverFileId => text()();
   TextColumn get localPath => text()();
   TextColumn get filename => text()();
@@ -69,7 +73,8 @@ class Files extends Table {
 class Memories extends Table {
   TextColumn get id => text()(); // UUID PK
   TextColumn get content => text()(); // the memory text
-  TextColumn get source => text().nullable()(); // provenance (conversation id, 'manual')
+  TextColumn get source =>
+      text().nullable()(); // provenance (conversation id, 'manual')
   DateTimeColumn get createdAt => dateTime()();
   DateTimeColumn get updatedAt => dateTime()();
 
@@ -77,45 +82,70 @@ class Memories extends Table {
   Set<Column> get primaryKey => {id};
 }
 
-@DriftDatabase(tables: [Conversations, Messages, Files, Memories])
+@DataClassName('ManagedPendingTurnRow')
+class ManagedPendingTurns extends Table {
+  // No FK to conversations: a FIRST send persists the pending turn before the
+  // local conversation row exists (the row is only written after the server
+  // replies, and a logout/clear must be able to drop the row independently).
+  TextColumn get conversationId => text()();
+  TextColumn get scopeKey => text()();
+  TextColumn get messageId => text()();
+  TextColumn get envelope => text()();
+  BoolColumn get reconcileOnly =>
+      boolean().withDefault(const Constant(false))();
+
+  @override
+  Set<Column> get primaryKey => {conversationId, scopeKey};
+}
+
+@DriftDatabase(
+  tables: [Conversations, Messages, Files, Memories, ManagedPendingTurns],
+)
 class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 5;
+  int get schemaVersion => 6;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
-        onCreate: (m) async {
-          await m.createAll();
-          await _createMemoryFts(m);
-        },
-        onUpgrade: (m, from, to) async {
-          if (from < 2) {
-            await m.createTable(files);
-            await m.createIndex(filesConversationIdIdx);
-          }
-          if (from < 3) {
-            await m.alterTable(TableMigration(files, newColumns: [files.description]));
-          }
-          if (from < 4) {
-            await m.createTable(memories);
-            await m.createIndex(memoriesUpdatedAtIdx);
-            await _createMemoryFts(m);
-          }
-          if (from < 5) {
-            await m.createIndex(messagesConversationIdIdx);
-          }
-          // v4: memories table + FTS5 full-text search (see DriftMemoryStore).
-          // v5: index on messages.conversationId (per-conversation message
-          // loads and watchConversations scan no longer table-scan).
-        },
-        beforeOpen: (details) async {
-          // SQLite does NOT enable FK enforcement by default — without this
-          // the ON DELETE CASCADE above silently never fires.
-          await customStatement('PRAGMA foreign_keys = ON');
-        },
-      );
+    onCreate: (m) async {
+      await m.createAll();
+      await _createMemoryFts(m);
+    },
+    onUpgrade: (m, from, to) async {
+      if (from < 2) {
+        await m.createTable(files);
+        await m.createIndex(filesConversationIdIdx);
+      }
+      if (from < 3) {
+        await m.alterTable(
+          TableMigration(files, newColumns: [files.description]),
+        );
+      }
+      if (from < 4) {
+        await m.createTable(memories);
+        await m.createIndex(memoriesUpdatedAtIdx);
+        await _createMemoryFts(m);
+      }
+      if (from < 5) {
+        await m.createIndex(messagesConversationIdIdx);
+      }
+      if (from < 6) {
+        await m.addColumn(conversations, conversations.scopeKey);
+        await m.addColumn(conversations, conversations.publicThreadId);
+        await m.createTable(managedPendingTurns);
+      }
+      // v4: memories table + FTS5 full-text search (see DriftMemoryStore).
+      // v5: index on messages.conversationId (per-conversation message
+      // loads and watchConversations scan no longer table-scan).
+    },
+    beforeOpen: (details) async {
+      // SQLite does NOT enable FK enforcement by default — without this
+      // the ON DELETE CASCADE above silently never fires.
+      await customStatement('PRAGMA foreign_keys = ON');
+    },
+  );
 
   /// Creates the external-content FTS5 index (`memories_fts`) over the
   /// `memories` table plus the triggers that keep it in sync.

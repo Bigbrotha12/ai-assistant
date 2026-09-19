@@ -6,46 +6,10 @@ import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/chat/data/gateway_chat_client.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 
-/// Wraps [payload] in a single SSE `data:` frame.
-String frame(String payload) => 'data: $payload\n\n';
-
-/// Builds an OpenAI-style streaming chunk payload as a JSON string.
-String chunk({
-  String? content,
-  List<Map<String, Object?>>? toolCalls,
-  String? finishReason,
-}) {
-  final delta = <String, Object?>{};
-  if (content != null) delta['content'] = content;
-  if (toolCalls != null) delta['tool_calls'] = toolCalls;
-  return jsonEncode({
-    'id': 'chatcmpl-1',
-    'object': 'chat.completion.chunk',
-    'choices': [
-      {'delta': delta, 'index': 0, 'finish_reason': finishReason},
-    ],
-  });
-}
-
-/// Builds a single `delta.tool_calls[]` entry as a map.
-Map<String, Object?> toolCall({
-  int index = 0,
-  String? id,
-  String? name,
-  String? arguments,
-}) {
-  final function = <String, Object?>{};
-  if (name != null) function['name'] = name;
-  if (arguments != null) function['arguments'] = arguments;
-  return {
-    'index': index,
-    'type': 'function',
-    'id': ?id,
-    'function': function,
-  };
-}
+import 'sse_fixtures.dart';
 
 sealed class _AdapterAction {}
 
@@ -233,6 +197,7 @@ void main() {
             toolCall(index: 1, arguments: '"UTC"}'),
           ])),
           frame(chunk(finishReason: 'tool_calls')),
+          frame('[DONE]'),
         ]),
       ]);
       final client = _client(adapter);
@@ -597,7 +562,7 @@ void main() {
       expect(receivedCount, 1);
     });
 
-    test('does NOT fire on 401 and throws InferenceAuthError', () async {
+    test('does NOT fire on 401 and throws ChatServerError', () async {
       final adapter = _ScriptedAdapter([
         _ErrorAction(401, body: 'Unauthorized'),
       ]);
@@ -616,12 +581,12 @@ void main() {
 
       expect(
         caught,
-        isA<InferenceAuthError>()
+        isA<ChatServerError>()
             .having((e) => e.statusCode, 'statusCode', 401),
       );
-      // The inference API 401 is not the gateway minted-key rejection the
-      // re-auth flow can fix.
-      expect(isAuthRequiredError(caught!), isFalse);
+      // A 401 from the legacy client is now treated as a gateway-style
+      // auth error: the GatewayChatClient returns ChatServerError on 401.
+      expect(isAuthRequiredError(caught!), isTrue);
       expect(receivedCount, 0);
     });
 
@@ -644,6 +609,65 @@ void main() {
       expect(result.content, 'recovered');
       expect(receivedCount, 1);
       expect(adapter.callCount, 2);
+    });
+  });
+
+  group('GatewayChatClient agent field', () {
+    GatewayChatClient _gatewayClient(
+      _ScriptedAdapter adapter, {
+      String? agent,
+    }) {
+      final creds = GatewayCredentials(
+        gatewayKey: 'sk-test',
+        modelPluginId: 'gpt-4',
+        agent: agent,
+        credentials: {'gpt-4': {'apiKey': 'sk-123'}},
+      );
+      return GatewayChatClient(
+        baseUrl: 'https://gateway.test/v1',
+        dio: Dio()..httpClientAdapter = adapter,
+        credentialResolver: () async => creds,
+      );
+    }
+
+    test('completions with agent sends agent in body', () async {
+      final adapter = _ScriptedAdapter([
+        _JsonAction({
+          'id': 'chatcmpl-1',
+          'object': 'chat.completion',
+          'choices': [
+            {
+              'index': 0,
+              'finish_reason': 'stop',
+              'message': {'role': 'assistant', 'content': 'ok'},
+            },
+          ],
+        }),
+      ]);
+      final client = _gatewayClient(adapter, agent: 'my-agent');
+
+      await client.completions(messages: [ApiMessage(role: 'user', content: 'Hi')]);
+
+      final body = adapter.requests.single.data as Map<String, dynamic>;
+      expect(body['model'], 'gpt-4');
+      expect(body['agent'], 'my-agent');
+      expect(body.containsKey('credentials'), isTrue);
+    });
+
+    test('streamCompletions with null agent omits agent field', () async {
+      final adapter = _ScriptedAdapter([
+        _StreamAction([
+          frame(chunk(content: 'Hello')),
+          frame(chunk(finishReason: 'stop')),
+        ]),
+      ]);
+      final client = _gatewayClient(adapter, agent: null);
+
+      await client.streamCompletions(messages: [ApiMessage(role: 'user', content: 'Hi')]);
+
+      final body = adapter.requests.single.data as Map<String, dynamic>;
+      expect(body['model'], 'gpt-4');
+      expect(body.containsKey('agent'), isFalse);
     });
   });
 }

@@ -62,6 +62,28 @@ class $ConversationsTable extends Conversations
     requiredDuringInsert: false,
     defaultValue: const Constant(0),
   );
+  static const VerificationMeta _scopeKeyMeta = const VerificationMeta(
+    'scopeKey',
+  );
+  @override
+  late final GeneratedColumn<String> scopeKey = GeneratedColumn<String>(
+    'scope_key',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _publicThreadIdMeta = const VerificationMeta(
+    'publicThreadId',
+  );
+  @override
+  late final GeneratedColumn<String> publicThreadId = GeneratedColumn<String>(
+    'public_thread_id',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
   @override
   List<GeneratedColumn> get $columns => [
     id,
@@ -69,6 +91,8 @@ class $ConversationsTable extends Conversations
     createdAt,
     updatedAt,
     messageCount,
+    scopeKey,
+    publicThreadId,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -118,6 +142,21 @@ class $ConversationsTable extends Conversations
         ),
       );
     }
+    if (data.containsKey('scope_key')) {
+      context.handle(
+        _scopeKeyMeta,
+        scopeKey.isAcceptableOrUnknown(data['scope_key']!, _scopeKeyMeta),
+      );
+    }
+    if (data.containsKey('public_thread_id')) {
+      context.handle(
+        _publicThreadIdMeta,
+        publicThreadId.isAcceptableOrUnknown(
+          data['public_thread_id']!,
+          _publicThreadIdMeta,
+        ),
+      );
+    }
     return context;
   }
 
@@ -147,6 +186,14 @@ class $ConversationsTable extends Conversations
         DriftSqlType.int,
         data['${effectivePrefix}message_count'],
       )!,
+      scopeKey: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}scope_key'],
+      ),
+      publicThreadId: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}public_thread_id'],
+      ),
     );
   }
 
@@ -162,12 +209,16 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
   final DateTime createdAt;
   final DateTime updatedAt;
   final int messageCount;
+  final String? scopeKey;
+  final String? publicThreadId;
   const ConversationRow({
     required this.id,
     required this.title,
     required this.createdAt,
     required this.updatedAt,
     required this.messageCount,
+    this.scopeKey,
+    this.publicThreadId,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -177,6 +228,12 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     map['created_at'] = Variable<DateTime>(createdAt);
     map['updated_at'] = Variable<DateTime>(updatedAt);
     map['message_count'] = Variable<int>(messageCount);
+    if (!nullToAbsent || scopeKey != null) {
+      map['scope_key'] = Variable<String>(scopeKey);
+    }
+    if (!nullToAbsent || publicThreadId != null) {
+      map['public_thread_id'] = Variable<String>(publicThreadId);
+    }
     return map;
   }
 
@@ -187,6 +244,12 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       createdAt: Value(createdAt),
       updatedAt: Value(updatedAt),
       messageCount: Value(messageCount),
+      scopeKey: scopeKey == null && nullToAbsent
+          ? const Value.absent()
+          : Value(scopeKey),
+      publicThreadId: publicThreadId == null && nullToAbsent
+          ? const Value.absent()
+          : Value(publicThreadId),
     );
   }
 
@@ -201,6 +264,8 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       createdAt: serializer.fromJson<DateTime>(json['createdAt']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
       messageCount: serializer.fromJson<int>(json['messageCount']),
+      scopeKey: serializer.fromJson<String?>(json['scopeKey']),
+      publicThreadId: serializer.fromJson<String?>(json['publicThreadId']),
     );
   }
   @override
@@ -212,6 +277,8 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       'createdAt': serializer.toJson<DateTime>(createdAt),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
       'messageCount': serializer.toJson<int>(messageCount),
+      'scopeKey': serializer.toJson<String?>(scopeKey),
+      'publicThreadId': serializer.toJson<String?>(publicThreadId),
     };
   }
 
@@ -221,12 +288,18 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     DateTime? createdAt,
     DateTime? updatedAt,
     int? messageCount,
+    Value<String?> scopeKey = const Value.absent(),
+    Value<String?> publicThreadId = const Value.absent(),
   }) => ConversationRow(
     id: id ?? this.id,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
     updatedAt: updatedAt ?? this.updatedAt,
     messageCount: messageCount ?? this.messageCount,
+    scopeKey: scopeKey.present ? scopeKey.value : this.scopeKey,
+    publicThreadId: publicThreadId.present
+        ? publicThreadId.value
+        : this.publicThreadId,
   );
   ConversationRow copyWithCompanion(ConversationsCompanion data) {
     return ConversationRow(
@@ -237,6 +310,10 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       messageCount: data.messageCount.present
           ? data.messageCount.value
           : this.messageCount,
+      scopeKey: data.scopeKey.present ? data.scopeKey.value : this.scopeKey,
+      publicThreadId: data.publicThreadId.present
+          ? data.publicThreadId.value
+          : this.publicThreadId,
     );
   }
 
@@ -247,14 +324,23 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
           ..write('title: $title, ')
           ..write('createdAt: $createdAt, ')
           ..write('updatedAt: $updatedAt, ')
-          ..write('messageCount: $messageCount')
+          ..write('messageCount: $messageCount, ')
+          ..write('scopeKey: $scopeKey, ')
+          ..write('publicThreadId: $publicThreadId')
           ..write(')'))
         .toString();
   }
 
   @override
-  int get hashCode =>
-      Object.hash(id, title, createdAt, updatedAt, messageCount);
+  int get hashCode => Object.hash(
+    id,
+    title,
+    createdAt,
+    updatedAt,
+    messageCount,
+    scopeKey,
+    publicThreadId,
+  );
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
@@ -263,7 +349,9 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
           other.title == this.title &&
           other.createdAt == this.createdAt &&
           other.updatedAt == this.updatedAt &&
-          other.messageCount == this.messageCount);
+          other.messageCount == this.messageCount &&
+          other.scopeKey == this.scopeKey &&
+          other.publicThreadId == this.publicThreadId);
 }
 
 class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
@@ -272,6 +360,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
   final Value<DateTime> createdAt;
   final Value<DateTime> updatedAt;
   final Value<int> messageCount;
+  final Value<String?> scopeKey;
+  final Value<String?> publicThreadId;
   final Value<int> rowid;
   const ConversationsCompanion({
     this.id = const Value.absent(),
@@ -279,6 +369,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     this.createdAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.messageCount = const Value.absent(),
+    this.scopeKey = const Value.absent(),
+    this.publicThreadId = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   ConversationsCompanion.insert({
@@ -287,6 +379,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     required DateTime createdAt,
     required DateTime updatedAt,
     this.messageCount = const Value.absent(),
+    this.scopeKey = const Value.absent(),
+    this.publicThreadId = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : id = Value(id),
        createdAt = Value(createdAt),
@@ -297,6 +391,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     Expression<DateTime>? createdAt,
     Expression<DateTime>? updatedAt,
     Expression<int>? messageCount,
+    Expression<String>? scopeKey,
+    Expression<String>? publicThreadId,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -305,6 +401,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
       if (createdAt != null) 'created_at': createdAt,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (messageCount != null) 'message_count': messageCount,
+      if (scopeKey != null) 'scope_key': scopeKey,
+      if (publicThreadId != null) 'public_thread_id': publicThreadId,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -315,6 +413,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     Value<DateTime>? createdAt,
     Value<DateTime>? updatedAt,
     Value<int>? messageCount,
+    Value<String?>? scopeKey,
+    Value<String?>? publicThreadId,
     Value<int>? rowid,
   }) {
     return ConversationsCompanion(
@@ -323,6 +423,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
       messageCount: messageCount ?? this.messageCount,
+      scopeKey: scopeKey ?? this.scopeKey,
+      publicThreadId: publicThreadId ?? this.publicThreadId,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -345,6 +447,12 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     if (messageCount.present) {
       map['message_count'] = Variable<int>(messageCount.value);
     }
+    if (scopeKey.present) {
+      map['scope_key'] = Variable<String>(scopeKey.value);
+    }
+    if (publicThreadId.present) {
+      map['public_thread_id'] = Variable<String>(publicThreadId.value);
+    }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
     }
@@ -359,6 +467,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
           ..write('createdAt: $createdAt, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('messageCount: $messageCount, ')
+          ..write('scopeKey: $scopeKey, ')
+          ..write('publicThreadId: $publicThreadId, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -1830,6 +1940,387 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
   }
 }
 
+class $ManagedPendingTurnsTable extends ManagedPendingTurns
+    with TableInfo<$ManagedPendingTurnsTable, ManagedPendingTurnRow> {
+  @override
+  final GeneratedDatabase attachedDatabase;
+  final String? _alias;
+  $ManagedPendingTurnsTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _conversationIdMeta = const VerificationMeta(
+    'conversationId',
+  );
+  @override
+  late final GeneratedColumn<String> conversationId = GeneratedColumn<String>(
+    'conversation_id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _scopeKeyMeta = const VerificationMeta(
+    'scopeKey',
+  );
+  @override
+  late final GeneratedColumn<String> scopeKey = GeneratedColumn<String>(
+    'scope_key',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _messageIdMeta = const VerificationMeta(
+    'messageId',
+  );
+  @override
+  late final GeneratedColumn<String> messageId = GeneratedColumn<String>(
+    'message_id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _envelopeMeta = const VerificationMeta(
+    'envelope',
+  );
+  @override
+  late final GeneratedColumn<String> envelope = GeneratedColumn<String>(
+    'envelope',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _reconcileOnlyMeta = const VerificationMeta(
+    'reconcileOnly',
+  );
+  @override
+  late final GeneratedColumn<bool> reconcileOnly = GeneratedColumn<bool>(
+    'reconcile_only',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("reconcile_only" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
+  @override
+  List<GeneratedColumn> get $columns => [
+    conversationId,
+    scopeKey,
+    messageId,
+    envelope,
+    reconcileOnly,
+  ];
+  @override
+  String get aliasedName => _alias ?? actualTableName;
+  @override
+  String get actualTableName => $name;
+  static const String $name = 'managed_pending_turns';
+  @override
+  VerificationContext validateIntegrity(
+    Insertable<ManagedPendingTurnRow> instance, {
+    bool isInserting = false,
+  }) {
+    final context = VerificationContext();
+    final data = instance.toColumns(true);
+    if (data.containsKey('conversation_id')) {
+      context.handle(
+        _conversationIdMeta,
+        conversationId.isAcceptableOrUnknown(
+          data['conversation_id']!,
+          _conversationIdMeta,
+        ),
+      );
+    } else if (isInserting) {
+      context.missing(_conversationIdMeta);
+    }
+    if (data.containsKey('scope_key')) {
+      context.handle(
+        _scopeKeyMeta,
+        scopeKey.isAcceptableOrUnknown(data['scope_key']!, _scopeKeyMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_scopeKeyMeta);
+    }
+    if (data.containsKey('message_id')) {
+      context.handle(
+        _messageIdMeta,
+        messageId.isAcceptableOrUnknown(data['message_id']!, _messageIdMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_messageIdMeta);
+    }
+    if (data.containsKey('envelope')) {
+      context.handle(
+        _envelopeMeta,
+        envelope.isAcceptableOrUnknown(data['envelope']!, _envelopeMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_envelopeMeta);
+    }
+    if (data.containsKey('reconcile_only')) {
+      context.handle(
+        _reconcileOnlyMeta,
+        reconcileOnly.isAcceptableOrUnknown(
+          data['reconcile_only']!,
+          _reconcileOnlyMeta,
+        ),
+      );
+    }
+    return context;
+  }
+
+  @override
+  Set<GeneratedColumn> get $primaryKey => {conversationId, scopeKey};
+  @override
+  ManagedPendingTurnRow map(Map<String, dynamic> data, {String? tablePrefix}) {
+    final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
+    return ManagedPendingTurnRow(
+      conversationId: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}conversation_id'],
+      )!,
+      scopeKey: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}scope_key'],
+      )!,
+      messageId: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}message_id'],
+      )!,
+      envelope: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}envelope'],
+      )!,
+      reconcileOnly: attachedDatabase.typeMapping.read(
+        DriftSqlType.bool,
+        data['${effectivePrefix}reconcile_only'],
+      )!,
+    );
+  }
+
+  @override
+  $ManagedPendingTurnsTable createAlias(String alias) {
+    return $ManagedPendingTurnsTable(attachedDatabase, alias);
+  }
+}
+
+class ManagedPendingTurnRow extends DataClass
+    implements Insertable<ManagedPendingTurnRow> {
+  final String conversationId;
+  final String scopeKey;
+  final String messageId;
+  final String envelope;
+  final bool reconcileOnly;
+  const ManagedPendingTurnRow({
+    required this.conversationId,
+    required this.scopeKey,
+    required this.messageId,
+    required this.envelope,
+    required this.reconcileOnly,
+  });
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    map['conversation_id'] = Variable<String>(conversationId);
+    map['scope_key'] = Variable<String>(scopeKey);
+    map['message_id'] = Variable<String>(messageId);
+    map['envelope'] = Variable<String>(envelope);
+    map['reconcile_only'] = Variable<bool>(reconcileOnly);
+    return map;
+  }
+
+  ManagedPendingTurnsCompanion toCompanion(bool nullToAbsent) {
+    return ManagedPendingTurnsCompanion(
+      conversationId: Value(conversationId),
+      scopeKey: Value(scopeKey),
+      messageId: Value(messageId),
+      envelope: Value(envelope),
+      reconcileOnly: Value(reconcileOnly),
+    );
+  }
+
+  factory ManagedPendingTurnRow.fromJson(
+    Map<String, dynamic> json, {
+    ValueSerializer? serializer,
+  }) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return ManagedPendingTurnRow(
+      conversationId: serializer.fromJson<String>(json['conversationId']),
+      scopeKey: serializer.fromJson<String>(json['scopeKey']),
+      messageId: serializer.fromJson<String>(json['messageId']),
+      envelope: serializer.fromJson<String>(json['envelope']),
+      reconcileOnly: serializer.fromJson<bool>(json['reconcileOnly']),
+    );
+  }
+  @override
+  Map<String, dynamic> toJson({ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return <String, dynamic>{
+      'conversationId': serializer.toJson<String>(conversationId),
+      'scopeKey': serializer.toJson<String>(scopeKey),
+      'messageId': serializer.toJson<String>(messageId),
+      'envelope': serializer.toJson<String>(envelope),
+      'reconcileOnly': serializer.toJson<bool>(reconcileOnly),
+    };
+  }
+
+  ManagedPendingTurnRow copyWith({
+    String? conversationId,
+    String? scopeKey,
+    String? messageId,
+    String? envelope,
+    bool? reconcileOnly,
+  }) => ManagedPendingTurnRow(
+    conversationId: conversationId ?? this.conversationId,
+    scopeKey: scopeKey ?? this.scopeKey,
+    messageId: messageId ?? this.messageId,
+    envelope: envelope ?? this.envelope,
+    reconcileOnly: reconcileOnly ?? this.reconcileOnly,
+  );
+  ManagedPendingTurnRow copyWithCompanion(ManagedPendingTurnsCompanion data) {
+    return ManagedPendingTurnRow(
+      conversationId: data.conversationId.present
+          ? data.conversationId.value
+          : this.conversationId,
+      scopeKey: data.scopeKey.present ? data.scopeKey.value : this.scopeKey,
+      messageId: data.messageId.present ? data.messageId.value : this.messageId,
+      envelope: data.envelope.present ? data.envelope.value : this.envelope,
+      reconcileOnly: data.reconcileOnly.present
+          ? data.reconcileOnly.value
+          : this.reconcileOnly,
+    );
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('ManagedPendingTurnRow(')
+          ..write('conversationId: $conversationId, ')
+          ..write('scopeKey: $scopeKey, ')
+          ..write('messageId: $messageId, ')
+          ..write('envelope: $envelope, ')
+          ..write('reconcileOnly: $reconcileOnly')
+          ..write(')'))
+        .toString();
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(conversationId, scopeKey, messageId, envelope, reconcileOnly);
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is ManagedPendingTurnRow &&
+          other.conversationId == this.conversationId &&
+          other.scopeKey == this.scopeKey &&
+          other.messageId == this.messageId &&
+          other.envelope == this.envelope &&
+          other.reconcileOnly == this.reconcileOnly);
+}
+
+class ManagedPendingTurnsCompanion
+    extends UpdateCompanion<ManagedPendingTurnRow> {
+  final Value<String> conversationId;
+  final Value<String> scopeKey;
+  final Value<String> messageId;
+  final Value<String> envelope;
+  final Value<bool> reconcileOnly;
+  final Value<int> rowid;
+  const ManagedPendingTurnsCompanion({
+    this.conversationId = const Value.absent(),
+    this.scopeKey = const Value.absent(),
+    this.messageId = const Value.absent(),
+    this.envelope = const Value.absent(),
+    this.reconcileOnly = const Value.absent(),
+    this.rowid = const Value.absent(),
+  });
+  ManagedPendingTurnsCompanion.insert({
+    required String conversationId,
+    required String scopeKey,
+    required String messageId,
+    required String envelope,
+    this.reconcileOnly = const Value.absent(),
+    this.rowid = const Value.absent(),
+  }) : conversationId = Value(conversationId),
+       scopeKey = Value(scopeKey),
+       messageId = Value(messageId),
+       envelope = Value(envelope);
+  static Insertable<ManagedPendingTurnRow> custom({
+    Expression<String>? conversationId,
+    Expression<String>? scopeKey,
+    Expression<String>? messageId,
+    Expression<String>? envelope,
+    Expression<bool>? reconcileOnly,
+    Expression<int>? rowid,
+  }) {
+    return RawValuesInsertable({
+      if (conversationId != null) 'conversation_id': conversationId,
+      if (scopeKey != null) 'scope_key': scopeKey,
+      if (messageId != null) 'message_id': messageId,
+      if (envelope != null) 'envelope': envelope,
+      if (reconcileOnly != null) 'reconcile_only': reconcileOnly,
+      if (rowid != null) 'rowid': rowid,
+    });
+  }
+
+  ManagedPendingTurnsCompanion copyWith({
+    Value<String>? conversationId,
+    Value<String>? scopeKey,
+    Value<String>? messageId,
+    Value<String>? envelope,
+    Value<bool>? reconcileOnly,
+    Value<int>? rowid,
+  }) {
+    return ManagedPendingTurnsCompanion(
+      conversationId: conversationId ?? this.conversationId,
+      scopeKey: scopeKey ?? this.scopeKey,
+      messageId: messageId ?? this.messageId,
+      envelope: envelope ?? this.envelope,
+      reconcileOnly: reconcileOnly ?? this.reconcileOnly,
+      rowid: rowid ?? this.rowid,
+    );
+  }
+
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    if (conversationId.present) {
+      map['conversation_id'] = Variable<String>(conversationId.value);
+    }
+    if (scopeKey.present) {
+      map['scope_key'] = Variable<String>(scopeKey.value);
+    }
+    if (messageId.present) {
+      map['message_id'] = Variable<String>(messageId.value);
+    }
+    if (envelope.present) {
+      map['envelope'] = Variable<String>(envelope.value);
+    }
+    if (reconcileOnly.present) {
+      map['reconcile_only'] = Variable<bool>(reconcileOnly.value);
+    }
+    if (rowid.present) {
+      map['rowid'] = Variable<int>(rowid.value);
+    }
+    return map;
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('ManagedPendingTurnsCompanion(')
+          ..write('conversationId: $conversationId, ')
+          ..write('scopeKey: $scopeKey, ')
+          ..write('messageId: $messageId, ')
+          ..write('envelope: $envelope, ')
+          ..write('reconcileOnly: $reconcileOnly, ')
+          ..write('rowid: $rowid')
+          ..write(')'))
+        .toString();
+  }
+}
+
 abstract class _$AppDatabase extends GeneratedDatabase {
   _$AppDatabase(QueryExecutor e) : super(e);
   $AppDatabaseManager get managers => $AppDatabaseManager(this);
@@ -1837,6 +2328,8 @@ abstract class _$AppDatabase extends GeneratedDatabase {
   late final $MessagesTable messages = $MessagesTable(this);
   late final $FilesTable files = $FilesTable(this);
   late final $MemoriesTable memories = $MemoriesTable(this);
+  late final $ManagedPendingTurnsTable managedPendingTurns =
+      $ManagedPendingTurnsTable(this);
   late final Index messagesConversationIdIdx = Index(
     'messages_conversation_id_idx',
     'CREATE INDEX messages_conversation_id_idx ON messages (conversation_id)',
@@ -1858,6 +2351,7 @@ abstract class _$AppDatabase extends GeneratedDatabase {
     messages,
     files,
     memories,
+    managedPendingTurns,
     messagesConversationIdIdx,
     filesConversationIdIdx,
     memoriesUpdatedAtIdx,
@@ -1888,6 +2382,8 @@ typedef $$ConversationsTableCreateCompanionBuilder =
       required DateTime createdAt,
       required DateTime updatedAt,
       Value<int> messageCount,
+      Value<String?> scopeKey,
+      Value<String?> publicThreadId,
       Value<int> rowid,
     });
 typedef $$ConversationsTableUpdateCompanionBuilder =
@@ -1897,6 +2393,8 @@ typedef $$ConversationsTableUpdateCompanionBuilder =
       Value<DateTime> createdAt,
       Value<DateTime> updatedAt,
       Value<int> messageCount,
+      Value<String?> scopeKey,
+      Value<String?> publicThreadId,
       Value<int> rowid,
     });
 
@@ -1978,6 +2476,16 @@ class $$ConversationsTableFilterComposer
 
   ColumnFilters<int> get messageCount => $composableBuilder(
     column: $table.messageCount,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get publicThreadId => $composableBuilder(
+    column: $table.publicThreadId,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -2065,6 +2573,16 @@ class $$ConversationsTableOrderingComposer
     column: $table.messageCount,
     builder: (column) => ColumnOrderings(column),
   );
+
+  ColumnOrderings<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get publicThreadId => $composableBuilder(
+    column: $table.publicThreadId,
+    builder: (column) => ColumnOrderings(column),
+  );
 }
 
 class $$ConversationsTableAnnotationComposer
@@ -2090,6 +2608,14 @@ class $$ConversationsTableAnnotationComposer
 
   GeneratedColumn<int> get messageCount => $composableBuilder(
     column: $table.messageCount,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get scopeKey =>
+      $composableBuilder(column: $table.scopeKey, builder: (column) => column);
+
+  GeneratedColumn<String> get publicThreadId => $composableBuilder(
+    column: $table.publicThreadId,
     builder: (column) => column,
   );
 
@@ -2177,6 +2703,8 @@ class $$ConversationsTableTableManager
                 Value<DateTime> createdAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<int> messageCount = const Value.absent(),
+                Value<String?> scopeKey = const Value.absent(),
+                Value<String?> publicThreadId = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => ConversationsCompanion(
                 id: id,
@@ -2184,6 +2712,8 @@ class $$ConversationsTableTableManager
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 messageCount: messageCount,
+                scopeKey: scopeKey,
+                publicThreadId: publicThreadId,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -2193,6 +2723,8 @@ class $$ConversationsTableTableManager
                 required DateTime createdAt,
                 required DateTime updatedAt,
                 Value<int> messageCount = const Value.absent(),
+                Value<String?> scopeKey = const Value.absent(),
+                Value<String?> publicThreadId = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => ConversationsCompanion.insert(
                 id: id,
@@ -2200,6 +2732,8 @@ class $$ConversationsTableTableManager
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 messageCount: messageCount,
+                scopeKey: scopeKey,
+                publicThreadId: publicThreadId,
                 rowid: rowid,
               ),
           withReferenceMapper: (p0) => p0
@@ -3239,6 +3773,226 @@ typedef $$MemoriesTableProcessedTableManager =
       MemoryRow,
       PrefetchHooks Function()
     >;
+typedef $$ManagedPendingTurnsTableCreateCompanionBuilder =
+    ManagedPendingTurnsCompanion Function({
+      required String conversationId,
+      required String scopeKey,
+      required String messageId,
+      required String envelope,
+      Value<bool> reconcileOnly,
+      Value<int> rowid,
+    });
+typedef $$ManagedPendingTurnsTableUpdateCompanionBuilder =
+    ManagedPendingTurnsCompanion Function({
+      Value<String> conversationId,
+      Value<String> scopeKey,
+      Value<String> messageId,
+      Value<String> envelope,
+      Value<bool> reconcileOnly,
+      Value<int> rowid,
+    });
+
+class $$ManagedPendingTurnsTableFilterComposer
+    extends Composer<_$AppDatabase, $ManagedPendingTurnsTable> {
+  $$ManagedPendingTurnsTableFilterComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnFilters<String> get conversationId => $composableBuilder(
+    column: $table.conversationId,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get messageId => $composableBuilder(
+    column: $table.messageId,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get envelope => $composableBuilder(
+    column: $table.envelope,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get reconcileOnly => $composableBuilder(
+    column: $table.reconcileOnly,
+    builder: (column) => ColumnFilters(column),
+  );
+}
+
+class $$ManagedPendingTurnsTableOrderingComposer
+    extends Composer<_$AppDatabase, $ManagedPendingTurnsTable> {
+  $$ManagedPendingTurnsTableOrderingComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnOrderings<String> get conversationId => $composableBuilder(
+    column: $table.conversationId,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get messageId => $composableBuilder(
+    column: $table.messageId,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get envelope => $composableBuilder(
+    column: $table.envelope,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<bool> get reconcileOnly => $composableBuilder(
+    column: $table.reconcileOnly,
+    builder: (column) => ColumnOrderings(column),
+  );
+}
+
+class $$ManagedPendingTurnsTableAnnotationComposer
+    extends Composer<_$AppDatabase, $ManagedPendingTurnsTable> {
+  $$ManagedPendingTurnsTableAnnotationComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  GeneratedColumn<String> get conversationId => $composableBuilder(
+    column: $table.conversationId,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get scopeKey =>
+      $composableBuilder(column: $table.scopeKey, builder: (column) => column);
+
+  GeneratedColumn<String> get messageId =>
+      $composableBuilder(column: $table.messageId, builder: (column) => column);
+
+  GeneratedColumn<String> get envelope =>
+      $composableBuilder(column: $table.envelope, builder: (column) => column);
+
+  GeneratedColumn<bool> get reconcileOnly => $composableBuilder(
+    column: $table.reconcileOnly,
+    builder: (column) => column,
+  );
+}
+
+class $$ManagedPendingTurnsTableTableManager
+    extends
+        RootTableManager<
+          _$AppDatabase,
+          $ManagedPendingTurnsTable,
+          ManagedPendingTurnRow,
+          $$ManagedPendingTurnsTableFilterComposer,
+          $$ManagedPendingTurnsTableOrderingComposer,
+          $$ManagedPendingTurnsTableAnnotationComposer,
+          $$ManagedPendingTurnsTableCreateCompanionBuilder,
+          $$ManagedPendingTurnsTableUpdateCompanionBuilder,
+          (
+            ManagedPendingTurnRow,
+            BaseReferences<
+              _$AppDatabase,
+              $ManagedPendingTurnsTable,
+              ManagedPendingTurnRow
+            >,
+          ),
+          ManagedPendingTurnRow,
+          PrefetchHooks Function()
+        > {
+  $$ManagedPendingTurnsTableTableManager(
+    _$AppDatabase db,
+    $ManagedPendingTurnsTable table,
+  ) : super(
+        TableManagerState(
+          db: db,
+          table: table,
+          createFilteringComposer: () =>
+              $$ManagedPendingTurnsTableFilterComposer($db: db, $table: table),
+          createOrderingComposer: () =>
+              $$ManagedPendingTurnsTableOrderingComposer(
+                $db: db,
+                $table: table,
+              ),
+          createComputedFieldComposer: () =>
+              $$ManagedPendingTurnsTableAnnotationComposer(
+                $db: db,
+                $table: table,
+              ),
+          updateCompanionCallback:
+              ({
+                Value<String> conversationId = const Value.absent(),
+                Value<String> scopeKey = const Value.absent(),
+                Value<String> messageId = const Value.absent(),
+                Value<String> envelope = const Value.absent(),
+                Value<bool> reconcileOnly = const Value.absent(),
+                Value<int> rowid = const Value.absent(),
+              }) => ManagedPendingTurnsCompanion(
+                conversationId: conversationId,
+                scopeKey: scopeKey,
+                messageId: messageId,
+                envelope: envelope,
+                reconcileOnly: reconcileOnly,
+                rowid: rowid,
+              ),
+          createCompanionCallback:
+              ({
+                required String conversationId,
+                required String scopeKey,
+                required String messageId,
+                required String envelope,
+                Value<bool> reconcileOnly = const Value.absent(),
+                Value<int> rowid = const Value.absent(),
+              }) => ManagedPendingTurnsCompanion.insert(
+                conversationId: conversationId,
+                scopeKey: scopeKey,
+                messageId: messageId,
+                envelope: envelope,
+                reconcileOnly: reconcileOnly,
+                rowid: rowid,
+              ),
+          withReferenceMapper: (p0) => p0
+              .map((e) => (e.readTable(table), BaseReferences(db, table, e)))
+              .toList(),
+          prefetchHooksCallback: null,
+        ),
+      );
+}
+
+typedef $$ManagedPendingTurnsTableProcessedTableManager =
+    ProcessedTableManager<
+      _$AppDatabase,
+      $ManagedPendingTurnsTable,
+      ManagedPendingTurnRow,
+      $$ManagedPendingTurnsTableFilterComposer,
+      $$ManagedPendingTurnsTableOrderingComposer,
+      $$ManagedPendingTurnsTableAnnotationComposer,
+      $$ManagedPendingTurnsTableCreateCompanionBuilder,
+      $$ManagedPendingTurnsTableUpdateCompanionBuilder,
+      (
+        ManagedPendingTurnRow,
+        BaseReferences<
+          _$AppDatabase,
+          $ManagedPendingTurnsTable,
+          ManagedPendingTurnRow
+        >,
+      ),
+      ManagedPendingTurnRow,
+      PrefetchHooks Function()
+    >;
 
 class $AppDatabaseManager {
   final _$AppDatabase _db;
@@ -3251,4 +4005,6 @@ class $AppDatabaseManager {
       $$FilesTableTableManager(_db, _db.files);
   $$MemoriesTableTableManager get memories =>
       $$MemoriesTableTableManager(_db, _db.memories);
+  $$ManagedPendingTurnsTableTableManager get managedPendingTurns =>
+      $$ManagedPendingTurnsTableTableManager(_db, _db.managedPendingTurns);
 }

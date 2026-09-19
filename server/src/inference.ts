@@ -4,7 +4,7 @@ import { auth } from "./auth.ts";
 import { env } from "./env.ts";
 import { createTokenBucketLimiter } from "./rate_limit.ts";
 
-function extractBearerToken(header: string | null | undefined): string | null {
+export function extractBearerToken(header: string | null | undefined): string | null {
   const match = /^Bearer\s+(.+)$/i.exec((header ?? "").trim());
   return match ? match[1]!.trim() : null;
 }
@@ -36,7 +36,7 @@ export async function requireApiKey(c: Context): Promise<string | null> {
 
 export const inferenceRoutes = new Hono();
 
-const inferenceLimiter = createTokenBucketLimiter(
+export const inferenceLimiter = createTokenBucketLimiter(
   env.INFERENCE_RATE_LIMIT,
   env.INFERENCE_RATE_BURST,
 );
@@ -47,57 +47,13 @@ inferenceRoutes.get("/auth/check", async (c) => {
   return c.json({ status: "ok" });
 });
 
-inferenceRoutes.post("/chat/completions", async (c) => {
-  const apiKey = await requireApiKey(c);
-  if (!apiKey) return unauthorized(c);
-  if (!inferenceLimiter(apiKey)) {
-    return c.json({ error: "rate_limited" }, 429);
-  }
-
-  const body = await c.req.text();
-  const upstream = new URL("/v1/chat/completions", env.INFERENCE_URL);
-
-  try {
-    const resp = await fetch(upstream, {
-      method: "POST",
-      headers: {
-        "content-type": c.req.header("content-type") ?? "application/json",
-        accept: c.req.header("accept") ?? "text/event-stream",
-      },
-      body,
-    });
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: {
-        "content-type": resp.headers.get("content-type") ?? "text/event-stream",
-        "cache-control": resp.headers.get("cache-control") ?? "no-cache",
-      },
-    });
-  } catch (err) {
-    console.error("gateway: upstream chat/completions request failed", err);
-    return c.json({ error: "inference_unavailable" }, 502);
-  }
-});
-
-inferenceRoutes.get("/models", async (c) => {
-  const apiKey = await requireApiKey(c);
-  if (!apiKey) return unauthorized(c);
-
-  const upstream = new URL("/v1/models", env.INFERENCE_URL);
-
-  try {
-    const resp = await fetch(upstream, {
-      method: "GET",
-      headers: { accept: "application/json" },
-    });
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: {
-        "content-type": resp.headers.get("content-type") ?? "application/json",
-      },
-    });
-  } catch (err) {
-    console.error("gateway: upstream models request failed", err);
-    return c.json({ error: "inference_unavailable" }, 502);
-  }
-});
+// NOTE: `POST /v1/chat/completions` was REMOVED here in Phase 3, Wave C1 — it
+// moved to `src/transport/chat.ts` (createChatRoutes), which builds a LangChain
+// agent from the installed MODEL plugin + per-request credentials and streams
+// SSE via the transport adapter, instead of proxying INFERENCE_URL. The shared
+// seams below (`extractBearerToken`, `inferenceLimiter`, `requireApiKey`,
+// `unauthorized`) stay here because sibling transports import them.
+// NOTE: `GET /v1/models` was REMOVED here in Phase 3, Wave B — it moved to
+// `src/transport/models.ts` (createModelsRoutes), which serves the installed
+// MODEL plugins (incl. visionCapable) instead of proxying INFERENCE_URL. This
+// keeps a single `/v1/models` owner and avoids a duplicate-path mount conflict.

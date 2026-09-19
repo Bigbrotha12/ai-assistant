@@ -61,8 +61,14 @@ the ledger needs migrating.
 | `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
 | `LEDGER_STUCK_TIMEOUT_MS`| no | `10000`               | Heartbeat silence that marks a task `stuck`. **Must be < lease.** |
 | `LEDGER_LEASE_EXPIRY_MS`| no  | `60000`               | Worker lease expiry. Final tuning is Phase 4 (M5).               |
-| `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute per API key).             |
+| `CHECKPOINT_DB_PATH`    | no  | `./data/checkpoints.db` | **Dedicated** SQLCipher-encrypted SQLite file for LangGraph conversation checkpoints (Phase 2, Wave B1). |
+| `CHECKPOINT_DB_KEY`     | prod | *(dev default, warned)* | SQLCipher key for the checkpoint DB. **Required when `NODE_ENV=production`** (fail-fast). Dev falls back to a stable development-only default and logs a loud warning. `openssl rand -hex 32`. |
+| `PLUGINS_STORE_PATH`    | no  | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests (Phase 1). Recreated empty on first boot. |
+| `PLUGINS_TRUSTED_HOSTS` | no  | `""`                  | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin baseUrls (admin-trusted internal hosts, e.g. `vikunja.local`, `*.local`). Scheme enforcement (`https` in production) is never bypassed. |
+| `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute **per user**).            |
 | `INFERENCE_RATE_BURST`| no     | `20`                   | `/v1/chat/completions` burst ceiling (consecutive requests allowed at once).     |
+| `BUDGET_MAX_CONCURRENT`| no    | `2`                    | Per-user in-flight chat cap (sync streams + background jobs share the pool).     |
+| `BUDGET_QUEUE_MAX`    | no     | `3`                    | Per-user background queue depth before rejection (`503 busy` + `Retry-After`).   |
 | `NODE_ENV`          | no       | `development`          | `production` switches on secure cookies.                                        |
 
 The server refuses to start on invalid/missing env (fails fast). The `migrate`
@@ -113,7 +119,7 @@ not the session token):
 | ------------------------- | -------------------------------------------------------------------- |
 | `GET  /v1/auth/check`     | API-key validity check (no upstream call). `200 {"status":"ok"}` with a valid key, else `401 {"error":"unauthorized"}`. |
 | `POST /v1/chat/completions` | Forwarded to `${INFERENCE_URL}/v1/chat/completions`. SSE passthrough. |
-| `GET  /v1/models`         | Forwarded to `${INFERENCE_URL}/v1/models`.                           |
+| `GET  /v1/models`         | Lists installed MODEL plugins (id + capability flags incl. `visionCapable`); never leaks provider endpoints. |
 
 Invalid or missing key → `401 {"error":"unauthorized"}`. Upstream unreachable →
 `502 {"error":"inference_unavailable"}`. `POST /v1/chat/completions` is
@@ -196,6 +202,72 @@ stuck<lease ordering, sequence-aware loop detection (`findLoop`), hash-chain
 verification + tamper detection, owner binding, and migration (fresh + upgrade
 + idempotency). `npm run typecheck` covers `src/` and `test/`.
 
+## Plugin store (`/v1/plugins`, Phase 1)
+
+Phase 1 of the backend LangChain plan (`docs/backend-langchain-plan.md`)
+introduces a plugin system foundation under `server/src/plugins/`:
+
+- `types.ts` — zod-validated `PluginDefinition` (tool + model) + store schema.
+- `ssrf.ts` — SSRF allowlist validation (scheme, private/loopback/metadata
+  ranges, DNS-rebinding defense, `redirect: "manual"`).
+- `store.ts` — `PluginStore`: persists which **tool-plugin manifests** are
+  installed as JSON (`PLUGINS_STORE_PATH`). Missing file → empty store written
+  with `schemaVersion` (fail-fast on mismatch). `install`/`uninstall` operate
+  **on manifests only** — builtins ship in the build, are always available and
+  can never be uninstalled (no disabling toggle in Phase 1). Every allowlisted
+  baseUrl is SSRF-validated on install; admin-trusted internal hosts are
+  listed in `PLUGINS_TRUSTED_HOSTS`. Saves are atomic (temp file + rename) at
+  `0600`, and credentials are persisted spec-only (label/required flags) —
+  credential **values** are never written.
+- `registry.ts` — `PluginRegistry` (lifecycle view): redacted public list
+  (`baseUrls` id+label only; model `endpoint` omitted) vs. auth-gated details
+  (full URLs), `requirePlugin` with actionable `PLUGIN_NOT_FOUND`/
+  `PLUGIN_DISABLED` errors, `hotReload()` + a debounced `fs.watch` on the store
+  file that never fights the store's own saves.
+- `index.ts` — composition root wiring env + bundled builtins +
+  `availableToolManifests` (both owned by the build artifact).
+
+## Conversation checkpoints (`/v1/threads`, Phase 2 Wave B1)
+
+The LangGraph agent's conversation state is persisted server-side in a
+dedicated SQLite checkpoint store so conversations resume across requests and
+gateway restarts. `src/checkpoints/store.ts` wraps LangGraph's `SqliteSaver`
+with encryption, owner scoping and migrations; `src/agents/compile.ts` provides
+`compileGraphWithCheckpointer(graph, checkpointer)` (the graph from
+`createAgentGraph` is checkpointer-free; the transport recompiles it over
+`store.checkpointer`).
+
+**Encryption at rest (decision).** Plain `better-sqlite3` has no encryption, so
+the store opens the DB with `better-sqlite3-multiple-ciphers` — a drop-in fork
+whose `Database` is API-identical to `better-sqlite3` (verified structurally
+compatible with `SqliteSaver`'s `Database` parameter). The DB is created in
+**SQLCipher mode** (`cipher='sqlcipher'` + `legacy=4`) and keyed from
+`CHECKPOINT_DB_KEY`. This was chosen over a transparent
+encrypt-on-close/decrypt-on-open file wrapper because SQLCipher encrypts every
+page as it is written: a crash mid-turn cannot lose state to an un-run encrypt
+pass, and the on-disk file contains no plaintext. A wrong or missing key makes
+the first read throw (`file is not a database`). `CHECKPOINT_DB_KEY` is
+**required in production** (fail-fast in `env.ts`); development falls back to a
+stable, loudly-warned development-only default so dev conversations still
+survive restarts. The DB file (and its `-wal`/`-shm` siblings) is `0600`.
+
+**Schema / ownership.** SqliteSaver creates its own `checkpoints`/`writes`
+tables (kept opaque; the store only hard-deletes/counts them). The store adds a
+parallel `thread_owner` table keyed by the hashed `thread_id`
+(`sha256(userId + clientThreadId)`, see `checkpointThreadId`) recording the
+owning API-key `referenceId`, timestamps and last error. All list/delete/GC
+operations are owner-scoped: a cross-owner or unknown thread is an IDOR-safe
+miss (`[]` / `false` / `0`). Schema versioning uses `PRAGMA user_version`
+(`CURRENT_CHECKPOINT_VERSION`), mirroring the ledger. `redactForCheckpoint`
+masks `Authorization`/`Bearer`/`sk-…` credential material with `***` before
+content reaches checkpoint rows (reusing `CREDENTIAL_REDACTION`).
+
+| Endpoint                       | Purpose                                                        |
+| ------------------------------ | -------------------------------------------------------------- |
+| `GET    /v1/threads`           | List the caller's conversations (id, timestamps, message-count proxy). |
+| `DELETE /v1/threads/:threadId` | Owner-scoped hard delete; `404 {"error":"not_found"}` if absent. |
+| `DELETE /v1/threads`           | Per-user GC: delete all of the caller's threads → `{"deleted": N}`. |
+
 ## Production notes
 
 - **Postgres**: swap the SQLite adapter in `src/auth.ts` for a `pg` Pool
@@ -215,14 +287,27 @@ verification + tamper detection, owner binding, and migration (fresh + upgrade
   deployments use `storage: "database"` or `"secondary-storage"` (Redis) instead of
   the default `"memory"`.
 - **Inference rate limiting**: `/v1/chat/completions` uses an in-memory
-  per-API-key token bucket (`INFERENCE_RATE_LIMIT` / `INFERENCE_RATE_BURST`). It
-  is per-process and not shared across instances — acceptable for a single
-  gateway; scale out needs a shared limiter (e.g. Redis) instead.
+  **per-user** token bucket (`INFERENCE_RATE_LIMIT` / `INFERENCE_RATE_BURST`)
+  built by `createPerOwnerRateLimiter` (`src/middleware/rate_limit.ts`): the
+  bucket key is the authenticated user id, so a user with many API keys cannot
+  rotate keys to bypass a rejection. A rejection returns
+  `429 { error: "rate_limited" }` + `Retry-After`. It is per-process and not
+  shared across instances — acceptable for a single gateway; scale out needs a
+  shared limiter (e.g. Redis) instead.
+- **Concurrency budget**: the same route also applies a per-user budget
+  (`src/middleware/budget.ts`, `BUDGET_MAX_CONCURRENT`/`BUDGET_QUEUE_MAX`) that
+  caps in-flight operations — sync streams and background jobs share one
+  per-user pool. Sync with a full pool returns `429 { error: "busy" }` +
+  `Retry-After`; an async admission queues on the owner's bounded FIFO (depth
+  `BUDGET_QUEUE_MAX`, wait bounded by the budget's `waitMs`) and a full queue
+  returns `503 { error: "busy" }` + `Retry-After`. Idempotent replay of the
+  same message is NOT blocked here — the task ledger's `(owner, messageId)`
+  dedupe handles that.
 - **API keys**: the `@better-auth/api-key` plugin (separate package since better-auth
   1.7). The gateway configures `defaultPrefix: "sk"`, `defaultKeyLength: 32`,
   `keyExpiration.defaultExpiresIn` (1 year, in **milliseconds**), and
   `rateLimit: { enabled: false }` — the plugin's default per-key cap (10
-  verifications/24h) is disabled so the gateway's own per-key inference limiter
+  verifications/24h) is disabled so the gateway's own per-user inference limiter
   (`INFERENCE_RATE_LIMIT`/`INFERENCE_RATE_BURST`) is the effective throttle.
   Note the option names changed from the pre-1.7 plugin
   (`prefix`/`length`/`expiresIn`).

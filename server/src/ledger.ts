@@ -29,6 +29,10 @@ export type LedgerConfig = {
   leaseExpiryMs?: number;
   /** Gateway clock; defaults to Date.now. Injectable for tests. */
   now?: () => number;
+  /** Timer factory for `startHeartbeat`. Injectable for tests; defaults to the
+   *  real global timers. */
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
 };
 
 export type TaskRow = {
@@ -45,6 +49,11 @@ export type TaskRow = {
   last_heartbeat_ts: number;
   lease_expires_at: number | null;
   lease_owner: string | null;
+  /** Monotonic fence token: rotated by every `claimTask`/`resumeTask` and
+   *  required (when supplied) by `heartbeat`/`appendStep`, so a superseded
+   *  worker's writes/heartbeats are rejected with `FENCE_CONFLICT`. The empty
+   *  string means "no fence held" (pre-v3 rows, or a call with no token). */
+  fence_token: string;
 };
 
 export type StepRow = {
@@ -55,6 +64,8 @@ export type StepRow = {
   action: string;
   result: string | null;
   ts: number;
+  /** Tool-call id (v4) for replay dedupe; null for non-tool steps. */
+  tool_call_id: string | null;
 };
 
 export type ChainRow = {
@@ -71,6 +82,7 @@ export type LedgerErrorCode =
   | "FORBIDDEN"
   | "INVALID_TRANSITION"
   | "LEASE_CONFLICT"
+  | "FENCE_CONFLICT"
   | "INVALID_CONFIG"
   | "APPEND_ONLY_VIOLATION";
 
@@ -223,6 +235,74 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
         ADD COLUMN last_heartbeat_ts INTEGER NOT NULL DEFAULT 0;
     `);
   },
+  // v3 — monotonic fence token.
+  // Adds `fence_token`, rotated by every `claimTask`/`resumeTask`. Workers hold
+  // the token granted at claim/resume and present it on `heartbeat`/
+  // `appendStep`; a superseded worker (whose task was resumed under a new
+  // fence) is rejected with `FENCE_CONFLICT`, so it can no longer extend a
+  // lease or append steps — killing duplicate-execution races between
+  // overlapping workers. Data-preserving (existing rows default to `''` = no
+  // fence held; calls that pass no token skip the check, so old callers keep
+  // working).
+  (db) => {
+    db.exec(`
+      ALTER TABLE ledger_task
+        ADD COLUMN fence_token TEXT NOT NULL DEFAULT '';
+    `);
+  },
+  // v4 — idempotency (Phase 2 Wave B).
+  //
+  // (a) Unique (owner, intent_key): a client's idempotency key (messageId)
+  // maps to EXACTLY ONE task, forever, under one owner. This is the
+  // owner-scoped uniqueness that makes get-or-create-by-key race-safe. The v1
+  // comment deferred this constraint to Phase 6 (M12); Wave B's idempotency
+  // needs it now, so it lands here — and the get-or-create catches the
+  // SQLITE_CONSTRAINT violation and re-reads the existing row instead of
+  // erroring (no raw-INSERT 500 on a repeat). An UNCONDITIONAL index (no
+  // partial WHERE) is deliberate: a terminal task's intentKey is never
+  // re-sent as a new message (the client generates messageId once per send),
+  // so a partial index would only introduce "which row wins" ambiguity when a
+  // terminal and a fresh task share a key.
+  //
+  // M4: a pre-v4 DB written through the raw-insert path can already hold
+  // duplicate (owner, intent_key) rows; creating the UNIQUE index over them
+  // would abort the whole migration at import. So BEFORE the index, delete the
+  // older duplicates, keeping the NEWEST row per group (newest by updated_ts,
+  // id as the deterministic tie-breaker) — the same "newest wins" rule the
+  // get-or-create re-read applies. (Orphaned steps/chain rows of the deleted
+  // duplicates remain — they are never surfaced because reads are keyed by
+  // task_id, and ledger_step's append-only trigger forbids cleanup.)
+  //
+  // (b) Replay dedupe: `ledger_step` gains a nullable `tool_call_id` (an
+  // OpenAI-style tool call id) recorded atomically with the tool's result, so
+  // a resumed checkpoint can look it up and NEVER re-execute a tool whose
+  // result was already stored. Partial unique index (only tool steps carry a
+  // tool_call_id) makes `hasToolResult` an indexed point lookup, not a scan,
+  // and makes a duplicate record a SQLITE_CONSTRAINT that `recordToolResult`
+  // catches (idempotent record). The column is intentionally NOT part of the
+  // hash-chain content (`canonicalStepContent`): adding it would change digest
+  // computation for pre-existing chains and break `verifyChain` backward
+  // compatibility. Data-preserving (existing steps get NULL tool_call_id).
+  (db) => {
+    db.exec(`
+      DELETE FROM ledger_task AS older
+      WHERE EXISTS (
+        SELECT 1 FROM ledger_task AS newer
+        WHERE newer.owner = older.owner
+          AND newer.intent_key = older.intent_key
+          AND (newer.updated_ts > older.updated_ts
+               OR (newer.updated_ts = older.updated_ts AND newer.id > older.id))
+      );
+
+      CREATE UNIQUE INDEX idx_ledger_task_owner_intent
+        ON ledger_task(owner, intent_key);
+
+      ALTER TABLE ledger_step ADD COLUMN tool_call_id TEXT;
+      CREATE UNIQUE INDEX idx_ledger_step_tool_call
+        ON ledger_step(task_id, tool_call_id)
+        WHERE tool_call_id IS NOT NULL;
+    `);
+  },
 ];
 
 export const CURRENT_LEDGER_VERSION = LEDGER_MIGRATIONS.length;
@@ -251,6 +331,19 @@ export function migrateLedger(db: DatabaseType): void {
   applyMigrations(db, LEDGER_MIGRATIONS, CURRENT_LEDGER_VERSION);
 }
 
+/**
+ * Default cadence for the timer-driven heartbeat: floor(stuckTimeout / 3).
+ *
+ * The invariant is `interval <= stuckTimeout / 3`: even with one full interval
+ * of timer slack, the worst-case gap between two heartbeats (2 * interval <=
+ * 2/3 * stuckTimeout) stays strictly under the stuck timeout, so the watchdog
+ * can never fire between two heartbeats of a live worker. `startHeartbeat`
+ * rejects intervals larger than this (`INVALID_CONFIG`).
+ */
+export function heartbeatIntervalMs(stuckTimeoutMs: number): number {
+  return Math.floor(stuckTimeoutMs / 3);
+}
+
 export interface CreateTaskInput {
   owner: string;
   intentKey: string;
@@ -262,6 +355,9 @@ export interface AppendStepInput {
   stage: string;
   action: string;
   result: string | null;
+  /** Tool-call id (v4) recorded with the step for replay dedupe; undefined for
+   *  non-tool steps. */
+  toolCallId?: string;
 }
 
 export class Ledger {
@@ -270,6 +366,8 @@ export class Ledger {
   private readonly leaseExpiryMs: number;
   private readonly now: () => number;
   private readonly appendTx: (fn: () => void) => void;
+  private readonly setInterval: typeof setInterval;
+  private readonly clearInterval: typeof clearInterval;
 
   constructor(db: DatabaseType, config: LedgerConfig = {}) {
     const stuckTimeoutMs = config.stuckTimeoutMs ?? DEFAULT_STUCK_TIMEOUT_MS;
@@ -286,6 +384,9 @@ export class Ledger {
     this.leaseExpiryMs = leaseExpiryMs;
     this.now = config.now ?? Date.now;
     this.appendTx = db.transaction((fn: () => void) => fn());
+    this.setInterval = config.setInterval ?? globalThis.setInterval.bind(globalThis);
+    this.clearInterval =
+      config.clearInterval ?? globalThis.clearInterval.bind(globalThis);
   }
 
   createTask(input: CreateTaskInput): TaskRow {
@@ -322,13 +423,55 @@ export class Ledger {
     const row = this.db
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
-                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner
+                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
+                fence_token
          FROM ledger_task WHERE id = ?`,
       )
       .get(id) as TaskRow | undefined;
     if (!row) return null;
     if (owner !== undefined && row.owner !== owner) return null;
     return row;
+  }
+
+  /**
+   * Owner-scoped lookup by idempotency key (v4 unique index). The get-or-create
+   * path and the status-by-key endpoint both use this instead of a raw INSERT,
+   * so a repeat (owner, intent_key) re-reads the existing row and never 500s.
+   * Cross-owner reads are a miss (`null`).
+   */
+  getTaskByIntentKey(owner: string, intentKey: string): TaskRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, owner, intent_key, spec, worker, status, created_ts,
+                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
+                fence_token
+         FROM ledger_task WHERE owner = ? AND intent_key = ?`,
+      )
+      .get(owner, intentKey) as TaskRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Replay-dedupe lookup (v4): the step (if any) that already recorded this
+   * tool-call-id's result for a task. Backed by the partial unique index on
+   * (task_id, tool_call_id), so it is an indexed point lookup, not a scan.
+   * When [owner] is provided, cross-owner reads are a miss (`null`).
+   */
+  getStepByToolCallId(
+    taskId: string,
+    toolCallId: string,
+    owner?: string,
+  ): StepRow | null {
+    if (owner !== undefined && this.getTask(taskId, owner) === null) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
+         FROM ledger_step WHERE task_id = ? AND tool_call_id = ?`,
+      )
+      .get(taskId, toolCallId) as StepRow | undefined;
+    return row ?? null;
   }
 
   /**
@@ -341,7 +484,8 @@ export class Ledger {
       return this.db
         .prepare(
           `SELECT id, owner, intent_key, spec, worker, status, created_ts,
-                  updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner
+                  updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
+                  fence_token
            FROM ledger_task WHERE owner = ? ORDER BY created_ts`,
         )
         .all(owner) as TaskRow[];
@@ -349,7 +493,8 @@ export class Ledger {
     return this.db
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
-                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner
+                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
+                fence_token
          FROM ledger_task ORDER BY created_ts`,
       )
       .all() as TaskRow[];
@@ -365,7 +510,7 @@ export class Ledger {
     }
     return this.db
       .prepare(
-        `SELECT id, task_id, seq, stage, action, result, ts
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
          FROM ledger_step WHERE task_id = ? ORDER BY seq`,
       )
       .all(taskId) as StepRow[];
@@ -406,6 +551,23 @@ export class Ledger {
     return task;
   }
 
+  /**
+   * Rejects a caller whose fence token (when supplied) does not match the
+   * task's current token. A superseded worker holds a stale token — granted by
+   * an earlier `claimTask`/`resumeTask` that has since rotated it — so its
+   * heartbeats and step appends are refused. When [fenceToken] is undefined the
+   * check is skipped (backwards compatibility for pre-v3 callers/tests); the
+   * routes always pass it through from claim/resume.
+   */
+  private requireFence(task: TaskRow, fenceToken: string | undefined): void {
+    if (fenceToken !== undefined && task.fence_token !== fenceToken) {
+      throw new LedgerError(
+        "FENCE_CONFLICT",
+        `caller's fence token does not match task ${task.id} (superseded worker)`,
+      );
+    }
+  }
+
   /** Transitions a task's status, enforcing the state machine. */
   private setStatus(taskId: string, from: TaskStatus, to: TaskStatus): void {
     assertTransition(from, to);
@@ -425,22 +587,28 @@ export class Ledger {
     }
   }
 
-  /** Claims a queued task: takes the lease and moves it to `running`. */
+  /**
+   * Claims a queued task: takes the lease, mints a fresh fence token and moves
+   * the task to `running`. The returned row (with `fence_token`) is what a
+   * worker holds and must present on `heartbeat`/`appendStep`.
+   */
   claimTask(taskId: string, owner: string): TaskRow {
     const task = this.getTask(taskId);
     if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     this.requireOwnership(task, owner);
     this.requireStatus(task, ["queued"]);
     const now = this.now();
+    const fence = randomUUID();
     this.db
       .prepare(
         `UPDATE ledger_task
          SET status = 'running', worker = COALESCE(worker, @owner),
              lease_owner = @owner, lease_expires_at = @expires,
+             fence_token = @fence,
              updated_ts = @now, last_heartbeat_ts = @now
          WHERE id = @id`,
       )
-      .run({ id: taskId, owner, expires: now + this.leaseExpiryMs, now });
+      .run({ id: taskId, owner, expires: now + this.leaseExpiryMs, fence, now });
     const row = this.getTask(taskId);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     return row;
@@ -448,18 +616,22 @@ export class Ledger {
 
   /**
    * Appends a Step and its hash-chain record atomically. The task must be
-   * `running`. Ownership is re-validated. Gateway clock stamps `ts`.
+   * `running`. Ownership is re-validated. When [fenceToken] is supplied it must
+   * match the task's current token (a superseded worker appending steps is
+   * rejected with `FENCE_CONFLICT`). Gateway clock stamps `ts`.
    * Returns the new step and its chain digest.
    */
   appendStep(
     taskId: string,
     owner: string,
     input: AppendStepInput,
+    fenceToken?: string,
   ): { step: StepRow; digest: string } {
     const task = this.getTask(taskId);
     if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     this.requireOwnership(task, owner);
     this.requireStatus(task, ["running"]);
+    this.requireFence(task, fenceToken);
 
     let step: StepRow | null = null;
     let digest = "";
@@ -470,8 +642,9 @@ export class Ledger {
       const stepId = randomUUID();
       this.db
         .prepare(
-          `INSERT INTO ledger_step (id, task_id, seq, stage, action, result, ts)
-           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts)`,
+          `INSERT INTO ledger_step
+             (id, task_id, seq, stage, action, result, ts, tool_call_id)
+           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts, @toolCallId)`,
         )
         .run({
           id: stepId,
@@ -481,6 +654,7 @@ export class Ledger {
           action: input.action,
           result: input.result,
           ts,
+          toolCallId: input.toolCallId ?? null,
         });
 
       const prevDigest = this.readChain(taskId).at(-1)?.digest ?? genesisDigest(taskId);
@@ -510,14 +684,19 @@ export class Ledger {
         action: input.action,
         result: input.result,
         ts,
+        tool_call_id: input.toolCallId ?? null,
       };
     });
     if (!step) throw new LedgerError("APPEND_ONLY_VIOLATION", "step append failed");
     return { step, digest };
   }
 
-  /** Heartbeat: gateway-stamped lease renewal + liveness update. */
-  heartbeat(taskId: string, owner: string): TaskRow {
+  /**
+   * Heartbeat: gateway-stamped lease renewal + liveness update. When
+   * [fenceToken] is supplied it must match the task's current token; a
+   * superseded worker's heartbeat is rejected with `FENCE_CONFLICT`.
+   */
+  heartbeat(taskId: string, owner: string, fenceToken?: string): TaskRow {
     const task = this.getTask(taskId);
     if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     this.requireOwnership(task, owner);
@@ -528,6 +707,7 @@ export class Ledger {
         `caller ${owner} does not hold the lease on task ${taskId}`,
       );
     }
+    this.requireFence(task, fenceToken);
     const now = this.now();
     this.db
       .prepare(
@@ -563,8 +743,79 @@ export class Ledger {
   }
 
   /**
+   * Starts a timer-driven heartbeat for a running task: every [intervalMs] the
+   * loop calls `heartbeat(taskId, owner, fenceToken)`. This is what the SSE
+   * transport and background workers run during streaming/tool execution so a
+   * long-running-but-alive turn is never marked stuck. Appending steps does NOT
+   * count as a heartbeat — stuck detection keys off `last_heartbeat_ts`, and
+   * this loop is what keeps it fresh.
+   *
+   * The default cadence is `heartbeatIntervalMs(stuckTimeoutMs)` =
+   * floor(stuckTimeout / 3); intervals larger than that are rejected
+   * (`INVALID_CONFIG`) because the stuck watchdog must never be able to fire
+   * between two heartbeats of a live worker (see `heartbeatIntervalMs`). Per
+   * tick, errors are forwarded to [onError] and never escape the timer.
+   *
+   * Returns a handle whose `stop()` clears the timer.
+   */
+  startHeartbeat(
+    taskId: string,
+    owner: string,
+    fenceToken: string | undefined,
+    options: { intervalMs?: number; onError?: (err: unknown) => void } = {},
+  ): { stop(): void } {
+    const maxInterval = heartbeatIntervalMs(this.stuckTimeoutMs);
+    const intervalMs = options.intervalMs ?? maxInterval;
+    if (!(intervalMs > 0 && intervalMs <= maxInterval)) {
+      throw new LedgerError(
+        "INVALID_CONFIG",
+        `heartbeat interval ${intervalMs}ms must be in (0, ${maxInterval}] ` +
+          `(<= stuckTimeoutMs/3) so the stuck watchdog cannot fire between heartbeats`,
+      );
+    }
+    const handle = this.setInterval(() => {
+      try {
+        this.heartbeat(taskId, owner, fenceToken);
+      } catch (err) {
+        options.onError?.(err);
+      }
+    }, intervalMs);
+    return { stop: () => this.clearInterval(handle) };
+  }
+
+  /**
+   * Startup orphan reconciliation: marks every `running` task that has gone
+   * quiet (heartbeat stale past the stuck-timeout) OR whose lease has lapsed as
+   * `stuck`. This recovers tasks orphaned by a gateway restart or a crashed
+   * worker, so they can be re-queued/resumed instead of lying false-stuck as
+   * `running`. It is idempotent (a second pass finds nothing left stale), never
+   * touches `queued`/terminal tasks, and mirrors `markStuckIfHeartbeatStale`
+   * exactly (stuck fires when `last_heartbeat_ts <= now - stuckTimeoutMs`).
+   */
+  reconcileOrphans(): { marked: string[] } {
+    const now = this.now();
+    const staleCutoff = now - this.stuckTimeoutMs;
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM ledger_task
+         WHERE status = 'running'
+           AND (last_heartbeat_ts <= ?
+                OR (lease_expires_at IS NOT NULL AND lease_expires_at < ?))`,
+      )
+      .all(staleCutoff, now) as { id: string }[];
+    const marked: string[] = [];
+    for (const { id } of rows) {
+      this.setStatus(id, "running", "stuck");
+      marked.push(id);
+    }
+    return { marked };
+  }
+
+  /**
    * Resumes a task on behalf of the task owner. Non-owners are rejected.
-   * Clears the broken lease and grants it to the resumer.
+   * Clears the broken lease, grants it to the resumer and ROTATES the fence
+   * token (a resumed task gets a NEW token), so any superseded worker holding
+   * the old token is rejected on its next heartbeat/append.
    */
   resumeTask(taskId: string, owner: string): TaskRow {
     const task = this.getTask(taskId);
@@ -577,15 +828,17 @@ export class Ledger {
       );
     }
     const now = this.now();
+    const fence = randomUUID();
     this.setStatus(taskId, task.status, "running");
     this.db
       .prepare(
         `UPDATE ledger_task
          SET lease_owner = @owner, lease_expires_at = @expires,
+             fence_token = @fence,
              updated_ts = @now, last_heartbeat_ts = @now
          WHERE id = @id`,
       )
-      .run({ id: taskId, owner, expires: now + this.leaseExpiryMs, now });
+      .run({ id: taskId, owner, expires: now + this.leaseExpiryMs, fence, now });
     const row = this.getTask(taskId);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     return row;
@@ -596,6 +849,7 @@ export class Ledger {
     taskId: string,
     owner: string,
     to: Exclude<TaskStatus, "queued" | "running" | "stuck">,
+    fenceToken?: string,
   ): TaskRow {
     if (
       to !== "succeeded" &&
@@ -608,6 +862,7 @@ export class Ledger {
     const task = this.getTask(taskId);
     if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     this.requireOwnership(task, owner);
+    this.requireFence(task, fenceToken);
     this.setStatus(taskId, task.status, to);
     const row = this.getTask(taskId);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);

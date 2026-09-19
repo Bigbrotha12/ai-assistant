@@ -19,8 +19,7 @@ class InMemorySecureStorage extends FlutterSecureStorage {
     WebOptions? webOptions,
     MacOsOptions? mOptions,
     WindowsOptions? wOptions,
-  }) async =>
-      _values[key];
+  }) async => _values[key];
 
   @override
   Future<void> write({
@@ -55,9 +54,60 @@ class InMemorySecureStorage extends FlutterSecureStorage {
 }
 
 void main() {
+  test(
+    'identity round-trips and legacy saves remove the previous scope',
+    () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureAuthCredentialsStore(storage: storage);
+      await store.save(
+        const AuthCredentials(
+          apiKey: 'key',
+          ownerId: 'user-1',
+          backendOrigin: 'HTTPS://Example.COM:443/',
+        ),
+      );
+      final loaded = (await store.load())!;
+      expect(loaded.ownerId, 'user-1');
+      expect(loaded.backendOrigin, 'https://example.com');
+      expect(loaded.accountScope, isNotNull);
+      await store.save(const AuthCredentials(apiKey: 'legacy'));
+      expect((await store.load())!.accountScope, isNull);
+      expect(storage.values.containsKey('auth_owner_id'), isFalse);
+      expect(storage.values.containsKey('auth_backend_origin'), isFalse);
+      await store.clear();
+      expect(storage.values, isEmpty);
+    },
+  );
+
+  test('scope is stable, collision-safe, and requires verified identity', () {
+    AuthAccountScope? scope(String? origin, String? owner) =>
+        AuthAccountScope.fromIdentity(backendOrigin: origin, ownerId: owner);
+    final a = scope('HTTPS://Example.COM:443/', 'user/a');
+    final b = scope('https://example.com/api/auth', 'user/a');
+    expect(a, b);
+    expect(a!.storageId, b!.storageId);
+    expect(a, isNot(scope('http://example.com', 'user/a')));
+    expect(a, isNot(scope('https://example.com:8443', 'user/a')));
+    expect(a, isNot(scope('https://example.com', 'user/b')));
+    expect(scope('https://example.com', null), isNull);
+    expect(scope('https://example.com', ' '), isNull);
+    for (final origin in [
+      null,
+      '',
+      'example.com',
+      'file:///tmp',
+      'https://user:password@example.com',
+      'https://example.com?key=x',
+    ]) {
+      expect(scope(origin, 'user'), isNull);
+    }
+    expect(
+      const AuthCredentials(apiKey: 'a', ownerId: 'u'),
+      isNot(const AuthCredentials(apiKey: 'a', ownerId: 'v')),
+    );
+  });
   test('load returns null when nothing has been saved', () async {
-    final store =
-        SecureAuthCredentialsStore(storage: InMemorySecureStorage());
+    final store = SecureAuthCredentialsStore(storage: InMemorySecureStorage());
 
     expect(await store.load(), isNull);
   });
@@ -66,9 +116,7 @@ void main() {
     final storage = InMemorySecureStorage();
     final store = SecureAuthCredentialsStore(storage: storage);
 
-    await store.save(
-      const AuthCredentials(apiKey: 'cake_x', email: 'a@b.c'),
-    );
+    await store.save(const AuthCredentials(apiKey: 'cake_x', email: 'a@b.c'));
 
     expect(storage.values['auth_api_key'], 'cake_x');
     expect(storage.values['auth_email'], 'a@b.c');
@@ -138,29 +186,31 @@ void main() {
     );
   });
 
-  test('save with a blank keyId or sessionToken deletes the stored value',
-      () async {
-    final storage = InMemorySecureStorage();
-    final store = SecureAuthCredentialsStore(storage: storage);
+  test(
+    'save with a blank keyId or sessionToken deletes the stored value',
+    () async {
+      final storage = InMemorySecureStorage();
+      final store = SecureAuthCredentialsStore(storage: storage);
 
-    await store.save(
-      const AuthCredentials(
-        apiKey: 'cake_x',
-        keyId: 'key-42',
-        sessionToken: 'tok-99',
-      ),
-    );
-    expect(storage.values.containsKey('auth_key_id'), isTrue);
-    expect(storage.values.containsKey('auth_session_token'), isTrue);
+      await store.save(
+        const AuthCredentials(
+          apiKey: 'cake_x',
+          keyId: 'key-42',
+          sessionToken: 'tok-99',
+        ),
+      );
+      expect(storage.values.containsKey('auth_key_id'), isTrue);
+      expect(storage.values.containsKey('auth_session_token'), isTrue);
 
-    await store.save(const AuthCredentials(apiKey: 'cake_x'));
+      await store.save(const AuthCredentials(apiKey: 'cake_x'));
 
-    expect(storage.values.containsKey('auth_key_id'), isFalse);
-    expect(storage.values.containsKey('auth_session_token'), isFalse);
-    final loaded = await store.load();
-    expect(loaded!.keyId, isNull);
-    expect(loaded.sessionToken, isNull);
-  });
+      expect(storage.values.containsKey('auth_key_id'), isFalse);
+      expect(storage.values.containsKey('auth_session_token'), isFalse);
+      final loaded = await store.load();
+      expect(loaded!.keyId, isNull);
+      expect(loaded.sessionToken, isNull);
+    },
+  );
 
   test('load treats a blank stored keyId or sessionToken as absent', () async {
     final storage = InMemorySecureStorage();
@@ -199,10 +249,16 @@ void main() {
   test('equality includes keyId and sessionToken', () {
     const base = AuthCredentials(apiKey: 'k', email: 'a@b.c');
     const same = AuthCredentials(apiKey: 'k', email: 'a@b.c');
-    const withKeyId =
-        AuthCredentials(apiKey: 'k', email: 'a@b.c', keyId: 'kid');
+    const withKeyId = AuthCredentials(
+      apiKey: 'k',
+      email: 'a@b.c',
+      keyId: 'kid',
+    );
     const withToken = AuthCredentials(
-        apiKey: 'k', email: 'a@b.c', sessionToken: 'tok');
+      apiKey: 'k',
+      email: 'a@b.c',
+      sessionToken: 'tok',
+    );
 
     expect(base, same);
     expect(base.hashCode, same.hashCode);
@@ -211,5 +267,4 @@ void main() {
     expect(base, isNot(withToken));
     expect(base.hashCode, isNot(withToken.hashCode));
   });
-
 }

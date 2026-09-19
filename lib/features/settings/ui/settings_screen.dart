@@ -23,6 +23,7 @@ import '../../voice/ui/voice_settings_providers.dart';
 import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
 import '../../auth/ui/auth_flow.dart';
+import '../../plugins/ui/plugins_screen.dart';
 
 /// App home screen: configure the gateway host for account services and
 /// verify connectivity (auth on the gateway; inference/vision against the
@@ -197,13 +198,27 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-      setState(() {
-        _hostController.clear();
-        _mcpSecretController.clear();
-        _filesSecretController.clear();
-        _storageUrlController.clear();
-      });
-    await ref.read(settingsProvider.notifier).clear();
+    try {
+      await ref.read(authCredentialsProvider.notifier).clear();
+      if (!mounted) return;
+      await ref.read(settingsProvider.notifier).clear();
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Could not finish clearing settings. Try again.'),
+          action: SnackBarAction(label: 'Retry', onPressed: _clearSettings),
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _hostController.clear();
+      _mcpSecretController.clear();
+      _filesSecretController.clear();
+      _storageUrlController.clear();
+    });
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Settings cleared')),
@@ -278,14 +293,18 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   /// Client-side sign-out. Revokes the stored API key and signs the session
   /// out on the server (best-effort, so an unreachable gateway still signs
-  /// out locally), then clears the persisted credentials.
+  /// out locally), then clears the persisted credentials. The clear is
+  /// fail-closed: if local cleanup fails the user is offered a retry and no
+  /// stale account state lingers.
   Future<void> _signOut() async {
     setState(() => _authFlowVisible = false);
     final creds = ref.read(authCredentialsProvider).value;
+    // Snapshot the client (and creds) before any await: if the backend origin
+    // changes mid-flight, the old key must never be sent to the new origin.
+    final auth = ref.read(authClientProvider);
     if (creds != null) {
       final sessionToken = creds.sessionToken;
       final keyId = creds.keyId;
-      final auth = ref.read(authClientProvider);
       try {
         if (sessionToken != null && keyId != null) {
           await auth.revokeApiKey(sessionToken: sessionToken, keyId: keyId);
@@ -297,7 +316,18 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         // Best-effort: revocation must not block local sign-out.
       }
     }
-    await ref.read(authCredentialsProvider.notifier).clear();
+    try {
+      await ref.read(authCredentialsProvider.notifier).clear();
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Could not finish local sign-out. Try again.'),
+          action: SnackBarAction(label: 'Retry', onPressed: _signOut),
+        ),
+      );
+      return;
+    }
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Signed out')),
@@ -464,6 +494,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 _buildAccount(context),
                 const SizedBox(height: 32),
                 _buildVoice(context),
+                const SizedBox(height: 32),
+                ListTile(
+                  key: const Key('settings-plugins'),
+                  leading: const Icon(Icons.extension_outlined),
+                  title: const Text('Plugins'),
+                  subtitle: const Text('Staged model and tool configuration'),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const PluginsScreen()),
+                  ),
+                ),
               ],
             ),
           ),

@@ -1,6 +1,31 @@
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/notifications/data/notif_client.dart';
+
+/// Captures every actual request (path/headers) and returns a scripted
+/// response body.
+class _CaptureAdapter implements HttpClientAdapter {
+  _CaptureAdapter(this.body);
+
+  final ResponseBody body;
+  final List<RequestOptions> requests = [];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests.add(options);
+    return body;
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
 
 void main() {
   group('parseNtfyEvent', () {
@@ -41,6 +66,48 @@ void main() {
           '{"id":"x","event":"message","message":"Hi","title":"T"}');
       expect(message, isNotNull);
       expect(message!.topic, '');
+    });
+  });
+
+  group('NtfyNotifClient', () {
+    const base = 'https://ntfy.example';
+
+    ResponseBody streamBody() => ResponseBody.fromString(
+          '{"id":"a","event":"message","topic":"alerts","message":"Hi","title":"T"}\n',
+          200,
+        );
+
+    test('subscribe sends Bearer token when accessToken is set', () async {
+      final adapter = _CaptureAdapter(streamBody());
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = NtfyNotifClient(
+        baseUrl: base,
+        dio: dio,
+        accessToken: 'test-token',
+      );
+      addTearDown(client.dispose);
+
+      await client.subscribe('alerts');
+
+      final req = adapter.requests.single;
+      expect(req.uri.path, '/alerts/json');
+      expect(req.headers['Authorization'], 'Bearer test-token');
+    });
+
+    test('subscribe sends no Authorization header without accessToken',
+        () async {
+      final adapter = _CaptureAdapter(streamBody());
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = NtfyNotifClient(baseUrl: base, dio: dio);
+      addTearDown(client.dispose);
+
+      await client.subscribe('alerts');
+
+      final req = adapter.requests.single;
+      expect(req.uri.path, '/alerts/json');
+      expect(req.headers.containsKey('Authorization'), isFalse);
     });
   });
 }

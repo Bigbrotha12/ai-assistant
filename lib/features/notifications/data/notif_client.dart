@@ -41,12 +41,15 @@ class NotifMessage {
 /// provider returns [NoOpNotifClient] unless a server URL is configured. This
 /// class ships ready for wiring the moment one exists.
 class NtfyNotifClient implements NotifClient {
-  NtfyNotifClient({required String baseUrl, Dio? dio})
+  NtfyNotifClient({required String baseUrl, Dio? dio, this.accessToken})
       : _baseUrl = baseUrl.replaceAll(RegExp(r'/$'), ''),
         _dio = dio ?? Dio();
 
   final String _baseUrl;
   final Dio _dio;
+
+  /// Bearer token for authenticated topics. When null, requests are anonymous.
+  final String? accessToken;
 
   final StreamController<NotifMessage> _controller =
       StreamController<NotifMessage>.broadcast();
@@ -64,7 +67,10 @@ class NtfyNotifClient implements NotifClient {
       '$_baseUrl/$topic/json',
       options: Options(
         responseType: ResponseType.stream,
-        headers: const {'Accept': 'text/event-stream'},
+        headers: {
+          'Accept': 'text/event-stream',
+          if (accessToken != null) 'Authorization': 'Bearer $accessToken',
+        },
       ),
     );
     final body = response.data;
@@ -99,6 +105,9 @@ class NtfyNotifClient implements NotifClient {
     String? link,
   }) async {
     final headers = {'Content-Type': 'text/plain'};
+    if (accessToken != null) {
+      headers['Authorization'] = 'Bearer $accessToken';
+    }
     if (title.isNotEmpty) headers['Title'] = title;
     if (link != null && link.isNotEmpty) headers['Click'] = link;
     await _dio.post<String>(

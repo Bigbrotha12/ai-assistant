@@ -3,9 +3,11 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
 import { requireApiKey, unauthorized } from "./inference.ts";
 import { Ledger, LedgerError, migrateLedger } from "./ledger.ts";
+import type { VerifyApiKeyFn } from "./plugins/routes.ts";
 
 /**
  * The ledger lives in a dedicated SQLite file (`LEDGER_DB_PATH`, default
@@ -23,12 +25,26 @@ export const ledger = new Ledger(ledgerDb, {
   stuckTimeoutMs: env.LEDGER_STUCK_TIMEOUT_MS,
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,
 });
+// One-time startup orphan reconciliation: tasks left `running` by a crash or
+// restart with a lapsed lease / stale heartbeat become `stuck` before the
+// server accepts requests, so they can be resumed instead of lying false-stuck.
+// Count only, no task details.
+const orphanedCount = ledger.reconcileOrphans().marked.length;
+if (orphanedCount > 0) {
+  console.log(
+    `ledger: reconciled ${orphanedCount} orphaned running task(s) as stuck`,
+  );
+}
 
-export function createLedgerRoutes(l: Ledger): Hono {
+export function createLedgerRoutes(
+  l: Ledger,
+  opts: { verifyKey?: VerifyApiKeyFn } = {},
+): Hono {
+  const verifyKey = opts.verifyKey ?? requireApiKey;
   const routes = new Hono();
 
   routes.post("/tasks", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       intentKey?: unknown;
@@ -38,23 +54,40 @@ export function createLedgerRoutes(l: Ledger): Hono {
     if (!body || typeof body.intentKey !== "string") {
       return c.json({ error: "invalid_request" }, 400);
     }
-    const task = l.createTask({
+    // M2: owner-scoped get-or-create. A repeat (owner, intentKey) returns the
+    // EXISTING task with 200 instead of raw-INSERT 500ing on the v4 unique
+    // index. The pre-check distinguishes created (201) from returned (200).
+    const existing = l.getTaskByIntentKey(owner, body.intentKey);
+    const created = existing === null;
+    const task = await getOrCreateTask(l, {
       owner,
       intentKey: body.intentKey,
       spec: JSON.stringify(body.spec ?? {}),
       worker: typeof body.worker === "string" ? body.worker : undefined,
     });
-    return c.json(task, 201);
+    return c.json(task, created ? 201 : 200);
   });
 
   routes.get("/tasks", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     return c.json(l.listTasks(owner));
   });
 
+  // Status-by-idempotency-key: the client's poll-after-drop endpoint (plan
+  // line 228). Owner-scoped via getTaskByIntentKey — a cross-owner lookup is a
+  // miss → 404 (IDOR), never a leak. Registered before `/tasks/:id`; Hono's
+  // router disambiguates by segment count regardless.
+  routes.get("/tasks/by-key/:intentKey", async (c) => {
+    const owner = await verifyKey(c);
+    if (!owner) return unauthorized(c);
+    const task = l.getTaskByIntentKey(owner, c.req.param("intentKey"));
+    if (!task) return c.json({ error: "not_found" }, 404);
+    return c.json(task);
+  });
+
   routes.get("/tasks/:id", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const id = c.req.param("id");
     // Scope the read to the caller (IDOR): cross-owner reads are a miss → 404.
@@ -68,7 +101,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/claim", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     try {
       return c.json(l.claimTask(c.req.param("id"), owner));
@@ -78,12 +111,13 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/steps", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       stage?: unknown;
       action?: unknown;
       result?: unknown;
+      fenceToken?: unknown;
     } | null;
     if (
       !body ||
@@ -92,12 +126,29 @@ export function createLedgerRoutes(l: Ledger): Hono {
     ) {
       return c.json({ error: "invalid_request" }, 400);
     }
+    const id = c.req.param("id");
+    const task = l.getTask(id, owner);
+    if (!task) return c.json({ error: "not_found" }, 404);
+    const fenceToken =
+      typeof body.fenceToken === "string" ? body.fenceToken : undefined;
+    // M8: a RUNNING task is fence-protected — a caller appending steps without
+    // the claim/resume fence token is (or may be) a superseded worker and must
+    // not write. Queued/terminal transitions never carry a fence, so the gate
+    // is conditional on `running`.
+    if (task.status === "running" && !fenceToken) {
+      return c.json({ error: "fence_conflict" }, 403);
+    }
     try {
-      const out = l.appendStep(c.req.param("id"), owner, {
-        stage: body.stage,
-        action: body.action,
-        result: typeof body.result === "string" ? body.result : null,
-      });
+      const out = l.appendStep(
+        id,
+        owner,
+        {
+          stage: body.stage,
+          action: body.action,
+          result: typeof body.result === "string" ? body.result : null,
+        },
+        fenceToken,
+      );
       return c.json(out, 201);
     } catch (e) {
       return ledgerError(c, e);
@@ -105,17 +156,31 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/heartbeat", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
+    const body = (await c.req.json().catch(() => null)) as {
+      fenceToken?: unknown;
+    } | null;
+    const id = c.req.param("id");
+    const task = l.getTask(id, owner);
+    if (!task) return c.json({ error: "not_found" }, 404);
+    const fenceToken =
+      body && typeof body.fenceToken === "string" ? body.fenceToken : undefined;
+    // M8: heartbeats only apply to `running` tasks, and those are
+    // fence-protected — a heartbeat without the fence token is a superseded
+    // worker trying to extend a lease it no longer holds.
+    if (task.status === "running" && !fenceToken) {
+      return c.json({ error: "fence_conflict" }, 403);
+    }
     try {
-      return c.json(l.heartbeat(c.req.param("id"), owner));
+      return c.json(l.heartbeat(id, owner, fenceToken));
     } catch (e) {
       return ledgerError(c, e);
     }
   });
 
   routes.post("/tasks/:id/resume", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     try {
       return c.json(l.resumeTask(c.req.param("id"), owner));
@@ -125,7 +190,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
   });
 
   routes.post("/tasks/:id/complete", async (c) => {
-    const owner = await requireApiKey(c);
+    const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     const body = (await c.req.json().catch(() => null)) as {
       status?: unknown;
@@ -152,7 +217,7 @@ export function createLedgerRoutes(l: Ledger): Hono {
 function ledgerError(c: Context, e: unknown): Response {
   if (e instanceof LedgerError) {
     if (e.code === "TASK_NOT_FOUND") return c.json({ error: "not_found" }, 404);
-    if (e.code === "FORBIDDEN" || e.code === "LEASE_CONFLICT") {
+    if (e.code === "FORBIDDEN" || e.code === "LEASE_CONFLICT" || e.code === "FENCE_CONFLICT") {
       return c.json({ error: e.code.toLowerCase() }, 403);
     }
     if (e.code === "INVALID_CONFIG") return c.json({ error: "invalid_config" }, 500);

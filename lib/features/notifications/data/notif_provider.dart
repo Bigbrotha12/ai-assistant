@@ -11,6 +11,10 @@ final notifBaseUrlProvider = Provider<String>((ref) {
   return url.isEmpty ? '' : url;
 });
 
+/// The ntfy access token for authenticated topics. Empty (default) until a
+/// later phase provisions and stores the real token.
+final notifAccessTokenProvider = Provider<String>((ref) => '');
+
 /// Provides the active [NotifClient].
 ///
 /// Dependency-gated: returns [NoOpNotifClient] when no notifier server URL is
@@ -18,7 +22,12 @@ final notifBaseUrlProvider = Provider<String>((ref) {
 final notifClientProvider = Provider<NotifClient>((ref) {
   final baseUrl = ref.watch(notifBaseUrlProvider);
   if (baseUrl.isEmpty) return const NoOpNotifClient();
-  final client = NtfyNotifClient(baseUrl: baseUrl, dio: ref.watch(dioProvider));
+  final accessToken = ref.watch(notifAccessTokenProvider);
+  final client = NtfyNotifClient(
+    baseUrl: baseUrl,
+    dio: ref.watch(dioProvider),
+    accessToken: accessToken.isEmpty ? null : accessToken,
+  );
   ref.onDispose(client.dispose);
   return client;
 });

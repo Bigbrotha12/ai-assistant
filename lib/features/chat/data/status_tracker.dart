@@ -188,10 +188,7 @@ class StatusTracker {
 
 String statusPhraseForError(Object error, {Random? random}) {
   final rng = random ?? Random();
-  // An InferenceAuthError is a 401 from the build-time LLM key that the
-  // gateway re-auth flow cannot fix; voice it as a plain server error rather
-  // than the "sign in again" auth phrasing.
-  if (error is ChatServerError && error is! InferenceAuthError) {
+  if (error is ChatServerError) {
     if (error.statusCode == 401 || error.statusCode == 403) {
       return _pick(authErrorPhrases, rng);
     }

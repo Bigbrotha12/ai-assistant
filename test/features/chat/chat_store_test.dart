@@ -29,16 +29,16 @@ void main() {
     List<Message> messages = const [],
     DateTime? createdAt,
     DateTime? updatedAt,
-  }) =>
-      Conversation(
-        id: id,
-        title: title,
-        messages: messages,
-        createdAt: createdAt ?? DateTime(2024, 1, 1),
-        updatedAt: updatedAt ?? DateTime(2024, 1, 1, 0, 0, 1),
-      );
+  }) => Conversation(
+    id: id,
+    title: title,
+    messages: messages,
+    createdAt: createdAt ?? DateTime(2024, 1, 1),
+    updatedAt: updatedAt ?? DateTime(2024, 1, 1, 0, 0, 1),
+  );
 
-  Message userMessage(String id, String content, {DateTime? createdAt}) => Message(
+  Message userMessage(String id, String content, {DateTime? createdAt}) =>
+      Message(
         id: id,
         role: MessageRole.user,
         content: content,
@@ -46,87 +46,95 @@ void main() {
       );
 
   Message assistantWithTools() => const Message(
-        id: 'm2',
-        role: MessageRole.assistant,
-        content: '',
-        toolCalls: [
-          ToolCall(
-            id: 'call_1',
-            name: 'get_weather',
-            args: {'city': 'Berlin'},
-            result: '22C',
-          ),
-        ],
-        createdAt: null,
-      );
+    id: 'm2',
+    role: MessageRole.assistant,
+    content: '',
+    toolCalls: [
+      ToolCall(
+        id: 'call_1',
+        name: 'get_weather',
+        args: {'city': 'Berlin'},
+        result: '22C',
+      ),
+    ],
+    createdAt: null,
+  );
 
   Message toolMessage() => const Message(
-        id: 'm3',
-        role: MessageRole.tool,
-        content: '{"city":"Berlin"}',
-        toolCallId: 'call_1',
-        createdAt: null,
+    id: 'm3',
+    role: MessageRole.tool,
+    content: '{"city":"Berlin"}',
+    toolCallId: 'call_1',
+    createdAt: null,
+  );
+
+  test(
+    'save + loadConversation round-trips messages incl. toolCalls',
+    () async {
+      final c = conversation(
+        messages: [
+          userMessage('m1', 'hi'),
+          assistantWithTools(),
+          toolMessage(),
+        ],
       );
 
-  test('save + loadConversation round-trips messages incl. toolCalls', () async {
-    final c = conversation(messages: [
-      userMessage('m1', 'hi'),
-      assistantWithTools(),
-      toolMessage(),
-    ]);
+      await store.saveConversation(c);
 
-    await store.saveConversation(c);
+      final loaded = await store.loadConversation('c1');
+      expect(loaded, isNotNull);
+      expect(loaded!.id, 'c1');
+      expect(loaded.title, 'Title');
+      expect(loaded.messages, hasLength(3));
 
-    final loaded = await store.loadConversation('c1');
-    expect(loaded, isNotNull);
-    expect(loaded!.id, 'c1');
-    expect(loaded.title, 'Title');
-    expect(loaded.messages, hasLength(3));
+      final assistant = loaded.messages[1];
+      expect(assistant.role, MessageRole.assistant);
+      expect(assistant.toolCalls, hasLength(1));
+      expect(assistant.toolCalls!.first.name, 'get_weather');
+      expect(assistant.toolCalls!.first.args, {'city': 'Berlin'});
+      expect(assistant.toolCalls!.first.result, '22C');
 
-    final assistant = loaded.messages[1];
-    expect(assistant.role, MessageRole.assistant);
-    expect(assistant.toolCalls, hasLength(1));
-    expect(assistant.toolCalls!.first.name, 'get_weather');
-    expect(assistant.toolCalls!.first.args, {'city': 'Berlin'});
-    expect(assistant.toolCalls!.first.result, '22C');
-
-    final tool = loaded.messages[2];
-    expect(tool.role, MessageRole.tool);
-    expect(tool.toolCallId, 'call_1');
-  });
+      final tool = loaded.messages[2];
+      expect(tool.role, MessageRole.tool);
+      expect(tool.toolCallId, 'call_1');
+    },
+  );
 
   test('loadConversation returns null for unknown id', () async {
     expect(await store.loadConversation('nope'), isNull);
   });
 
-  test('appendMessage bumps updatedAt + messageCount and watch emits', () async {
-    final c = conversation();
-    await store.saveConversation(c);
+  test(
+    'appendMessage bumps updatedAt + messageCount and watch emits',
+    () async {
+      final c = conversation();
+      await store.saveConversation(c);
 
-    final updatedAtBefore = (await store.loadConversation('c1'))!.updatedAt;
+      final updatedAtBefore = (await store.loadConversation('c1'))!.updatedAt;
 
-    final first = store.watchConversations();
-    final updates = <List<Conversation>>[];
-    final sub = first.listen(updates.add, onError: (Object e) {});
+      final first = store.watchConversations();
+      final updates = <List<Conversation>>[];
+      final sub = first.listen(updates.add, onError: (Object e) {});
 
-    await store.appendMessage('c1', userMessage('m1', 'hello'));
-    await store.appendMessage('c1', userMessage('m2', 'world'));
+      await store.appendMessage('c1', userMessage('m1', 'hello'));
+      await store.appendMessage('c1', userMessage('m2', 'world'));
 
-    // Let the stream deliver events.
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+      // Let the stream deliver events.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
 
-    final latest = updates.isEmpty ? null : updates.last;
-    expect(latest, isNotNull);
-    expect(latest!.single.id, 'c1');
-    expect(latest.single.messages, hasLength(2));
+      final latest = updates.isEmpty ? null : updates.last;
+      expect(latest, isNotNull);
+      expect(latest!.single.id, 'c1');
+      expect(latest.single.messages, hasLength(2));
 
-    final after = await store.loadConversation('c1');
-    expect(after!.messages, hasLength(2));
-    expect(after.updatedAt.isAfter(updatedAtBefore), isTrue);
-    expect(after.messages.last.content, 'world');
+      final after = await store.loadConversation('c1');
+      expect(after!.messages, hasLength(2));
+      expect(after.updatedAt.isAfter(updatedAtBefore), isTrue);
+      expect(after.messages.last.content, 'world');
 
-    await sub.cancel();
-  });
+      await sub.cancel();
+    },
+  );
 
   test('ensureConversation creates the row once and never overwrites existing '
       'messages (concurrent first-turn safety)', () async {
@@ -153,9 +161,9 @@ void main() {
   });
 
   test('updateMessage replaces content (streaming partial)', () async {
-    await store.saveConversation(conversation(messages: [
-      userMessage('m1', 'partial'),
-    ]));
+    await store.saveConversation(
+      conversation(messages: [userMessage('m1', 'partial')]),
+    );
 
     await store.updateMessage(
       'c1',
@@ -169,16 +177,16 @@ void main() {
   });
 
   test('deleteConversation cascades to messages', () async {
-    await store.saveConversation(conversation(messages: [
-      userMessage('m1', 'a'),
-      userMessage('m2', 'b'),
-    ]));
+    await store.saveConversation(
+      conversation(messages: [userMessage('m1', 'a'), userMessage('m2', 'b')]),
+    );
 
     await store.deleteConversation('c1');
 
     expect(await store.loadConversation('c1'), isNull);
-    final remaining = await (db.select(db.messages)..where((t) => t.conversationId.equals('c1')))
-        .get();
+    final remaining = await (db.select(
+      db.messages,
+    )..where((t) => t.conversationId.equals('c1'))).get();
     expect(remaining, isEmpty);
   });
 
@@ -198,44 +206,50 @@ void main() {
     expect(conversations.any((c) => c.id == 'c21'), isTrue);
   });
 
-  test('appending beyond 100 messages keeps all of them in the store', () async {
-    await store.saveConversation(conversation());
-    for (var i = 0; i < 105; i++) {
-      await store.appendMessage(
-        'c1',
-        userMessage('m$i', 'msg$i', createdAt: DateTime(2024, 1, 1).add(Duration(minutes: i))),
-      );
-    }
+  test(
+    'appending beyond 100 messages keeps all of them in the store',
+    () async {
+      await store.saveConversation(conversation());
+      for (var i = 0; i < 105; i++) {
+        await store.appendMessage(
+          'c1',
+          userMessage(
+            'm$i',
+            'msg$i',
+            createdAt: DateTime(2024, 1, 1).add(Duration(minutes: i)),
+          ),
+        );
+      }
 
-    final loaded = await store.loadConversation('c1');
-    expect(loaded!.messages, hasLength(105));
-    // No silent mid-conversation trim: the oldest messages survive, and the
-    // messageCount reflects the real count.
-    expect(loaded.messages.any((m) => m.id == 'm0'), isTrue);
-    expect(loaded.messages.any((m) => m.id == 'm104'), isTrue);
-  });
+      final loaded = await store.loadConversation('c1');
+      expect(loaded!.messages, hasLength(105));
+      // No silent mid-conversation trim: the oldest messages survive, and the
+      // messageCount reflects the real count.
+      expect(loaded.messages.any((m) => m.id == 'm0'), isTrue);
+      expect(loaded.messages.any((m) => m.id == 'm104'), isTrue);
+    },
+  );
 
   test('deleteMessage removes the row and decrements messageCount', () async {
-    await store.saveConversation(conversation(messages: [
-      userMessage('m1', 'a'),
-      userMessage('m2', 'b'),
-    ]));
+    await store.saveConversation(
+      conversation(messages: [userMessage('m1', 'a'), userMessage('m2', 'b')]),
+    );
 
     await store.deleteMessage('c1', 'm1');
 
     final loaded = await store.loadConversation('c1');
     expect(loaded!.messages, hasLength(1));
     expect(loaded.messages.single.id, 'm2');
-    final row = await (db.select(db.conversations)
-          ..where((t) => t.id.equals('c1')))
-        .getSingle();
+    final row = await (db.select(
+      db.conversations,
+    )..where((t) => t.id.equals('c1'))).getSingle();
     expect(row.messageCount, 1);
   });
 
   test('deleteAll clears everything', () async {
-    await store.saveConversation(conversation(messages: [
-      userMessage('m1', 'a'),
-    ]));
+    await store.saveConversation(
+      conversation(messages: [userMessage('m1', 'a')]),
+    );
     await store.saveConversation(
       conversation(id: 'c2', title: 'Two', messages: [userMessage('m2', 'b')]),
     );
@@ -249,30 +263,31 @@ void main() {
     expect(await store.watchConversations().first, isEmpty);
   });
 
-  test('schemaVersion is 5 and a fresh database round-trips a FileRow',
-      () async {
-    expect(db.schemaVersion, 5);
+  test(
+    'schemaVersion is 6 and a fresh database round-trips a FileRow',
+    () async {
+      expect(db.schemaVersion, 6);
 
-    await store.saveConversation(conversation(id: 'c1'));
-    final fileStore = DriftFileStore(db);
-    await fileStore.saveFile(
-      const FileInfo(
-        id: 'f1',
-        filename: 'photo.jpg',
-        sizeBytes: 1024,
-        mimeType: 'image/jpeg',
-      ),
-      conversationId: 'c1',
-    );
+      await store.saveConversation(conversation(id: 'c1'));
+      final fileStore = DriftFileStore(db);
+      await fileStore.saveFile(
+        const FileInfo(
+          id: 'f1',
+          filename: 'photo.jpg',
+          sizeBytes: 1024,
+          mimeType: 'image/jpeg',
+        ),
+        conversationId: 'c1',
+      );
 
-    final loaded = await fileStore.getFileById('f1');
-    expect(loaded, isNotNull);
-    expect(loaded!.filename, 'photo.jpg');
-    expect(loaded.mimeType, 'image/jpeg');
-  });
+      final loaded = await fileStore.getFileById('f1');
+      expect(loaded, isNotNull);
+      expect(loaded!.filename, 'photo.jpg');
+      expect(loaded.mimeType, 'image/jpeg');
+    },
+  );
 
-  test('migrating a v1 database creates the Files table and its index',
-      () async {
+  test('migrating a v1 database creates the Files table and its index', () async {
     final dir = await Directory.systemTemp.createTemp('migration_test');
     final file = File('${dir.path}/app.db');
     addTearDown(() async {
@@ -285,31 +300,33 @@ void main() {
     // is created via raw SQL in the setup hook (which runs BEFORE drift's
     // onUpgrade), with user_version pinned to 1 so opening AppDatabase (at
     // schema version 5) runs the onUpgrade path instead of onCreate.
-    final v1 = AppDatabase(NativeDatabase(
-      file,
-      setup: (raw) {
-        raw.execute(
-          'CREATE TABLE conversations ('
-          'id TEXT NOT NULL PRIMARY KEY, '
-          'title TEXT NOT NULL DEFAULT \'\', '
-          'created_at INTEGER NOT NULL, '
-          'updated_at INTEGER NOT NULL, '
-          'message_count INTEGER NOT NULL DEFAULT 0)',
-        );
-        raw.execute(
-          'CREATE TABLE messages ('
-          'id TEXT NOT NULL PRIMARY KEY, '
-          'conversation_id TEXT NOT NULL '
-          'REFERENCES conversations (id) ON DELETE CASCADE, '
-          'role TEXT NOT NULL, '
-          'content TEXT NOT NULL DEFAULT \'\', '
-          'tool_calls TEXT, '
-          'tool_call_id TEXT, '
-          'created_at INTEGER NOT NULL)',
-        );
-        raw.execute('PRAGMA user_version = 1;');
-      },
-    ));
+    final v1 = AppDatabase(
+      NativeDatabase(
+        file,
+        setup: (raw) {
+          raw.execute(
+            'CREATE TABLE conversations ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'title TEXT NOT NULL DEFAULT \'\', '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'message_count INTEGER NOT NULL DEFAULT 0)',
+          );
+          raw.execute(
+            'CREATE TABLE messages ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT NOT NULL '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'role TEXT NOT NULL, '
+            'content TEXT NOT NULL DEFAULT \'\', '
+            'tool_calls TEXT, '
+            'tool_call_id TEXT, '
+            'created_at INTEGER NOT NULL)',
+          );
+          raw.execute('PRAGMA user_version = 1;');
+        },
+      ),
+    );
     await v1.close();
 
     // Reopen with the current schema: onUpgrade must add the Files table and
@@ -345,8 +362,7 @@ void main() {
     expect(indexRows, hasLength(1));
   });
 
-  test('migrating a v3 database creates the memories and memories_fts tables',
-      () async {
+  test('migrating a v3 database creates the memories and memories_fts tables', () async {
     final dir = await Directory.systemTemp.createTemp('migration_v3_test');
     final file = File('${dir.path}/app.db');
     addTearDown(() async {
@@ -359,48 +375,50 @@ void main() {
     // schema is created via raw SQL in the setup hook (which runs BEFORE
     // drift's onUpgrade), with user_version pinned to 3 so opening AppDatabase
     // (at schema version 5) runs the onUpgrade path instead of onCreate.
-    final v3 = AppDatabase(NativeDatabase(
-      file,
-      setup: (raw) {
-        raw.execute(
-          'CREATE TABLE conversations ('
-          'id TEXT NOT NULL PRIMARY KEY, '
-          'title TEXT NOT NULL DEFAULT \'\', '
-          'created_at INTEGER NOT NULL, '
-          'updated_at INTEGER NOT NULL, '
-          'message_count INTEGER NOT NULL DEFAULT 0)',
-        );
-        raw.execute(
-          'CREATE TABLE messages ('
-          'id TEXT NOT NULL PRIMARY KEY, '
-          'conversation_id TEXT NOT NULL '
-          'REFERENCES conversations (id) ON DELETE CASCADE, '
-          'role TEXT NOT NULL, '
-          'content TEXT NOT NULL DEFAULT \'\', '
-          'tool_calls TEXT, '
-          'tool_call_id TEXT, '
-          'created_at INTEGER NOT NULL)',
-        );
-        raw.execute(
-          'CREATE TABLE files ('
-          'id TEXT NOT NULL PRIMARY KEY, '
-          'conversation_id TEXT '
-          'REFERENCES conversations (id) ON DELETE CASCADE, '
-          'server_file_id TEXT NOT NULL, '
-          'local_path TEXT NOT NULL, '
-          'filename TEXT NOT NULL, '
-          'size_bytes INTEGER NOT NULL, '
-          'mime_type TEXT NOT NULL, '
-          'created_at INTEGER NOT NULL, '
-          'updated_at INTEGER NOT NULL, '
-          'description TEXT)',
-        );
-        raw.execute(
-          'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
-        );
-        raw.execute('PRAGMA user_version = 3;');
-      },
-    ));
+    final v3 = AppDatabase(
+      NativeDatabase(
+        file,
+        setup: (raw) {
+          raw.execute(
+            'CREATE TABLE conversations ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'title TEXT NOT NULL DEFAULT \'\', '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'message_count INTEGER NOT NULL DEFAULT 0)',
+          );
+          raw.execute(
+            'CREATE TABLE messages ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT NOT NULL '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'role TEXT NOT NULL, '
+            'content TEXT NOT NULL DEFAULT \'\', '
+            'tool_calls TEXT, '
+            'tool_call_id TEXT, '
+            'created_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE TABLE files ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'server_file_id TEXT NOT NULL, '
+            'local_path TEXT NOT NULL, '
+            'filename TEXT NOT NULL, '
+            'size_bytes INTEGER NOT NULL, '
+            'mime_type TEXT NOT NULL, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'description TEXT)',
+          );
+          raw.execute(
+            'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
+          );
+          raw.execute('PRAGMA user_version = 3;');
+        },
+      ),
+    );
     await v3.close();
 
     // Reopen with the current schema: onUpgrade must add the memories table,
@@ -416,8 +434,10 @@ void main() {
           "AND name IN ('memories', 'memories_fts')",
         )
         .get();
-    expect(memoryTables.map((r) => r.read<String>('name')).toSet(),
-        {'memories', 'memories_fts'});
+    expect(memoryTables.map((r) => r.read<String>('name')).toSet(), {
+      'memories',
+      'memories_fts',
+    });
 
     final indexRows = await upgraded
         .customSelect(
@@ -449,5 +469,128 @@ void main() {
     expect(await memoryStore.getMemory('mem1'), isNotNull);
     final hits = await memoryStore.searchMemories('fox');
     expect(hits.map((m) => m.id).toList(), ['mem1']);
+  });
+
+  test('migrating a v5 database adds managed columns and the pending-turns '
+      'table', () async {
+    final dir = await Directory.systemTemp.createTemp('migration_v5_test');
+    final file = File('${dir.path}/app.db');
+    addTearDown(() async {
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    // Build a v5 database (Conversations + Messages + Files + Memories, at the
+    // pre-managed schema) with one conversation row, then reopen at v6.
+    final v5 = AppDatabase(
+      NativeDatabase(
+        file,
+        setup: (raw) {
+          raw.execute(
+            'CREATE TABLE conversations ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'title TEXT NOT NULL DEFAULT \'\', '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'message_count INTEGER NOT NULL DEFAULT 0)',
+          );
+          raw.execute(
+            'CREATE TABLE messages ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT NOT NULL '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'role TEXT NOT NULL, '
+            'content TEXT NOT NULL DEFAULT \'\', '
+            'tool_calls TEXT, '
+            'tool_call_id TEXT, '
+            'created_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE TABLE files ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'server_file_id TEXT NOT NULL, '
+            'local_path TEXT NOT NULL, '
+            'filename TEXT NOT NULL, '
+            'size_bytes INTEGER NOT NULL, '
+            'mime_type TEXT NOT NULL, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'description TEXT)',
+          );
+          raw.execute(
+            'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
+          );
+          raw.execute(
+            'CREATE TABLE memories ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'content TEXT NOT NULL, '
+            'source TEXT, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE INDEX memories_updated_at_idx ON memories (updated_at)',
+          );
+          raw.execute(
+            'CREATE VIRTUAL TABLE memories_fts USING '
+            "fts5(content, content='memories', content_rowid='rowid')",
+          );
+          raw.execute('PRAGMA user_version = 5;');
+        },
+      ),
+    );
+    await v5.close();
+
+    final upgraded = AppDatabase(NativeDatabase(file));
+    addTearDown(upgraded.close);
+    await upgraded.customSelect('SELECT 1').get();
+
+    final columns = await upgraded
+        .customSelect('PRAGMA table_info(conversations)')
+        .get();
+    final names = columns.map((r) => r.read<String>('name')).toSet();
+    expect(names, containsAll(['scope_key', 'public_thread_id']));
+
+    final pendingTables = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master "
+          "WHERE type = 'table' AND name = 'managed_pending_turns'",
+        )
+        .get();
+    expect(pendingTables, hasLength(1));
+
+    // Pre-existing unscoped rows stay readable through an unscoped store.
+    final unscoped = DriftChatStore(upgraded);
+    final unscopedConversation = Conversation(
+      id: 'legacy',
+      title: 'Legacy',
+      createdAt: DateTime(2024),
+      updatedAt: DateTime(2024),
+      messages: const [
+        Message(id: 'm1', role: MessageRole.user, content: 'old'),
+      ],
+    );
+    await unscoped.saveConversation(unscopedConversation);
+    final loaded = await unscoped.loadConversation('legacy');
+    expect(loaded, isNotNull);
+    expect(loaded!.messages.single.content, 'old');
+
+    // And a scoped store still round-trips its own rows on the migrated DB.
+    final scoped = DriftChatStore(upgraded, scopeKey: 'scope-a');
+    final scopedConversation = Conversation(
+      id: 'scoped',
+      title: 'Scoped',
+      createdAt: DateTime(2024),
+      updatedAt: DateTime(2024),
+      messages: const [
+        Message(id: 'm2', role: MessageRole.user, content: 'new'),
+      ],
+    );
+    await scoped.saveConversation(scopedConversation);
+    expect(await scoped.loadConversation('scoped'), isNotNull);
+    expect(await scoped.loadConversation('legacy'), isNull);
   });
 }

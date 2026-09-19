@@ -4,62 +4,9 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/sse.dart';
 
-/// Encodes [text] as a single byte chunk.
-Stream<List<int>> sseBytes(String text) =>
-    Stream.fromIterable([utf8.encode(text)]);
-
-/// Splits [text] at the given byte offsets into separate chunks.
-Stream<List<int>> sseChunked(String text, List<int> splitPoints) {
-  final bytes = utf8.encode(text);
-  final chunks = <List<int>>[];
-  var start = 0;
-  for (final p in splitPoints) {
-    chunks.add(bytes.sublist(start, p));
-    start = p;
-  }
-  if (start < bytes.length) chunks.add(bytes.sublist(start));
-  return Stream.fromIterable(chunks);
-}
+import 'sse_fixtures.dart';
 
 Future<List<SseEvent>> collect(Stream<SseEvent> events) => events.toList();
-
-/// Builds an OpenAI-style chunk payload as a JSON string.
-String chunk({
-  String? content,
-  String? reasoning,
-  List<Map<String, Object?>>? toolCalls,
-  String? finishReason,
-}) {
-  final delta = <String, Object?>{};
-  if (content != null) delta['content'] = content;
-  if (reasoning != null) delta['reasoning_content'] = reasoning;
-  if (toolCalls != null) delta['tool_calls'] = toolCalls;
-  return jsonEncode({
-    'id': 'chatcmpl-1',
-    'object': 'chat.completion.chunk',
-    'choices': [
-      {'delta': delta, 'index': 0, 'finish_reason': finishReason},
-    ],
-  });
-}
-
-/// Builds a single `delta.tool_calls[]` entry.
-Map<String, Object?> toolCall({
-  int index = 0,
-  String? id,
-  String? name,
-  String? arguments,
-}) {
-  final function = <String, Object?>{};
-  if (name != null) function['name'] = name;
-  if (arguments != null) function['arguments'] = arguments;
-  return {
-    'index': index,
-    'type': 'function',
-    'id': ?id,
-    'function': function,
-  };
-}
 
 void expectDone(SseEvent e, String? finishReason) {
   expect(e.type, SseEventType.done);
@@ -217,13 +164,102 @@ void main() {
       expectDone(events.single, null);
     });
 
-    test('finish_reason stop produces a done event', () async {
+    test('finish_reason stop is sticky and the trailing [DONE] carries it',
+        () async {
       final events = await collect(parseSse(sseBytes(
-        'data: ${chunk(content: 'bye', finishReason: 'stop')}\n\n',
+        'data: ${chunk(content: 'bye', finishReason: 'stop')}\n\n'
+        'data: [DONE]\n\n',
       )));
 
       expect(events.map((e) => e.type), [SseEventType.content, SseEventType.done]);
       expectDone(events.last, 'stop');
+    });
+  });
+
+  group('sticky finish_reason wire contract', () {
+    test('tool-call stream yields every delta then one done(tool_calls)',
+        () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: ${chunk(toolCalls: [toolCall(index: 0, id: 'call_1', name: 'voices', arguments: '{"voice"')])}\n\n'
+        'data: ${chunk(toolCalls: [toolCall(index: 0, arguments: ':"amy"}')])}\n\n'
+        'data: ${chunk(finishReason: 'tool_calls')}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      // Both tool-call deltas stream before the single terminal done event;
+      // the old parser returned early on the finish_reason chunk and would
+      // have discarded nothing here, but the contract must explicitly allow
+      // content/toolCall events AFTER a finish_reason chunk (see below).
+      expect(events.map((e) => e.type), [
+        SseEventType.toolCall,
+        SseEventType.toolCall,
+        SseEventType.done,
+      ]);
+      final args = events
+          .where((e) => e.type == SseEventType.toolCall)
+          .map((e) => e.toolCall!.argsFragment)
+          .join();
+      expect(args, '{"voice":"amy"}');
+      final doneEvents =
+          events.where((e) => e.type == SseEventType.done).toList();
+      expect(doneEvents, hasLength(1));
+      expectDone(doneEvents.single, 'tool_calls');
+    });
+
+    test('a mid-stream finish_reason does not terminate the stream', () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: ${chunk(content: 'first', finishReason: 'stop')}\n\n'
+        'data: ${chunk(content: ' second')}\n\n'
+        'data: ${chunk(content: ' third')}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      expect(events.map((e) => e.type), [
+        SseEventType.content,
+        SseEventType.content,
+        SseEventType.content,
+        SseEventType.done,
+      ]);
+      expect(
+        events
+            .where((e) => e.type == SseEventType.content)
+            .map((e) => e.content!)
+            .join(),
+        'first second third',
+      );
+      // The sticky reason is the one seen mid-stream, not overwritten by the
+      // terminal [DONE] (which carries no reason).
+      expectDone(events.last, 'stop');
+    });
+
+    test('[DONE] without a finish_reason carries the sticky one', () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: ${chunk(finishReason: 'tool_calls')}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      expect(events, hasLength(1));
+      expectDone(events.single, 'tool_calls');
+    });
+
+    test('no finish_reason at all yields done(null)', () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: ${chunk(content: 'hello')}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      expect(events.map((e) => e.type), [
+        SseEventType.content,
+        SseEventType.done,
+      ]);
+      expectDone(events.last, null);
+    });
+
+    test('an empty [DONE]-only stream yields a single done(null)', () async {
+      final events = await collect(parseSse(sseBytes('data: [DONE]\n\n')));
+
+      expect(events, hasLength(1));
+      expectDone(events.single, null);
     });
   });
 
@@ -342,6 +378,22 @@ void main() {
 
       expect(events.single.type, SseEventType.error);
       expect(events.single.error, 'boom');
+    });
+
+    test('error envelope followed by [DONE] yields one error and no done',
+        () async {
+      final events = await collect(parseSse(sseBytes(
+        'data: {"error": "upstream blew up"}\n\n'
+        'data: [DONE]\n\n',
+      )));
+
+      expect(events, hasLength(1));
+      expect(events.single.type, SseEventType.error);
+      expect(events.single.error, 'upstream blew up');
+      expect(
+        events.where((e) => e.type == SseEventType.done),
+        isEmpty,
+      );
     });
 
     test('malformed JSON lines are skipped without crashing', () async {
