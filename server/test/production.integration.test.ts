@@ -44,7 +44,6 @@ test("production context config validates limits and warmups default off", () =>
         NODE_ENV: "test",
         BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
         BETTER_AUTH_URL: "http://localhost:17600",
-        INFERENCE_URL: "http://localhost:17601",
         PORT: "17600",
         CHECKPOINT_DB_KEY: "test-checkpoint-key",
         PLUGINS_TRUSTED_HOSTS: "",

@@ -1,43 +1,56 @@
-import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../app/app_startup.dart';
 import '../../../core/config.dart';
 import '../../../core/http/dio_provider.dart';
-import './chat_client.dart';
+import '../../auth/data/auth_credentials_providers.dart';
+import '../../plugins/data/plugin_credentials_providers.dart';
+import '../../settings/data/settings_providers.dart';
+import 'chat_client.dart';
+import 'gateway_chat_client.dart';
 
-/// Provides the [ChatClient] wired to the configured inference endpoint.
-/// Reuses the shared [dioProvider] so every HTTP client shares one connection
-/// pool.
-///
-/// Inference target resolution is **compile-time only**: the `LLM_BASE_URL` /
-/// `LLM_MODEL` / `LLM_API_KEY` dart-defines (see `dev.env` / `dev.sh`) are the
-/// sole routing source. There is no gateway fallback — a build missing any of
-/// the three fails loudly here instead of silently routing chat to a local
-/// gateway proxy (see AGENTS.md).
+/// Provides [ChatClient] wired to the LangChain gateway for inference. The
+/// gateway resolves model + tool plugins and executes tools in the agent graph;
+/// the client sends only the model, messages, and plugin credentials.
 final chatApiClientProvider = Provider<ChatClient>((ref) {
-  final baseUrl = BackendConfig.trimTrailingSlash(
-    BackendConfig.defaultLlmBaseUrl,
-  );
-  final model = BackendConfig.defaultLlmModel.trim();
-  final apiKey = BackendConfig.defaultLlmApiKey.trim();
+  final settings = ref.watch(settingsProvider).value;
+  final baseUrl = '${BackendConfig.gatewayBase(
+    effectiveHost(settings),
+    environment: effectiveEnvironment(settings),
+  ).toString().replaceAll(RegExp(r'/$'), '')}/v1';
 
-  if (baseUrl.isEmpty || model.isEmpty || apiKey.isEmpty) {
-    throw StateError(
-      'No inference endpoint configured: set the LLM_BASE_URL, LLM_MODEL and '
-      'LLM_API_KEY dart-defines (see dev.env.example). There is no gateway '
-      'fallback.',
-    );
-  }
-
-  debugPrint(
-    'ChatClient routing: base=$baseUrl model=$model '
-    'key=${apiKey.isNotEmpty ? 'set' : 'none'}',
-  );
-
-  return ChatApiClient(
+  return GatewayChatClient(
     baseUrl: baseUrl,
     dio: ref.watch(dioProvider),
-    model: model,
-    apiKey: apiKey,
+    credentialResolver: () async {
+      final auth = ref.read(authCredentialsProvider).value;
+      final pluginCreds = ref.read(pluginCredentialsProvider).value;
+      if (auth == null || auth.apiKey.trim().isEmpty || pluginCreds == null) {
+        return null;
+      }
+      final selected = pluginCreds.selectedModel;
+      if (selected == null) return null;
+
+      final selectedAgent = pluginCreds.selectedAgent;
+
+      final credentials = <String, Map<String, String>>{};
+      for (final entry in pluginCreds.plugins.entries) {
+        final id = entry.key;
+        if (id == selected || entry.value.enabled) {
+          final fields = entry.value.credentials;
+          if (fields['apiKey']?.trim().isNotEmpty == true) {
+            credentials[id] = {'apiKey': fields['apiKey']!.trim()};
+          }
+        }
+      }
+      if (!credentials.containsKey(selected)) return null;
+
+      return GatewayCredentials(
+        gatewayKey: auth.apiKey.trim(),
+        modelPluginId: selected,
+        agent: selectedAgent,
+        credentials: credentials,
+      );
+    },
   );
 });

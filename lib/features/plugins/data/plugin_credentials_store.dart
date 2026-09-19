@@ -28,10 +28,12 @@ class PluginAccountConfiguration {
   PluginAccountConfiguration({
     Map<String, PluginConfiguration> plugins = const {},
     this.selectedModel,
+    this.selectedAgent,
   }) : plugins = Map.unmodifiable(plugins);
 
   final Map<String, PluginConfiguration> plugins;
   final String? selectedModel;
+  final String? selectedAgent;
 }
 
 class PluginCredentialsStore {
@@ -75,6 +77,7 @@ class PluginCredentialsStore {
       return PluginAccountConfiguration(
         plugins: plugins,
         selectedModel: data['selectedModel'] as String?,
+        selectedAgent: data['selectedAgent'] as String?,
       );
     } catch (_) {
       throw const FormatException('Stored plugin configuration is invalid.');
@@ -95,6 +98,7 @@ class PluginCredentialsStore {
         }),
       ),
       'selectedModel': config.selectedModel,
+      'selectedAgent': config.selectedAgent,
     }),
   );
 
@@ -142,6 +146,7 @@ class PluginCredentialsStore {
           pluginId: update(config.plugins[pluginId] ?? PluginConfiguration()),
         },
         selectedModel: config.selectedModel,
+        selectedAgent: config.selectedAgent,
       ),
     );
   });
@@ -155,18 +160,33 @@ class PluginCredentialsStore {
           PluginAccountConfiguration(
             plugins: plugins,
             selectedModel: config.selectedModel,
+            selectedAgent: config.selectedAgent,
           ),
         );
       });
 
-  Future<void> setSelectedModel(AuthAccountScope scope, String? model) =>
+Future<void> setSelectedModel(AuthAccountScope scope, String? model) =>
+    _serialized(() async {
+      final config = await _load(scope);
+      await _save(
+        scope,
+        PluginAccountConfiguration(
+          plugins: config.plugins,
+          selectedModel: model == null || model.trim().isEmpty ? null : model,
+          selectedAgent: config.selectedAgent,
+        ),
+      );
+    });
+
+  Future<void> setSelectedAgent(AuthAccountScope scope, String? id) =>
       _serialized(() async {
         final config = await _load(scope);
         await _save(
           scope,
           PluginAccountConfiguration(
             plugins: config.plugins,
-            selectedModel: model == null || model.trim().isEmpty ? null : model,
+            selectedModel: config.selectedModel,
+            selectedAgent: id == null || id.trim().isEmpty ? null : id,
           ),
         );
       });

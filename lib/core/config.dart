@@ -101,9 +101,8 @@ class BackendConfig {
     return uri.replace(scheme: env.scheme).toString();
   }
 
-  /// Gateway origin for the app's account services only (better-auth under
-  /// `/api/auth`): `host:17600`. Inference never routes through the gateway —
-  /// it targets the configured external API (see [defaultLlmBaseUrl]).
+  /// Gateway origin for the LangChain gateway: `host:17600`. Chat, voice, and
+  /// vision inference now route through the gateway (see AGENTS.md).
   static Uri gatewayBase(String host, {BackendEnvironment? environment}) =>
       Uri(
         scheme: _scheme(environment),
@@ -130,37 +129,7 @@ class BackendConfig {
     return value.isEmpty ? defaultHost : value;
   }
 
-  /// External OpenAI-compatible inference base URL dart-define (e.g. a
-  /// LibreChat agents endpoint `https://<host>/api/agents/v1`, including the
-  /// API-version `/v1` prefix the chat client appends `chat/completions` to).
-  ///
-  /// THE ONLY inference routing source: there is no gateway fallback. A build
-  /// without this (and [defaultLlmModel] / [defaultLlmApiKey]) fails loudly at
-  /// chat-client creation.
-  static const String defaultLlmBaseUrl = String.fromEnvironment(
-    'LLM_BASE_URL',
-  );
-
-  /// Inference model dart-define (e.g. a LibreChat agent id).
-  static const String defaultLlmModel = String.fromEnvironment('LLM_MODEL');
-
-  /// Inference bearer key dart-define (e.g. a LibreChat API key).
-  static const String defaultLlmApiKey = String.fromEnvironment('LLM_API_KEY');
-
-  /// Normalises [base] for clients that append their own `/v1/...` path
-  /// (vision's models probe + client): strips whitespace, a trailing slash,
-  /// and a trailing API-version `/v1` suffix. `https://h/api/agents/v1` →
-  /// `https://h/api/agents`; `https://h/api/openai/v1/` → `https://h/api/openai`.
-  static String stripV1Suffix(String base) {
-    final value = trimTrailingSlash(base);
-    if (value.endsWith('/v1')) {
-      return value.substring(0, value.length - 3);
-    }
-    return value;
-  }
-
-  /// Removes surrounding whitespace and a trailing `/` from [value]. Keeps
-  /// any API-version `/v1` prefix — that is [stripV1Suffix]'s job.
+  /// Removes surrounding whitespace and a trailing `/` from [value].
   static String trimTrailingSlash(String value) {
     var result = value.trim();
     while (result.endsWith('/')) {

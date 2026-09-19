@@ -53,6 +53,27 @@ ResponseBody jsonResponse(Object value, {int status = 200}) =>
       },
     );
 
+Map<String, dynamic> agentJson() => {
+  'id': 'test-agent',
+  'object': 'agent',
+  'created': 1,
+  'owned_by': 'plugin',
+  'name': 'Test Agent',
+  'description': 'A test agent',
+  'visionCapable': false,
+  'skillCount': 0,
+};
+
+Map<String, dynamic> agentPluginJson() => {
+  'id': 'test-agent',
+  'type': 'agent',
+  'name': 'Test Agent',
+  'description': 'A test agent',
+  'version': '1.0.0',
+  'schemaVersion': 1,
+  'installed': true,
+};
+
 void main() {
   late FakePluginAdapter adapter;
   late Dio dio;
@@ -110,12 +131,17 @@ void main() {
       switch (options.uri.path) {
         case '/v1/plugins':
           return jsonResponse({
-            'plugins': empty ? [] : [pluginJson()],
+            'plugins': empty ? [] : [pluginJson(), agentPluginJson()],
           });
         case '/v1/models':
           return jsonResponse({
             'object': 'list',
             'data': empty ? [] : [modelJson()],
+          });
+        case '/v1/agents':
+          return jsonResponse({
+            'object': 'list',
+            'data': empty ? [] : [agentJson()],
           });
         case '/v1/chat/completions':
           return ResponseBody.fromString(
@@ -155,7 +181,6 @@ void main() {
       );
       await tester.tap(find.byKey(const Key('settings-plugins')));
       await tester.pumpAndSettle();
-      expect(find.textContaining('Staged for Phase 6'), findsOneWidget);
       await tester.tap(find.byKey(const Key('plugin-openrouter')));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Select model'));
@@ -313,7 +338,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 10));
     expect(container.read(pluginAccessProvider), PluginAccess.ready);
     expect(container.read(pluginCatalogProvider).error, isNull);
-    expect(adapter.requests, hasLength(2));
+    expect(adapter.requests, hasLength(3));
     final old = adapter.requests.toList();
     auth.replace(
       const AuthCredentials(
@@ -325,7 +350,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 10));
     await tester.pump(const Duration(milliseconds: 10));
     expect(old.every((request) => request.cancelToken!.isCancelled), isTrue);
-    expect(adapter.requests.length, 4);
+    expect(adapter.requests.length, 6);
     sub.close();
     container.dispose();
     await tester.pump();
@@ -371,6 +396,50 @@ void main() {
           .credentials
           .containsKey('baseUrlEntry'),
       isFalse,
+    );
+  });
+
+  testWidgets('agent section shows agent tile and can navigate to editor', (
+    tester,
+  ) async {
+    await mount(tester);
+    expect(find.text('Test Agent'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('agent-test-agent')));
+    await tester.pumpAndSettle();
+    expect(find.text('Configure agent'), findsOneWidget);
+    expect(find.text('A test agent'), findsOneWidget);
+  });
+
+  testWidgets('agent section shows empty state when no agents', (
+    tester,
+  ) async {
+    empty = true;
+    await mount(tester);
+    expect(
+      find.text(
+        'No agents available. Ask your administrator to install an agent plugin.',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('selecting and deselecting an agent', (tester) async {
+    await mount(tester);
+    await tester.tap(find.byKey(const ValueKey('agent-test-agent')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Select agent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Deselect agent'), findsOneWidget);
+    expect(
+      (await store.load(account.accountScope!)).selectedAgent,
+      'test-agent',
+    );
+    await tester.tap(find.text('Deselect agent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Select agent'), findsOneWidget);
+    expect(
+      (await store.load(account.accountScope!)).selectedAgent,
+      isNull,
     );
   });
 }

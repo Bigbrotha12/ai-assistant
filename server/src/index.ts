@@ -17,6 +17,7 @@ import { NotifyStore } from "./notify/store.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createModelsRoutes } from "./transport/models.ts";
+import { createAgentsRoutes } from "./transport/agents.ts";
 import { createChatRoutes } from "./transport/chat.ts";
 import type { JobModelRequestConfig } from "./transport/chat.ts";
 import { buildModel } from "./transport/model.ts";
@@ -67,6 +68,10 @@ app.route("/v1", createPluginRoutes({ registry: pluginRegistry, store: pluginSto
 // the single `/v1/models` owner — no duplicate-path shadowing regardless of
 // mount order. Never leaks plugin endpoints/baseUrls (see transport/models.ts).
 app.route("/v1", createModelsRoutes({ registry: pluginRegistry }));
+
+// Wave 1: `GET /v1/agents` lists installed agent plugins. Same security
+// contract as /v1/models — never leaks systemPrompt/skills content/endpoints.
+app.route("/v1", createAgentsRoutes({ registry: pluginRegistry }));
 
 // Durable, encrypted conversation checkpoints (Phase 2, Wave B1). The store
 // opens the SQLCipher-keyed SQLite file at CHECKPOINT_DB_PATH; the transport

@@ -1,9 +1,11 @@
 import { vikunjaManifest } from "./vikunja.ts";
 import { mealieManifest } from "./mealie.ts";
 import { spielManifest } from "./spiel.ts";
-import type { ToolPluginDefinition } from "../types.ts";
+import { defaultAgentPlugin, builtinAgentPlugins } from "./agent-default.ts";
+import type { ToolPluginDefinition, AgentPluginDefinition } from "../types.ts";
 
 export { vikunjaManifest, mealieManifest, spielManifest };
+export { defaultAgentPlugin, builtinAgentPlugins };
 
 /**
  * Catalog of admin-installable tool plugin templates. These are NOT loaded
@@ -17,3 +19,11 @@ export const availableToolManifests: readonly ToolPluginDefinition[] = [
   mealieManifest,
   spielManifest,
 ];
+
+/**
+ * Catalog of built-in agent manifests that are always available but are
+ * NOT part of `builtinPlugins` (agent manifests are not persisted to the
+ * store; they are served separately via `GET /v1/agents`).
+ */
+export const availableAgentManifests: readonly AgentPluginDefinition[] =
+  builtinAgentPlugins;

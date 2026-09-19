@@ -1,72 +1,81 @@
 # ai-assistant
 
 A self-hosted, privacy-first voice assistant that runs entirely on your own
-hardware — Flutter client, on-device speech, your own LLM backend, or a compatible
-OpenAI API.
+hardware — Flutter client, on-device speech, plugin model credentials (your own
+LLM provider keys), and a LangChain orchestrator that runs the agent graph.
 
 Speak to it like a person. Speech-to-text and text-to-speech run **on device**
-(no audio ever leaves your phone), the conversation is streamed to your own
-OpenAI-compatible LLM backend, and the assistant can call your tools — tasks,
-recipes, games, calendar — through a plugin architecture.
+(no audio ever leaves your phone), the conversation is streamed through the
+LangChain gateway, which resolves model and tool plugins, runs tools in the
+agent graph, and manages conversation state on the server.
 
 ## Highlights
 
 - **On-device voice** — Whisper STT (sub-1s, 99 languages) + Supertonic 3 TTS,
   ~220 MB loaded, engine-agnostic so models can be swapped without code changes.
-- **Streaming text chat** — SSE streaming against an OpenAI-compatible API,
-  markdown rendering, tool-call chips, thinking-mode suppression for low
-  latency.
+- **Streaming text chat** — SSE streaming through the LangChain gateway,
+  markdown rendering, tool-call chips, server-managed tool execution.
 - **Your data stays yours** — conversations and AI memory live in local SQLite;
   auth credentials and plugin keys live in the OS secure store.
 - **Plugin architecture** — admin-curated tool plugins (Vikunja, Mealie,
-  SpielIndexer, calendar) and model plugins. - Under-development
-- **Extensible** — attachments/images, push notifications (ntfy), a task
-  ledger, and a plan to move orchestration to LangChain for async agentic
-  delegation.
+  SpielIndexer, calendar) and model plugins with user-owned provider keys.
+- **LangChain agent graph** — server-side orchestration with tool execution,
+  budget, idempotency, and checkpoint management.
+- **Push notifications** — ntfy-based provisioning for async job status.
 
 ## Architecture
 
 ```
-┌──────────────────────────┐        ┌──────────────────────────────┐
-│  Flutter client          │  HTTPS │  Backend gateway (Node/Hono) │
-│  ┌────────────────────┐  │  ─────▶│  · better-auth (email/pass)  │
-│  │ Chat UI / SSE      │  │        │  · API-key minting           │
-│  │ Voice (STT + TTS)  │  │  ◀─────│  · OpenAI-compatible /v1     │
-│  │ Tool-call chips    │  │  SSE   │  · task ledger, rate limits  │
-│  │ Local SQLite +     │  │        └────────────┬─────────────────┘
-│  │ secure storage     │  │                     │
-│  └────────────────────┘  │                     │ OpenAI-compatible
-│                          │                     ▼
-└──────────────────────────┘        ┌──────────────────────────────┐
-                                    │  External LLM backend        │
-                                    │  (e.g. LibreChat agents,     │
-                                    │   llama.cpp, vLLM, OpenAI)   │
-                                    └──────────────────────────────┘
+┌──────────────────────────┐        ┌──────────────────────────────────────┐
+│  Flutter client          │  HTTPS │  LangChain gateway (Node/Hono)      │
+│  ┌────────────────────┐  │  ─────▶│  · better-auth (email/pass)          │
+│  │ Chat UI / SSE      │  │        │  · LangChain agent graph            │
+│  │ Voice (STT + TTS)  │  │        │  · Tool execution + budget          │
+│  │ Plugin credentials  │  │  ◀─────│  · Conversation checkpoints        │
+│  │ Local SQLite +      │  │  SSE   │  · Task ledger + idempotency       │
+│  │ secure storage      │  │        │  · ntfy notification hook          │
+│  └────────────────────┘  │        └─────────┬──────────────────────┬─────┘
+│                          │                   │                      │
+└──────────────────────────┘        ┌──────────▼────┐    ┌───────────▼──────┐
+                                    │ Plugin model  │    │  Plugin tools     │
+                                    │ APIs (OpenAI, │    │  Vikunja, Mealie, │
+                                    │ OpenRouter,   │    │  SpielIndexer,    │
+                                    │ llama.cpp)    │    │  calendar, ...    │
+                                    └───────────────┘    └──────────────────┘
 ```
 
-- **Voice stays on-device.** Mic → Whisper STT → text → LLM (HTTP/SSE) →
-  response text → Supertonic 3 TTS → speaker. No audio network hops, no
-  LiveKit/room plumbing.
+- **Voice stays on-device.** Mic → Whisper STT → text → gateway (HTTP/SSE) →
+  response text → Supertonic 3 TTS → speaker. No audio network hops.
+- **Tools run server-side.** The LangChain agent graph executes tool plugins and
+  returns the final response — the client never dispatches tools itself.
 
 ## Repository layout
 
 ```
 lib/               Flutter client (app, core, features split into data/ + ui/)
-  core/            config (dart-defines), backend settings/probe, SSE, network
+  core/            config, backend settings/probe, SSE, network
   features/
     auth/          better-auth sign-up/sign-in + secure credential store
     chat/          streaming SSE client, conversation UI, tool-call rendering
     voice/         capture pipeline, VAD, STT/TTS engine registry, controller
     attachments/   picker, upload queue, files client + store + cache
+    plugins/       plugin system — registry client, credential store,
+    |              staged inference adapters, managed conversation service
     vision/        image understanding client + VRAM gate
     memory/        drift-backed AI memory (search/compact)
     notifications/ ntfy push client
     onboarding/    setup screen (host, auth, models)
     settings/      settings screen + preference stores
 server/            Node.js gateway (Hono + better-auth)
-  src/             auth, inference routes, rate limiting, task ledger
-  test/            server unit tests
-test/              Flutter unit tests
+  src/
+    auth/          better-auth server configuration
+    plugins/       plugin types, registry, store, SSRF validation
+    transport/     LangChain agent graph, OpenAI-compatible /v1/chat/completions
+    checkpoints/   conversation state (thread + checkpoint store)
+    notify/        encrypted ntfy notification provisioning + push hook
+    ledger/        task ledger with idempotency and lease management
+  test/            server unit tests (567+, node:test)
+test/              Flutter unit tests (700+)
 ```
 
 ## Getting started
@@ -106,26 +115,24 @@ var is unset, so `FLUTTER_DEVICE=<id> ./dev.sh` overrides for a single run.
 
 ### Configuring inference
 
-This section will need to be updated after migrating to LangChain. Current set-up uses
-Librechat for agent orchestration.
-Inference is routed via three build defines (`LLM_BASE_URL`, `LLM_MODEL`,
-`LLM_API_KEY`) that point at any OpenAI-compatible API — set them in `dev.env`:
+Inference routes through the LangChain gateway. After signing in, install and
+configure model and tool plugins through the **Plugins** screen in the app:
 
-```
-LLM_BASE_URL=https://<host>/api/agents/v1     # OpenAI-compatible base incl. /v1
-LLM_MODEL=agent_<id>                          # model / agent id
-LLM_API_KEY=sk-...                            # bearer key
-```
+- Select a model plugin (e.g. OpenRouter) and enter your provider API key.
+- Enable tool plugins (Vikunja, Mealie, calendar, etc.) with their credentials.
+- The gateway uses these credentials per-request — they flow in the request
+  body and are never persisted server-side.
 
-A build without these fails loudly at chat-client creation rather than
-silently falling back to a local proxy.
+The inference endpoint (`LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` dart-defines)
+has been removed: the gateway is the sole inference path. The `main` branch
+retains LibreChat as a fallback.
 
 ### Tests
 
 ```sh
-cd server && npm test        # server unit tests (ledger)
+cd server && npm test        # server unit tests (567+)
 cd server && npm run typecheck
-flutter test                 # client unit tests
+flutter test                 # client unit tests (700+)
 ```
 
 ## Roadmap
@@ -143,22 +150,16 @@ flutter test                 # client unit tests
       model download + cache, device capability fallback.
 - [x] **Phase 5 — Polish** — image understanding, file storage, ntfy push,
       launcher shortcuts, error/retry ergonomics.
+- [x] **Phase 6 — LangChain cutover** — plugin architecture (model + tool
+      plugins), managed conversation service, server-side agent graph with tool
+      execution, checkpoint store, encrypted ntfy provisioning, conversation
+      identity state machine (seeded/resumed/recreated/reseed_required), async
+      alerting, cross-device conversation ids, server-side tools and budget.
+      Inference now routes through the LangChain gateway; the old `LLM_*`
+      dart-define path has been retired.
 
 **In progress / planned**
 
-- [ ] **LangChain plugin backend** — replace LibreChat with a LangChain.js
-      orchestrator behind the same OpenAI-compatible endpoint:
-      - Plugin architecture: admin-curated tool plugins (Vikunja, Mealie,
-        SpielIndexer, calendar) and model plugins (user-owned LLM keys).
-      - Server-side conversation state (LangGraph checkpoints, per-user
-        scoping) so the client stops resending full history.
-      - Async agentic delegation — the orchestrator answers immediately while
-        background jobs update calendars/fetch data, with push-status delivery.
-      - Idempotent turns, credential-free server (user keys flow per-request,
-        never persisted), SSRF-hardened outbound calls, compaction + context
-        management.
-- [ ] **OpenAI-compatible transport hardening** — wire-spec-guaranteed SSE,
-      per-user rate limiting + upstream budget.
 - [ ] **Multi-device / cross-device conversations** via server-issued
       conversation ids and a list-conversations endpoint.
 - [ ] **Background audio** — Android foreground service / iOS background
@@ -166,11 +167,16 @@ flutter test                 # client unit tests
 
 ## Security model
 
-- **No upstream secrets on the server.** User-owned API keys are submitted
-  per-request over HTTPS and discarded; the client stores them in the OS
-  secure storage.
-- **Never log or persist credentials.** Tool outputs are redacted for
-  secret-shaped data before checkpoint/cache writes.
+- **No upstream secrets stored on the server.** User-owned provider API keys
+  flow per-request in the request body over HTTPS and are never persisted.
+  The client stores them in the OS secure storage.
+- **Encrypted ntfy tokens.** Notification credentials are AES-256-GCM
+  encrypted at rest, derived from the checkpoint DB key, and never logged.
+- **SSRF-hardened outbound calls.** Plugin endpoints are validated against an
+  admin-curated allowlist; DNS-rebinding pinning prevents host-name reuse
+  attacks; redirects are not followed.
+- **Budget and rate limiting.** Per-user budget gates prevent runaway spending;
+  per-owner rate limiters prevent abuse of the inference endpoint.
 - Full details are in the (local-only) planning docs under `docs/`.
 
 ## License

@@ -1,7 +1,7 @@
 import { watch } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
-import { isModelPlugin, isToolPlugin } from "./types.ts";
+import { isModelPlugin, isToolPlugin, isAgentPlugin } from "./types.ts";
 import type { CredentialSpec, PluginDefinition, ToolDefinition } from "./types.ts";
 import { PluginStore } from "./store.ts";
 
@@ -37,7 +37,7 @@ export class PluginRegistryError extends Error {
 
 export type PluginSummary = {
   id: string;
-  type: "tool" | "model";
+  type: "tool" | "model" | "agent";
   name: string;
   description: string;
   version: string;
@@ -55,6 +55,15 @@ export type PluginSummary = {
     tokenLimit: number;
     supportsStreaming: boolean;
     visionCapable: boolean;
+  };
+  /** Agent plugins only — redacted summary (no systemPrompt/skills contents). */
+  agent?: {
+    modelRef?: string;
+    toolGrants?: { pluginId: string; required: boolean }[];
+    temperature?: number;
+    maxTokens?: number;
+    visionCapable: boolean;
+    skillCount: number;
   };
 };
 
@@ -127,6 +136,10 @@ export class PluginRegistry {
 
   canResolveToolPlugin(id: string): boolean {
     return this.store.getPlugin(id)?.type === "tool";
+  }
+
+  canResolveAgentPlugin(id: string): boolean {
+    return this.store.getPlugin(id)?.type === "agent";
   }
 
   /** Re-read the store file (called after fs.watch fires, or by an endpoint). */
@@ -229,6 +242,17 @@ function summarizePlugin(plugin: PluginDefinition, installed: boolean): PluginSu
       visionCapable: plugin.inference.visionCapable,
     };
     if (plugin.credentials) summary.credentials = plugin.credentials;
+  } else if (isAgentPlugin(plugin)) {
+    summary.baseUrls = (plugin.baseUrls ?? []).map(redactEntry);
+    if (plugin.credentials) summary.credentials = plugin.credentials;
+    summary.agent = {
+      modelRef: plugin.modelRef,
+      toolGrants: plugin.tools,
+      temperature: plugin.inference?.temperature,
+      maxTokens: plugin.inference?.maxTokens,
+      visionCapable: plugin.inference?.visionCapable ?? false,
+      skillCount: plugin.skills?.length ?? 0,
+    };
   }
   return summary;
 }

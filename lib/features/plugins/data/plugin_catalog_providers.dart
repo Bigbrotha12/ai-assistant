@@ -45,7 +45,7 @@ final pluginRegistryClientProvider = Provider.autoDispose<PluginRegistryClient>(
 );
 
 class PluginCatalog {
-  PluginCatalog(this.plugins, List<PluginModelDto> models)
+  PluginCatalog(this.plugins, List<PluginModelDto> models, List<AgentDto> agents)
     : models = List.unmodifiable(
         models.where(
           (model) => plugins.any(
@@ -56,10 +56,22 @@ class PluginCatalog {
                 plugin.isSupported,
           ),
         ),
+      ),
+      agents = List.unmodifiable(
+        agents.where(
+          (agent) => plugins.any(
+            (plugin) =>
+                plugin.id == agent.id &&
+                plugin.type == 'agent' &&
+                plugin.installed &&
+                plugin.isSupported,
+          ),
+        ),
       );
 
   final List<PluginDto> plugins;
   final List<PluginModelDto> models;
+  final List<AgentDto> agents;
 
   PluginDto? installedPlugin(String id) {
     for (final plugin in plugins) {
@@ -85,12 +97,13 @@ final pluginCatalogProvider = FutureProvider.autoDispose<PluginCatalog>(
     final auth = ref.watch(authCredentialsProvider).requireValue!;
     final client = ref.watch(pluginRegistryClientProvider);
     try {
-      final (plugins, models) = await (
+      final (plugins, models, agents) = await (
         client.listPlugins(gatewayKey: auth.apiKey, cancelToken: token),
         client.listModels(gatewayKey: auth.apiKey, cancelToken: token),
+        client.listAgents(gatewayKey: auth.apiKey, cancelToken: token),
       ).wait;
       if (token.isCancelled) throw const PluginClientException('cancelled');
-      return PluginCatalog(plugins, models);
+      return PluginCatalog(plugins, models, agents);
     } finally {
       token.cancel();
     }

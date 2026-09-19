@@ -55,6 +55,7 @@ void main() {
       expect(loaded.plugins['one']!.enabled, isTrue);
       expect(loaded.plugins['two']!.enabled, isFalse);
       expect(loaded.selectedModel, 'model-a');
+      expect(loaded.selectedAgent, isNull);
       expect(loaded.toString(), isNot(contains('secret')));
       expect(loaded.plugins.toString(), isNot(contains('secret')));
       expect(
@@ -65,6 +66,10 @@ void main() {
       expect((await store.load(a)).plugins.keys, ['two']);
       await store.setSelectedModel(a, null);
       expect((await store.load(a)).selectedModel, isNull);
+      await store.setSelectedAgent(a, 'agent-workflow');
+      expect((await store.load(a)).selectedAgent, 'agent-workflow');
+      await store.setSelectedAgent(a, null);
+      expect((await store.load(a)).selectedAgent, isNull);
       await storage.write(key: 'auth_api_key', value: 'unrelated');
       await store.clearScope(a);
       expect((await store.load(a)).plugins, isEmpty);
@@ -90,6 +95,7 @@ void main() {
         store.setEnabled(a, 'one', true),
         store.setCredentials(a, 'two', {'token': 'second'}),
         store.setSelectedModel(a, 'model'),
+        store.setSelectedAgent(a, 'agent-x'),
       ];
       mutable['token'] = 'mutated';
       storage.gate!.complete();
@@ -99,6 +105,7 @@ void main() {
       expect(loaded.plugins['one']!.enabled, isTrue);
       expect(loaded.plugins.length, 2);
       expect(loaded.selectedModel, 'model');
+      expect(loaded.selectedAgent, 'agent-x');
       await Future.wait([
         store.setEnabled(a, 'one', false),
         store.clearScope(a),

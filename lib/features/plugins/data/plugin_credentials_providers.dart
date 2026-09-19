@@ -53,6 +53,14 @@ final pluginCredentialsProvider =
       return ref.watch(pluginCredentialsStoreProvider).load(scope);
     });
 
+final selectedModelProvider = Provider<String?>((ref) {
+  return ref.watch(pluginCredentialsProvider).value?.selectedModel;
+});
+
+final selectedAgentProvider = Provider<String?>((ref) {
+  return ref.watch(pluginCredentialsProvider).value?.selectedAgent;
+});
+
 final scopedPluginCredentialsProvider =
     Provider.autoDispose<ScopedPluginCredentials>((ref) {
       final scope = ref.watch(pluginAccountScopeProvider);
@@ -108,6 +116,9 @@ class ScopedPluginCredentials {
 
   Future<void> setSelectedModel(String? model) =>
       _write(() => _store.setSelectedModel(scope, model));
+
+  Future<void> setSelectedAgent(String? id) =>
+      _write(() => _store.setSelectedAgent(scope, id));
 
   Future<void> removePlugin(String pluginId) =>
       _write(() => _store.removePlugin(scope, pluginId));

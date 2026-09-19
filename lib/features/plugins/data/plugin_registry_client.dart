@@ -36,6 +36,11 @@ class PluginRegistryClient {
     CancelToken? cancelToken,
   }) => _get('/models', gatewayKey, cancelToken, PluginModelDto.parseList);
 
+  Future<List<AgentDto>> listAgents({
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  }) => _get('/agents', gatewayKey, cancelToken, AgentDto.parseList);
+
   Future<T> _get<T>(
     String path,
     String key,

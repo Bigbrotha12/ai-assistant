@@ -48,6 +48,7 @@ export type BeforeModelCall = (
 export type AgentGraphDeps = {
   model: BaseChatModel;
   tools: StructuredToolInterface[];
+  systemPrompt?: string;
   maxIterations?: number;
   prepareMessages?: PrepareMessages;
   beforeModelCall?: BeforeModelCall;
@@ -56,6 +57,7 @@ export type AgentGraphDeps = {
 export function createAgentGraph({
   model,
   tools,
+  systemPrompt,
   maxIterations = MAX_TOOL_ROUNDS,
   prepareMessages,
   beforeModelCall,
@@ -87,7 +89,7 @@ export function createAgentGraph({
     if (state.toolRounds >= maxIterations) {
       return { messages: [new AIMessage("Tool round limit reached. No further tools were run.")] };
     }
-    const input = [new SystemMessage(SUPERVISOR_PROMPT), ...state.messages];
+    const input = [new SystemMessage(systemPrompt ?? SUPERVISOR_PROMPT), ...state.messages];
     const messages = prepareMessages ? await prepareMessages(input, config) : input;
     config.signal?.throwIfAborted();
     await beforeModelCall?.(messages, config);

@@ -257,6 +257,11 @@ void main() {
                     'object': 'list',
                     'data': [modelJson()],
                   }
+                : options.path.endsWith('/agents')
+                ? {
+                    'object': 'list',
+                    'data': [],
+                  }
                 : options.path.endsWith('/openrouter')
                 ? pluginJson(detail: true)
                 : {
@@ -283,12 +288,17 @@ void main() {
         'openrouter',
       );
       expect(
+        (await client.listAgents(gatewayKey: 'four')),
+        isEmpty,
+      );
+      expect(
         (await client.getPlugin('openrouter', gatewayKey: 'three')).installed,
         isTrue,
       );
       expect(adapter.requests.map((r) => r.headers['Authorization']), [
         'Bearer one',
         'Bearer two',
+        'Bearer four',
         'Bearer three',
       ]);
       for (final options in adapter.requests) {
@@ -308,7 +318,7 @@ void main() {
         () => client.getPlugin('../bad', gatewayKey: 'one'),
         throwsA(isA<PluginProtocolException>()),
       );
-      expect(adapter.requests, hasLength(3));
+      expect(adapter.requests, hasLength(4));
     },
   );
 

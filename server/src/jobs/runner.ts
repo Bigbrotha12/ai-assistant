@@ -309,6 +309,8 @@ export type JobDescriptor = {
   modelPluginId: string;
   /** Provider request config forwarded to `buildModel`. */
   modelRequestConfig?: unknown;
+  /** Agent system prompt override (Wave 1, Step 4). */
+  systemPrompt?: string;
   /** Override the real executor (tests use a recording fake). */
   toolHandler?: JobToolHandler;
   /** Invoke input; defaults to `{ messages: [new HumanMessage(spec)] }`. */
@@ -924,6 +926,7 @@ export class JobRunner {
         createAgentGraph({
           model,
           tools,
+          systemPrompt: descriptor.systemPrompt,
           beforeModelCall,
           prepareMessages: this.deps.contextManager?.prepareMessages,
         }),

@@ -40,8 +40,8 @@ import { PluginRegistryError } from "../plugins/registry.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { PluginStoreError } from "../plugins/store.ts";
 import type { PluginStore } from "../plugins/store.ts";
-import { isModelPlugin, isToolPlugin } from "../plugins/types.ts";
-import type { ModelPluginDefinition } from "../plugins/types.ts";
+import { isAgentPlugin, isModelPlugin, isToolPlugin } from "../plugins/types.ts";
+import type { AgentPluginDefinition, ModelPluginDefinition } from "../plugins/types.ts";
 import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
 import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
@@ -428,6 +428,11 @@ type ResolvedChat = {
   managed: boolean;
   managedMessageId: string | undefined;
   enabledPlugins: string[] | undefined;
+  agentOverride?: {
+    systemPrompt: string;
+    toolGrants?: { pluginId: string; required: boolean }[];
+    inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
+  };
 };
 
 function resolveChatRequest(
@@ -437,7 +442,7 @@ function resolveChatRequest(
 ): { ok: true; value: ResolvedChat } | { ok: false; response: Response } {
   const selection = resolveModelSelection(body);
   if (!selection) return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
-  const { modelPluginId, requestModel } = selection;
+  let { modelPluginId, requestModel } = selection;
 
   let plugin: ModelPluginDefinition;
   try {
@@ -577,6 +582,114 @@ function resolveChatRequest(
     enabledPlugins = [...new Set(rawEnabled.map((id) => String(id).trim()))];
   }
 
+  // Agent resolution (Step 4, Wave 1): optional `agent` field overrides model,
+  // tools, and system prompt.
+  let agentOverride: ResolvedChat["agentOverride"] = undefined;
+  const rawAgentId = typeof body["agent"] === "string" ? body["agent"].trim() : "";
+  if (rawAgentId !== "") {
+    let agentPlugin: AgentPluginDefinition;
+    try {
+      const resolved = registry.requirePlugin(rawAgentId);
+      if (!isAgentPlugin(resolved)) {
+        return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+      }
+      agentPlugin = resolved;
+    } catch (err) {
+      if (err instanceof PluginRegistryError) {
+        return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+      }
+      if (err instanceof PluginStoreError && err.code === "NOT_LOADED") {
+        return { ok: false, response: c.json({ error: "inference_unavailable" }, 502) };
+      }
+      return { ok: false, response: c.json({ error: "internal" }, 500) };
+    }
+
+    // Override model plugin if agent has modelRef
+    if (agentPlugin.modelRef) {
+      modelPluginId = agentPlugin.modelRef;
+      requestModel = undefined;
+      try {
+        const resolved = registry.requirePlugin(modelPluginId);
+        if (!isModelPlugin(resolved) || !resolved.inference.supportsStreaming) {
+          return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+        }
+        plugin = resolved;
+      } catch (err) {
+        if (err instanceof PluginRegistryError) {
+          return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
+        }
+        if (err instanceof PluginStoreError && err.code === "NOT_LOADED") {
+          return { ok: false, response: c.json({ error: "inference_unavailable" }, 502) };
+        }
+        return { ok: false, response: c.json({ error: "internal" }, 500) };
+      }
+
+      // Re-resolve credentials for the new model plugin
+      try {
+        const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, {
+          isModel: true,
+        });
+        credentials = validateCredentials(plugin.credentials, input, modelPluginId, {
+          isModel: true,
+        });
+      } catch (err) {
+        if (err instanceof PluginCredentialError) {
+          return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
+        }
+        return { ok: false, response: c.json({ error: "internal" }, 500) };
+      }
+    }
+
+    // Merge inference overrides into requestParameters
+    if (agentPlugin.inference) {
+      if (agentPlugin.inference.temperature !== undefined) {
+        requestParameters["temperature"] = agentPlugin.inference.temperature;
+      }
+      if (agentPlugin.inference.maxTokens !== undefined) {
+        requestParameters["maxTokens"] = agentPlugin.inference.maxTokens;
+      }
+      if (agentPlugin.inference.visionCapable !== undefined) {
+        requestParameters["visionCapable"] = agentPlugin.inference.visionCapable;
+      }
+    }
+
+    // Tool scoping: agent grants are exclusive when defined
+    if (agentPlugin.tools !== undefined) {
+      const agentToolIds = agentPlugin.tools.map((t) => t.pluginId);
+      if (enabledPlugins !== undefined) {
+        const agentSet = new Set(agentToolIds);
+        enabledPlugins = enabledPlugins.filter((id) => agentSet.has(id));
+      } else {
+        enabledPlugins = [...new Set(agentToolIds)];
+      }
+
+      // Validate required tool grants have credentials
+      for (const grant of agentPlugin.tools) {
+        if (grant.required) {
+          const toolCreds = toolCredentialsByPlugin[grant.pluginId];
+          if (!toolCreds || !toolCreds["apiKey"] || toolCreds["apiKey"].trim() === "") {
+            return {
+              ok: false,
+              response: c.json(
+                {
+                  error: "invalid_credentials",
+                  message: `required tool plugin '${grant.pluginId}' is missing credentials for this agent`,
+                },
+                400,
+              ),
+            };
+          }
+        }
+      }
+    }
+
+    agentOverride = {
+      systemPrompt: agentPlugin.systemPrompt,
+      toolGrants: agentPlugin.tools,
+      inference: agentPlugin.inference,
+    };
+  }
+
   return {
     ok: true,
     value: {
@@ -591,6 +704,7 @@ function resolveChatRequest(
       managed,
       managedMessageId,
       enabledPlugins,
+      agentOverride,
     },
   };
 }
@@ -711,6 +825,7 @@ async function handleSyncStream(
   const base = createAgentGraph({
     model,
     tools,
+    systemPrompt: resolved.value.agentOverride?.systemPrompt,
     prepareMessages: opts.contextManager?.prepareMessages,
     beforeModelCall: () => {
       execution.signal.throwIfAborted();
@@ -1202,6 +1317,7 @@ async function handleBackground(
         requestModel,
         requestParameters,
       } satisfies JobModelRequestConfig,
+      systemPrompt: resolved.value.agentOverride?.systemPrompt,
       pinHandles,
       inputFactory: async ({ threadId: lockedThreadId, signal }) => {
         signal.throwIfAborted();

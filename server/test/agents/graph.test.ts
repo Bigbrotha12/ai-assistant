@@ -10,6 +10,7 @@ import {
   AIMessageChunk,
   BaseMessage,
   HumanMessage,
+  SystemMessage,
   ToolMessage,
 } from "@langchain/core/messages";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -183,6 +184,28 @@ describe("agent graph — supervisor loop", () => {
     assert.equal(result.toolRounds, MAX_TOOL_ROUNDS);
     const toolMessages = result.messages.filter((m) => m instanceof ToolMessage);
     assert.equal(toolMessages.length, MAX_TOOL_ROUNDS);
+  });
+
+  test("custom systemPrompt reaches the model on every orchestrator call", async () => {
+    const customPrompt = "You are a test assistant. Always answer in French.";
+    const model = new ScriptedChatModel({ responses: [new AIMessage("réponse")] });
+    const seenMessages: BaseMessage[][] = [];
+    const graph = createAgentGraph({
+      model,
+      tools: [listTasksTool()],
+      systemPrompt: customPrompt,
+      beforeModelCall: (messages) => { seenMessages.push([...messages]); },
+    });
+
+    await graph.invoke({ messages: [new HumanMessage("hello")] });
+
+    assert.ok(seenMessages.length >= 1, "orchestrator must have been called");
+    const firstCall = seenMessages[0];
+    assert.ok(firstCall, "first call messages must exist");
+    const firstSystem = firstCall[0];
+    assert.ok(firstSystem instanceof SystemMessage);
+    assert.equal(firstSystem.content, customPrompt);
+    assert.notEqual(firstSystem.content, SUPERVISOR_PROMPT);
   });
 
   test("M7: a tool that throws rejects the invoke (handleToolErrors: false — no swallowed ToolMessage)", async () => {
@@ -572,5 +595,29 @@ describe("createAgent — registry tool binding", () => {
       projectId: "p1",
       note: "executor not wired",
     });
+  });
+
+  test("createAgent passes systemPrompt through to the graph", async (t) => {
+    const { registry } = await makeEnv(t);
+    const customPrompt = "Custom orchestrator prompt";
+    let capturedPrompt = "";
+    class InspectModel extends ScriptedChatModel {
+      override bindTools(_tools: StructuredToolInterface[]) {
+        return this;
+      }
+      override async _generate(messages: BaseMessage[], options?: this["ParsedCallOptions"]) {
+        capturedPrompt = String(messages[0]?.content);
+        return super._generate(messages, options);
+      }
+    }
+    const graph = createAgent({
+      model: new InspectModel({ responses: [new AIMessage("ok")] }),
+      registry,
+      systemPrompt: customPrompt,
+      toolHandler: { async execute() { return "ok"; } },
+      maxIterations: 1,
+    });
+    await graph.invoke({ messages: [new HumanMessage("hi")] });
+    assert.equal(capturedPrompt, customPrompt);
   });
 });

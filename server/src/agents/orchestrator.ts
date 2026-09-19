@@ -54,6 +54,8 @@ export type CreateAgentParams = {
   registry: PluginRegistry;
   /** Tool execution handler. Defaults to {@link stubToolCallHandler}. */
   toolHandler?: ToolCallHandler;
+  /** System prompt override for the agent graph. Defaults to SUPERVISOR_PROMPT. */
+  systemPrompt?: string;
   /** Max tool rounds before the graph terminates. Default `MAX_TOOL_ROUNDS`. */
   maxIterations?: number;
 };
@@ -63,9 +65,9 @@ export type CreateAgentParams = {
  * tools into the graph and returns the compiled graph.
  */
 export function createAgent(params: CreateAgentParams): ReturnType<typeof createAgentGraph> {
-  const { model, registry, toolHandler = stubToolCallHandler, maxIterations } = params;
+  const { model, registry, toolHandler = stubToolCallHandler, systemPrompt, maxIterations } = params;
   const tools = bindPluginTools(registry, toolHandler);
-  const deps: AgentGraphDeps = { model, tools, maxIterations };
+  const deps: AgentGraphDeps = { model, tools, systemPrompt, maxIterations };
   return createAgentGraph(deps);
 }
 

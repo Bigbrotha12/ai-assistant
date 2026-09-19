@@ -168,10 +168,12 @@ class PluginDto {
     installed = _boolean(json['installed']);
     baseUrls = detail && type != 'tool' && !json.containsKey('baseUrls')
         ? const []
-        : pluginJsonList(
-            json['baseUrls'],
-            (value) => PluginBaseUrl.fromJson(value, detail: detail),
-          );
+        : json.containsKey('baseUrls')
+            ? pluginJsonList(
+                json['baseUrls'],
+                (value) => PluginBaseUrl.fromJson(value, detail: detail),
+              )
+            : const [];
     credentials = _optional(json, 'credentials', PluginCredentialSpec.fromJson);
     tools = type == 'tool' || json.containsKey('tools')
         ? pluginJsonList(json['tools'], PluginToolDto.fromJson)
@@ -197,12 +199,62 @@ class PluginDto {
   late final PluginInferenceDto? inference;
 
   bool get isSupported =>
-      schemaVersion == 1 && (type == 'tool' || type == 'model');
+      schemaVersion == 1 && (type == 'tool' || type == 'model' || type == 'agent');
 
   static List<PluginDto> parseList(Object? value) => pluginJsonList(
     pluginJsonObject(value)['plugins'],
     PluginDto.fromSummaryJson,
   );
+}
+
+class AgentDto {
+  AgentDto.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    id = pluginJsonId(json['id']);
+    if (json['object'] != 'agent') throw const PluginProtocolException();
+    created = _integer(json['created'], minimum: 0);
+    ownedBy = pluginJsonString(json['owned_by']);
+    name = pluginJsonString(json['name']);
+    description = pluginJsonString(json['description']);
+    defaultModel = _optional(json, 'defaultModel', pluginJsonString);
+    visionCapable = _boolean(json['visionCapable']);
+    temperature = _optional(json, 'temperature', (v) => (v as num).toDouble());
+    maxTokens = _optional(json, 'maxTokens', (v) => _integer(v, minimum: 1));
+    toolGrants = _optional(
+      json, 'toolGrants',
+      (list) => pluginJsonList(list, (v) => AgentToolGrant.fromJson(v)),
+    ) ?? const [];
+    skillCount = _integer(json['skillCount'], minimum: 0);
+  }
+
+  late final String id;
+  late final int created;
+  late final String ownedBy;
+  late final String name;
+  late final String description;
+  late final String? defaultModel;
+  late final bool visionCapable;
+  late final double? temperature;
+  late final int? maxTokens;
+  late final List<AgentToolGrant> toolGrants;
+  late final int skillCount;
+
+  static List<AgentDto> parseList(Object? value) {
+    final json = pluginJsonObject(value);
+    if (json['object'] != 'list') throw const PluginProtocolException();
+    return pluginJsonList(json['data'], AgentDto.fromJson);
+  }
+}
+
+class AgentToolGrant {
+  AgentToolGrant.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    pluginId = pluginJsonId(json['pluginId']);
+    required = _boolean(json['required']);
+  }
+
+  late final String pluginId;
+  late final bool required;
 }
 
 class PluginModelDto {

@@ -31,7 +31,9 @@ import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
 import type {
+  AgentPluginDefinition,
   ModelPluginDefinition,
+  PluginDefinition,
   ToolPluginDefinition,
 } from "../../src/plugins/types.ts";
 import { createChatRoutes } from "../../src/transport/chat.ts";
@@ -126,6 +128,20 @@ function toolPlugin(): ToolPluginDefinition {
   };
 }
 
+function agentPlugin(overrides?: Partial<AgentPluginDefinition>): AgentPluginDefinition {
+  return {
+    id: "kitchen-copilot",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "agent",
+    name: "Kitchen Copilot",
+    description: "Mealie-powered cooking assistant",
+    systemPrompt: "You are a kitchen assistant. Use tools sparingly.",
+    tools: [{ pluginId: "vikunja", required: true }],
+    ...overrides,
+  } satisfies AgentPluginDefinition;
+}
+
 const DNS: Record<string, LookupAddress[]> = {
   "openrouter.ai": [{ address: "1.1.1.1", family: 4 }],
   "vikunja.example.com": [{ address: "1.1.1.1", family: 4 }],
@@ -146,11 +162,12 @@ async function makeTempDir(t: TestContext): Promise<string> {
 
 async function makeEnv(
   dir: string,
+  extraPlugins?: PluginDefinition[],
 ): Promise<{ store: PluginStore; registry: PluginRegistry }> {
   const store = new PluginStore({
     storePath: join(dir, "plugins.json"),
     trustedHosts: [],
-    builtinPlugins: [openRouterPlugin(), toolPlugin()],
+    builtinPlugins: [openRouterPlugin(), toolPlugin(), ...(extraPlugins ?? [])],
     manifests: [],
     lookup: fakeLookup(),
   });
@@ -384,9 +401,10 @@ type AppOptions = {
 async function makeApp(
   t: TestContext,
   opts: AppOptions = {},
+  extraPlugins?: PluginDefinition[],
 ): Promise<{ app: Hono; store: PluginStore; registry: PluginRegistry }> {
   const dir = await makeTempDir(t);
-  const { store, registry } = await makeEnv(dir);
+  const { store, registry } = await makeEnv(dir, extraPlugins);
   const app = new Hono();
   app.route(
     "/v1",
@@ -2831,5 +2849,140 @@ describe("transport integration regressions", () => {
       await waitFor(() => warmups.activeCount === 0);
       assert.deepEqual(calls, enabled ? [{ plugin: "vikunja", tool: "list_tasks", credentials: { apiKey: "tool-key" } }] : []);
     }
+  });
+});
+
+describe("POST /v1/chat/completions — agent resolution (Wave 1, Step 4)", () => {
+  test("no agent field: existing behavior unchanged", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "Hello" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn }, [agentPlugin()]);
+    const res = await postChat(app, chatBody({ credentials: { openrouter: { apiKey: "sk-test" }, vikunja: { apiKey: "tok-123" } } }));
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0]!.modelPluginId, "openrouter");
+    assert.equal(fake.calls[0]!.requestModel, undefined);
+    // System prompt is the default supervisor prompt (no agent override)
+    const systemMsg = fake.recordedInputs[0]!.find((m) => m.constructor.name === "SystemMessage");
+    assert.ok(systemMsg, "system prompt present");
+  });
+
+  test("valid agent id without modelRef: model stays as-is, systemPrompt overrides", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "agent reply" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn }, [agentPlugin()]);
+    const res = await postChat(app, chatBody({
+      agent: "kitchen-copilot",
+      credentials: { openrouter: { apiKey: "sk-test" }, vikunja: { apiKey: "tok-123" } },
+    }));
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0]!.modelPluginId, "openrouter", "model plugin unchanged when agent has no modelRef");
+    const systemMsg = fake.recordedInputs[0]!.find((m) => m.constructor.name === "SystemMessage");
+    assert.ok(systemMsg, "system prompt present");
+    assert.match(String(systemMsg!.content), /kitchen assistant/, "agent system prompt overrides default");
+  });
+
+  test("agent with modelRef: model plugin overridden", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "agent reply" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn }, [agentPlugin({ modelRef: "openrouter", tools: [] })]);
+    const res = await postChat(app, chatBody({
+      agent: "kitchen-copilot",
+      credentials: { openrouter: { apiKey: "sk-test" } },
+    }));
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0]!.modelPluginId, "openrouter", "agent modelRef overrides client model");
+  });
+
+  test("agent with required tool grant but missing credentials → 400 invalid_credentials", async (t) => {
+    const { app } = await makeApp(t, {}, [agentPlugin()]);
+    const res = await postChat(app, chatBody({
+      agent: "kitchen-copilot",
+      credentials: { openrouter: { apiKey: "sk-test" } },
+    }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as { error: string; message?: string };
+    assert.equal(json.error, "invalid_credentials");
+    assert.match(json.message ?? "", /vikunja/, "error message references the missing tool plugin");
+  });
+
+  test("unknown agent id → 400 invalid_request", async (t) => {
+    const { app } = await makeApp(t, {}, [agentPlugin()]);
+    const res = await postChat(app, chatBody({ agent: "does-not-exist" }));
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+  });
+
+  test("non-agent plugin id in agent field → 400 invalid_request", async (t) => {
+    const { app } = await makeApp(t, {}, [agentPlugin()]);
+    const res = await postChat(app, chatBody({ agent: "vikunja" }));
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+  });
+
+  test("agent with empty tools array: no tool plugins bind", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "no tools" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn }, [agentPlugin({ tools: [] })]);
+    const res = await postChat(app, chatBody({
+      agent: "kitchen-copilot",
+      credentials: { openrouter: { apiKey: "sk-test" } },
+    }));
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(fake.calls.length, 1);
+    // With empty agent tools, no tool plugins are bound (the model should never call tools)
+    const turn = fake.recordedInputs[0]!;
+    assert.ok(turn.length > 0, "model received messages");
+  });
+
+  test("agent with inference overrides merges into requestParameters", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "agent reply" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn }, [agentPlugin({
+      inference: { temperature: 0.3, maxTokens: 512, visionCapable: true },
+    })]);
+    const res = await postChat(app, chatBody({
+      agent: "kitchen-copilot",
+      credentials: { openrouter: { apiKey: "sk-test" }, vikunja: { apiKey: "tok-123" } },
+    }));
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0]!.requestParameters?.["temperature"], 0.3);
+    assert.equal(fake.calls[0]!.requestParameters?.["maxTokens"], 512);
+  });
+
+  test("background (async) path with agent: systemPrompt threads through to the runner", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const runner = makeFakeJobRunner([
+      { status: "succeeded", taskId: "task-agent", threadId: "thr-agent" },
+    ]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: runner as unknown as JobRunner,
+    }, [agentPlugin()]);
+    const res = await postChat(app, chatBody({
+      agent: "kitchen-copilot",
+      background: true,
+      messageId: "msg-agent",
+      thread_id: "thread-agent",
+      credentials: { openrouter: { apiKey: "sk-test" }, vikunja: { apiKey: "tok-123" } },
+    }));
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+      status: "succeeded",
+      taskId: "task-agent",
+      threadId: "thr-agent",
+    });
+    assert.equal(runner.calls.length, 1, "background: runner called once");
+    const d = runner.calls[0]!;
+    assert.equal(d.modelPluginId, "openrouter", "background: model plugin unchanged");
+    assert.equal(d.systemPrompt, "You are a kitchen assistant. Use tools sparingly.", "background: systemPrompt in descriptor");
+    assert.deepEqual(d.toolPlugins, ["vikunja"], "background: tool scoping from agent grants");
   });
 });

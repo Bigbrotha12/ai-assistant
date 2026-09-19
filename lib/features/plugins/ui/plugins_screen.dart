@@ -8,9 +8,6 @@ import '../data/plugin_credentials_providers.dart';
 import '../data/plugin_credentials_store.dart';
 import '../data/plugin_dto.dart';
 
-const _stagedNotice =
-    'Staged for Phase 6. Chat, voice, and vision routing is unchanged. No inference is sent from these screens.';
-
 const _defaultBaseUrlEntry = '__default__';
 
 class PluginsScreen extends StatelessWidget {
@@ -77,18 +74,7 @@ class _PluginPage extends ConsumerWidget {
     }
     return Scaffold(
       appBar: AppBar(title: Text(title)),
-      body: Column(
-        children: [
-          Material(
-            color: Theme.of(context).colorScheme.secondaryContainer,
-            child: const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text(_stagedNotice),
-            ),
-          ),
-          Expanded(child: body),
-        ],
-      ),
+      body: body,
     );
   }
 }
@@ -123,6 +109,7 @@ class _PluginList extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final modelIds = catalog.models.map((model) => model.id).toSet();
     final selected = configuration.selectedModel;
+    final selectedAgent = configuration.selectedAgent;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -150,6 +137,14 @@ class _PluginList extends ConsumerWidget {
                 : plugin.inference!.defaultModel,
           ),
         const SizedBox(height: 16),
+        Text('Agents', style: Theme.of(context).textTheme.titleMedium),
+        if (catalog.agents.isEmpty)
+          const Text(
+            'No agents available. Ask your administrator to install an agent plugin.',
+          ),
+        for (final agent in catalog.agents)
+          _agentTile(context, agent, selectedAgent == agent.id, configuration),
+        const SizedBox(height: 16),
         Text('Tools', style: Theme.of(context).textTheme.titleMedium),
         for (final plugin in catalog.plugins.where(
           (plugin) => plugin.type == 'tool',
@@ -166,6 +161,58 @@ class _PluginList extends ConsumerWidget {
           child: const Text('Refresh catalog'),
         ),
       ],
+    );
+  }
+
+  Widget _agentTile(
+    BuildContext context,
+    AgentDto agent,
+    bool isSelected,
+    PluginAccountConfiguration configuration,
+  ) =>
+      ListTile(
+        key: ValueKey('agent-${agent.id}'),
+        title: Text(agent.name),
+        subtitle: Text(
+          isSelected
+              ? 'Selected for this account'
+              : agent.description,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (agent.skillCount > 0)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: Chip(
+                  label: Text('${agent.skillCount} skills'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            const Icon(Icons.chevron_right),
+          ],
+        ),
+        onTap: () => _openAgentEditor(context, agent, configuration),
+      );
+
+  void _openAgentEditor(
+    BuildContext context,
+    AgentDto agent,
+    PluginAccountConfiguration configuration,
+  ) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _PluginPage(
+          title: 'Configure agent',
+          builder: (catalog, configuration) => _AgentEditor(
+            key: ValueKey(agent.id),
+            agent: agent,
+            configuration: configuration,
+          ),
+        ),
+      ),
     );
   }
 
@@ -407,6 +454,85 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
         ],
         if (_busy) const LinearProgressIndicator(),
         if (_error != null) Semantics(liveRegion: true, child: Text(_error!)),
+      ],
+    );
+  }
+}
+
+class _AgentEditor extends ConsumerWidget {
+  const _AgentEditor({
+    super.key,
+    required this.agent,
+    required this.configuration,
+  });
+
+  final AgentDto agent;
+  final PluginAccountConfiguration configuration;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    ref.watch(scopedPluginCredentialsProvider);
+    final isSelected = configuration.selectedAgent == agent.id;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Text(agent.name, style: Theme.of(context).textTheme.headlineSmall),
+        Text(agent.description),
+        const SizedBox(height: 16),
+        if (agent.defaultModel case final model?)
+          Text('Default model: $model'),
+        if (agent.toolGrants.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text('Grants access to:', style: Theme.of(context).textTheme.titleSmall),
+          for (final grant in agent.toolGrants)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
+                children: [
+                  if (grant.required)
+                    Icon(Icons.lock, size: 16,
+                      color: Theme.of(context).colorScheme.error),
+                  const SizedBox(width: 4),
+                  Text(grant.pluginId),
+                ],
+              ),
+            ),
+        ],
+        if (agent.skillCount > 0) ...[
+          const SizedBox(height: 12),
+          Text('Includes ${agent.skillCount} skill bundle(s)'),
+        ],
+        if (agent.temperature != null || agent.maxTokens != null) ...[
+          const SizedBox(height: 12),
+          Text('Settings:'),
+          if (agent.temperature != null)
+            Text('Temperature: ${agent.temperature}'),
+          if (agent.maxTokens != null)
+            Text('Max tokens: ${agent.maxTokens}'),
+          Text('Vision: ${agent.visionCapable ? 'Yes' : 'No'}'),
+        ],
+        const SizedBox(height: 24),
+        if (isSelected)
+          FilledButton(
+            onPressed: () async {
+              await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(null);
+            },
+            child: const Text('Deselect agent'),
+          )
+        else
+          FilledButton(
+            onPressed: () async {
+              await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(agent.id);
+            },
+            child: const Text('Select agent'),
+          ),
+        if (!isSelected) ...[
+          const SizedBox(height: 12),
+          Text(
+            'The Default agent will be used if you do not select one.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
       ],
     );
   }

@@ -347,15 +347,14 @@ void main() {
       expect(phrases.first, anyOf(authErrorPhrases));
     });
 
-    test('server error for InferenceAuthError 401 (re-auth cannot help)', () {
+    test('auth error for ChatServerError 401 (gateway key rejected)', () {
       final phrases = [
         statusPhraseForError(
-          const InferenceAuthError('inference key rejected'),
+          const ChatServerError('unauthorized', statusCode: 401),
           random: Random(42),
         ),
       ];
-      expect(phrases.first, anyOf(serverErrorPhrases));
-      expect(phrases.first, isNot(anyOf(authErrorPhrases)));
+      expect(phrases.first, anyOf(authErrorPhrases));
     });
 
     test('auth error for ChatServerError 403', () {

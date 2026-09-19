@@ -9,11 +9,10 @@ import {
   PluginSchemaError,
   isToolPlugin,
   isModelPlugin,
+  isAgentPlugin,
   pluginIdSchema,
 } from "../../src/plugins/types.ts";
 import type {
-  ToolPluginDefinition,
-  ModelPluginDefinition,
   PluginDefinition,
 } from "../../src/plugins/types.ts";
 
@@ -64,6 +63,19 @@ function modelPlugin(overrides: Record<string, unknown> = {}): Record<string, un
   };
 }
 
+function minimalAgent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "kitchen-copilot",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "agent",
+    name: "Kitchen Copilot",
+    description: "Mealie recipe assistant",
+    systemPrompt: "You are a helpful assistant",
+    ...overrides,
+  };
+}
+
 describe("plugin definition schemas", () => {
   test("valid tool plugin parses", () => {
     const parsed = pluginDefinitionSchema.safeParse(toolPlugin());
@@ -102,6 +114,86 @@ describe("plugin definition schemas", () => {
     delete bad.inference;
     const parsed = pluginDefinitionSchema.safeParse(bad);
     assert.equal(parsed.success, false);
+  });
+
+  test("valid agent plugin parses", () => {
+    const parsed = pluginDefinitionSchema.safeParse(minimalAgent());
+    assert.equal(parsed.success, true);
+    if (parsed.success) {
+      assert.equal(parsed.data.type, "agent");
+      assert.equal(parsed.data.id, "kitchen-copilot");
+    }
+  });
+
+  test("agent plugin with optional fields parses", () => {
+    const parsed = pluginDefinitionSchema.safeParse(
+      minimalAgent({
+        skills: [
+          { id: "recipes", title: "Recipes", content: "## Recipe tips\n..." },
+        ],
+        tools: [{ pluginId: "mealie", required: true }],
+        modelRef: "open-router",
+        inference: { temperature: 0.3, maxTokens: 2048, visionCapable: true },
+        baseUrls: [{ id: "mealie-api", url: "https://mealie.example.com" }],
+        credentials: { apiKey: { label: "Mealie key", required: true } },
+      }),
+    );
+    assert.equal(parsed.success, true);
+  });
+
+  test("agent plugin missing systemPrompt fails", () => {
+    const bad = minimalAgent({ systemPrompt: undefined });
+    delete bad.systemPrompt;
+    assert.equal(pluginDefinitionSchema.safeParse(bad).success, false);
+  });
+
+  test("agent plugin empty systemPrompt fails", () => {
+    assert.equal(
+      pluginDefinitionSchema.safeParse(minimalAgent({ systemPrompt: "   " })).success,
+      false,
+    );
+  });
+
+  test("agent plugin empty skill content fails", () => {
+    assert.equal(
+      pluginDefinitionSchema.safeParse(
+        minimalAgent({ skills: [{ id: "bad", title: " ", content: "ok" }] }),
+      ).success,
+      false,
+    );
+    assert.equal(
+      pluginDefinitionSchema.safeParse(
+        minimalAgent({ skills: [{ id: "bad", title: "ok", content: "   " }] }),
+      ).success,
+      false,
+    );
+  });
+
+  test("agent plugin bad modelRef fails (not kebab)", () => {
+    assert.equal(
+      pluginDefinitionSchema.safeParse(minimalAgent({ modelRef: "Open Router" })).success,
+      false,
+    );
+  });
+
+  test("default agent manifest parses correctly", () => {
+    const parsed = pluginDefinitionSchema.safeParse({
+      id: "default",
+      version: "1.0.0",
+      schemaVersion: 1,
+      type: "agent",
+      name: "Default",
+      description: "General-purpose assistant",
+      systemPrompt: "You are a helpful voice and text assistant.",
+      skills: [],
+      tools: [],
+    });
+    assert.equal(parsed.success, true);
+    if (parsed.success) {
+      assert.equal(parsed.data.type, "agent");
+      assert.equal(parsed.data.id, "default");
+      assert.equal(parsed.data.name, "Default");
+    }
   });
 
   test("type: 'weird' fails", () => {
@@ -167,12 +259,12 @@ describe("plugin definition schemas", () => {
     const tp = pluginDefinitionSchema.parse(toolPlugin());
     assert.equal(tp.type, "tool");
     assert.ok(Array.isArray(tp.tools));
-    assert.equal((tp as ToolPluginDefinition).inference, undefined);
+    assert.equal("inference" in tp, false);
 
     const mp = pluginDefinitionSchema.parse(modelPlugin());
     assert.equal(mp.type, "model");
     assert.ok(mp.inference);
-    assert.equal((mp as ModelPluginDefinition).tools, undefined);
+    assert.equal("tools" in mp, false);
   });
 });
 
@@ -217,12 +309,12 @@ describe("plugin store config", () => {
   test("parses a valid store with mixed plugins", () => {
     const store = {
       schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-      plugins: [toolPlugin(), modelPlugin()],
+      plugins: [toolPlugin(), modelPlugin(), minimalAgent()],
     };
     const parsed = pluginStoreConfigSchema.safeParse(store);
     assert.equal(parsed.success, true);
     if (parsed.success) {
-      assert.equal(parsed.data.plugins.length, 2);
+      assert.equal(parsed.data.plugins.length, 3);
     }
   });
 
@@ -249,10 +341,10 @@ describe("plugin store config", () => {
   test("valid store passes the check", () => {
     const store = {
       schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-      plugins: [toolPlugin()],
+      plugins: [toolPlugin(), minimalAgent()],
     };
     const parsed = parsePluginStoreConfig(store);
-    assert.equal(parsed.plugins.length, 1);
+    assert.equal(parsed.plugins.length, 2);
   });
 
   test("Fix 10: duplicate plugin ids in the store fail the check", () => {
@@ -271,20 +363,29 @@ describe("plugin store config", () => {
 });
 
 describe("type narrowing helpers", () => {
-  test("isToolPlugin / isModelPlugin narrow correctly", () => {
+  test("isToolPlugin / isModelPlugin / isAgentPlugin narrow correctly", () => {
     const tool: PluginDefinition = pluginDefinitionSchema.parse(toolPlugin());
     const model: PluginDefinition = pluginDefinitionSchema.parse(modelPlugin());
+    const agent: PluginDefinition = pluginDefinitionSchema.parse(minimalAgent());
 
     assert.equal(isToolPlugin(tool), true);
     assert.equal(isModelPlugin(tool), false);
+    assert.equal(isAgentPlugin(tool), false);
     assert.equal(isToolPlugin(model), false);
     assert.equal(isModelPlugin(model), true);
+    assert.equal(isAgentPlugin(model), false);
+    assert.equal(isToolPlugin(agent), false);
+    assert.equal(isModelPlugin(agent), false);
+    assert.equal(isAgentPlugin(agent), true);
 
     if (isToolPlugin(tool)) {
       assert.equal(tool.tools.length, 1);
     }
     if (isModelPlugin(model)) {
       assert.equal(model.inference.defaultModel, "anthropic/claude-3.5-sonnet");
+    }
+    if (isAgentPlugin(agent)) {
+      assert.equal(agent.systemPrompt, "You are a helpful assistant");
     }
   });
 

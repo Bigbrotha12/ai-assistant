@@ -20,9 +20,6 @@ const envSchema = z.object({
   BETTER_AUTH_URL: z
     .string()
     .url("BETTER_AUTH_URL must be an absolute URL, e.g. http://localhost:17600"),
-  INFERENCE_URL: z
-    .string()
-    .url("INFERENCE_URL must be an absolute URL of the OpenAI-compatible engine"),
   PORT: z.coerce.number().int().positive().default(17600),
   DB_PATH: z.string().default("./data/gateway.db"),
   // Sustained / burst ceiling for `POST /v1/chat/completions`, applied
@@ -126,19 +123,6 @@ try {
   parseTrustedHostEntries(env.PLUGINS_TRUSTED_HOSTS);
 } catch (err) {
   console.error(`Gateway: ${(err as Error).message}`);
-  process.exit(1);
-}
-
-const inferenceUrl = new URL(env.INFERENCE_URL);
-const inferencePort = inferenceUrl.port
-  ? Number(inferenceUrl.port)
-  : inferenceUrl.protocol === "https:"
-    ? 443
-    : 80;
-if (inferencePort === env.PORT) {
-  console.error(
-    `Gateway: INFERENCE_URL (${env.INFERENCE_URL}) must not point at this gateway's own port (PORT=${env.PORT}).`,
-  );
   process.exit(1);
 }
 

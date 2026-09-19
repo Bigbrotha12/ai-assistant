@@ -206,7 +206,6 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
         _enqueuePersist(() => _persistAssistantReply(turnId, reply));
       },
       contextBuilder: (userText) => _buildRequestMessages(userText),
-      systemPrompt: kSystemPrompt,
     );
 
     // Engines register asynchronously (model-dir resolution happens on a

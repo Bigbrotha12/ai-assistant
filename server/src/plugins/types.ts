@@ -105,9 +105,41 @@ export const modelPluginDefinitionSchema = z.object({
     credentials: credentialSpecSchema.optional(),
   });
 
+export const agentPluginDefinitionSchema = z.object({
+    id: pluginIdSchema,
+    version: semverSchema,
+    schemaVersion: z.literal(CURRENT_PLUGIN_DEFINITION_SCHEMA_VERSION),
+    type: z.literal("agent"),
+    name: z.string().trim().min(1),
+    description: z.string().trim().min(1),
+    systemPrompt: z.string().trim().min(1),
+    skills: z
+      .array(z.object({
+        id: pluginIdSchema,
+        title: z.string().trim().min(1),
+        content: z.string().trim().min(1),
+      }))
+      .optional(),
+    tools: z
+      .array(z.object({
+        pluginId: pluginIdSchema,
+        required: z.boolean().default(false),
+      }))
+      .optional(),
+    modelRef: pluginIdSchema.optional(),
+    inference: z.object({
+      temperature: z.number().optional(),
+      maxTokens: z.number().int().positive().optional(),
+      visionCapable: z.boolean().default(false),
+    }).optional(),
+    baseUrls: z.array(baseUrlAllowlistEntrySchema).optional(),
+    credentials: credentialSpecSchema.optional(),
+  });
+
 export const pluginDefinitionSchema = z.discriminatedUnion("type", [
   toolPluginDefinitionSchema,
   modelPluginDefinitionSchema,
+  agentPluginDefinitionSchema,
 ]);
 
 export const pluginStoreConfigSchema: z.ZodType<PluginStoreConfig> = z.object({
@@ -165,6 +197,12 @@ export function isModelPlugin(
   return plugin.type === "model";
 }
 
+export function isAgentPlugin(
+  plugin: PluginDefinition,
+): plugin is AgentPluginDefinition {
+  return plugin.type === "agent";
+}
+
 export interface PluginDefinition {
   /** "vikunja", "mealie", "openrouter" */
   id: string;
@@ -172,16 +210,10 @@ export interface PluginDefinition {
   version: string;
   /** Plugin schema version (zod-validated at boot) */
   schemaVersion: number;
-  type: "tool" | "model";
+  type: "tool" | "model" | "agent";
   /** Display name for client UI */
   name: string;
   description: string;
-
-  /** Tool plugins only */
-  tools?: ToolDefinition[];
-
-  /** Model plugins only */
-  inference?: InferenceDefinition;
 }
 
 export interface ToolPluginDefinition extends PluginDefinition {
@@ -198,6 +230,17 @@ export interface ModelPluginDefinition extends PluginDefinition {
   /** Optional: override/extra allowlisted URLs */
   baseUrls?: BaseUrlAllowlistEntry[];
   /** User supplies their own provider key */
+  credentials?: CredentialSpec;
+}
+
+export interface AgentPluginDefinition extends PluginDefinition {
+  type: "agent";
+  systemPrompt: string;
+  skills?: { id: string; title: string; content: string }[];
+  tools?: { pluginId: string; required: boolean }[];
+  modelRef?: string;
+  inference?: { temperature?: number; maxTokens?: number; visionCapable: boolean };
+  baseUrls?: BaseUrlAllowlistEntry[];
   credentials?: CredentialSpec;
 }
 

@@ -1,164 +1,53 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
 
-import './message_model.dart';
+import 'chat_client.dart';
+import 'message_model.dart';
+import 'sse.dart';
 import '../../../core/http/dio_errors.dart';
-import './sse.dart';
 
-/// The fully-assembled result of a chat completion turn.
-class ChatResult {
-  const ChatResult({
-    required this.content,
-    required this.toolCalls,
-    required this.finishReason,
+typedef CredentialResolver = Future<GatewayCredentials?> Function();
+
+class GatewayCredentials {
+  final String gatewayKey;
+  final String modelPluginId;
+  final String? agent;
+  final Map<String, Map<String, String>> credentials;
+
+  const GatewayCredentials({
+    required this.gatewayKey,
+    required this.modelPluginId,
+    this.agent,
+    required this.credentials,
   });
-
-  final String content;
-
-  /// Non-empty iff [finishReason] == 'tool_calls'.
-  final List<ToolCall> toolCalls;
-
-  /// 'stop' | 'tool_calls'.
-  final String finishReason;
 }
 
-/// Base class for all errors surfaced by [ChatApiClient].
-sealed class ChatApiError implements Exception {
-  const ChatApiError(this.message);
-
-  final String message;
-
-  @override
-  String toString() => '$runtimeType: $message';
-}
-
-/// Transport-level failure (timeout, connection refused, cancellation).
-class ChatNetworkError extends ChatApiError {
-  const ChatNetworkError(super.message);
-}
-
-/// The server responded with a non-2xx status.
-class ChatServerError extends ChatApiError {
-  const ChatServerError(super.message, {this.statusCode});
-
-  final int? statusCode;
-}
-
-/// The server sent an error envelope inside the stream.
-class ChatStreamError extends ChatApiError {
-  const ChatStreamError(super.message);
-}
-
-/// Internal marker for a request that failed with zero bytes received; the
-/// streaming path retries once to ride out cold-starts (~30s model reload).
 class _ConnectionFailure implements Exception {
   _ConnectionFailure(this.message);
 
   final String message;
 }
 
-/// Accumulates the argument fragments of a single tool call during streaming.
-class _ToolAccumulator {
-  final StringBuffer args = StringBuffer();
-  String? id;
-  String? name;
-}
-
-/// Contract for the OpenAI-compatible chat completions client. Extracted so
-/// tests can inject a fake without coupling to the Dio-backed implementation.
-abstract interface class ChatClient {
-  /// Streams a chat completion, calling [onContent] for each content delta and
-  /// [onToolCallDelta] for each tool-call fragment. Returns the full result.
-  ///
-  /// [onReceived] fires exactly once when the backend accepts the request
-  /// (HTTP 2xx), before any SSE frames are iterated.
-  Future<ChatResult> streamCompletions({
-    required List<ApiMessage> messages,
-    String? systemPrompt,
-    int maxTokens,
-    int? temperature,
-    List<Map<String, Object?>>? tools,
-    bool enableThinking,
-    void Function(String text)? onContent,
-    void Function(int index, String name, String argsFragment)? onToolCallDelta,
-    CancelToken? cancelToken,
-    void Function()? onReceived,
-  });
-
-  /// Non-streaming chat completion (fallback when streamed tool args fail).
-  ///
-  /// [onReceived] fires exactly once when the backend accepts the request
-  /// (HTTP 2xx), before parsing the response body.
-  Future<ChatResult> completions({
-    required List<ApiMessage> messages,
-    String? systemPrompt,
-    int maxTokens,
-    int? temperature,
-    List<Map<String, Object?>>? tools,
-    bool enableThinking,
-    CancelToken? cancelToken,
-    void Function()? onReceived,
-  });
-}
-
-/// OpenAI-compatible chat completions client. Phase 4-era; replaced by
-/// [GatewayChatClient] for new inference (the LangChain gateway). Kept for
-/// reference; no active consumers.
-class ChatApiClient implements ChatClient {
-  ChatApiClient({
+class GatewayChatClient implements ChatClient {
+  GatewayChatClient({
     required this.baseUrl,
-    Dio? dio,
-    this.model = '',
-    this.apiKey,
-  }) : _dio = dio ?? Dio();
+    // ignore: prefer_initializing_formals
+    required Dio dio,
+    required this.credentialResolver,
+  }) : _dio = dio;
 
-  /// OpenAI-compatible API base root including the `/v1` prefix, e.g.
-  /// `https://librechat.../api/agents/v1`. No trailing slash.
   final String baseUrl;
-
-  final String model;
-
-  /// External inference API bearer key sent as `Authorization: Bearer <apiKey>`
-  /// on every request.
-  final String? apiKey;
-
   final Dio _dio;
+  final CredentialResolver credentialResolver;
 
   static const Duration _connectTimeout = Duration(seconds: 8);
-  // 180s: the LibreChat agents backend cold-starts Qwen3-14B on an idle
-  // llama.cpp, and the first chunk can arrive ~90-120s after TTFB. A 60s
-  // window made the very first call after a pause fail as a network error.
   static const Duration _receiveTimeout = Duration(seconds: 180);
   static const Duration _retryBackoff = Duration(seconds: 1);
 
   String get _endpoint => '$baseUrl/chat/completions';
 
-  /// Builds the per-request [Options]. The bearer API key (when set) is
-  /// attached to every request so the inference API never 401s a chat call. The
-  /// streaming path also opts into an SSE `accept` header and stream response
-  /// type.
-  Options _options({bool stream = false}) {
-    final headers = <String, Object?>{};
-    if (stream) headers['accept'] = 'text/event-stream';
-    final key = apiKey;
-    if (key != null && key.isNotEmpty) {
-      headers['Authorization'] = 'Bearer $key';
-    }
-    return Options(
-      headers: headers,
-      responseType: stream ? ResponseType.stream : null,
-      // Never replay the bearer key to a redirect target on another origin;
-      // a 3xx is a misconfiguration and must surface as an error.
-      followRedirects: false,
-      connectTimeout: _connectTimeout,
-      receiveTimeout: _receiveTimeout,
-    );
-  }
-
-  /// Streams a chat completion. Calls [onContent] for each content delta
-  /// (thinking already stripped by the SSE parser), [onToolCallDelta] for each
-  /// tool-call fragment. Returns the complete result.
   @override
   Future<ChatResult> streamCompletions({
     required List<ApiMessage> messages,
@@ -186,10 +75,6 @@ class ChatApiClient implements ChatClient {
         return await _streamOnce(
           messages: messages,
           systemPrompt: systemPrompt,
-          maxTokens: maxTokens,
-          temperature: temperature,
-          tools: tools,
-          enableThinking: enableThinking,
           onContent: onContent,
           onToolCallDelta: onToolCallDelta,
           cancelToken: cancelToken,
@@ -205,7 +90,6 @@ class ChatApiClient implements ChatClient {
     throw StateError('unreachable');
   }
 
-  /// Non-streaming fallback (used when streamed tool args fail to decode).
   @override
   Future<ChatResult> completions({
     required List<ApiMessage> messages,
@@ -217,22 +101,37 @@ class ChatApiClient implements ChatClient {
     CancelToken? cancelToken,
     void Function()? onReceived,
   }) async {
-    final body = _buildBody(
-      messages: messages,
-      systemPrompt: systemPrompt,
-      maxTokens: maxTokens,
-      temperature: temperature,
-      tools: tools,
-      enableThinking: enableThinking,
-      stream: false,
-    );
+    final creds = await credentialResolver();
+    if (creds == null) {
+      throw ChatNetworkError('Not authenticated');
+    }
+
+    final body = <String, Object?>{
+      'model': creds.modelPluginId,
+      if (creds.agent != null) 'agent': creds.agent!,
+      'messages': [
+        if (systemPrompt != null)
+          _serializeMessage(
+            ApiMessage(role: 'system', content: systemPrompt),
+          ),
+        ...messages.map(_serializeMessage),
+      ],
+      'credentials': creds.credentials,
+    };
 
     Response<Map<String, dynamic>> response;
     try {
       response = await _dio.post<Map<String, dynamic>>(
         _endpoint,
         data: body,
-        options: _options(),
+        options: Options(
+          headers: {
+            'Authorization': 'Bearer ${creds.gatewayKey}',
+          },
+          followRedirects: false,
+          connectTimeout: _connectTimeout,
+          receiveTimeout: _receiveTimeout,
+        ),
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
@@ -251,7 +150,7 @@ class ChatApiClient implements ChatClient {
     if (choices is! List || choices.isEmpty) {
       throw ChatStreamError('malformed completion response');
     }
-    final choice = choices.isEmpty ? null : choices.first;
+    final choice = choices.first;
     final message = choice is Map<String, dynamic> ? choice['message'] : null;
     if (message is! Map<String, dynamic>) {
       throw ChatStreamError('malformed completion response');
@@ -289,32 +188,46 @@ class ChatApiClient implements ChatClient {
   Future<ChatResult> _streamOnce({
     required List<ApiMessage> messages,
     String? systemPrompt,
-    required int maxTokens,
-    int? temperature,
-    List<Map<String, Object?>>? tools,
-    required bool enableThinking,
     void Function(String text)? onContent,
     void Function(int index, String name, String argsFragment)?
         onToolCallDelta,
     CancelToken? cancelToken,
     void Function()? onReceived,
   }) async {
-    final body = _buildBody(
-      messages: messages,
-      systemPrompt: systemPrompt,
-      maxTokens: maxTokens,
-      temperature: temperature,
-      tools: tools,
-      enableThinking: enableThinking,
-      stream: true,
-    );
+    final creds = await credentialResolver();
+    if (creds == null) {
+      throw ChatNetworkError('Not authenticated');
+    }
+
+    final body = <String, Object?>{
+      'model': creds.modelPluginId,
+      if (creds.agent != null) 'agent': creds.agent!,
+      'messages': [
+        if (systemPrompt != null)
+          _serializeMessage(
+            ApiMessage(role: 'system', content: systemPrompt),
+          ),
+        ...messages.map(_serializeMessage),
+      ],
+      'stream': true,
+      'credentials': creds.credentials,
+    };
 
     Response<ResponseBody> response;
     try {
       response = await _dio.post<ResponseBody>(
         _endpoint,
         data: body,
-        options: _options(stream: true),
+        options: Options(
+          headers: {
+            'Authorization': 'Bearer ${creds.gatewayKey}',
+            'accept': 'text/event-stream',
+          },
+          responseType: ResponseType.stream,
+          followRedirects: false,
+          connectTimeout: _connectTimeout,
+          receiveTimeout: _receiveTimeout,
+        ),
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
@@ -348,10 +261,6 @@ class ChatApiClient implements ChatClient {
                 toolAccums.putIfAbsent(delta.index, _ToolAccumulator.new);
             if (delta.id != null) acc.id = delta.id;
             if (delta.name != null) acc.name = delta.name;
-            // Forward every fragment — including the name-only first one
-            // (empty args) — so a listener (e.g. the status tracker) can
-            // resolve a domain from the tool name immediately, instead of
-            // only once argument fragments accumulate a keyword.
             if (delta.name != null || delta.argsFragment.isNotEmpty) {
               if (delta.argsFragment.isNotEmpty) {
                 acc.args.write(delta.argsFragment);
@@ -388,15 +297,10 @@ class ChatApiClient implements ChatClient {
       for (final acc in toolAccums.values) {
         final args = _decodeToolArgs(acc.args.toString());
         if (args == null) {
-          return completions(
-            messages: messages,
-            systemPrompt: systemPrompt,
-            maxTokens: maxTokens,
-            temperature: temperature,
-            tools: tools,
-            enableThinking: enableThinking,
-            cancelToken: cancelToken,
-            onReceived: onReceived,
+          return ChatResult(
+            content: stripStructuredTokens(content.toString()),
+            toolCalls: toolCalls,
+            finishReason: effectiveFinish,
           );
         }
         toolCalls.add(
@@ -406,42 +310,10 @@ class ChatApiClient implements ChatClient {
     }
 
     return ChatResult(
-      // Strip any structured-output control tokens that survived the
-      // per-delta parser cleaning (a PUA tool/citation marker can be split
-      // across multiple SSE deltas, so the accumulated buffer is cleaned too).
       content: stripStructuredTokens(content.toString()),
       toolCalls: toolCalls,
       finishReason: effectiveFinish,
     );
-  }
-
-  Map<String, Object?> _buildBody({
-    required List<ApiMessage> messages,
-    String? systemPrompt,
-    required int maxTokens,
-    int? temperature,
-    List<Map<String, Object?>>? tools,
-    required bool enableThinking,
-    required bool stream,
-  }) {
-    final body = <String, Object?>{
-      'model': model,
-      'messages': [
-        if (systemPrompt != null)
-          _serializeMessage(
-            ApiMessage(role: 'system', content: systemPrompt),
-          ),
-        ...messages.map(_serializeMessage),
-      ],
-      'stream': stream,
-      'max_tokens': maxTokens,
-    };
-    if (temperature != null) body['temperature'] = temperature;
-    if (!enableThinking) {
-      body['chat_template_kwargs'] = {'enable_thinking': false};
-    }
-    if (tools != null && tools.isNotEmpty) body['tools'] = tools;
-    return body;
   }
 
   Map<String, dynamic> _serializeMessage(ApiMessage message) {
@@ -468,13 +340,16 @@ class ChatApiClient implements ChatClient {
     }
   }
 
-  /// A non-2xx status from the inference API.
   Never _serverStatusError(int? status, {String? message}) {
+    if (status == 401) {
+      throw ChatServerError(
+        'Inference unavailable – check your credentials.',
+        statusCode: 401,
+      );
+    }
     throw ChatServerError(message ?? 'HTTP $status', statusCode: status);
   }
 
-  /// Decodes a tool-call `arguments` JSON string into a map. Returns null for
-  /// empty or malformed payloads, and for JSON that is not an object.
   static Map<String, dynamic>? _decodeToolArgs(String? raw) {
     if (raw == null || raw.isEmpty) return null;
     final Object? decoded;
@@ -487,8 +362,8 @@ class ChatApiClient implements ChatClient {
   }
 }
 
-/// True when [error] is a gateway key rejection that the re-auth flow can
-/// remedy — a [ChatServerError] with 401 from the gateway.
-bool isAuthRequiredError(Object error) =>
-    error is ChatServerError &&
-    error.statusCode == 401;
+class _ToolAccumulator {
+  final StringBuffer args = StringBuffer();
+  String? id;
+  String? name;
+}

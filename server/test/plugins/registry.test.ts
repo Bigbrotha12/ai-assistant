@@ -7,11 +7,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry, PluginRegistryError } from "../../src/plugins/registry.ts";
-import { CURRENT_PLUGIN_STORE_SCHEMA_VERSION, isModelPlugin, isToolPlugin } from "../../src/plugins/types.ts";
+import { CURRENT_PLUGIN_STORE_SCHEMA_VERSION, isModelPlugin, isToolPlugin, isAgentPlugin } from "../../src/plugins/types.ts";
 import type {
   ModelPluginDefinition,
   PluginStoreConfig,
   ToolPluginDefinition,
+  AgentPluginDefinition,
 } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 
@@ -83,6 +84,38 @@ function mealieManifest(): ToolPluginDefinition {
   };
 }
 
+function defaultAgentPlugin(): AgentPluginDefinition {
+  return {
+    id: "default",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "agent",
+    name: "Default",
+    description: "General-purpose assistant",
+    systemPrompt: "You are a helpful assistant.",
+    skills: [],
+    tools: [],
+  };
+}
+
+function kitchenCopilotAgent(): AgentPluginDefinition {
+  return {
+    id: "kitchen-copilot",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "agent",
+    name: "Kitchen Copilot",
+    description: "Mealie recipe assistant",
+    systemPrompt: "You are a kitchen assistant.",
+    skills: [
+      { id: "recipes", title: "Recipes", content: "## Recipe tips\n..." },
+    ],
+    tools: [{ pluginId: "mealie", required: true }],
+    modelRef: "open-router",
+    inference: { temperature: 0.3, maxTokens: 2048, visionCapable: true },
+  };
+}
+
 const DNS: Record<string, LookupAddress[]> = {
   "vikunja.example.com": [{ address: "1.1.1.1", family: 4 }],
   "mealie.example.com": [{ address: "1.1.1.1", family: 4 }],
@@ -114,7 +147,7 @@ async function makeEnv(dir: string): Promise<{
   const store = new PluginStore({
     storePath,
     trustedHosts: [],
-    builtinPlugins: [openRouterBuiltin()],
+    builtinPlugins: [openRouterBuiltin(), defaultAgentPlugin(), kitchenCopilotAgent()],
     manifests: [vikunjaManifest(), mealieManifest()],
     lookup: fakeLookup(),
   });
@@ -140,7 +173,7 @@ describe("PluginRegistry list (public) endpoints", () => {
     const list = registry.listAvailablePlugins();
     assert.deepEqual(
       list.map((p) => p.id),
-      ["openrouter", "vikunja", "mealie"],
+      ["openrouter", "default", "kitchen-copilot", "vikunja", "mealie"],
     );
 
     const openrouter = list.find((p) => p.id === "openrouter")!;
@@ -208,6 +241,55 @@ describe("PluginRegistry list (public) endpoints", () => {
 
     assert.equal(registry.getPluginDetails("ghost"), undefined);
   });
+
+  test("listAvailablePlugins includes agents with redacted summary", async (t) => {
+    const dir = await makeTempDir(t);
+    const { registry } = await makeEnv(dir);
+
+    const list = registry.listAvailablePlugins();
+
+    const defaultAgent = list.find((p) => p.id === "default")!;
+    assert.equal(defaultAgent.type, "agent");
+    assert.equal(defaultAgent.installed, true);
+    assert.equal(defaultAgent.agent!.skillCount, 0);
+    assert.equal(defaultAgent.agent!.visionCapable, false);
+    assert.deepEqual(defaultAgent.agent!.toolGrants, []);
+    assert.equal(defaultAgent.agent!.modelRef, undefined);
+
+    const copilot = list.find((p) => p.id === "kitchen-copilot")!;
+    assert.equal(copilot.type, "agent");
+    assert.equal(copilot.installed, true);
+    assert.equal(copilot.agent!.skillCount, 1);
+    assert.equal(copilot.agent!.visionCapable, true);
+    assert.deepEqual(copilot.agent!.toolGrants, [
+      { pluginId: "mealie", required: true },
+    ]);
+    assert.equal(copilot.agent!.modelRef, "open-router");
+    assert.ok(
+      !("systemPrompt" in copilot),
+      "systemPrompt must be redacted from public list",
+    );
+  });
+
+  test("getPluginDetails includes full agent definition with systemPrompt", async (t) => {
+    const dir = await makeTempDir(t);
+    const { registry } = await makeEnv(dir);
+
+    const agent = registry.getPluginDetails("default")!;
+    assert.equal(agent.installed, true);
+    assert.equal(agent.type, "agent");
+    if (isAgentPlugin(agent)) {
+      assert.equal(agent.systemPrompt, "You are a helpful assistant.");
+    }
+
+    const copilot = registry.getPluginDetails("kitchen-copilot")!;
+    assert.equal(copilot.installed, true);
+    if (isAgentPlugin(copilot)) {
+      assert.equal(copilot.systemPrompt, "You are a kitchen assistant.");
+      assert.equal(copilot.skills?.length, 1);
+      assert.equal(copilot.skills![0]!.content, "## Recipe tips\n...");
+    }
+  });
 });
 
 describe("PluginRegistry requirePlugin", () => {
@@ -247,17 +329,24 @@ describe("PluginRegistry requirePlugin", () => {
 });
 
 describe("PluginRegistry resolution helpers", () => {
-  test("canResolveModelPlugin / canResolveToolPlugin", async (t) => {
+  test("canResolveModelPlugin / canResolveToolPlugin / canResolveAgentPlugin", async (t) => {
     const dir = await makeTempDir(t);
     const { store, registry } = await makeEnv(dir);
 
     assert.equal(registry.canResolveModelPlugin("openrouter"), true);
     assert.equal(registry.canResolveToolPlugin("openrouter"), false);
+    assert.equal(registry.canResolveAgentPlugin("openrouter"), false);
 
     assert.equal(registry.canResolveToolPlugin("vikunja"), false);
     assert.equal(registry.canResolveModelPlugin("vikunja"), false);
+    assert.equal(registry.canResolveAgentPlugin("vikunja"), false);
     assert.equal(registry.canResolveToolPlugin("mealie"), false);
     assert.equal(registry.canResolveModelPlugin("ghost"), false);
+    assert.equal(registry.canResolveAgentPlugin("ghost"), false);
+
+    assert.equal(registry.canResolveAgentPlugin("default"), true);
+    assert.equal(registry.canResolveAgentPlugin("kitchen-copilot"), true);
+    assert.equal(registry.canResolveModelPlugin("default"), false);
 
     await store.install("vikunja");
     assert.equal(registry.canResolveToolPlugin("vikunja"), true);

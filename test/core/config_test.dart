@@ -65,22 +65,8 @@ void main() {
     });
   });
 
-  group('BackendConfig.stripV1Suffix', () {
-    test('strips a trailing /v1 and trailing slash', () {
-      expect(
-        BackendConfig.stripV1Suffix('https://h/api/agents/v1'),
-        'https://h/api/agents',
-      );
-      expect(
-        BackendConfig.stripV1Suffix('https://h/api/openai/v1/'),
-        'https://h/api/openai',
-      );
-      expect(BackendConfig.stripV1Suffix('https://h/api'), 'https://h/api');
-      expect(BackendConfig.stripV1Suffix('https://h'), 'https://h');
-      expect(BackendConfig.stripV1Suffix(''), '');
-    });
-
-    test('trimTrailingSlash keeps a /v1 version prefix', () {
+  group('BackendConfig.trimTrailingSlash', () {
+    test('strips trailing slash', () {
       expect(
         BackendConfig.trimTrailingSlash('https://h/api/agents/v1/'),
         'https://h/api/agents/v1',

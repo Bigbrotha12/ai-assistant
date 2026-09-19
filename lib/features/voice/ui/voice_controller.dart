@@ -172,8 +172,9 @@ final class VoiceController {
   /// message.
   final Future<List<ApiMessage>> Function(String userText)? contextBuilder;
 
-  /// System prompt passed to the chat client for every turn when set (matches
-  /// the chat feature's `kSystemPrompt` usage).
+  /// System prompt passed to the chat client for every turn when set. The
+  /// inference backend owns the assistant's system prompt, so this is left
+  /// unset by the app.
   final String? systemPrompt;
 
   late final StreamSubscription<List<int>> _micSubscription;
