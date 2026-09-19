@@ -12,6 +12,7 @@ import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 
 import { env } from "../env.ts";
+import { logger } from "../logger.ts";
 import { requireApiKey, unauthorized } from "../inference.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers } from "../agents/mcp.ts";
@@ -649,7 +650,7 @@ export function resolveChatRequest(
         if (entry) {
           resolvedSkills.push({ id: entry.id, title: entry.title, content: entry.content });
         } else {
-          console.warn(`[chat] custom agent: skill '${skillId}' not found in catalog; skipping`);
+          logger.warn(`[chat] custom agent: skill '${skillId}' not found in catalog; skipping`);
         }
       }
 
@@ -660,7 +661,7 @@ export function resolveChatRequest(
         if (entry) {
           resolvedMcp.push({ name: entry.name, url: entry.url, headers: entry.headers });
         } else {
-          console.warn(`[chat] custom agent: MCP server '${mcpRef.name}' not found in catalog; skipping`);
+          logger.warn(`[chat] custom agent: MCP server '${mcpRef.name}' not found in catalog; skipping`);
         }
       }
 
@@ -675,7 +676,7 @@ export function resolveChatRequest(
               if (grant.required) {
                 return { ok: false, response: c.json({ error: "invalid_credentials", message: `tool '${grant.pluginId}' is not a tool plugin` }, 400) };
               }
-              console.warn(`[chat] custom agent: '${grant.pluginId}' is not a tool plugin; skipping`);
+              logger.warn(`[chat] custom agent: '${grant.pluginId}' is not a tool plugin; skipping`);
               continue;
             }
             resolvedTools.push(grant);
@@ -684,7 +685,7 @@ export function resolveChatRequest(
               if (grant.required) {
                 return { ok: false, response: c.json({ error: "invalid_credentials", message: `tool '${grant.pluginId}' not installed or unavailable` }, 400) };
               }
-              console.warn(`[chat] custom agent: tool '${grant.pluginId}' not installed; skipping`);
+              logger.warn(`[chat] custom agent: tool '${grant.pluginId}' not installed; skipping`);
               continue;
             }
             throw e;

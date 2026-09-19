@@ -7,14 +7,34 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart'
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_catalog_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_registry_client.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
+import 'package:dio/dio.dart';
 import 'package:drift/native.dart';
 
 import '../../fakes.dart';
 import '../auth/auth_credentials_store_test.dart' show InMemorySecureStorage;
 import 'plugin_credentials_store_test.dart' show DelayedSecureStorage;
+
+class FakeRegistryClient extends PluginRegistryClient {
+  FakeRegistryClient()
+    : super(dio: Dio(), baseUrl: 'http://example.com:17600/v1');
+
+  List<Map<String, dynamic>> templates = const [];
+  Object? error;
+
+  @override
+  Future<List<Map<String, dynamic>>> fetchAgentTemplates({
+    required String gatewayKey,
+  }) async {
+    final failure = error;
+    if (failure != null) throw failure;
+    return templates;
+  }
+}
 
 AuthCredentials credentials(String owner, {String key = 'key'}) =>
     AuthCredentials(
@@ -27,10 +47,12 @@ void main() {
   late ProviderContainer container;
   late PluginCredentialsStore store;
   late FakeAuthCredentialsStore authStore;
+  late FakeRegistryClient registry;
 
   setUp(() async {
     store = PluginCredentialsStore(storage: InMemorySecureStorage());
     authStore = FakeAuthCredentialsStore(stored: credentials('a'));
+    registry = FakeRegistryClient();
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
     container = ProviderContainer(
@@ -40,6 +62,7 @@ void main() {
           FakeSettingsStore(stored: const BackendSettings(host: 'example.com')),
         ),
         pluginCredentialsStoreProvider.overrideWithValue(store),
+        pluginRegistryClientProvider.overrideWithValue(registry),
         databaseProvider.overrideWithValue(db),
       ],
     );
@@ -201,6 +224,7 @@ test(
         pluginCredentialsStoreProvider.overrideWithValue(
           PluginCredentialsStore(storage: storage),
         ),
+        pluginRegistryClientProvider.overrideWithValue(registry),
       ],
     );
     await container.read(authCredentialsProvider.future);
@@ -219,4 +243,36 @@ test(
       isEmpty,
     );
   });
+
+  test(
+    'seeding picks the first catalog template id when the store is empty',
+    () async {
+      registry.templates = [
+        {'id': 'kitchen-copilot', 'name': 'Kitchen Copilot'},
+        {'id': 'research-assistant', 'name': 'Research Assistant'},
+      ];
+      final config = await container.read(pluginCredentialsProvider.future);
+      expect(config.plugins.keys, ['kitchen-copilot']);
+      expect(config.plugins['kitchen-copilot']!.enabled, isTrue);
+      expect(
+        config.plugins['kitchen-copilot']!.agent!.id,
+        'kitchen-copilot',
+      );
+      expect(config.selectedAgent, 'kitchen-copilot');
+    },
+  );
+
+  test(
+    'seeding falls back to default when the template fetch fails',
+    () async {
+      registry.error = DioException(
+        requestOptions: RequestOptions(path: '/v1/agents'),
+        type: DioExceptionType.connectionError,
+      );
+      final config = await container.read(pluginCredentialsProvider.future);
+      expect(config.plugins.keys, ['default']);
+      expect(config.plugins['default']!.agent!.id, 'default');
+      expect(config.selectedAgent, 'default');
+    },
+  );
 }

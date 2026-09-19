@@ -214,18 +214,23 @@ class PluginCredentialsStore {
     ),
   );
 
-  Future<void> ensureDefaultAgent(AuthAccountScope scope) => _serialized(() async {
-    final config = await _load(scope);
-    if (config.plugins.isNotEmpty) return;
-    await _save(scope, PluginAccountConfiguration(
-      plugins: {'default': PluginConfiguration(
-        enabled: true,
-        agent: AgentConfig(id: 'default', kind: AgentKind.template),
-      )},
-      selectedAgent: 'default',
-      selectedModel: config.selectedModel,
-    ));
-  });
+  Future<void> ensureDefaultAgent(AuthAccountScope scope, {String? templateId}) =>
+      _serialized(() async {
+        final config = await _load(scope);
+        if (config.plugins.isNotEmpty) return;
+        final id =
+            (templateId != null && templateId.trim().isNotEmpty)
+            ? templateId
+            : 'default';
+        await _save(scope, PluginAccountConfiguration(
+          plugins: {id: PluginConfiguration(
+            enabled: true,
+            agent: AgentConfig(id: id, kind: AgentKind.template),
+          )},
+          selectedAgent: id,
+          selectedModel: config.selectedModel,
+        ));
+      });
 
   Future<void> clearScope(AuthAccountScope scope) =>
       _serialized(() => _storage.delete(key: _key(scope)));

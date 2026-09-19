@@ -192,7 +192,7 @@ void main() {
       await tester.pump();
       expect(
         (await store.load(account.accountScope!)).plugins.keys,
-        ['default'],
+        ['test-agent'],
       );
       await tester.tap(find.text('Save API key'));
       await tester.pumpAndSettle();
@@ -378,7 +378,7 @@ void main() {
     );
     expect(
       (await store.load(account.accountScope!)).plugins.keys,
-      ['default'],
+      ['test-agent'],
     );
     final primary = find.byKey(const ValueKey('plugin-baseurl-primary'));
     await tester.ensureVisible(primary);
@@ -433,19 +433,25 @@ void main() {
     await mount(tester);
     await tester.tap(find.byKey(const ValueKey('agent-test-agent')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Select agent'));
-    await tester.pumpAndSettle();
-    expect(find.text('Deselect agent'), findsOneWidget);
+    // The first catalog template is seeded as the selected agent.
     expect(
       (await store.load(account.accountScope!)).selectedAgent,
       'test-agent',
     );
+    expect(find.text('Deselect agent'), findsOneWidget);
     await tester.tap(find.text('Deselect agent'));
     await tester.pumpAndSettle();
     expect(find.text('Select agent'), findsOneWidget);
     expect(
       (await store.load(account.accountScope!)).selectedAgent,
       isNull,
+    );
+    await tester.tap(find.text('Select agent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Deselect agent'), findsOneWidget);
+    expect(
+      (await store.load(account.accountScope!)).selectedAgent,
+      'test-agent',
     );
   });
 }

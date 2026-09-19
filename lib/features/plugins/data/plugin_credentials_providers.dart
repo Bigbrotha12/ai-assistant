@@ -5,6 +5,7 @@ import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/data/auth_credentials_store.dart';
 import '../../settings/data/settings_providers.dart';
 import 'agent_config.dart';
+import 'plugin_catalog_providers.dart';
 import 'plugin_credentials_store.dart';
 
 final pluginCredentialsStoreProvider = Provider<PluginCredentialsStore>(
@@ -54,11 +55,27 @@ final pluginCredentialsProvider =
   final store = ref.watch(pluginCredentialsStoreProvider);
   var config = await store.load(scope);
   if (config.plugins.isEmpty) {
-    await store.ensureDefaultAgent(scope);
+    await store.ensureDefaultAgent(scope, templateId: await _firstAgentTemplateId(ref));
     config = await store.load(scope);
   }
   return config;
 });
+
+Future<String?> _firstAgentTemplateId(Ref ref) async {
+  try {
+    final auth = ref.read(authCredentialsProvider).value;
+    if (auth == null) return null;
+    final client = ref.read(pluginRegistryClientProvider);
+    final templates = await client
+        .fetchAgentTemplates(gatewayKey: auth.apiKey)
+        .timeout(const Duration(seconds: 5));
+    if (templates.isEmpty) return null;
+    final id = templates.first['id'];
+    return id is String && id.trim().isNotEmpty ? id : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 final selectedModelProvider = Provider<String?>((ref) {
   return ref.watch(pluginCredentialsProvider).value?.selectedModel;

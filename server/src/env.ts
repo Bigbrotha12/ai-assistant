@@ -46,6 +46,12 @@ export const envSchema = z.object({
   WARMUP_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   WARMUP_MAX_CONCURRENT: z.coerce.number().int().positive().max(2_147_483_647).default(2),
   WARMUP_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).default(10_000),
+  // Outbound model-call timeout (ms). ChatOpenAI otherwise uses the SDK's
+  // default (~10 min); a hung upstream would block a stream that long.
+  MODEL_CALL_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  // Per-call timeout (ms) for MCP server JSON-RPC (initialize/tools/list/
+  // tools/call). A hung MCP server must not block the request forever.
+  MCP_CALL_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),
@@ -115,6 +121,8 @@ export const envSchema = z.object({
     .url("DEFAULT_MODEL_PROVIDER_BASE_URL must be an absolute URL")
     .default("https://openrouter.ai/api/v1"),
   DEFAULT_MODEL_PROVIDER_MODEL: z.string().trim().min(1).default("openrouter/auto"),
+  // Console log level. error < warn < info < debug.
+  LOG_LEVEL: z.enum(["error", "warn", "info", "debug"]).default("info"),
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),

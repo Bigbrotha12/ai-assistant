@@ -1,5 +1,7 @@
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
+import { env } from "../env.ts";
+import { logger } from "../logger.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import { validatedFetch } from "../plugins/ssrf.ts";
 import type { JsonSchema } from "../plugins/types.ts";
@@ -19,7 +21,7 @@ export class McpError extends Error {
   }
 }
 
-async function mcpCall(
+export async function mcpCall(
   url: string,
   method: string,
   params: Record<string, unknown> | undefined,
@@ -39,36 +41,54 @@ async function mcpCall(
     id: 1,
   });
 
-  const response = await validatedFetch(
-    url,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...opts.headers,
+  // Combine the caller's signal with a per-call timeout so a hung MCP server
+  // cannot block the request indefinitely.
+  const timeoutSignal = AbortSignal.timeout(env.MCP_CALL_TIMEOUT_MS);
+  const combined = opts.signal
+    ? AbortSignal.any([opts.signal, timeoutSignal])
+    : timeoutSignal;
+
+  try {
+    const response = await validatedFetch(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          ...opts.headers,
+        },
+        body,
+        signal: combined,
       },
-      body,
-      signal: opts.signal,
-    },
-    {
-      trustedHosts: opts.trustedHosts,
-      lookup: opts.lookup,
-      fetchFn: opts.fetchFn,
-      mode: opts.mode,
-    },
-  );
+      {
+        trustedHosts: opts.trustedHosts,
+        lookup: opts.lookup,
+        fetchFn: opts.fetchFn,
+        mode: opts.mode,
+      },
+    );
 
-  if (!response.ok) {
-    throw new McpError(`MCP server returned ${response.status}`);
-  }
+    if (!response.ok) {
+      throw new McpError(`MCP server returned ${response.status}`);
+    }
 
-  const json: unknown = await response.json();
-  if (typeof json === "object" && json !== null && "error" in json) {
-    const err = (json as { error: { message?: string } }).error;
-    throw new McpError(`MCP error: ${err.message ?? JSON.stringify(err)}`);
+    const json: unknown = await response.json();
+    if (typeof json === "object" && json !== null && "error" in json) {
+      const err = (json as { error: { message?: string } }).error;
+      throw new McpError(`MCP error: ${err.message ?? JSON.stringify(err)}`);
+    }
+    return (json as { result: unknown }).result;
+  } catch (err) {
+    if (err instanceof McpError) throw err;
+    if (
+      err instanceof DOMException &&
+      (err.name === "AbortError" || err.name === "TimeoutError")
+    ) {
+      throw new McpError(`MCP call to ${url} timed out`);
+    }
+    throw err;
   }
-  return (json as { result: unknown }).result;
 }
 
 function jsonSchemaToZod(schema: JsonSchema): z.ZodType {
@@ -91,7 +111,7 @@ function jsonSchemaToZod(schema: JsonSchema): z.ZodType {
     case "array":
       return z.array(withDescription(jsonSchemaToZod(schema.items ?? {}), schema));
     default: {
-      console.warn(
+      logger.warn(
         `[mcp] tool schema: unmapped JSON schema type '${String(schema.type)}' → z.any()`,
       );
       return z.any();
@@ -163,7 +183,7 @@ export async function bindMcpServers(
         );
       }
     } catch (err) {
-      console.warn(
+      logger.warn(
         `[mcp] failed to bind tools from server '${server.name}':`,
         err instanceof McpError ? err.message : err,
       );

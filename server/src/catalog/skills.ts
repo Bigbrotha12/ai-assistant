@@ -1,5 +1,6 @@
 import { glob, readFile, realpath } from "node:fs/promises";
 import { join, parse } from "node:path";
+import { logger } from "../logger.ts";
 import { pluginIdSchema } from "../plugins/types.ts";
 
 export type SkillEntry = {
@@ -62,7 +63,7 @@ export async function loadSkillsCatalog(
     try {
       resolved = await realpath(fullPath);
     } catch {
-      console.warn(`Dangling symlink skipped: ${fullPath}`);
+      logger.warn(`Dangling symlink skipped: ${fullPath}`);
       continue;
     }
 

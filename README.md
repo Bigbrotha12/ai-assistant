@@ -127,6 +127,29 @@ The inference endpoint (`LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` dart-defines)
 has been removed: the gateway is the sole inference path. The `main` branch
 retains LibreChat as a fallback.
 
+### Running with Docker
+
+The gateway image is immutable: code and config ship in the image, while
+persistent state and extensible catalogs come from mounted volumes. Two mounts
+are expected:
+
+```
+docker run \
+  -v /host/ai-assistant-data:/app/data \   # persistent DBs + plugin store (created on first boot)
+  -v /host/ai-assistant-config:/config \   # skills/, mcp.json, agents/ catalogs (seeded default agent on first boot)
+  -e BETTER_AUTH_SECRET=... \
+  -e BETTER_AUTH_URL=https://gateway.example.com \
+  -e CHECKPOINT_DB_KEY=... \
+  -p 17600:17600 \
+  <image>
+```
+
+- Catalogs load at startup — edit files then `docker restart` to apply. Agent
+  plugin changes (client-held) need no restart.
+- `/app/data` and `/config` are the two volumes; the seed default agent is
+  written to `/config/agents/default.json` only when the agents dir is empty
+  (see docker-entrypoint.sh).
+
 ### Tests
 
 ```sh

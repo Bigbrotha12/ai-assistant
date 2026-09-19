@@ -21,6 +21,16 @@ ENV CONFIG_DIR=/config
 
 WORKDIR /app
 
+# Persistent state: SQLite databases + the plugin store live under /app/data.
+# Mount a volume here so conversations, ledger, checkpoints, and installed
+# plugins survive container recreation (immutable-image model).
+ENV DB_PATH=/app/data/gateway.db
+ENV LEDGER_DB_PATH=/app/data/ledger.db
+ENV CHECKPOINT_DB_PATH=/app/data/checkpoints.db
+ENV PLUGINS_STORE_PATH=/app/data/plugins.json
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/package.json ./

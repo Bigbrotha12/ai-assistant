@@ -1,6 +1,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { ChatOpenAIFields } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { env } from "../env.ts";
 import { PluginRegistryError } from "../plugins/registry.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import type { PluginStore } from "../plugins/store.ts";
@@ -166,6 +167,7 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
     apiKey: input.credentials.apiKey,
     streaming: true,
     maxRetries: 0,
+    timeout: env.MODEL_CALL_TIMEOUT_MS,
     configuration,
   } as unknown as ChatOpenAIFields;
 

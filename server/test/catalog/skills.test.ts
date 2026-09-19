@@ -107,8 +107,8 @@ describe("loadSkillsCatalog", () => {
   test("dangling symlink is skipped with warning", async () => {
     const warnings: string[] = [];
     const origWarn = console.warn;
-    console.warn = (msg: string) => {
-      warnings.push(msg);
+    console.warn = (...msgs: unknown[]) => {
+      warnings.push(msgs.join(" "));
     };
     try {
       await withDir(async (dir) => {

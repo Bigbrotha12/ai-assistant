@@ -1,3 +1,5 @@
+import { logger } from "../logger.ts";
+
 /**
  * Default skill token budget when a caller does not supply one. Production
  * callers pass env.AGENT_SKILL_BUDGET_TOKENS; this constant is the module
@@ -41,7 +43,7 @@ export function composeAgentPrompt(
 
   const dropped = skills.slice(included.length);
   if (dropped.length > 0) {
-    console.warn(
+    logger.warn(
       `composeAgentPrompt: skills dropped (budget exceeded): ${dropped.map((s) => s.id).join(", ")}`,
     );
   }

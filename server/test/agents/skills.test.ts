@@ -37,7 +37,7 @@ describe("composeAgentPrompt", () => {
   test("over budget drops trailing skills and warns", () => {
     const warnings: string[] = [];
     const origWarn = console.warn;
-    console.warn = (msg: string) => { warnings.push(msg); };
+    console.warn = (...msgs: unknown[]) => { warnings.push(msgs.join(" ")); };
     try {
       const result = composeAgentPrompt("X.", [
         { id: "keep", title: "Keep", content: "short" },
@@ -56,7 +56,7 @@ describe("composeAgentPrompt", () => {
   test("first skill alone exceeds budget is included anyway (graceful)", () => {
     const warnings: string[] = [];
     const origWarn = console.warn;
-    console.warn = (msg: string) => { warnings.push(msg); };
+    console.warn = (...msgs: unknown[]) => { warnings.push(msgs.join(" ")); };
     try {
       const result = composeAgentPrompt("X.", [
         { id: "huge", title: "Huge", content: "x".repeat(500) },
