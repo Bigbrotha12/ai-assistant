@@ -11,7 +11,6 @@ import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import {
   createAgentsRoutes,
-  agentListFromPlugins,
 } from "../../src/transport/agents.ts";
 import type { AgentsListResponse } from "../../src/transport/agents.ts";
 import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
@@ -175,79 +174,6 @@ function assertNoUrlLeak(node: unknown, path: string): void {
     }
   }
 }
-
-describe("agentListFromPlugins (pure)", () => {
-  test("maps an agent plugin to an AgentSummary with redacted metadata", () => {
-    const result = agentListFromPlugins([kitchenCopilotAgent()]);
-
-    assert.equal(result.object, "list");
-    assert.equal(result.data.length, 1);
-    const entry = result.data[0]!;
-    assert.equal(entry.id, "kitchen-copilot");
-    assert.equal(entry.object, "agent");
-    assert.ok(
-      Number.isInteger(entry.created) && entry.created > 0,
-      "created is a real epoch-seconds timestamp, not 0",
-    );
-    assert.equal(entry.owned_by, "plugin");
-    assert.equal(entry.name, "Kitchen Copilot");
-    assert.equal(entry.description, "Mealie recipe assistant");
-    assert.equal(entry.defaultModel, "open-router");
-    assert.equal(entry.visionCapable, true);
-    assert.equal(entry.temperature, 0.3);
-    assert.equal(entry.maxTokens, 2048);
-    assert.deepEqual(entry.toolGrants, [{ pluginId: "mealie", required: true }]);
-    assert.equal(entry.skillCount, 1);
-    assert.deepEqual(entry.skillIds, ["recipes"]);
-    assert.deepEqual(entry.mcpNames, []);
-    assert.equal(entry.source, "plugin");
-    assertNoUrlLeak(result, "result");
-  });
-
-  test("maps minimal agent (default) with no optional fields", () => {
-    const result = agentListFromPlugins([defaultAgentPlugin()]);
-    assert.equal(result.data.length, 1);
-    const entry = result.data[0]!;
-    assert.equal(entry.id, "default");
-    assert.equal(entry.defaultModel, undefined);
-    assert.equal(entry.visionCapable, false);
-    assert.equal(entry.temperature, undefined);
-    assert.equal(entry.maxTokens, undefined);
-    assert.deepEqual(entry.toolGrants, []);
-    assert.equal(entry.skillCount, 0);
-    assert.deepEqual(entry.skillIds, []);
-    assert.deepEqual(entry.mcpNames, []);
-    assert.equal(entry.source, "plugin");
-    assertNoUrlLeak(result, "result");
-  });
-
-  test("sorts entries by plugin id", () => {
-    const result = agentListFromPlugins([
-      kitchenCopilotAgent(),
-      defaultAgentPlugin(),
-    ]);
-    assert.deepEqual(
-      result.data.map((a) => a.id),
-      ["default", "kitchen-copilot"],
-    );
-  });
-
-  test("empty input -> empty list", () => {
-    assert.deepEqual(agentListFromPlugins([]), { object: "list", data: [] });
-  });
-
-  test("serialized output has no https:// patterns (no secret leakage)", () => {
-    const result = agentListFromPlugins([
-      kitchenCopilotAgent(),
-      defaultAgentPlugin(),
-    ]);
-    assert.equal(
-      JSON.stringify(result).includes("https://"),
-      false,
-      "systemPrompt/skills content must not leak",
-    );
-  });
-});
 
 describe("GET /v1/agents (HTTP)", () => {
   test("200 with installed agent plugins — no URL leak", async (t) => {

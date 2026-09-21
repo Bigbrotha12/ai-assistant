@@ -3,11 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   PluginCredentialError,
-  CREDENTIAL_REDACTION,
   credentialFingerprint,
-  extractBearerCredential,
   extractCredentialsFromBody,
-  redactCredentials,
   validateCredentials,
 } from "../../src/plugins/credential.ts";
 import type { CredentialSpec } from "../../src/plugins/types.ts";
@@ -262,26 +259,6 @@ describe("extractCredentialsFromBody", () => {
   });
 });
 
-describe("extractBearerCredential", () => {
-  test("missing or blank header → undefined", () => {
-    assert.equal(extractBearerCredential(undefined), undefined);
-    assert.equal(extractBearerCredential(""), undefined);
-    assert.equal(extractBearerCredential("   "), undefined);
-  });
-
-  test("malformed header → undefined", () => {
-    assert.equal(extractBearerCredential("Basic abc"), undefined);
-    assert.equal(extractBearerCredential("Bearer"), undefined);
-    assert.equal(extractBearerCredential("nonsense"), undefined);
-  });
-
-  test("valid Bearer token is extracted and trimmed", () => {
-    assert.equal(extractBearerCredential("Bearer sk-abc"), "sk-abc");
-    assert.equal(extractBearerCredential("bearer  sk-def  "), "sk-def");
-    assert.equal(extractBearerCredential("  BEARER sk-ghi "), "sk-ghi");
-  });
-});
-
 describe("credentialFingerprint", () => {
   test("is stable regardless of key order", () => {
     assert.equal(
@@ -313,23 +290,5 @@ describe("credentialFingerprint", () => {
   test("empty credentials still produce a fingerprint", () => {
     assert.equal(typeof credentialFingerprint({}), "string");
     assert.equal(credentialFingerprint({}), credentialFingerprint({}));
-  });
-});
-
-describe("redactCredentials", () => {
-  test("replaces every value with the redaction marker", () => {
-    const redacted = redactCredentials({ apiKey: "sk-secret", token: "t" });
-    assert.deepEqual(redacted, { apiKey: CREDENTIAL_REDACTION, token: CREDENTIAL_REDACTION });
-    for (const value of Object.values(redacted)) {
-      assert.equal(value, CREDENTIAL_REDACTION);
-    }
-    assert.equal(redacted["apiKey"], "***");
-  });
-
-  test("does not mutate the input and handles empty objects", () => {
-    const input = { apiKey: "sk-secret" };
-    redactCredentials(input);
-    assert.equal(input["apiKey"], "sk-secret");
-    assert.deepEqual(redactCredentials({}), {});
   });
 });

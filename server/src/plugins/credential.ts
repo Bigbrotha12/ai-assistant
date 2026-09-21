@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CredentialSpec } from "./types.ts";
+import { isRecord } from "../util.ts";
 
 /**
  * Per-request credential extraction & validation (Phase 1, Step 5).
@@ -24,17 +25,15 @@ import type { CredentialSpec } from "./types.ts";
  *   }
  *
  * `extractCredentialsFromBody` resolves the per-plugin object; the
- * `Authorization: Bearer` header (used for model-plugin keys) is deliberately a
- * SEPARATE concern (`extractBearerCredential`) so the transport picks the
- * source per plugin type.
+ * `Authorization: Bearer` header (used for model-plugin keys) is parsed by the
+ * transport's `requireApiKey`/`extractBearerToken` in `inference.ts`.
  *
  * Non-leak guardrails:
  *  - No credential value is ever logged, echoed, or included in error messages
  *    from this module.
  *  - `validateCredentials` returns the ONLY object callers may forward to an
  *    outbound call; it is discarded after that call.
- *  - `redactCredentials`/`credentialFingerprint` exist so error paths and
- *    cache keys never touch raw values.
+ *  - `credentialFingerprint` exists so cache keys never touch raw values.
  */
 
 /**
@@ -159,10 +158,6 @@ export function validateCredentials(
   return validated;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Pull the per-plugin credential input out of a request body (see the module
  * doc for the standardized `credentials` field). Returns only string values,
@@ -208,23 +203,6 @@ export function extractCredentialsFromBody(
 }
 
 /**
- * Read the upstream key from an `Authorization: Bearer <token>` header. Uses
- * the same syntax as `inference.ts`'s `extractBearerToken` (case-insensitive
- * `Bearer`, surrounding whitespace tolerated, token trimmed) and is kept a
- * separate concern from `extractCredentialsFromBody`: tool-plugin keys ride the
- * body, model-plugin keys may ride the header, and the transport picks the
- * source per plugin type. A thin mirror of the inference scheme rather than an
- * import, so this module stays dependency-free for unit testing; a future
- * refactor could extract the shared regex into a common header module.
- */
-export function extractBearerCredential(
-  header: string | undefined,
-): string | undefined {
-  const match = /^Bearer\s+(.+)$/i.exec((header ?? "").trim());
-  return match ? match[1]!.trim() : undefined;
-}
-
-/**
  * Stable, non-reversible sha256 over sorted `key=value` pairs of a validated
  * credential set (Phase 4's tool-result cache key:
  * `(userId, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)`).
@@ -241,14 +219,3 @@ export function credentialFingerprint(creds: Record<string, string>): string {
 
 /** Marker substituted for credential values in logs/errors — never the value. */
 export const CREDENTIAL_REDACTION = "***";
-
-/** Returns a same-key copy where every value is the redaction marker. */
-export function redactCredentials(
-  obj: Record<string, string>,
-): Record<string, typeof CREDENTIAL_REDACTION> {
-  const redacted: Record<string, typeof CREDENTIAL_REDACTION> = {};
-  for (const reference of Object.keys(obj)) {
-    redacted[reference] = CREDENTIAL_REDACTION;
-  }
-  return redacted;
-}

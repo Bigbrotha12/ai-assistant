@@ -2,7 +2,6 @@ import { Hono } from "hono";
 import { requireApiKey, unauthorized } from "../inference.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
-import type { AgentPluginDefinition } from "../plugins/types.ts";
 import type { Catalogs } from "../catalog/index.ts";
 
 export type AgentSummary = {
@@ -27,31 +26,6 @@ export type AgentsListResponse = {
   object: "list";
   data: AgentSummary[];
 };
-
-export function agentListFromPlugins(
-  agents: AgentPluginDefinition[],
-): AgentsListResponse {
-  const data = agents
-    .map((plugin): AgentSummary => ({
-      id: plugin.id,
-      object: "agent",
-      created: Math.floor(Date.now() / 1000),
-      owned_by: "plugin",
-      name: plugin.name,
-      description: plugin.description,
-      defaultModel: plugin.modelRef,
-      visionCapable: plugin.inference?.visionCapable ?? false,
-      temperature: plugin.inference?.temperature,
-      maxTokens: plugin.inference?.maxTokens,
-      toolGrants: plugin.tools,
-      skillCount: plugin.skills?.length ?? 0,
-      skillIds: (plugin.skills ?? []).map(s => s.id),
-      mcpNames: (plugin.mcpServers ?? []).map(s => s.name),
-      source: "plugin",
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id));
-  return { object: "list", data };
-}
 
 export function agentListFromCatalogs(
   catalogs: Catalogs,

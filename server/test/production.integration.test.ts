@@ -128,7 +128,7 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     "./auth.ts": { auth: { handler: () => new Response() } },
     "./env.ts": { env: environment },
     "./inference.ts": { inferenceRoutes: new Hono(), requireApiKey: async () => "test-user" },
-    "./ledger.routes.ts": { ledger: {}, ledgerRoutes: new Hono() },
+    "./ledger.routes.ts": { ledger: { close() {} }, ledgerRoutes: new Hono() },
     "./plugins/index.ts": { createPluginWiring: () => ({ registry, store }) },
     "./plugins/routes.ts": { createPluginRoutes: () => new Hono() },
     "./transport/models.ts": { createModelsRoutes: () => new Hono() },
@@ -136,7 +136,7 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     "./transport/mcps.ts": { createMcpRoutes: () => new Hono() },
     "./checkpoints/routes.ts": { createCheckpointRoutes: () => new Hono() },
     "./checkpoints/store.ts": {
-      createCheckpointStore: async () => ({ checkpointer: {}, touchThread() {} }),
+      createCheckpointStore: async () => ({ checkpointer: {}, touchThread() {}, async close() {} }),
     },
     "./transport/chat.ts": {
       createChatRoutes: (options: ChatRoutesOptions) => { chat = options; return new Hono(); },
@@ -250,7 +250,10 @@ test("production boot shares phase 4 services and uses scoped model credentials"
   const shutdown = process.listeners("SIGTERM").find((listener) => !originalTerm.includes(listener))!;
   shutdown("SIGTERM");
   shutdown("SIGTERM");
-  assert.deepEqual(cleanup, ["runner", "watch", "cache", "server"]);
+  // Shutdown stops the listener first (so nothing new can touch the stores),
+  // then disposes services; the mock server.close never invokes its callback,
+  // so the checkpoint-store/ledger close steps stay pending past this point.
+  assert.deepEqual(cleanup, ["server", "runner", "watch", "cache"]);
   assert.deepEqual(errors, [["gateway: plugin watcher cleanup failed"]]);
   assert.deepEqual(chat.warmups!.schedule(call), { ok: false, reason: "disposed" });
   const rejected = await fetchApp(new Request("http://localhost/"));

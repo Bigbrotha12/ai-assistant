@@ -4,6 +4,7 @@ import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isModelPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
+import { isRecord } from "../util.ts";
 
 /**
  * OpenAI-compatible `GET /v1/models` transport (Phase 3, Wave B).
@@ -93,10 +94,6 @@ export function sanitizeParameters(
     }
   }
   return out;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export type ModelsRoutesOptions = {

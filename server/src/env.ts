@@ -49,9 +49,19 @@ export const envSchema = z.object({
   // Outbound model-call timeout (ms). ChatOpenAI otherwise uses the SDK's
   // default (~10 min); a hung upstream would block a stream that long.
   MODEL_CALL_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  // Outbound plugin-tool-call timeout (ms). The model and MCP paths have
+  // explicit timeouts; without one here a hung tool backend (undici's default
+  // is ~5 min) would wedge the thread mutex / budget slot / job fence that
+  // long.
+  TOOL_CALL_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
   // Per-call timeout (ms) for MCP server JSON-RPC (initialize/tools/list/
   // tools/call). A hung MCP server must not block the request forever.
   MCP_CALL_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  // Max accepted request body for `POST /v1/chat/completions` (bytes). Bounds
+  // the body buffered before validation so an oversized POST cannot stall the
+  // event loop or inflate memory for all users. Large enough for inline
+  // base64 vision images.
+  MAX_REQUEST_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(10_000_000),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),

@@ -126,6 +126,7 @@ function toolPlugin(): ToolPluginDefinition {
     ],
     baseUrls: [{ id: "vikunja-api", url: "https://vikunja.example.com" }],
     credentials: { apiKey: { label: "Token", required: true } },
+    warmupTools: ["list_tasks"],
   };
 }
 
@@ -230,6 +231,9 @@ function fakeCheckpointStore(): CheckpointStore {
         }
       }
       return n;
+    },
+    isDeleted(threadId) {
+      return threads.get(threadId)?.deleted === true;
     },
   };
 }
@@ -648,7 +652,7 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.deepEqual(await res.json(), {
       status: "succeeded",
       taskId: "task-1",
-      threadId: "thr-hash",
+      threadId: "thread-1",
     });
 
     assert.equal(fake.calls.length, 1, "runJob delegated exactly once");
@@ -729,7 +733,7 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.deepEqual(await res2.json(), {
       status: "succeeded",
       taskId: "task-1",
-      threadId: "thr-1",
+      threadId: "msg-same",
     });
 
     assert.equal(fake.calls.length, 2);
@@ -754,7 +758,7 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.deepEqual(await res.json(), {
       status: "accepted",
       taskId: "task-1",
-      threadId: "thr-1",
+      threadId: "msg-running",
     });
   });
 
@@ -830,7 +834,7 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.deepEqual(await res.json(), {
       status: "succeeded",
       taskId: "task-1",
-      threadId: "thr-1",
+      threadId: "msg-term",
     });
     assert.throws(
       () => pins.get("test-user", "openrouter"),
@@ -857,6 +861,37 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       message: "messageId required for background requests",
     });
     assert.equal(fake.calls.length, 0);
+  });
+
+  test("a background send to a deleted thread -> 409 reseed_required, runJob never called", async (t) => {
+    const checkpointStore = fakeCheckpointStore();
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([]);
+    const { app } = await makeApp(t, {
+      checkpointStore,
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+    });
+    // Seed + delete the thread so `isDeleted` returns true.
+    await (await postChat(app, chatBody({ thread_id: "deleted-thread", messages: [{ role: "user", content: "hi" }] }))).text();
+    checkpointStore.deleteThread("test-user", checkpointThreadId("test-user", "deleted-thread"));
+
+    const res = await postChat(app, chatBody({
+      background: true,
+      messageId: "msg-deleted",
+      thread_id: "deleted-thread",
+      credentials: { openrouter: { apiKey: "sk-test-123" } },
+    }));
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), {
+      error: "reseed_required",
+      reason: "thread_deleted",
+      threadId: "deleted-thread",
+    });
+    assert.equal(fake.calls.length, 0, "runJob must never run for a deleted thread");
+    assert.equal(ledger.getTaskByIntentKey("test-user", "msg-deleted"), null);
   });
 
   test("async path not wired (no runner/checkpointer/ledger/pins) -> 503 background_unavailable", async (t) => {
@@ -2390,13 +2425,13 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
       assert.deepEqual(await res1.json(), {
         status: "accepted",
         taskId: "task-1",
-        threadId: "thr-1",
+        threadId: "thread-1",
       });
       assert.equal(res2.status, 202);
       assert.deepEqual(await res2.json(), {
         status: "accepted",
         taskId: "task-2",
-        threadId: "thr-2",
+        threadId: "thread-2",
       });
 
       // Both reservations released despite the in_flight duplicate status.
@@ -3007,7 +3042,7 @@ describe("POST /v1/chat/completions — agent resolution (Wave 1, Step 4)", () =
     assert.deepEqual(await res.json(), {
       status: "succeeded",
       taskId: "task-agent",
-      threadId: "thr-agent",
+      threadId: "thread-agent",
     });
     assert.equal(runner.calls.length, 1, "background: runner called once");
     const d = runner.calls[0]!;

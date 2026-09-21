@@ -31,6 +31,7 @@ import {
   validateStaticUrl,
 } from "./ssrf.ts";
 import type { LookupFn, Mode } from "./ssrf.ts";
+import { isRecord } from "../util.ts";
 
 /**
  * `PluginStore` persists which tool-plugin manifests an admin has installed
@@ -622,11 +623,6 @@ export class PluginStore {
       this.assertCredentialsSpecOnly(pluginId, value, `${path}.${reference}`);
     }
   }
-}
-
-/** True for a plain (non-null, non-array) object. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Credential spec of a plugin, narrowing the tool/model variants. */

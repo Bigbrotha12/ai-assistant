@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import {
   AIMessage,
@@ -8,14 +9,14 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
-import { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { DynamicStructuredTool } from "@langchain/core/tools";
 
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
 import { requireApiKey, unauthorized } from "../inference.ts";
-import { bindPluginTools } from "../agents/orchestrator.ts";
+import { bindPluginTools, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import { bindMcpServers } from "../agents/mcp.ts";
+import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
+import { isRecord } from "../util.ts";
 import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
@@ -325,65 +326,11 @@ type StreamExecution = ReturnType<typeof createStreamExecution>;
 function createStreamExecution(requestSignal: AbortSignal) {
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, requestSignal]);
-  const pending = new Set<Promise<unknown>>();
+  const execution = createTrackedExecution(signal);
   return {
-    signal,
+    ...execution,
     abort: () => controller.abort(),
-    async track<T>(run: () => Promise<T>): Promise<T> {
-      signal.throwIfAborted();
-      const work = Promise.resolve().then(() => {
-        signal.throwIfAborted();
-        return run();
-      });
-      pending.add(work);
-      try {
-        return await work;
-      } finally {
-        pending.delete(work);
-      }
-    },
-    async settle() {
-      while (pending.size) await Promise.allSettled([...pending]);
-    },
   };
-}
-
-function trackModelExecution(model: BaseChatModel, execution: StreamExecution): void {
-  const seen = new WeakSet<object>();
-  const wrap = (candidate: unknown): void => {
-    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
-    seen.add(candidate);
-    if (!(candidate instanceof BaseChatModel)) {
-      if ("bound" in candidate) wrap(candidate.bound);
-      return;
-    }
-    const generate = candidate._generate.bind(candidate);
-    candidate._generate = (...args) => execution.track(() => generate(...args));
-    const chunks = candidate._streamResponseChunks.bind(candidate);
-    if (candidate._streamResponseChunks !== BaseChatModel.prototype._streamResponseChunks) {
-      candidate._streamResponseChunks = async function* (...args) {
-        let finish!: () => void;
-        const done = new Promise<void>((resolve) => { finish = resolve; });
-        const tracked = execution.track(() => done);
-        try {
-          execution.signal.throwIfAborted();
-          yield* chunks(...args);
-        } finally {
-          finish();
-          await tracked;
-        }
-      };
-    }
-    const bind = candidate.bindTools?.bind(candidate);
-    if (bind) {
-      candidate.bindTools = (...args) => {
-        const bound = bind(...args);
-        wrap(bound);
-        return bound;
-      };
-    }
-  };
-  wrap(model);
 }
 
 /** The compiled agent graph the sync path streams (createAgentGraph's type). */
@@ -411,6 +358,16 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
   const budget = opts.budget ?? createBudgetManager();
 
   const routes = new Hono();
+
+  // Bounds the request body BEFORE it is buffered by `c.req.json()`. An
+  // oversized POST (no Content-Length, chunked) would otherwise stall the
+  // event loop and inflate memory for every user. 413 request_too_large.
+  routes.use(
+    bodyLimit({
+      maxSize: env.MAX_REQUEST_BODY_BYTES,
+      onError: (c) => c.json({ error: "request_too_large" }, 413),
+    }),
+  );
 
   routes.post("/chat/completions", async (c) => {
     const owner = await verifyKey(c);
@@ -470,6 +427,36 @@ type ResolvedChat = {
   };
 };
 
+/**
+ * Extract + validate a model plugin's credentials from the request body. The
+ * sync and async paths, and the post-agent-override re-resolution, all share
+ * this so credential sourcing never diverges. Model plugins also let the
+ * non-secret `baseUrlEntry` routing field through (it selects a base-URL
+ * instance from the plugin's allowlisted `baseUrls`); it rides the validated
+ * credentials so buildModel can resolve it against the allowlist.
+ */
+function resolveModelCredentials(
+  c: Context,
+  body: Record<string, unknown>,
+  modelPluginId: string,
+  plugin: ModelPluginDefinition,
+): { ok: true; credentials: Record<string, string> } | { ok: false; response: Response } {
+  try {
+    const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, {
+      isModel: true,
+    });
+    const credentials = validateCredentials(plugin.credentials, input, modelPluginId, {
+      isModel: true,
+    });
+    return { ok: true, credentials };
+  } catch (err) {
+    if (err instanceof PluginCredentialError) {
+      return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
+    }
+    return { ok: false, response: c.json({ error: "internal" }, 500) };
+  }
+}
+
 export function resolveChatRequest(
   c: Context,
   body: Record<string, unknown>,
@@ -497,25 +484,9 @@ export function resolveChatRequest(
     return { ok: false, response: c.json({ error: "internal" }, 500) };
   }
 
-  let credentials: Record<string, string>;
-  try {
-    // Model plugins also let the non-secret `baseUrlEntry` routing field
-    // through (it selects a base-URL instance from the plugin's allowlisted
-    // `baseUrls`); it rides the validated credentials so buildModel can resolve
-    // it against the allowlist (an unknown/blank id falls back to the
-    // plugin's inference endpoint).
-    const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, {
-      isModel: true,
-    });
-    credentials = validateCredentials(plugin.credentials, input, modelPluginId, {
-      isModel: true,
-    });
-  } catch (err) {
-    if (err instanceof PluginCredentialError) {
-      return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
-    }
-    return { ok: false, response: c.json({ error: "internal" }, 500) };
-  }
+  const resolvedCredentials = resolveModelCredentials(c, body, modelPluginId, plugin);
+  if (!resolvedCredentials.ok) return resolvedCredentials;
+  let credentials = resolvedCredentials.credentials;
 
   // H2: extract + validate every TOOL plugin credential the request carries.
   // Missing credentials for a tool plugin do NOT fail the request — the model
@@ -729,15 +700,9 @@ export function resolveChatRequest(
       }
 
       // Re-resolve credentials for the new model plugin
-      try {
-        const input = extractCredentialsFromBody(body, modelPluginId, plugin.credentials, { isModel: true });
-        credentials = validateCredentials(plugin.credentials, input, modelPluginId, { isModel: true });
-      } catch (err) {
-        if (err instanceof PluginCredentialError) {
-          return { ok: false, response: c.json({ error: "invalid_credentials" }, 400) };
-        }
-        return { ok: false, response: c.json({ error: "internal" }, 500) };
-      }
+      const reResolved = resolveModelCredentials(c, body, modelPluginId, plugin);
+      if (!reResolved.ok) return reResolved;
+      credentials = reResolved.credentials;
     }
 
     // Merge inference overrides
@@ -930,35 +895,42 @@ async function handleSyncStream(
     },
   }, resolved.value.enabledPlugins);
   const mcpBinding = resolved.value.agentOverride?.mcpServers
-    ? await bindMcpServers(resolved.value.agentOverride.mcpServers, undefined, {
+    ? await bindMcpServers(resolved.value.agentOverride.mcpServers, {
         signal: execution.signal,
         trustedHosts: env.MCP_TRUSTED_HOSTS,
       })
     : undefined;
-  const mcpTools = mcpBinding?.tools ?? [];
-  const allTools: DynamicStructuredTool[] = [];
-  const seen = new Set<string>();
-  for (const t of [...pluginTools, ...mcpTools]) {
-    if (seen.has(t.name)) {
-      if (mcpTools.includes(t)) {
-        console.warn(`[chat] tool '${t.name}' defined by both a plugin and an MCP server; skipping MCP version`);
-      }
-      continue;
+  // The MCP binding owns live SSE connections + pinned Agents until the stream
+  // takes ownership (buildStreamResponse) or this function exits. Every early
+  // return between here and stream handoff MUST dispose it: a rejected request
+  // would otherwise leak one connection + pinned Agent per retry (a replayed
+  // duplicate messageId leaks one per 409). Ownership transfers to the SSE
+  // stream right before buildStreamResponse; the `finally` disposes anything
+  // not handed off.
+  let mcpHandedOff = false;
+  let mcpDisposed = false;
+  const disposeMcp = async (): Promise<void> => {
+    if (!mcpBinding || mcpDisposed) return;
+    mcpDisposed = true;
+    try {
+      await mcpBinding.dispose();
+    } catch (err) {
+      console.warn("chat: MCP binding dispose failed", err);
     }
-    seen.add(t.name);
-    allTools.push(t);
-  }
-  const tools = allTools;
-  const base = createAgentGraph({
-    model,
-    tools,
-    systemPrompt: resolved.value.agentOverride?.systemPrompt,
-    prepareMessages: opts.contextManager?.prepareMessages,
-    beforeModelCall: () => {
-      execution.signal.throwIfAborted();
-      budget.beforeModelCall(owner, "sync");
-    },
-  });
+  };
+  try {
+    const mcpTools = mcpBinding?.tools ?? [];
+    const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
+    const base = createAgentGraph({
+      model,
+      tools,
+      systemPrompt: resolved.value.agentOverride?.systemPrompt,
+      prepareMessages: opts.contextManager?.prepareMessages,
+      beforeModelCall: () => {
+        execution.signal.throwIfAborted();
+        budget.beforeModelCall(owner, "sync");
+      },
+    });
   // H1: compile with the checkpointer ONLY for a threaded (checkpointed) run.
   // A stateless run (no `thread_id`) streams WITHOUT `configurable.thread_id`;
   // running that through a checkpointer would throw `Missing "thread_id"` on
@@ -982,17 +954,18 @@ async function handleSyncStream(
     // on the same thread serialize before either reads the checkpoint.
     let managedAdmission: ManagedAdmission | undefined;
     let stopHeartbeat: (() => void) | undefined;
-    // Phase 4 Wave A: reserve the per-user budget slot BEFORE the lock so a
-    // full pool rejects the request up front (429, no queue for sync) instead
-    // of blocking on the mutex with no capacity. Released together with the
-    // thread lock when the stream completes or is cancelled.
+    // Phase 4 Wave A: the per-user budget slot is reserved AFTER the thread
+    // lock is acquired. Reserving before the acquire would let a request
+    // parked on a busy thread (a long stream or a hung tool backend) hold a
+    // budget slot while waiting, so one slow thread could starve every other
+    // thread for the owner. A full pool still rejects with 429 — just after
+    // the (bounded) lock wait instead of before it.
+    const release = await lock.acquire(threadId);
     const reservation = budget.reserveSync(owner);
     if (!reservation.ok) {
+      release();
       return busy(c, 429, reservation.retryAfterSeconds);
     }
-    // Acquire BEFORE the seed/resume read so the decision is made atomically
-    // with the stream; released when the stream completes or is cancelled.
-    const release = await lock.acquire(threadId);
     let released = false;
     const releaseOnce = () => {
       if (released) return;
@@ -1055,6 +1028,7 @@ async function handleSyncStream(
       }
       execution.signal.throwIfAborted();
       scheduleWarmups(opts, owner, toolCredentialsByPlugin);
+      mcpHandedOff = true;
       const stream = buildStreamResponse(
         graph,
         input,
@@ -1066,7 +1040,7 @@ async function handleSyncStream(
         managedAdmission ? (outcome) => {
           opts.ledger!.completeTask(managedAdmission!.task.id, owner, outcome, managedAdmission!.task.fence_token);
         } : undefined,
-        mcpBinding?.dispose,
+        disposeMcp,
       );
       if (managed) {
         stream.headers.set("x-thread-id", effectiveClientThreadId!);
@@ -1158,6 +1132,7 @@ async function handleSyncStream(
   }
   try {
     scheduleWarmups(opts, owner, toolCredentialsByPlugin);
+    mcpHandedOff = true;
     return buildStreamResponse(
       graph,
       input,
@@ -1167,11 +1142,14 @@ async function handleSyncStream(
       reservation.release,
       afterStream,
       undefined,
-      mcpBinding?.dispose,
+      disposeMcp,
     );
   } catch (err) {
     reservation.release();
     throw err;
+  }
+  } finally {
+    if (!mcpHandedOff) await disposeMcp();
   }
 }
 
@@ -1326,6 +1304,13 @@ async function handleBackground(
   const clientThread = clientThreadId ?? messageId;
   const threadId = checkpointThreadId(owner, clientThread);
 
+  // A background send to a deleted thread must fail cleanly with
+  // `reseed_required` (mirroring the sync managed path) — never a silent 500
+  // when the runner's deferred `touchThread` throws `thread_deleted` mid-job.
+  if (checkpointStore.isDeleted?.(threadId)) {
+    return deletedThreadResponse(c, clientThread);
+  }
+
   // Snapshot whether this thread was ALREADY known (owner->thread mapping row
   // present) BEFORE this request admits/touches it. The admission-time
   // `touchThread` (below) makes the thread "known" to EVERY later reader, so
@@ -1476,7 +1461,7 @@ async function handleBackground(
     scheduleWarmups(opts, owner, resolved.value.toolCredentialsByPlugin);
   }
 
-  return mapRunJobResult(c, result);
+  return mapRunJobResult(c, result, clientThread);
 }
 
 /**
@@ -1559,17 +1544,23 @@ const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 400 | 401 | 409 | 429 | 502 | 
  *   - `succeeded` -> 200 { status: "succeeded" };
  *   - `already_terminal` -> 200 { status: <terminalStatus> };
  *   - `failed` -> the JobErrorCode HTTP status with the redacted message.
+ *
+ * `publicThreadId` is the RAW client thread handle (`clientThreadId ?? messageId`)
+ * — the value the client must echo back as `thread_id` to resume. The runner's
+ * internal `result.threadId` is the owner-bound hash (`checkpointThreadId`) and
+ * would be re-hashed into a different thread on resume, silently orphaning the
+ * conversation.
  */
-function mapRunJobResult(c: Context, result: RunJobResult): Response {
+function mapRunJobResult(c: Context, result: RunJobResult, publicThreadId: string): Response {
   switch (result.status) {
     case "in_flight":
       return c.json(
-        { status: "accepted", taskId: result.taskId, threadId: result.threadId },
+        { status: "accepted", taskId: result.taskId, threadId: publicThreadId },
         202,
       );
     case "succeeded":
       return c.json(
-        { status: "succeeded", taskId: result.taskId, threadId: result.threadId },
+        { status: "succeeded", taskId: result.taskId, threadId: publicThreadId },
         200,
       );
     case "already_terminal":
@@ -1577,7 +1568,7 @@ function mapRunJobResult(c: Context, result: RunJobResult): Response {
         {
           status: result.terminalStatus,
           taskId: result.taskId,
-          threadId: result.threadId,
+          threadId: publicThreadId,
         },
         200,
       );
@@ -1781,7 +1772,13 @@ function buildStreamResponse(
           await execution.settle();
           finalize();
           onRelease?.();
-          await disposeMcp?.();
+          // A rejected MCP close must never skip the stream's own termination
+          // (truncated/hung SSE on the client).
+          try {
+            await disposeMcp?.();
+          } catch (err) {
+            console.warn("chat: MCP binding dispose failed", err);
+          }
           if (!cancelled && !errored) controller.close();
         }
       })();
@@ -1864,15 +1861,18 @@ function scheduleWarmups(
 ): void {
   if (!opts.warmups) return;
   try {
-    for (const [pluginId, toolName] of [["vikunja", "list_tasks"], ["mealie", "search_recipes"], ["spiel", "search_media"]] as const) {
-      const credentials = credentialsByPlugin[pluginId];
+    // Warmable tools are declared in the plugin manifest (`warmupTools`) — the
+    // installed set drives what gets pre-warmed instead of a hardcoded list.
+    for (const plugin of opts.registry.listInstalledPlugins()) {
+      if (!isToolPlugin(plugin)) continue;
+      const credentials = credentialsByPlugin[plugin.id];
       if (!credentials) continue;
-      const plugin = opts.registry.listInstalledPlugins().find((candidate) => candidate.id === pluginId);
-      if (!plugin || !isToolPlugin(plugin)) continue;
-      const tool = plugin.tools.find((candidate) => candidate.name === toolName);
-      if (!tool?.readOnly || tool.inputSchema.required?.length) continue;
-      const admission = opts.warmups.schedule({ owner, pluginId, tool: toolName, args: {}, credentials: { ...credentials } });
-      if (admission.ok) void admission.done.catch(() => {});
+      for (const toolName of plugin.warmupTools ?? []) {
+        const tool = plugin.tools.find((candidate) => candidate.name === toolName);
+        if (!tool?.readOnly || tool.inputSchema.required?.length) continue;
+        const admission = opts.warmups.schedule({ owner, pluginId: plugin.id, tool: toolName, args: {}, credentials: { ...credentials } });
+        if (admission.ok) void admission.done.catch(() => {});
+      }
     }
   } catch {
     console.warn("chat: warmup scheduling skipped");
@@ -1898,6 +1898,11 @@ function preStreamError(c: Context, err: unknown): Response {
   if (err instanceof ModelBuildError) {
     if (err.code === "missing_credentials") {
       return c.json({ error: "invalid_credentials" }, 400);
+    }
+    if (err.code === "unsupported") {
+      // A non-streaming model plugin is actionable config, not a malformed
+      // request — surface it distinctly instead of folding into invalid_request.
+      return c.json({ error: "unsupported", message: err.message }, 400);
     }
     return c.json({ error: "invalid_request" }, 400);
   }
@@ -2021,8 +2026,4 @@ function parseToolArgs(args: unknown): Record<string, any> {
     }
   }
   return (args as Record<string, any>) ?? {};
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

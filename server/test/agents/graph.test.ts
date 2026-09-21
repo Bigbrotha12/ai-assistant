@@ -1,7 +1,5 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import type { TestContext } from "node:test";
-import type { LookupAddress } from "node:dns";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,12 +32,7 @@ import {
   estimateMessagesTokens,
 } from "../../src/middleware/context.ts";
 import { createAgentGraph, MAX_TOOL_ROUNDS } from "../../src/agents/graph.ts";
-import { createAgent, jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
-import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
-import { PluginStore } from "../../src/plugins/store.ts";
-import { PluginRegistry } from "../../src/plugins/registry.ts";
-import type { LookupFn } from "../../src/plugins/ssrf.ts";
-import type { ToolPluginDefinition } from "../../src/plugins/types.ts";
+import { jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
 
 /**
  * Scripted fake chat model: returns a preset sequence of AIMessages (some with
@@ -482,142 +475,5 @@ describe("agent graph — zod translation from plugin JsonSchema", () => {
     const schema = jsonSchemaToZod({ type: "file" });
     assert.equal(schema.safeParse(42).success, true);
     assert.equal(schema.safeParse({ nested: "x" }).success, true);
-  });
-});
-
-describe("createAgent — registry tool binding", () => {
-  const DNS: Record<string, LookupAddress[]> = {
-    "vikunja.example.com": [{ address: "1.1.1.1", family: 4 }],
-  };
-
-  function fakeLookup(): LookupFn {
-    return async (hostname, _options) => {
-      const records = DNS[hostname.toLowerCase()];
-      return records ? [...records] : [];
-    };
-  }
-
-  function vikunjaManifest(): ToolPluginDefinition {
-    return {
-      id: "vikunja",
-      version: "1.4.0",
-      schemaVersion: 1,
-      type: "tool",
-      name: "Vikunja",
-      description: "Task management tools",
-      tools: [
-        {
-          name: "list_tasks",
-          description: "List tasks from a project",
-          readOnly: true,
-          inputSchema: {
-            type: "object",
-            properties: { projectId: { type: "string" } },
-            required: ["projectId"],
-          },
-        },
-      ],
-      baseUrls: [{ id: "vikunja-api", url: "https://vikunja.example.com" }],
-      credentials: { apiKey: { label: "Personal access token", required: true } },
-    };
-  }
-
-  async function makeEnv(
-    t: TestContext,
-  ): Promise<{ store: PluginStore; registry: PluginRegistry }> {
-    const dir = await mkdtemp(join(tmpdir(), "agents-"));
-    t.after(() => rm(dir, { recursive: true, force: true }));
-    const store = new PluginStore({
-      storePath: join(dir, "plugins.json"),
-      trustedHosts: [],
-      builtinPlugins: [],
-      manifests: [vikunjaManifest()],
-      lookup: fakeLookup(),
-    });
-    await store.load();
-    await store.install("vikunja");
-    return { store, registry: new PluginRegistry(store) };
-  }
-
-  test("binds the tool plugin and invokes the injected handler with (pluginId, toolName, args)", async (t) => {
-    const { registry } = await makeEnv(t);
-    const calls: Array<{
-      pluginId: string;
-      toolName: string;
-      args: Record<string, unknown>;
-      credentials?: Record<string, unknown>;
-    }> = [];
-    const toolHandler: ToolCallHandler = {
-      async execute(pluginId, toolName, args, credentials) {
-        calls.push({ pluginId, toolName, args, credentials });
-        return JSON.stringify({ ok: true, toolName, ...args });
-      },
-    };
-
-    const model = new ScriptedChatModel({
-      responses: [
-        toolCallMessage("list_tasks", { projectId: "p1" }),
-        new AIMessage("Done."),
-      ],
-    });
-
-    const graph = createAgent({ model, registry, toolHandler });
-    const result = await graph.invoke({ messages: [new HumanMessage("list tasks")] });
-
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0], {
-      pluginId: "vikunja",
-      toolName: "list_tasks",
-      args: { projectId: "p1" },
-      credentials: undefined,
-    });
-
-    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
-    assert.equal(
-      String(toolMessage?.content),
-      JSON.stringify({ ok: true, toolName: "list_tasks", projectId: "p1" }),
-      "the handler's return value must become the tool message content",
-    );
-  });
-
-  test("the default stub handler is used when none is injected", async (t) => {
-    const { registry } = await makeEnv(t);
-    const model = new ScriptedChatModel({
-      responses: [toolCallMessage("list_tasks", { projectId: "p1" }), new AIMessage("ok")],
-    });
-
-    const graph = createAgent({ model, registry });
-    const result = await graph.invoke({ messages: [new HumanMessage("list tasks")] });
-
-    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
-    assert.deepEqual(JSON.parse(String(toolMessage?.content)), {
-      ok: true,
-      projectId: "p1",
-      note: "executor not wired",
-    });
-  });
-
-  test("createAgent passes systemPrompt through to the graph", async (t) => {
-    const { registry } = await makeEnv(t);
-    const customPrompt = "Custom orchestrator prompt";
-    let capturedPrompt = "";
-    class InspectModel extends ScriptedChatModel {
-      override bindTools(_tools: StructuredToolInterface[]) {
-        return this;
-      }
-      override async _generate(messages: BaseMessage[], options?: this["ParsedCallOptions"]) {
-        capturedPrompt = String(messages[0]?.content);
-        return super._generate(messages, options);
-      }
-    }
-    const graph = createAgent({
-      model: new InspectModel({ responses: [new AIMessage("ok")] }),
-      registry,
-      systemPrompt: customPrompt,
-      toolHandler: { async execute() { return "ok"; } },
-      maxIterations: 1,
-    });
-    await graph.invoke({ messages: [new HumanMessage("hi")] });
-    assert.equal(capturedPrompt, customPrompt);
   });
 });

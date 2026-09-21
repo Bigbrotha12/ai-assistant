@@ -89,6 +89,12 @@ export const toolPluginDefinitionSchema = z.object({
     description: z.string().trim().min(1),
     // A tool plugin with no tools is meaningless; require at least one.
     tools: z.array(toolDefinitionSchema).min(1),
+    // Read-only, zero-arg tools the gateway may pre-warm per owner (Phase 4
+    // warmups). Declared in plugin metadata instead of a hardcoded list so the
+    // admin's installed set controls what is warmed. Only `readOnly` tools with
+    // no required args are actually scheduled (defense in depth at schedule
+    // time too).
+    warmupTools: z.array(z.string()).optional(),
     baseUrls: z.array(baseUrlAllowlistEntrySchema),
     credentials: credentialSpecSchema.optional(),
   });
@@ -259,6 +265,8 @@ export interface PluginDefinition {
 export interface ToolPluginDefinition extends PluginDefinition {
   type: "tool";
   tools: ToolDefinition[];
+  /** Read-only, zero-arg tool names the gateway may pre-warm per owner. */
+  warmupTools?: string[];
   /** Allowlisted backend URLs the tools call */
   baseUrls: BaseUrlAllowlistEntry[];
   credentials?: CredentialSpec;

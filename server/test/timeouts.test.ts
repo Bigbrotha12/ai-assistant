@@ -121,7 +121,6 @@ describe("MCP abort handling", () => {
     };
     const binding = await bindMcpServers(
       [{ name: "slow-server", url: "https://mcp-slow.example.com" }],
-      undefined,
       { clientFactory: factory, signal: aborted },
     );
     assert.equal(binding.tools.length, 0);

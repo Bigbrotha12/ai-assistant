@@ -288,14 +288,25 @@ const cleanup = (name: string, dispose: () => void) => {
     console.error(`gateway: ${name} cleanup failed`);
   }
 };
-const shutdown = () => {
+const shutdown = async (): Promise<void> => {
   if (stopping) return;
   stopping = true;
+  // Stop accepting new requests first; the `stopping` middleware 503s anything
+  // new while in-flight requests drain. Bound the drain so a long-lived SSE
+  // stream can't hang shutdown forever.
+  const serverClosed = new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    setTimeout(resolve, 5_000).unref?.();
+  });
   cleanup("warmups", () => warmups.dispose());
   cleanup("jobs", () => jobRunner?.dispose());
   cleanup("plugin watcher", () => pluginRegistry.disposeWatch());
   cleanup("tool cache", () => toolCache.dispose());
-  cleanup("server", () => server.close());
+  await serverClosed;
+  // Close the encrypted checkpoint DB (WAL checkpoint + 0600 re-enforcement)
+  // and the ledger DB once no request can touch them anymore.
+  cleanup("checkpoint store", () => void checkpointStore?.close());
+  cleanup("ledger", () => ledger.close());
 };
 process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);

@@ -5,7 +5,8 @@ import type { BaseCheckpointSaver, CompiledStateGraph } from "@langchain/langgra
 import { createAgentGraph } from "../agents/graph.ts";
 import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
-import { jsonSchemaToZod } from "../agents/orchestrator.ts";
+import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
+import { jsonSchemaToZod, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { checkpointThreadId, redactForCheckpoint } from "../checkpoints/store.ts";
 import { env } from "../env.ts";
@@ -228,11 +229,18 @@ export class ToolExecutor implements ToolCallHandler {
       this.opts.resolveEndpoint ?? DEFAULT_ENDPOINT_RESOLVER;
     const url = await resolveEndpoint(pluginId, toolName, args, pinned);
     signal?.throwIfAborted();
+    // Bound every tool call (the model and MCP paths both have explicit
+    // timeouts; undici's fetch default alone would allow ~5 min stalls). A hung
+    // plugin backend must not wedge the thread mutex / budget slot / job fence
+    // that long.
+    const callSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(env.TOOL_CALL_TIMEOUT_MS)])
+      : AbortSignal.timeout(env.TOOL_CALL_TIMEOUT_MS);
     const response = await validatedFetch(
       url,
       {
         method: "POST",
-        signal,
+        signal: callSignal,
         headers: {
           "content-type": "application/json",
           ...buildAuthHeader(credentials),
@@ -623,70 +631,6 @@ function bindJobTool(
   });
 }
 
-function createJobExecution(signal: AbortSignal) {
-  const pending = new Set<Promise<unknown>>();
-  return {
-    signal,
-    async track<T>(run: () => Promise<T>): Promise<T> {
-      signal.throwIfAborted();
-      const work = Promise.resolve().then(() => {
-        signal.throwIfAborted();
-        return run();
-      });
-      pending.add(work);
-      try {
-        return await work;
-      } finally {
-        pending.delete(work);
-      }
-    },
-    async settle(): Promise<void> {
-      while (pending.size) await Promise.allSettled([...pending]);
-    },
-  };
-}
-
-function trackJobModelExecution(
-  model: BaseChatModel,
-  execution: ReturnType<typeof createJobExecution>,
-): void {
-  const seen = new WeakSet<object>();
-  const wrap = (candidate: unknown): void => {
-    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
-    seen.add(candidate);
-    if (!(candidate instanceof BaseChatModel)) {
-      if ("bound" in candidate) wrap(candidate.bound);
-      return;
-    }
-    const generate = candidate._generate.bind(candidate);
-    candidate._generate = (...args) => execution.track(() => generate(...args));
-    const chunks = candidate._streamResponseChunks.bind(candidate);
-    if (candidate._streamResponseChunks !== BaseChatModel.prototype._streamResponseChunks) {
-      candidate._streamResponseChunks = async function* (...args) {
-        let finish!: () => void;
-        const done = new Promise<void>((resolve) => { finish = resolve; });
-        const tracked = execution.track(() => done);
-        try {
-          execution.signal.throwIfAborted();
-          yield* chunks(...args);
-        } finally {
-          finish();
-          await tracked;
-        }
-      };
-    }
-    const bind = candidate.bindTools?.bind(candidate);
-    if (bind) {
-      candidate.bindTools = (...args) => {
-        const bound = bind(...args);
-        wrap(bound);
-        return bound;
-      };
-    }
-  };
-  wrap(model);
-}
-
 export class JobRunner {
   private readonly threadLocks: ThreadLockRegistry;
   private readonly deps: JobRunnerDeps;
@@ -905,8 +849,8 @@ export class JobRunner {
         assertActive: assertDispatch,
       });
       assertDispatch();
-      const execution = createJobExecution(signal);
-      trackJobModelExecution(model, execution);
+      const execution = createTrackedExecution(signal);
+      trackModelExecution(model, execution);
       const executor = this.deps.executor ?? this.createDefaultExecutor();
       const handler = descriptor.toolHandler ?? executor;
       const tools = bindJobTools({
@@ -927,24 +871,13 @@ export class JobRunner {
         allowMutatingRetry: !replaying,
       });
       const mcpBinding = descriptor.mcpServers
-        ? await bindMcpServers(descriptor.mcpServers, undefined, {
+        ? await bindMcpServers(descriptor.mcpServers, {
             signal,
             trustedHosts: env.MCP_TRUSTED_HOSTS,
           })
         : undefined;
       const mcpTools = mcpBinding?.tools ?? [];
-      const allTools: DynamicStructuredTool[] = [];
-      const seen = new Set<string>();
-      for (const t of [...tools, ...mcpTools]) {
-        if (seen.has(t.name)) {
-          if (mcpTools.includes(t)) {
-            console.warn(`[jobs] tool '${t.name}' defined by both a plugin and an MCP server; skipping MCP version`);
-          }
-          continue;
-        }
-        seen.add(t.name);
-        allTools.push(t);
-      }
+      const allTools = mergePluginAndMcpTools(tools, mcpTools, "[jobs]");
       const graph = compileGraphWithCheckpointer(
         createAgentGraph({
           model,
@@ -995,7 +928,12 @@ export class JobRunner {
           throw error;
         } finally {
           await execution.settle();
-          await mcpBinding?.dispose();
+          try {
+            await mcpBinding?.dispose();
+          } catch (err) {
+            // A rejected MCP close must never fail the job's cleanup path.
+            console.warn("[jobs] MCP binding dispose failed:", err);
+          }
         }
       });
       assertActive();

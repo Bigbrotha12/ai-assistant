@@ -342,7 +342,6 @@ export async function* toOpenAiSse(
         opts.onOutcome?.("failed");
         yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_MODEL, exhaustionCode(event.data.error));
         yield DONE_FRAME;
-        terminated = true;
         return;
       }
 
@@ -354,7 +353,6 @@ export async function* toOpenAiSse(
           TOOL_ERROR_CODE,
         );
         yield DONE_FRAME;
-        terminated = true;
         return;
       }
 
@@ -363,7 +361,6 @@ export async function* toOpenAiSse(
           opts.onOutcome?.("failed");
           yield errorFrame(redact(errorMessage(event.data.error)), ERROR_TYPE_SERVER, exhaustionCode(event.data.error));
           yield DONE_FRAME;
-          terminated = true;
           return;
         }
         break;
@@ -383,7 +380,6 @@ export async function* toOpenAiSse(
           yield finishFrame(finishReason, takeEnvelope());
           yield DONE_FRAME;
         }
-        terminated = true;
         return;
       }
 

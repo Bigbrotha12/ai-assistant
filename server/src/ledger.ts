@@ -898,5 +898,10 @@ export class Ledger {
     }
     return true;
   }
+
+  /** Closes the underlying SQLite handle (shutdown). Idempotent. */
+  close(): void {
+    this.db.close();
+  }
 }
 

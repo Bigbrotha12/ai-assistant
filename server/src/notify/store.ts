@@ -14,6 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isRecord } from "../util.ts";
 
 /**
  * Encrypted-at-rest store for per-owner ntfy push credentials (plan §
@@ -241,9 +242,4 @@ export class NotifyStore {
       );
     }
   }
-}
-
-/** True for a plain (non-null, non-array) object. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

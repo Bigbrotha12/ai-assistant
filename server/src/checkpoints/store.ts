@@ -131,17 +131,20 @@ export function applyCheckpointMigrations(
 }
 
 /**
- * Deterministic thread id for a conversation: `sha256(userId + clientThreadId)`
- * per the plan's transport-layer mapping. `userId` is the API-key referenceId
- * (from `requireApiKey`); the hash binds the thread to its owner, so an
- * unguessable id alone prevents cross-user thread access even before the
- * owner column is checked.
+ * Deterministic thread id for a conversation: `sha256(userId + "\n" +
+ * clientThreadId)` per the plan's transport-layer mapping. `userId` is the
+ * API-key referenceId (from `requireApiKey`); the hash binds the thread to its
+ * owner, so an unguessable id alone prevents cross-user thread access even
+ * before the owner column is checked. The `\n` delimiter between the two
+ * fields makes the pair unambiguous — without it, `(owner="ab", thread="c")`
+ * and `(owner="a", thread="bc")` would collide on the same concatenated
+ * string.
  */
 export function checkpointThreadId(
   userId: string,
   clientThreadId: string,
 ): string {
-  return createHash("sha256").update(userId + clientThreadId).digest("hex");
+  return createHash("sha256").update(`${userId}\n${clientThreadId}`).digest("hex");
 }
 
 export type HistoryMessage = {

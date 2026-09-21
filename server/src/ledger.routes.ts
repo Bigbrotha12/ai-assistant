@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { Hono } from "hono";
@@ -21,6 +21,10 @@ import type { VerifyApiKeyFn } from "./plugins/routes.ts";
 mkdirSync(dirname(env.LEDGER_DB_PATH), { recursive: true });
 const ledgerDb = new Database(env.LEDGER_DB_PATH);
 migrateLedger(ledgerDb);
+// The ledger persists user conversation content (`spec` = last user message
+// text, tool results in ledger_step.result), so its file must be hardened like
+// the sibling stores — SQLite creates it 0644 under a default umask otherwise.
+chmodSync(env.LEDGER_DB_PATH, 0o600);
 export const ledger = new Ledger(ledgerDb, {
   stuckTimeoutMs: env.LEDGER_STUCK_TIMEOUT_MS,
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,

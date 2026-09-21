@@ -1,8 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { auth } from "./auth.ts";
-import { env } from "./env.ts";
-import { createTokenBucketLimiter } from "./rate_limit.ts";
 
 export function extractBearerToken(header: string | null | undefined): string | null {
   const match = /^Bearer\s+(.+)$/i.exec((header ?? "").trim());
@@ -36,11 +34,6 @@ export async function requireApiKey(c: Context): Promise<string | null> {
 
 export const inferenceRoutes = new Hono();
 
-export const inferenceLimiter = createTokenBucketLimiter(
-  env.INFERENCE_RATE_LIMIT,
-  env.INFERENCE_RATE_BURST,
-);
-
 inferenceRoutes.get("/auth/check", async (c) => {
   const apiKey = await requireApiKey(c);
   if (!apiKey) return unauthorized(c);
@@ -51,8 +44,8 @@ inferenceRoutes.get("/auth/check", async (c) => {
 // moved to `src/transport/chat.ts` (createChatRoutes), which builds a LangChain
 // agent from the installed MODEL plugin + per-request credentials and streams
 // SSE via the transport adapter, instead of proxying INFERENCE_URL. The shared
-// seams below (`extractBearerToken`, `inferenceLimiter`, `requireApiKey`,
-// `unauthorized`) stay here because sibling transports import them.
+// seams below (`extractBearerToken`, `requireApiKey`, `unauthorized`) stay here
+// because sibling transports import them.
 // NOTE: `GET /v1/models` was REMOVED here in Phase 3, Wave B — it moved to
 // `src/transport/models.ts` (createModelsRoutes), which serves the installed
 // MODEL plugins (incl. visionCapable) instead of proxying INFERENCE_URL. This

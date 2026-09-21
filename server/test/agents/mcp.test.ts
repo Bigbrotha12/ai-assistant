@@ -80,7 +80,6 @@ describe("mcp", () => {
     );
     const binding = await bindMcpServers(
       [{ name: "test-server", url: "https://mcp.example.com" }],
-      undefined,
       { clientFactory: factory },
     );
 
@@ -105,7 +104,6 @@ describe("mcp", () => {
     );
     const binding = await bindMcpServers(
       [{ name: "test-server", url: "https://mcp.example.com" }],
-      undefined,
       { clientFactory: factory },
     );
 
@@ -129,7 +127,6 @@ describe("mcp", () => {
         { name: "failing-server", url: "https://mcp-fail.example.com" },
         { name: "good-server", url: "https://mcp-good.example.com" },
       ],
-      undefined,
       { clientFactory: factory },
     );
 
@@ -165,7 +162,6 @@ describe("mcp", () => {
     );
     const binding = await bindMcpServers(
       [{ name: "test-server", url: "https://mcp.example.com" }],
-      undefined,
       { clientFactory: factory },
     );
 
@@ -192,7 +188,6 @@ describe("mcp", () => {
     );
     const binding = await bindMcpServers(
       [{ name: "test-server", url: "https://mcp.example.com" }],
-      undefined,
       { clientFactory: factory },
     );
 
@@ -215,7 +210,6 @@ describe("mcp", () => {
         { name: "a", url: "https://a.example.com" },
         { name: "b", url: "https://b.example.com" },
       ],
-      undefined,
       { clientFactory: factory },
     );
 

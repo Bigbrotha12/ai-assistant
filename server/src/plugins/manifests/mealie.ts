@@ -33,6 +33,7 @@ const parsed = pluginDefinitionSchema.parse({
   credentials: {
     apiKey: { label: "Personal access token", required: true },
   },
+  warmupTools: ["search_recipes"],
   tools: [
     {
       name: "get_random_recipe",

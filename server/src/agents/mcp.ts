@@ -153,14 +153,37 @@ async function defaultSseClientFactory(
       dispatcher: agent,
     } as unknown as RequestInit);
   };
+  const connectController = new AbortController();
+  const connectSignal = deps.signal
+    ? AbortSignal.any([deps.signal, connectController.signal])
+    : connectController.signal;
   const transport = new SSEClientTransport(new URL(server.url), {
-    requestInit: { headers: server.headers, signal: deps.signal },
+    requestInit: { headers: server.headers, signal: connectSignal },
     fetch: mcpFetch,
   });
   const client = new Client({ name: "ai-assistant-gateway", version: "0.1.0" });
+  // The MCP_CALL_TIMEOUT_MS guard covers the JSON-RPC calls (listTools/
+  // callTool) but NOT the SSE handshake — a reachable-but-unresponsive server
+  // would otherwise hold the request (and, in the runner, the per-thread
+  // mutex) until the client aborts. Race connect against the same timeout and
+  // abort the underlying SSE fetch on timeout. The timer/controller is cleared
+  // once the handshake resolves so the long-lived SSE stream stays live.
+  let connectTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await client.connect(transport);
+    const connectPromise = client.connect(transport);
+    const timeout = new Promise<never>((_, reject) => {
+      connectTimer = setTimeout(() => {
+        connectController.abort();
+        reject(new McpError(`MCP connect to '${server.name}' timed out after ${env.MCP_CALL_TIMEOUT_MS}ms`));
+      }, env.MCP_CALL_TIMEOUT_MS);
+    });
+    connectTimer?.unref?.();
+    await Promise.race([connectPromise, timeout]);
+    if (connectTimer) clearTimeout(connectTimer);
+    connectTimer = undefined;
   } catch (err) {
+    if (connectTimer) clearTimeout(connectTimer);
+    connectController.abort();
     await agent.destroy().catch(() => {});
     throw new McpError(err instanceof Error ? err.message : String(err));
   }
@@ -188,7 +211,6 @@ async function defaultSseClientFactory(
 
 export async function bindMcpServers(
   mcpServers: McpServerConfig[],
-  _credentials?: Record<string, string>,
   opts?: {
     signal?: AbortSignal;
     trustedHosts?: readonly string[];
@@ -244,7 +266,9 @@ export async function bindMcpServers(
   return {
     tools,
     dispose: async () => {
-      for (const d of disposers) await d();
+      // One failing close must never prevent the remaining servers from being
+      // closed (a rejected close would otherwise hang the caller's dispose).
+      await Promise.allSettled(disposers.map((d) => d()));
     },
   };
 }
