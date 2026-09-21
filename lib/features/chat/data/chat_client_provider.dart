@@ -6,6 +6,7 @@ import '../../../core/http/dio_provider.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../plugins/data/agent_config.dart';
 import '../../plugins/data/plugin_credentials_providers.dart';
+import '../../plugins/data/plugin_credentials_store.dart';
 import '../../settings/data/settings_providers.dart';
 import 'chat_client.dart';
 import 'gateway_chat_client.dart';
@@ -25,12 +26,35 @@ final chatApiClientProvider = Provider<ChatClient>((ref) {
     dio: ref.watch(dioProvider),
     credentialResolver: () async {
       final auth = ref.read(authCredentialsProvider).value;
-      final pluginCreds = ref.read(pluginCredentialsProvider).value;
-      if (auth == null || auth.apiKey.trim().isEmpty || pluginCreds == null) {
+      // No stored session/API key: the app is simply not authenticated. Throw
+      // so chat/voice map this to the re-auth login flow (a plain `null` here
+      // would surface as a generic "Not authenticated" network error instead).
+      if (auth == null || auth.apiKey.trim().isEmpty) {
+        throw const ChatAuthRequiredError('Not authenticated');
+      }
+      // Await the per-account plugin configuration instead of reading its
+      // current snapshot: the provider is autoDisposed, so a cold read is
+      // often mid-build with a null `.value` and would surface as a bogus
+      // "plugin configuration unavailable" error even when nothing is wrong.
+      final PluginAccountConfiguration pluginCreds;
+      try {
+        pluginCreds = await ref.read(pluginCredentialsProvider.future);
+      } on PluginReauthenticationRequired {
+        throw const ChatAuthRequiredError(
+          'Sign in again to configure plugins for this account.',
+        );
+      } catch (_) {
         return null;
       }
       final selected = pluginCreds.selectedModel;
-      if (selected == null) return null;
+      // No model is configured for this account yet. Throw a descriptive error
+      // instead of returning null, so chat/voice don't surface the misleading
+      // "Not authenticated" message for a configuration gap.
+      if (selected == null) {
+        throw const ChatNetworkError(
+          'No model selected. Configure one under Settings → Plugins.',
+        );
+      }
 
       final selectedAgent = pluginCreds.selectedAgent;
       final agentConfig = selectedAgent != null
@@ -67,7 +91,11 @@ final chatApiClientProvider = Provider<ChatClient>((ref) {
         }
       }
 
-      if (!credentials.containsKey(selected)) return null;
+      if (!credentials.containsKey(selected)) {
+        throw const ChatNetworkError(
+          'No API key saved for the selected model. Add one under Settings → Plugins.',
+        );
+      }
 
       final agent = agentConfig != null && agentConfig.kind == AgentKind.custom
           ? <String, dynamic>{

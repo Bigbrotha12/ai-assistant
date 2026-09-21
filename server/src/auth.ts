@@ -4,6 +4,7 @@ import { bearer } from "better-auth/plugins";
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { sendPasswordResetMail } from "./email.ts";
 import { env } from "./env.ts";
 
 mkdirSync(dirname(env.DB_PATH), { recursive: true });
@@ -20,6 +21,16 @@ export const auth = betterAuth({
     enabled: true,
     minPasswordLength: 8,
     autoSignIn: true,
+    // Route the email to our own reset page (`GET /reset-password?token=…`,
+    // served by the Hono app) instead of better-auth's `/api/auth` callback
+    // redirect — the app has no deep-link handling, so the emailed link must
+    // land on a page the token can be entered into.
+    sendResetPassword: async ({ user, token }) => {
+      await sendPasswordResetMail({
+        to: user.email,
+        url: `${env.BETTER_AUTH_URL}/reset-password?token=${token}`,
+      });
+    },
   },
   advanced: {
     cookiePrefix: "ai-assistant",

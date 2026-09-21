@@ -929,12 +929,13 @@ async function handleSyncStream(
       });
     },
   }, resolved.value.enabledPlugins);
-  const mcpTools = resolved.value.agentOverride?.mcpServers
+  const mcpBinding = resolved.value.agentOverride?.mcpServers
     ? await bindMcpServers(resolved.value.agentOverride.mcpServers, undefined, {
         signal: execution.signal,
-        trustedHosts: opts.trustedHosts,
+        trustedHosts: env.MCP_TRUSTED_HOSTS,
       })
-    : [];
+    : undefined;
+  const mcpTools = mcpBinding?.tools ?? [];
   const allTools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
   for (const t of [...pluginTools, ...mcpTools]) {
@@ -1065,6 +1066,7 @@ async function handleSyncStream(
         managedAdmission ? (outcome) => {
           opts.ledger!.completeTask(managedAdmission!.task.id, owner, outcome, managedAdmission!.task.fence_token);
         } : undefined,
+        mcpBinding?.dispose,
       );
       if (managed) {
         stream.headers.set("x-thread-id", effectiveClientThreadId!);
@@ -1164,6 +1166,8 @@ async function handleSyncStream(
       execution,
       reservation.release,
       afterStream,
+      undefined,
+      mcpBinding?.dispose,
     );
   } catch (err) {
     reservation.release();
@@ -1723,6 +1727,7 @@ function buildStreamResponse(
   onRelease?: () => void,
   onAfterStream?: () => void | Promise<void>,
   onOutcome?: (outcome: "succeeded" | "failed" | "cancelled") => void,
+  disposeMcp?: () => Promise<void>,
 ): Response {
   const events = graph.streamEvents(input, { ...streamOptions, signal: execution.signal });
   let streamFailed = false;
@@ -1776,6 +1781,7 @@ function buildStreamResponse(
           await execution.settle();
           finalize();
           onRelease?.();
+          await disposeMcp?.();
           if (!cancelled && !errored) controller.close();
         }
       })();

@@ -125,6 +125,48 @@ void main() {
       );
     });
 
+    test('maps a 422 duplicate-email sign-up to AuthEmailTaken with its code',
+        () async {
+      // better-auth (1.7.x) rejects a duplicate sign-up with 422 and an
+      // explicit USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL code.
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/sign-up/email',
+        (r) => r.reply(422, {
+          'message': 'User already exists. Use another email.',
+          'code': 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
+        throwsA(
+          isA<AuthEmailTaken>()
+              .having((e) => e.statusCode, 'statusCode', 422)
+              .having((e) => e.code, 'code', 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL'),
+        ),
+      );
+    });
+
+    test('maps a 400 password-policy violation to AuthInvalidCredentials', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/sign-up/email',
+        (r) => r.reply(400, {
+          'message': 'Password too short',
+          'code': 'PASSWORD_TOO_SHORT',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
+        throwsA(
+          isA<AuthInvalidCredentials>()
+              .having((e) => e.code, 'code', 'PASSWORD_TOO_SHORT'),
+        ),
+      );
+    });
+
     test('throws AuthServerError on a 500 response', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
@@ -201,6 +243,30 @@ void main() {
       await expectLater(
         _client(dio).signIn(email: 'a@b.c', password: 'wrong'),
         throwsA(isA<AuthUnauthorized>()),
+      );
+    });
+
+    test('maps a 401 INVALID_EMAIL_OR_PASSWORD sign-in to AuthInvalidCredentials',
+        () async {
+      // Wrong credentials surface as 401 with an explicit code; this is a
+      // credential error ("Incorrect email or password"), not a session
+      // rejection.
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/sign-in/email',
+        (r) => r.reply(401, {
+          'message': 'Invalid email or password',
+          'code': 'INVALID_EMAIL_OR_PASSWORD',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).signIn(email: 'a@b.c', password: 'wrong'),
+        throwsA(
+          isA<AuthInvalidCredentials>()
+              .having((e) => e.statusCode, 'statusCode', 401)
+              .having((e) => e.code, 'code', 'INVALID_EMAIL_OR_PASSWORD'),
+        ),
       );
     });
   });
@@ -299,6 +365,67 @@ void main() {
       expect(req.headers['Authorization'], 'Bearer tok-3');
       final body = req.data as Map<String, dynamic>;
       expect(body['keyId'], 'key-9');
+    });
+  });
+
+  group('requestPasswordReset', () {
+    test('posts the email to the request endpoint and reads status', () async {
+      final adapter = _CaptureAdapter(body: {'status': true});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await _client(dio).requestPasswordReset(email: 'a@b.c');
+
+      final req = adapter.requests.single;
+      expect(req.path, '$_base/api/auth/request-password-reset');
+      final body = req.data as Map<String, dynamic>;
+      expect(body['email'], 'a@b.c');
+    });
+
+    test('always succeeds for a 200 status true (even an unknown account)',
+        () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/request-password-reset',
+        (r) => r.reply(200, {
+          'status': true,
+          'message': 'If this email exists in our system, check your email for the reset link',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).requestPasswordReset(email: 'ghost@example.com'),
+        completes,
+      );
+    });
+
+    test('throws AuthServerError when the response status is not true',
+        () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/request-password-reset',
+        (r) => r.reply(200, {'status': false}),
+      );
+
+      await expectLater(
+        _client(dio).requestPasswordReset(email: 'a@b.c'),
+        throwsA(isA<AuthServerError>()),
+      );
+    });
+
+    test('maps a 422 validation error to AuthInvalidCredentials', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/request-password-reset',
+        (r) => r.reply(422, {
+          'message': 'Invalid email',
+          'code': 'VALIDATION_ERROR',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).requestPasswordReset(email: 'not-an-email'),
+        throwsA(isA<AuthInvalidCredentials>()),
+      );
     });
   });
 

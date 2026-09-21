@@ -344,6 +344,34 @@ void main() {
     expect(find.byType(ReauthCard), findsNothing);
   });
 
+  testWidgets('missing credentials render the ReauthCard, not an error banner',
+      (tester) async {
+    final store = FakeSettingsStore(
+      stored: const BackendSettings(host: 'myhost'),
+    );
+    // No stored session/API key: the credential resolver throws a
+    // ChatAuthRequiredError before any network call. The UI must treat it
+    // exactly like a gateway 401 and show the login flow.
+    final client = FakeChatClient()
+      ..error = const ChatAuthRequiredError('Not authenticated');
+    await tester.pumpWidget(chatApp(
+      store: store,
+      probe: FakeProbe(),
+      chatStore: FakeChatStore(),
+      client: client,
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'Hello');
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ReauthCard), findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+    expect(find.text('Session expired'), findsOneWidget);
+  });
+
   testWidgets('History screen lists conversations and delete removes one',
       (tester) async {
     final now = DateTime.now();

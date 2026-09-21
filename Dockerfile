@@ -1,9 +1,12 @@
 # Multi-stage build for the LangChain gateway.
 # The server uses tsx as a TypeScript loader (tsc has noEmit: true).
 # Runtime entry: tsx src/index.ts
+# Base is Debian ("-slim"), NOT Alpine: better-sqlite3 and
+# better-sqlite3-multiple-ciphers ship glibc prebuilt bindings, and Alpine
+# (musl) cannot load them (ERR_DLOPEN_FAILED / missing ld-linux-x86-64.so.2).
 
 # ---- Builder stage: install npm dependencies ----
-FROM node:22-alpine AS builder
+FROM node:22-slim AS builder
 WORKDIR /app
 
 # Install ALL deps (including tsx from devDependencies — needed at runtime)
@@ -13,7 +16,7 @@ RUN npm ci
 COPY server .
 
 # ---- Production stage ----
-FROM node:22-alpine
+FROM node:22-slim
 
 # CONFIG_DIR drives skills/agents/mcp catalog paths (see src/catalog/index.ts)
 ENV NODE_ENV=production

@@ -101,13 +101,23 @@ class BackendConfig {
     return uri.replace(scheme: env.scheme).toString();
   }
 
-  /// Gateway origin for the LangChain gateway: `host:17600`. Chat, voice, and
-  /// vision inference now route through the gateway (see AGENTS.md).
+  /// The TCP port for [devPort] in the given environment. Dev serves the
+  /// backend on fixed non-443 ports over http; production exposes it behind a
+  /// standard HTTPS ingress, so no explicit port is emitted (443 implied by
+  /// the `https` scheme anyway).
+  static int? _servicePort(int devPort, BackendEnvironment? environment) =>
+      (environment ?? defaultEnvironment) == BackendEnvironment.production
+          ? null
+          : devPort;
+
+  /// Gateway origin: dev `host:17600` over http, production
+  /// `https://host` (443). Chat, voice, and vision inference route through the
+  /// gateway (see AGENTS.md).
   static Uri gatewayBase(String host, {BackendEnvironment? environment}) =>
       Uri(
         scheme: _scheme(environment),
         host: _sanitizeAuthority(host),
-        port: 17600,
+        port: _servicePort(17600, environment),
       );
 
   /// Normalises a user-entered or stored authority so the service URI builders
@@ -143,7 +153,7 @@ class BackendConfig {
       Uri(
         scheme: _scheme(environment),
         host: _sanitizeAuthority(host),
-        port: 17601,
+        port: _servicePort(17601, environment),
       );
 
   /// files service: bearer-gated upload/list/fetch/delete.
@@ -151,7 +161,7 @@ class BackendConfig {
       Uri(
         scheme: _scheme(environment),
         host: _sanitizeAuthority(host),
-        port: 17603,
+        port: _servicePort(17603, environment),
       );
 
   static String _scheme(BackendEnvironment? environment) =>

@@ -7,6 +7,7 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart'
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
+import 'package:ai_assistant/features/plugins/data/agent_config.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_catalog_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
@@ -122,11 +123,11 @@ test(
         container.read(pluginCredentialsEpochProvider),
         greaterThan(oldEpoch),
       );
-      // New scope is seeded with the 'default' agent plugin by
-      // ensureDefaultAgent; the original 'one' plugin is not carried over.
+      // No agent templates exist, so nothing is fabricated for the new scope;
+      // the original 'one' plugin is not carried over.
       expect(
         (await container.read(pluginCredentialsProvider.future)).plugins,
-        isNotEmpty,
+        isEmpty,
       );
       expect(
         (await container.read(pluginCredentialsProvider.future)).plugins.keys,
@@ -139,10 +140,11 @@ test(
       await container
           .read(authCredentialsProvider.notifier)
           .save(credentials('a', key: 'rotated'));
-      // Scope 'a' still has its earlier seeded 'default' agent.
+      // Scope 'a' had its plugin store cleared on the owner switch and no
+      // agent templates exist, so nothing is fabricated back.
       expect(
         (await container.read(pluginCredentialsProvider.future)).plugins,
-        isNotEmpty,
+        isEmpty,
       );
       await container.read(authCredentialsProvider.notifier).clear();
       await expectLater(
@@ -263,16 +265,34 @@ test(
   );
 
   test(
-    'seeding falls back to default when the template fetch fails',
+    'seeding adopts the default template when a model is set but no agent',
+    () async {
+      registry.templates = [
+        {'id': 'voice-assistant', 'name': 'Voice Assistant'},
+      ];
+      final scope = credentials('a').accountScope!;
+      await store.setCredentials(scope, 'openrouter', {'apiKey': 'sk-x'});
+      await store.setSelectedModel(scope, 'openrouter');
+      final config = await container.read(pluginCredentialsProvider.future);
+      expect(config.selectedModel, 'openrouter');
+      expect(config.selectedAgent, 'voice-assistant');
+      expect(
+        config.plugins['voice-assistant']!.agent!.kind,
+        AgentKind.template,
+      );
+    },
+  );
+
+  test(
+    'seeding leaves the store empty when the template fetch fails',
     () async {
       registry.error = DioException(
         requestOptions: RequestOptions(path: '/v1/agents'),
         type: DioExceptionType.connectionError,
       );
       final config = await container.read(pluginCredentialsProvider.future);
-      expect(config.plugins.keys, ['default']);
-      expect(config.plugins['default']!.agent!.id, 'default');
-      expect(config.selectedAgent, 'default');
+      expect(config.plugins, isEmpty);
+      expect(config.selectedAgent, isNull);
     },
   );
 }

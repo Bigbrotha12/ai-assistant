@@ -1,9 +1,16 @@
 import { DynamicStructuredTool } from "@langchain/core/tools";
+import { Client } from "@modelcontextprotocol/sdk/client";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { z } from "zod";
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
-import { validatedFetch } from "../plugins/ssrf.ts";
+import {
+  buildPinnedAgent,
+  normalizeHostname,
+  resolveAndValidateHost,
+  validateStaticUrl,
+} from "../plugins/ssrf.ts";
 import type { JsonSchema } from "../plugins/types.ts";
 
 export type McpServerConfig = {
@@ -21,78 +28,55 @@ export class McpError extends Error {
   }
 }
 
-export async function mcpCall(
-  url: string,
-  method: string,
-  params: Record<string, unknown> | undefined,
-  opts: {
-    headers?: Record<string, string>;
-    signal?: AbortSignal;
-    trustedHosts?: readonly string[];
+export type McpTool = {
+  name: string;
+  description?: string;
+  inputSchema?: JsonSchema;
+};
+
+export type McpCallResult = {
+  content?: { type?: string; text?: string }[];
+};
+
+/**
+ * A connected MCP client. The default implementation speaks the SSE transport
+ * over a pinned, SSRF-validated connection; tests substitute a fake so the
+ * tool-binding logic is exercised without a real server.
+ */
+export type McpClientLike = {
+  listTools: () => Promise<{ tools: McpTool[] }>;
+  callTool: (params: { name: string; arguments: Record<string, unknown> }) => Promise<McpCallResult>;
+  close: () => Promise<void>;
+};
+
+export type McpClientFactory = (
+  server: McpServerConfig,
+  deps: {
+    trustedHosts: readonly string[];
     lookup?: LookupFn;
-    fetchFn?: typeof fetch;
     mode?: Mode;
+    signal?: AbortSignal;
   },
-): Promise<unknown> {
-  const body = JSON.stringify({
-    jsonrpc: "2.0",
-    method,
-    params,
-    id: 1,
-  });
+) => Promise<McpClientLike>;
 
-  // Combine the caller's signal with a per-call timeout so a hung MCP server
-  // cannot block the request indefinitely.
-  const timeoutSignal = AbortSignal.timeout(env.MCP_CALL_TIMEOUT_MS);
-  const combined = opts.signal
-    ? AbortSignal.any([opts.signal, timeoutSignal])
-    : timeoutSignal;
+export type McpBinding = {
+  tools: DynamicStructuredTool[];
+  dispose: () => Promise<void>;
+};
 
-  try {
-    const response = await validatedFetch(
-      url,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          ...opts.headers,
-        },
-        body,
-        signal: combined,
-      },
-      {
-        trustedHosts: opts.trustedHosts,
-        lookup: opts.lookup,
-        fetchFn: opts.fetchFn,
-        mode: opts.mode,
-      },
-    );
+/**
+ * Map a JSON schema to a Zod schema for a tool's arguments. MCP tool schemas
+ * frequently omit a top-level `type` (e.g. `{ properties: {...} }`), so the
+ * shape is inferred from `properties`/`items` when absent. Only genuinely
+ * unrecognized `type` values fall back to `z.any()` (and warn) — an empty or
+ * inferable schema maps cleanly without a warning.
+ */
+export function jsonSchemaToZod(schema: JsonSchema): z.ZodType {
+  const rawType = typeof schema.type === "string" ? schema.type : undefined;
+  const inferred =
+    rawType ?? (schema.properties ? "object" : schema.items ? "array" : undefined);
 
-    if (!response.ok) {
-      throw new McpError(`MCP server returned ${response.status}`);
-    }
-
-    const json: unknown = await response.json();
-    if (typeof json === "object" && json !== null && "error" in json) {
-      const err = (json as { error: { message?: string } }).error;
-      throw new McpError(`MCP error: ${err.message ?? JSON.stringify(err)}`);
-    }
-    return (json as { result: unknown }).result;
-  } catch (err) {
-    if (err instanceof McpError) throw err;
-    if (
-      err instanceof DOMException &&
-      (err.name === "AbortError" || err.name === "TimeoutError")
-    ) {
-      throw new McpError(`MCP call to ${url} timed out`);
-    }
-    throw err;
-  }
-}
-
-function jsonSchemaToZod(schema: JsonSchema): z.ZodType {
-  switch (schema.type) {
+  switch (inferred) {
     case "object": {
       const properties = schema.properties ?? {};
       const entries = Object.entries(properties).map(([key, prop]) => {
@@ -106,14 +90,20 @@ function jsonSchemaToZod(schema: JsonSchema): z.ZodType {
       return z.string();
     case "number":
       return z.number();
+    case "integer":
+      return z.number().int();
     case "boolean":
       return z.boolean();
-    case "array":
-      return z.array(withDescription(jsonSchemaToZod(schema.items ?? {}), schema));
+    case "array": {
+      const items = schema.items ?? {};
+      return z.array(withDescription(jsonSchemaToZod(items), items));
+    }
+    case "null":
+      return z.null();
     default: {
-      logger.warn(
-        `[mcp] tool schema: unmapped JSON schema type '${String(schema.type)}' → z.any()`,
-      );
+      if (rawType !== undefined) {
+        logger.warn(`[mcp] tool schema: unrecognized type '${rawType}' → z.any()`);
+      }
       return z.any();
     }
   }
@@ -123,6 +113,79 @@ function withDescription(field: z.ZodType, schema: JsonSchema): z.ZodType {
   return schema.description ? field.describe(schema.description) : field;
 }
 
+/**
+ * Default client: opens an SSRF-pinned SSE session to the MCP server. The
+ * pinned Agent is kept open for the lifetime of the session (the SSE stream is
+ * long-lived) and destroyed on close — it must NOT be closed right after the
+ * initial response, which would kill the stream.
+ */
+async function defaultSseClientFactory(
+  server: McpServerConfig,
+  deps: {
+    trustedHosts: readonly string[];
+    lookup?: LookupFn;
+    mode?: Mode;
+    signal?: AbortSignal;
+  },
+): Promise<McpClientLike> {
+  const trusted = deps.trustedHosts;
+  const parsed = validateStaticUrl(server.url, {
+    trustedHosts: trusted,
+    httpAllowedHosts: trusted,
+    mode: deps.mode,
+  });
+  const hostname = normalizeHostname(parsed.hostname);
+  const pinned = await resolveAndValidateHost(hostname, {
+    trustedHosts: trusted,
+    lookup: deps.lookup,
+  });
+  const agent = buildPinnedAgent(hostname, parsed, pinned);
+  const mcpFetch = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    validateStaticUrl(url, {
+      trustedHosts: trusted,
+      httpAllowedHosts: trusted,
+      mode: deps.mode,
+    });
+    return globalThis.fetch(url, {
+      ...init,
+      redirect: "manual",
+      dispatcher: agent,
+    } as unknown as RequestInit);
+  };
+  const transport = new SSEClientTransport(new URL(server.url), {
+    requestInit: { headers: server.headers, signal: deps.signal },
+    fetch: mcpFetch,
+  });
+  const client = new Client({ name: "ai-assistant-gateway", version: "0.1.0" });
+  try {
+    await client.connect(transport);
+  } catch (err) {
+    await agent.destroy().catch(() => {});
+    throw new McpError(err instanceof Error ? err.message : String(err));
+  }
+  return {
+    listTools: async () => {
+      const r = await client.listTools(undefined, { timeout: env.MCP_CALL_TIMEOUT_MS });
+      return {
+        tools: (r.tools ?? []).map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema as JsonSchema,
+        })),
+      };
+    },
+    callTool: async (params: { name: string; arguments: Record<string, unknown> }) => {
+      const r = await client.callTool(params, undefined, { timeout: env.MCP_CALL_TIMEOUT_MS });
+      return { content: r.content as McpCallResult["content"] };
+    },
+    close: () => {
+      void agent.destroy().catch(() => {});
+      return client.close();
+    },
+  };
+}
+
 export async function bindMcpServers(
   mcpServers: McpServerConfig[],
   _credentials?: Record<string, string>,
@@ -130,31 +193,26 @@ export async function bindMcpServers(
     signal?: AbortSignal;
     trustedHosts?: readonly string[];
     lookup?: LookupFn;
-    fetchFn?: typeof fetch;
     mode?: Mode;
+    clientFactory?: McpClientFactory;
   },
-): Promise<DynamicStructuredTool[]> {
+): Promise<McpBinding> {
   const tools: DynamicStructuredTool[] = [];
+  const disposers: Array<() => Promise<void>> = [];
+  const factory = opts?.clientFactory ?? defaultSseClientFactory;
   for (const server of mcpServers) {
+    if (opts?.signal?.aborted) break;
+    let bound: McpClientLike | undefined;
     try {
-      await mcpCall(server.url, "initialize", {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "ai-assistant-gateway", version: "0.1.0" },
-      }, { ...opts, headers: server.headers });
-
-      const result = await mcpCall(server.url, "tools/list", undefined, {
-        ...opts,
-        headers: server.headers,
+      const client = await factory(server, {
+        trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
+        lookup: opts?.lookup,
+        mode: opts?.mode,
+        signal: opts?.signal,
       });
-
-      const mcpTools = ((result as { tools?: unknown[] })?.tools ?? []) as {
-        name: string;
-        description?: string;
-        inputSchema?: JsonSchema;
-      }[];
-
-      for (const tool of mcpTools) {
+      bound = client;
+      const listed = await client.listTools();
+      for (const tool of listed.tools) {
         if (!tool.name) continue;
 
         const schema = tool.inputSchema
@@ -167,27 +225,26 @@ export async function bindMcpServers(
             description: tool.description ?? "",
             schema,
             func: async (args: Record<string, unknown>) => {
-              const callResult = (await mcpCall(server.url, "tools/call", {
-                name: tool.name,
-                arguments: args,
-              }, {
-                ...opts,
-                headers: server.headers,
-                signal: opts?.signal,
-              })) as { content?: { type?: string; text?: string }[] };
-
-              const content = callResult?.content ?? [];
+              const result = await client.callTool({ name: tool.name, arguments: args });
+              const content = result.content ?? [];
               return content.map((c) => c.text ?? "").join("\n");
             },
           }),
         );
       }
+      disposers.push(() => client.close());
     } catch (err) {
+      await bound?.close().catch(() => {});
       logger.warn(
         `[mcp] failed to bind tools from server '${server.name}':`,
         err instanceof McpError ? err.message : err,
       );
     }
   }
-  return tools;
+  return {
+    tools,
+    dispose: async () => {
+      for (const d of disposers) await d();
+    },
+  };
 }

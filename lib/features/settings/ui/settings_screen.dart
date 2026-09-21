@@ -22,7 +22,7 @@ import '../../voice/data/voice_settings.dart';
 import '../../voice/ui/voice_settings_providers.dart';
 import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
-import '../../auth/ui/auth_flow.dart';
+import '../../auth/ui/sign_in_screen.dart';
 import '../../plugins/ui/plugins_screen.dart';
 
 /// App home screen: configure the gateway host for account services and
@@ -50,17 +50,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   /// Dev vs production environment; saved together with the backend form and
   /// drives the http/https scheme used by every derived backend URI.
   BackendEnvironment _environment = BackendConfig.defaultEnvironment;
-
-  /// Whether the account re-auth form ([AuthFlow]) is revealed in the Account
-  /// section, and (when it is) whether it was opened by "Rotate key".
-  bool _authFlowVisible = false;
-  bool _authFlowForRotation = false;
-
-  /// The key id / session token of the credentials being rotated, captured
-  /// when "Rotate key" is tapped so the superseded key can be revoked once the
-  /// rotation succeeds (the fresh session replaces them in the store).
-  String? _rotationOldKeyId;
-  String? _rotationOldSessionToken;
 
   /// Guards controller listeners until after [initState], when a setState()
   /// triggered by the initial field population is no longer needed.
@@ -253,19 +242,35 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  /// Shared AuthFlow completion handler for both "Sign in" and "Rotate key".
-  /// The key was already minted and persisted by [AuthFlow]; here we only
-  /// revoke the superseded key (rotation), collapse the form and confirm.
-  Future<void> _onAuthSuccess(AuthSession session) async {
-    final wasRotation = _authFlowForRotation;
-    final oldKeyId = _rotationOldKeyId;
-    final oldSessionToken = _rotationOldSessionToken;
-    setState(() {
-      _authFlowVisible = false;
-      _authFlowForRotation = false;
-      _rotationOldKeyId = null;
-      _rotationOldSessionToken = null;
-    });
+  /// Opens the dedicated [SignInScreen] and hands its returned [AuthSession]
+  /// (or null when the user backed out) to [_onAuthSuccess]. For rotation, the
+  /// superseded key id + session token are captured here, before the screen is
+  /// pushed, so they can be revoked once the fresh session arrives.
+  Future<void> _openAccount({required bool rotation}) async {
+    final oldKeyId = rotation ? ref.read(authCredentialsProvider).value?.keyId : null;
+    final oldSessionToken =
+        rotation ? ref.read(authCredentialsProvider).value?.sessionToken : null;
+    final session = await Navigator.of(context).push<AuthSession>(
+      MaterialPageRoute(builder: (_) => SignInScreen(rotation: rotation)),
+    );
+    if (session == null || !mounted) return;
+    await _onAuthSuccess(
+      session,
+      wasRotation: rotation,
+      oldKeyId: oldKeyId,
+      oldSessionToken: oldSessionToken,
+    );
+  }
+
+  /// Completion handler for a successful sign-in or key rotation. The key was
+  /// already minted and persisted by [AuthFlow] inside [SignInScreen]; here we
+  /// only revoke the superseded key (rotation) and confirm.
+  Future<void> _onAuthSuccess(
+    AuthSession session, {
+    required bool wasRotation,
+    String? oldKeyId,
+    String? oldSessionToken,
+  }) async {
     if (wasRotation) {
       // Best-effort server cleanup: revoke the superseded key (using the
       // fresh session, which belongs to the same account) and sign the old
@@ -297,7 +302,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   /// fail-closed: if local cleanup fails the user is offered a retry and no
   /// stale account state lingers.
   Future<void> _signOut() async {
-    setState(() => _authFlowVisible = false);
     final creds = ref.read(authCredentialsProvider).value;
     // Snapshot the client (and creds) before any await: if the backend origin
     // changes mid-flight, the old key must never be sent to the new origin.
@@ -771,10 +775,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   /// "Account" section: signed-in email (or a sign-in prompt) with Sign out /
-  /// Rotate key actions. The shared [AuthFlow] mints and persists a fresh API
-  /// key on success, so this section only reacts to the stored credentials.
-  /// Appended at the end of the list so the text-field indices used by the
-  /// settings tests stay stable.
+  /// Rotate key actions. Signing in and rotating keys open the dedicated
+  /// [SignInScreen]; the shared [AuthFlow] inside it mints and persists a
+  /// fresh API key on success, so this section only reacts to the stored
+  /// credentials. Appended at the end of the list so the text-field indices
+  /// used by the settings tests stay stable.
   Widget _buildAccount(BuildContext context) {
     final theme = Theme.of(context);
     final creds = ref.watch(authCredentialsProvider).value;
@@ -801,18 +806,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               const SizedBox(width: 12),
               Expanded(
                 child: OutlinedButton(
-                  onPressed: () {
-                    final creds =
-                        ref.read(authCredentialsProvider).value;
-                    setState(() {
-                      _authFlowForRotation = true;
-                      _authFlowVisible = true;
-                      // Remember what is being replaced so the superseded key
-                      // can be revoked once the rotation completes.
-                      _rotationOldKeyId = creds?.keyId;
-                      _rotationOldSessionToken = creds?.sessionToken;
-                    });
-                  },
+                  onPressed: () => _openAccount(rotation: true),
                   child: const Text('Rotate key'),
                 ),
               ),
@@ -827,23 +821,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
           const SizedBox(height: 12),
           OutlinedButton(
-            onPressed: () => setState(() {
-              _authFlowForRotation = false;
-              _authFlowVisible = true;
-            }),
+            onPressed: () => _openAccount(rotation: false),
             child: const Text('Sign in'),
           ),
-        ],
-        if (_authFlowVisible) ...[
-          const SizedBox(height: 16),
-          if (signedIn)
-            Text(
-              'Sign in again to mint a new key.',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          AuthFlow(onSuccess: _onAuthSuccess),
         ],
       ],
     );

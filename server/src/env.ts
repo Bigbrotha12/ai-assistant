@@ -81,6 +81,15 @@ export const envSchema = z.object({
       );
       return CHECKPOINT_DEV_DEFAULT_KEY;
     }),
+  // SMTP settings for the password-reset email (better-auth
+  // `sendResetPassword`). Empty SMTP_HOST (the default) disables sending and
+  // logs the reset link instead — a development fallback so the forgot-password
+  // flow stays testable without a mail server.
+  SMTP_HOST: z.string().default(""),
+  SMTP_PORT: z.coerce.number().int().positive().max(65535).default(587),
+  SMTP_USER: z.string().default(""),
+  SMTP_PASS: z.string().default(""),
+  SMTP_FROM: z.string().default(""),
   // ntfy push-notification server base URL (e.g. `https://ntfy.example.com`).
   // Empty (the default) = push notifications disabled; the /api/notify
   // provisioning endpoints remain available regardless.
@@ -104,6 +113,25 @@ export const envSchema = z.object({
     }),
   PLUGINS_STORE_PATH: z.string().default("./data/plugins.json"),
   PLUGINS_TRUSTED_HOSTS: z
+    .string()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((host) => host.trim())
+        .filter((host) => host.length > 0),
+    ),
+  // Admin-vouched MCP server hosts (hostnames/IPs/wildcards, comma-separated).
+  // Two privileges over the default SSRF posture, scoped to the MCP path ONLY:
+  //  1. Range checks are bypassed (like PLUGINS_TRUSTED_HOSTS) so in-cluster
+  //     ClusterIP MCP servers resolve without DISALLOWED_HOST/DNS_REBINDING.
+  //  2. Unlike plugins — which stay https-only in production — an MCP host on
+  //     this list MAY use http: in production, because MCP SSE/streamable
+  //     servers inside a homelab are plain http services. Scheme enforcement
+  //     for everything else (plugins, LLM endpoints) is untouched, and all
+  //     other SSRF defenses (DNS-rebinding pinning, redirect refusal) still
+  //     apply to MCP calls.
+  MCP_TRUSTED_HOSTS: z
     .string()
     .default("")
     .transform((value) =>
@@ -146,6 +174,15 @@ export const env = parsed.data;
 // matching the other env checks below.
 try {
   parseTrustedHostEntries(env.PLUGINS_TRUSTED_HOSTS);
+} catch (err) {
+  console.error(`Gateway: ${(err as Error).message}`);
+  process.exit(1);
+}
+
+// Same fail-fast for MCP_TRUSTED_HOSTS; a malformed entry would silently never
+// match and leave an admin thinking an internal MCP host is reachable.
+try {
+  parseTrustedHostEntries(env.MCP_TRUSTED_HOSTS);
 } catch (err) {
   console.error(`Gateway: ${(err as Error).message}`);
   process.exit(1);

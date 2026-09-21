@@ -235,18 +235,76 @@ void main() {
     expect(config.inference!.visionCapable, isTrue);
   });
 
-  test('seeding: empty store gets default agent after ensureDefaultAgent', () async {
+  test('seeding: no template id leaves the store empty (never fabricated)', () async {
     final storage = InMemorySecureStorage();
     final store = PluginCredentialsStore(storage: storage);
     final a = scope('a');
     await store.ensureDefaultAgent(a);
     final loaded = await store.load(a);
-    expect(loaded.plugins, hasLength(1));
-    expect(loaded.plugins, containsPair('default', isA<PluginConfiguration>()));
-    expect(loaded.plugins['default']!.agent, isNotNull);
-    expect(loaded.plugins['default']!.agent!.id, 'default');
-    expect(loaded.plugins['default']!.agent!.kind, AgentKind.template);
-    expect(loaded.selectedAgent, 'default');
+    expect(loaded.plugins, isEmpty);
+    expect(loaded.selectedAgent, isNull);
+  });
+
+  test('seeding: a real template id seeds that agent', () async {
+    final storage = InMemorySecureStorage();
+    final store = PluginCredentialsStore(storage: storage);
+    final a = scope('a');
+    await store.ensureDefaultAgent(a, templateId: 'kitchen-copilot');
+    final loaded = await store.load(a);
+    expect(loaded.plugins.keys, ['kitchen-copilot']);
+    expect(loaded.plugins['kitchen-copilot']!.agent!.id, 'kitchen-copilot');
+    expect(loaded.plugins['kitchen-copilot']!.agent!.kind, AgentKind.template);
+    expect(loaded.selectedAgent, 'kitchen-copilot');
+  });
+
+  test('seeding: no template id drops a previously fabricated fallback agent', () async {
+    final storage = InMemorySecureStorage();
+    final store = PluginCredentialsStore(storage: storage);
+    final a = scope('a');
+    // Simulate an older build that fabricated and selected 'default'.
+    await store.ensureDefaultAgent(a, templateId: 'default');
+    expect(store.hasFallbackAgent(await store.load(a)), isTrue);
+    // A later load with no templates must heal the fabricated state.
+    await store.ensureDefaultAgent(a);
+    final loaded = await store.load(a);
+    expect(loaded.plugins, isEmpty);
+    expect(loaded.selectedAgent, isNull);
+    expect(store.hasFallbackAgent(loaded), isFalse);
+  });
+
+  test('seeding: adopts the default agent when other plugins exist', () async {
+    final store = PluginCredentialsStore(storage: InMemorySecureStorage());
+    final a = scope('a');
+    await store.setCredentials(a, 'openrouter', {'apiKey': 'sk-x'});
+    await store.setSelectedModel(a, 'openrouter');
+    await store.ensureDefaultAgent(a, templateId: 'voice-assistant');
+    final loaded = await store.load(a);
+    expect(loaded.plugins.keys, containsAll(['openrouter', 'voice-assistant']));
+    expect(loaded.plugins['voice-assistant']!.agent!.kind, AgentKind.template);
+    expect(loaded.selectedAgent, 'voice-assistant');
+    expect(loaded.selectedModel, 'openrouter');
+  });
+
+  test('seeding: preserves an existing agent selection', () async {
+    final store = PluginCredentialsStore(storage: InMemorySecureStorage());
+    final a = scope('a');
+    await store.ensureDefaultAgent(a, templateId: 'agent-a');
+    await store.ensureDefaultAgent(a, templateId: 'agent-b');
+    final loaded = await store.load(a);
+    expect(loaded.selectedAgent, 'agent-a');
+    expect(loaded.plugins.containsKey('agent-b'), isFalse);
+  });
+
+  test('seeding: a deselected default agent is not re-seeded', () async {
+    final store = PluginCredentialsStore(storage: InMemorySecureStorage());
+    final a = scope('a');
+    await store.ensureDefaultAgent(a, templateId: 'voice-assistant');
+    await store.setSelectedAgent(a, null);
+    expect(store.needsDefaultAgent(await store.load(a)), isFalse);
+    await store.ensureDefaultAgent(a, templateId: 'voice-assistant');
+    final loaded = await store.load(a);
+    expect(loaded.selectedAgent, isNull);
+    expect(loaded.plugins.containsKey('voice-assistant'), isTrue);
   });
 
   test('removePlugin clears selectedAgent when removing the selected plugin', () async {

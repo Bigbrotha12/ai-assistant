@@ -115,4 +115,156 @@ void main() {
     expect(container.read(authCredentialsProvider).hasError, isTrue);
     expect(store.stored!.apiKey, 'old');
   });
+
+  testWidgets('forgot-password sub-flow sends the reset request and confirms',
+      (tester) async {
+    final store = FakeAuthCredentialsStore();
+    final client = FakeAuthClient();
+    final container = ProviderContainer(
+      overrides: [
+        authCredentialsStoreProvider.overrideWithValue(store),
+        authClientProvider.overrideWithValue(client),
+        authBackendOriginProvider.overrideWithValue('https://example.com'),
+        accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(authCredentialsProvider.future);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: AuthFlow(onSuccess: _noop),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('auth-forgot-link')));
+    await tester.pumpAndSettle();
+    expect(find.text('Reset your password'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('auth-forgot-email')),
+      'user@example.com',
+    );
+    await tester.tap(find.byKey(const Key('auth-forgot-submit')));
+    await tester.pumpAndSettle();
+
+    // The request went out one time and the confirmation replaced the form.
+    expect(client.passwordResetRequests, ['user@example.com']);
+    expect(find.textContaining('reset link is on its way'), findsOneWidget);
+
+    // Back to sign in keeps the addressed email prefilled.
+    await tester.tap(find.byKey(const Key('auth-forgot-back')));
+    await tester.pumpAndSettle();
+    final emailField =
+        tester.widget<TextField>(find.byKey(const Key('auth-email')));
+    expect(emailField.controller!.text, 'user@example.com');
+  });
+
+  testWidgets('a failed reset request shows an error and stays on the form',
+      (tester) async {
+    final store = FakeAuthCredentialsStore();
+    final client = FakeAuthClient(
+      onRequestPasswordReset: (email) async =>
+          throw const AuthNetworkError('unreachable'),
+    );
+    final container = ProviderContainer(
+      overrides: [
+        authCredentialsStoreProvider.overrideWithValue(store),
+        authClientProvider.overrideWithValue(client),
+        authBackendOriginProvider.overrideWithValue('https://example.com'),
+        accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(authCredentialsProvider.future);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: AuthFlow(onSuccess: _noop),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('auth-forgot-link')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('auth-forgot-email')),
+      'user@example.com',
+    );
+    await tester.tap(find.byKey(const Key('auth-forgot-submit')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Could not reach the server'), findsOneWidget);
+    expect(find.byKey(const Key('auth-forgot-submit')), findsOneWidget);
+  });
+
+  testWidgets('a duplicate-email sign-up offers Sign in instead and prefills it',
+      (tester) async {
+    final store = FakeAuthCredentialsStore();
+    final client = FakeAuthClient(
+      onSignUp: (name, email, password) async =>
+          throw const AuthEmailTaken('already exists'),
+    );
+    final container = ProviderContainer(
+      overrides: [
+        authCredentialsStoreProvider.overrideWithValue(store),
+        authClientProvider.overrideWithValue(client),
+        authBackendOriginProvider.overrideWithValue('https://example.com'),
+        accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(authCredentialsProvider.future);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: AuthFlow(onSuccess: _noop),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Create account'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('auth-name')), 'Ada');
+    await tester.enterText(
+      find.byKey(const Key('auth-email')),
+      'user@example.com',
+    );
+    await tester.enterText(
+      find.byKey(const Key('auth-password')),
+      'password1',
+    );
+    await tester.tap(find.byKey(const Key('auth-submit')));
+    await tester.pumpAndSettle();
+
+    // The duplicate-email error explains itself and offers the escape hatch.
+    expect(
+      find.text('An account already exists for this email'),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('auth-signin-instead')), findsOneWidget);
+
+    // Switching lands in sign-in mode with the email carried over.
+    await tester.tap(find.byKey(const Key('auth-signin-instead')));
+    await tester.pumpAndSettle();
+    final emailField =
+        tester.widget<TextField>(find.byKey(const Key('auth-email')));
+    expect(emailField.controller!.text, 'user@example.com');
+    expect(find.byKey(const Key('auth-forgot-link')), findsOneWidget);
+  });
 }
+
+void _noop(AuthSession session) {}

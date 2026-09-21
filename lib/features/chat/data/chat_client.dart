@@ -45,6 +45,14 @@ class ChatServerError extends ChatApiError {
   final int? statusCode;
 }
 
+/// The app is not authenticated (no stored session/API key), so the request
+/// cannot even be attempted. Surfaced by the credential resolver BEFORE any
+/// network I/O; the UI interprets it like a gateway 401 and shows the re-auth
+/// login flow.
+class ChatAuthRequiredError extends ChatApiError {
+  const ChatAuthRequiredError(super.message);
+}
+
 /// The server sent an error envelope inside the stream.
 class ChatStreamError extends ChatApiError {
   const ChatStreamError(super.message);
@@ -488,7 +496,8 @@ class ChatApiClient implements ChatClient {
 }
 
 /// True when [error] is a gateway key rejection that the re-auth flow can
-/// remedy — a [ChatServerError] with 401 from the gateway.
+/// remedy — a [ChatServerError] with 401 from the gateway, or a
+/// [ChatAuthRequiredError] raised locally when no credentials exist to send.
 bool isAuthRequiredError(Object error) =>
-    error is ChatServerError &&
-    error.statusCode == 401;
+    error is ChatServerError && error.statusCode == 401 ||
+    error is ChatAuthRequiredError;

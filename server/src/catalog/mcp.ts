@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
+import { env } from "../env.ts";
 import { pluginIdSchema } from "../plugins/types.ts";
 import {
   SsrfValidationError,
@@ -83,8 +84,14 @@ export async function loadMcpCatalog(filePath: string): Promise<McpEntry[]> {
     }
     seen.add(entry.name);
 
-    const parsedUrl = validateStaticUrl(entry.url, { mode: (process.env.NODE_ENV ?? "development") as any });
-    await resolveAndValidateHost(parsedUrl.hostname, { trustedHosts: [] });
+    const parsedUrl = validateStaticUrl(entry.url, {
+      mode: env.NODE_ENV,
+      trustedHosts: env.MCP_TRUSTED_HOSTS,
+      httpAllowedHosts: env.MCP_TRUSTED_HOSTS,
+    });
+    await resolveAndValidateHost(parsedUrl.hostname, {
+      trustedHosts: env.MCP_TRUSTED_HOSTS,
+    });
 
     if (entry.headers) {
       for (const headerName of Object.keys(entry.headers)) {

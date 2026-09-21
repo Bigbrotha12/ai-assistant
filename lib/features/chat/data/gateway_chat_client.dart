@@ -7,6 +7,7 @@ import 'chat_client.dart';
 import 'message_model.dart';
 import 'sse.dart';
 import '../../../core/http/dio_errors.dart';
+import '../../../core/network_errors.dart' show truncateText;
 
 typedef CredentialResolver = Future<GatewayCredentials?> Function();
 
@@ -103,7 +104,9 @@ class GatewayChatClient implements ChatClient {
   }) async {
     final creds = await credentialResolver();
     if (creds == null) {
-      throw ChatNetworkError('Not authenticated');
+      throw ChatNetworkError(
+        'Plugin configuration is unavailable. Sign in again from Settings to continue.',
+      );
     }
 
     final body = <String, Object?>{
@@ -135,12 +138,21 @@ class GatewayChatClient implements ChatClient {
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
-      throw _mapRequestError(e);
+      throw await _mapRequestError(e);
     }
 
     final status = response.statusCode;
     if (status == null || status < 200 || status >= 300) {
-      throw _serverStatusError(status);
+      if (status == 401) {
+        throw const ChatServerError(
+          'Inference unavailable – check your credentials.',
+          statusCode: 401,
+        );
+      }
+      throw ChatServerError(
+        await _describeBody(response.data, status),
+        statusCode: status,
+      );
     }
 
     onReceived?.call();
@@ -196,7 +208,9 @@ class GatewayChatClient implements ChatClient {
   }) async {
     final creds = await credentialResolver();
     if (creds == null) {
-      throw ChatNetworkError('Not authenticated');
+      throw ChatNetworkError(
+        'Plugin configuration is unavailable. Sign in again from Settings to continue.',
+      );
     }
 
     final body = <String, Object?>{
@@ -231,7 +245,7 @@ class GatewayChatClient implements ChatClient {
         cancelToken: cancelToken,
       );
     } on DioException catch (e) {
-      throw _mapRequestError(e);
+      throw await _mapRequestError(e);
     }
 
     final responseBody = response.data;
@@ -326,13 +340,22 @@ class GatewayChatClient implements ChatClient {
     return map;
   }
 
-  Never _mapRequestError(DioException e) {
+  Future<Never> _mapRequestError(DioException e) async {
     switch (classifyDioException(e)) {
       case DioErrorCategory.cancelled:
         throw ChatNetworkError('cancelled');
       case DioErrorCategory.badResponse:
-        throw _serverStatusError(e.response?.statusCode,
-            message: describeDioException(e));
+        final status = e.response?.statusCode;
+        if (status == 401) {
+          throw ChatServerError(
+            'Inference unavailable – check your credentials.',
+            statusCode: 401,
+          );
+        }
+        throw ChatServerError(
+          await _describeResponseError(e, status),
+          statusCode: status,
+        );
       case DioErrorCategory.timeoutNetwork:
         throw _ConnectionFailure(describeDioException(e));
       case DioErrorCategory.other:
@@ -340,14 +363,45 @@ class GatewayChatClient implements ChatClient {
     }
   }
 
-  Never _serverStatusError(int? status, {String? message}) {
-    if (status == 401) {
-      throw ChatServerError(
-        'Inference unavailable – check your credentials.',
-        statusCode: 401,
-      );
+  /// Builds the most useful message for a non-2xx response, preferring the
+  /// gateway's JSON `message`/`error` over a raw body dump. A streaming
+  /// response hands back a [ResponseBody] that must be drained to see the
+  /// payload, which is why this is async.
+  Future<String> _describeResponseError(DioException e, int? status) =>
+      _describeBody(e.response?.data, status);
+
+  Future<String> _describeBody(Object? data, int? status) async {
+    Object? decoded;
+    if (data is ResponseBody) {
+      try {
+        final bytes = await data.stream.fold<List<int>>(
+          <int>[],
+          (acc, chunk) => acc..addAll(chunk),
+        );
+        decoded = jsonDecode(utf8.decode(bytes, allowMalformed: true));
+      } catch (_) {
+        decoded = null;
+      }
+    } else if (data is String) {
+      try {
+        decoded = jsonDecode(data);
+      } catch (_) {
+        decoded = null;
+      }
+    } else {
+      decoded = data;
     }
-    throw ChatServerError(message ?? 'HTTP $status', statusCode: status);
+    if (decoded is Map) {
+      for (final key in const ['message', 'error']) {
+        final value = decoded[key];
+        if (value is String && value.trim().isNotEmpty) {
+          return value.trim();
+        }
+      }
+    }
+    final raw = (data == null ? '' : '$data').trim();
+    if (raw.isEmpty) return 'HTTP $status';
+    return 'HTTP $status: ${truncateText(raw)}';
   }
 
   static Map<String, dynamic>? _decodeToolArgs(String? raw) {

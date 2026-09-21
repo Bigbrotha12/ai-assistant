@@ -8,6 +8,7 @@ import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
 import { jsonSchemaToZod } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { checkpointThreadId, redactForCheckpoint } from "../checkpoints/store.ts";
+import { env } from "../env.ts";
 import {
   canRetryTool,
   getOrCreateTask,
@@ -925,12 +926,13 @@ export class JobRunner {
         fenceToken,
         allowMutatingRetry: !replaying,
       });
-      const mcpTools = descriptor.mcpServers
+      const mcpBinding = descriptor.mcpServers
         ? await bindMcpServers(descriptor.mcpServers, undefined, {
             signal,
-            trustedHosts: this.deps.trustedHosts,
+            trustedHosts: env.MCP_TRUSTED_HOSTS,
           })
-        : [];
+        : undefined;
+      const mcpTools = mcpBinding?.tools ?? [];
       const allTools: DynamicStructuredTool[] = [];
       const seen = new Set<string>();
       for (const t of [...tools, ...mcpTools]) {
@@ -993,6 +995,7 @@ export class JobRunner {
           throw error;
         } finally {
           await execution.settle();
+          await mcpBinding?.dispose();
         }
       });
       assertActive();

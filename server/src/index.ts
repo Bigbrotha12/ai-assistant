@@ -16,6 +16,7 @@ import { createNotifyRoutes } from "./notify/routes.ts";
 import { NotifyStore } from "./notify/store.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
+import { createResetPasswordRoutes } from "./reset_password.ts";
 import { createModelsRoutes } from "./transport/models.ts";
 import { createAgentsRoutes } from "./transport/agents.ts";
 import { createSkillsRoutes } from "./transport/skills.ts";
@@ -43,6 +44,12 @@ app.get("/api/auth/ok", (c) => c.json({ status: "ok" }));
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 app.route("/v1", inferenceRoutes);
 app.route("/ledger", ledgerRoutes);
+
+// Password-reset completion page — the emailed link targets `GET
+// /reset-password?token=…`, not better-auth's /api/auth callback redirect
+// (the app has no deep-link handling). Mounted OUTSIDE the /api/auth namespace
+// so the page is only ever served by this Hono app.
+app.route("/", createResetPasswordRoutes());
 
 // ntfy push-notification provisioning (plan §Notifications): the topic +
 // access token are encrypted at rest with the CHECKPOINT_DB_KEY secret; the
@@ -258,6 +265,18 @@ app.get("/", (c) =>
     threads: "/v1/threads",
   }),
 );
+
+// Last-resort error handler: any exception that reaches the top of the Hono
+// stack (i.e. outside better-auth, which intercepts its own /api/auth errors)
+// returns a JSON body instead of an empty/bare 5xx so clients never see a
+// cryptic `HTTP 500` with no payload. Never leaks internal messages.
+app.onError((err, c) => {
+  console.error(`gateway error on ${c.req.path}:`, err);
+  return c.json(
+    { message: "internal server error", code: "INTERNAL_SERVER_ERROR" },
+    500,
+  );
+});
 
 const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
   console.log(`ai-assistant gateway listening on http://localhost:${info.port}`);

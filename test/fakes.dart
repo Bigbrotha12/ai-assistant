@@ -598,6 +598,7 @@ class FakeAuthClient implements AuthClient {
     this.onMintApiKey,
     this.onSignOut,
     this.onRevokeApiKey,
+    this.onRequestPasswordReset,
   });
 
   Future<AuthSession> Function(String name, String email, String password)? onSignUp;
@@ -605,9 +606,11 @@ class FakeAuthClient implements AuthClient {
   Future<MintedApiKey> Function(String sessionToken)? onMintApiKey;
   Future<void> Function(String sessionToken)? onSignOut;
   Future<void> Function(String sessionToken, String keyId)? onRevokeApiKey;
+  Future<void> Function(String email)? onRequestPasswordReset;
 
   final List<String> signOutTokens = [];
   final List<(String, String)> revokeCalls = [];
+  final List<String> passwordResetRequests = [];
 
   @override
   Future<AuthSession> signUp({
@@ -647,5 +650,11 @@ class FakeAuthClient implements AuthClient {
   }) async {
     revokeCalls.add((sessionToken, keyId));
     await onRevokeApiKey?.call(sessionToken, keyId);
+  }
+
+  @override
+  Future<void> requestPasswordReset({required String email}) async {
+    passwordResetRequests.add(email);
+    await onRequestPasswordReset?.call(email);
   }
 }

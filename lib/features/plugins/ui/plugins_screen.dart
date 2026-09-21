@@ -605,7 +605,17 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
                       ...?saved?.credentials,
                       'apiKey': _keyController.text,
                     };
-                    _write((store) => store.setCredentials(plugin.id, fields));
+                    _write((store) async {
+                      await store.setCredentials(plugin.id, fields);
+                      if (plugin.type == 'model') {
+                        // Re-read a fresh handle: setCredentials bumps the
+                        // epoch, so the same handle would trip its own
+                        // stale-guard and fail the selection write.
+                        await ref
+                            .read(scopedPluginCredentialsProvider)
+                            .setSelectedModel(plugin.id);
+                      }
+                    });
                   },
             child: const Text('Save API key'),
           ),

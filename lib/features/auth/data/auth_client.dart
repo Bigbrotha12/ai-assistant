@@ -25,10 +25,16 @@ class AuthSession {
 
 /// Base class for all errors surfaced by [AuthClient].
 sealed class AuthApiError implements Exception {
-  const AuthApiError(this.message, {this.statusCode});
+  const AuthApiError(this.message, {this.statusCode, this.code});
 
   final String message;
   final int? statusCode;
+
+  /// The better-auth error `code` from the response body, when present (e.g.
+  /// `INVALID_EMAIL_OR_PASSWORD`, `USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL`,
+  /// `PASSWORD_TOO_SHORT`). Null when the server replied without one or the
+  /// failure was transport-level.
+  final String? code;
 
   @override
   String toString() => '$runtimeType: $message';
@@ -36,23 +42,23 @@ sealed class AuthApiError implements Exception {
 
 /// The provided credentials were rejected (invalid email/password on sign-in).
 class AuthInvalidCredentials extends AuthApiError {
-  const AuthInvalidCredentials(super.message, {super.statusCode});
+  const AuthInvalidCredentials(super.message, {super.statusCode, super.code});
 }
 
 /// The email is already registered (attempted to sign up).
 class AuthEmailTaken extends AuthApiError {
-  const AuthEmailTaken(super.message, {super.statusCode});
+  const AuthEmailTaken(super.message, {super.statusCode, super.code});
 }
 
 /// The session token was rejected by the server (HTTP 401). Used later to
 /// trigger a global re-authentication flow.
 class AuthUnauthorized extends AuthApiError {
-  const AuthUnauthorized(super.message, {super.statusCode});
+  const AuthUnauthorized(super.message, {super.statusCode, super.code});
 }
 
 /// The server responded with a 4xx/5xx status not covered by the typed errors.
 class AuthServerError extends AuthApiError {
-  const AuthServerError(super.message, {super.statusCode});
+  const AuthServerError(super.message, {super.statusCode, super.code});
 }
 
 /// Transport-level failure (timeout, connection refused, cancellation).
@@ -102,6 +108,13 @@ abstract interface class AuthClient {
     required String sessionToken,
     required String keyId,
   });
+
+  /// Asks the server to email a password-reset link for [email].
+  ///
+  /// The endpoint always answers success for registered and unregistered
+  /// addresses alike (anti-enumeration), so a healthy call returns normally
+  /// even when no account matches.
+  Future<void> requestPasswordReset({required String email});
 }
 
 /// better-auth REST client over the shared [Dio].
@@ -202,6 +215,18 @@ class BetterAuthClient implements AuthClient {
     );
   }
 
+  @override
+  Future<void> requestPasswordReset({required String email}) async {
+    final response = await _post(
+      '$_endpoint/request-password-reset',
+      body: <String, Object?>{'email': email},
+    );
+    final status = response.data?['status'];
+    if (status is! bool || !status) {
+      throw const AuthServerError('malformed request-password-reset response');
+    }
+  }
+
   Future<Response<Map<String, dynamic>>> _post(
     String path, {
     required Map<String, Object?> body,
@@ -243,6 +268,7 @@ class BetterAuthClient implements AuthClient {
 
   Never _mapDioError(DioException e) {
     final message = describeDioException(e);
+    final code = _errorCode(e);
     switch (classifyDioException(e)) {
       case DioErrorCategory.cancelled:
         throw const AuthNetworkError('cancelled');
@@ -250,21 +276,51 @@ class BetterAuthClient implements AuthClient {
         final status = e.response?.statusCode;
         switch (status) {
           case 401:
-            throw AuthUnauthorized(message, statusCode: status);
+            // Sign-in with bad credentials is a 401 carrying an explicit
+            // INVALID_EMAIL_OR_PASSWORD code; surface it as a credential
+            // error, not a session rejection.
+            if (code == 'INVALID_EMAIL_OR_PASSWORD') {
+              throw AuthInvalidCredentials(message, statusCode: status, code: code);
+            }
+            throw AuthUnauthorized(message, statusCode: status, code: code);
           case 409:
-            throw AuthEmailTaken(message, statusCode: status);
+            throw AuthEmailTaken(message, statusCode: status, code: code);
           case 400:
-            // better-auth returns 422 for most validation / credential errors;
-            // 400 covers the remaining malformed-request family.
-            throw AuthInvalidCredentials(message, statusCode: status);
           case 422:
-            throw AuthInvalidCredentials(message, statusCode: status);
+            // better-auth rejects a duplicate sign-up with 422 and an explicit
+            // USER_ALREADY_EXISTS* code; map it to the typed duplicate-email
+            // error so the UI can offer "Sign in instead". Everything else in
+            // this family (invalid email, password policy) is a credential
+            // error.
+            if (_isEmailTaken(code)) {
+              throw AuthEmailTaken(message, statusCode: status, code: code);
+            }
+            throw AuthInvalidCredentials(message, statusCode: status, code: code);
           default:
-            throw AuthServerError(message, statusCode: status);
+            throw AuthServerError(message, statusCode: status, code: code);
         }
       case DioErrorCategory.timeoutNetwork:
       case DioErrorCategory.other:
         throw AuthNetworkError(message);
     }
   }
+
+  /// Extracts better-auth's error `code` from a response body. The wire shape
+  /// is `{"message", "code"}`; an outer `{"error": {...}}` wrapper is also
+  /// tolerated for forward compatibility.
+  static String? _errorCode(DioException e) {
+    final data = e.response?.data;
+    if (data is! Map<String, dynamic>) return null;
+    final code = data['code'];
+    if (code is String && code.isNotEmpty) return code;
+    final error = data['error'];
+    if (error is Map<String, dynamic>) {
+      final nested = error['code'];
+      if (nested is String && nested.isNotEmpty) return nested;
+    }
+    return null;
+  }
+
+  static bool _isEmailTaken(String? code) =>
+      code != null && code.startsWith('USER_ALREADY_EXISTS');
 }

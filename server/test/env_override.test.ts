@@ -41,6 +41,20 @@ describe("immutable-image env overrides (env schema)", () => {
     assert.equal(parse().AGENT_SPEC_MAX_SKILLS, 50);
   });
 
+  test("MCP_TRUSTED_HOSTS defaults to an empty list", () => {
+    assert.deepEqual(parse().MCP_TRUSTED_HOSTS, []);
+  });
+
+  test("MCP_TRUSTED_HOSTS parses a comma-separated list", () => {
+    const env = parse({
+      MCP_TRUSTED_HOSTS: "*.productivity.svc.cluster.local, ln.health.svc.cluster.local ",
+    });
+    assert.deepEqual(env.MCP_TRUSTED_HOSTS, [
+      "*.productivity.svc.cluster.local",
+      "ln.health.svc.cluster.local",
+    ]);
+  });
+
   test("agent spec caps + skill budget are env-configurable", () => {
     const env = parse({
       AGENT_SKILL_BUDGET_TOKENS: "9000",
@@ -107,5 +121,39 @@ describe("builtin openrouter plugin env overrides (fresh process)", () => {
       defaultModel: "my-selfhosted-model",
       baseUrl: "https://llm.example.test/v1",
     });
+  });
+});
+
+describe("MCP_TRUSTED_HOSTS fail-fast (fresh process)", () => {
+  const run = (mcpTrustedHosts: string) => {
+    const environment = { ...process.env };
+    for (const key of ["MCP_TRUSTED_HOSTS", "PLUGINS_TRUSTED_HOSTS"]) delete environment[key];
+    return spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+      await import('./src/env.ts');
+      process.stdout.write('ok');
+    `], {
+      cwd: new URL("../", import.meta.url),
+      encoding: "utf8",
+      env: {
+        ...environment,
+        DOTENV_CONFIG_PATH: "/dev/null",
+        NODE_ENV: "test",
+        BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
+        BETTER_AUTH_URL: "http://localhost:17600",
+        MCP_TRUSTED_HOSTS: mcpTrustedHosts,
+      },
+    });
+  };
+
+  test("a well-formed allowlist starts the gateway", () => {
+    const result = run("*.productivity.svc.cluster.local");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "ok");
+  });
+
+  test("a malformed entry (scheme) fails fast at load", () => {
+    const result = run("http://example.com");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /invalid MCP_TRUSTED_HOSTS|must be an exact/);
   });
 });

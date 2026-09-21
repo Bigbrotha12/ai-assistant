@@ -174,6 +174,31 @@ void main() {
     expect(find.text('Session expired'), findsOneWidget);
   });
 
+  testWidgets('missing credentials surface the ReauthCard on the voice surface',
+      (tester) async {
+    // No stored session/API key: the resolver throws ChatAuthRequiredError
+    // before any network call; the voice surface must treat it like a gateway
+    // 401 and surface the login flow.
+    final chatClient = FakeChatClient()
+      ..error = const ChatAuthRequiredError('Not authenticated');
+    final container = buildContainer(chatClient: chatClient);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    await controller.startConversation();
+    await controller.sendText('hello');
+    await settle(tester);
+
+    expect(find.byType(ReauthCard), findsOneWidget);
+    expect(find.text('Session expired'), findsOneWidget);
+  });
+
   testWidgets('dismissing the ReauthCard clears the voice error',
       (tester) async {
     final chatClient = FakeChatClient()

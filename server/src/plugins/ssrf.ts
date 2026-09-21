@@ -68,7 +68,7 @@ export class SsrfValidationError extends Error {
   }
 }
 
-function normalizeHostname(hostname: string): string {
+export function normalizeHostname(hostname: string): string {
   // Strip IPv6 brackets again defensively (WHATWG URL hostname already carries
   // them for IPv6 literals), a trailing FQDN dot, and normalize case.
   return hostname
@@ -275,6 +275,14 @@ export type UrlValidateOptions = {
   allowHttp?: boolean;
   /** Admin-trusted hostnames/IPs that bypass range checks (never scheme). */
   trustedHosts?: readonly string[];
+  /**
+   * Admin-vouched hostnames/IPs permitted to use http: in production. Unlike
+   * `allowHttp` this is a per-host allowlist — the ONLY production http:
+   * carve-out (used for in-cluster MCP servers, which are plain http). Hosts
+   * not listed stay https-only; DNS-rebinding and redirect defenses still
+   * apply. `allowHttp: true` remains forbidden in production regardless.
+   */
+  httpAllowedHosts?: readonly string[];
 };
 
 function parseUrl(url: string): URL {
@@ -319,10 +327,13 @@ export function validateStaticUrl(url: string, opts: UrlValidateOptions = {}): U
     // Always allowed.
   } else if (parsed.protocol === "http:") {
     if (!allowHttp) {
-      throw new SsrfValidationError(
-        "UNSUPPORTED_SCHEME",
-        `http: is not allowed in production (${url}); use https:`,
-      );
+      if (!isTrustedHost(normalizeHostname(parsed.hostname), opts.httpAllowedHosts ?? [])) {
+        throw new SsrfValidationError(
+          "UNSUPPORTED_SCHEME",
+          `http: is not allowed in production (${url}); use https: or add the host to ` +
+            `httpAllowedHosts (MCP_TRUSTED_HOSTS)`,
+        );
+      }
     }
   } else {
     throw new SsrfValidationError(
@@ -540,10 +551,46 @@ export type ValidatedFetchOptions = {
   allowHttp?: boolean;
   /** Admin-trusted hostnames/IPs that bypass range checks (never scheme). */
   trustedHosts?: readonly string[];
+  /** Per-host production http: carve-out (see `UrlValidateOptions`). */
+  httpAllowedHosts?: readonly string[];
   /** Injectable A/AAAA resolver; defaults to node:dns/promises lookup. */
   lookup?: LookupFn;
   fetchFn?: typeof fetch;
 };
+
+/**
+ * Builds the SSRF-pinned undici Agent: it connects only to the resolved-and-
+ * validated IP for the exact host/scheme/port and refuses any other destination
+ * (DNS-rebinding + redirect defense). One agent per outbound call; callers
+ * that hold a long-lived stream (MCP SSE) keep it open and destroy it on
+ * dispose instead of closing immediately.
+ */
+export function buildPinnedAgent(
+  hostname: string,
+  parsed: URL,
+  pinned: readonly string[],
+): Agent {
+  const connect = buildConnector({
+    lookup: buildPinnedLookup(hostname, pinned),
+    rejectUnauthorized: true,
+    autoSelectFamily: true,
+  });
+  return new Agent({
+    connect(options, callback) {
+      if (
+        normalizeHostname(options.hostname) !== hostname ||
+        options.protocol !== parsed.protocol ||
+        Number(options.port || (options.protocol === "https:" ? 443 : 80)) !==
+          Number(parsed.port || (options.protocol === "https:" ? 443 : 80)) ||
+        options.httpSocket
+      ) {
+        callback(new SsrfValidationError("DISALLOWED_HOST", "unexpected connection destination"), null);
+        return;
+      }
+      connect({ ...options, servername: isIP(hostname) ? undefined : parsed.hostname }, callback);
+    },
+  });
+}
 
 export async function validatedFetch(
   url: string,
@@ -553,33 +600,19 @@ export async function validatedFetch(
   const mode = opts.mode ?? NODE_ENV;
   const allowHttp = opts.allowHttp ?? mode !== "production";
 
-  const parsed = validateStaticUrl(url, { mode, allowHttp, trustedHosts: opts.trustedHosts });
+  const parsed = validateStaticUrl(url, {
+    mode,
+    allowHttp,
+    trustedHosts: opts.trustedHosts,
+    httpAllowedHosts: opts.httpAllowedHosts,
+  });
   const pinned = await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
     trustedHosts: opts.trustedHosts,
     lookup: opts.lookup,
   });
 
   const hostname = normalizeHostname(parsed.hostname);
-  const connect = buildConnector({
-    lookup: buildPinnedLookup(hostname, pinned),
-    rejectUnauthorized: true,
-    autoSelectFamily: true,
-  });
-  const agent = new Agent({
-    connect(options, callback) {
-      if (
-        normalizeHostname(options.hostname) !== hostname ||
-        options.protocol !== parsed.protocol ||
-        Number(options.port || (options.protocol === "https:" ? 443 : 80)) !==
-          Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80)) ||
-        options.httpSocket
-      ) {
-        callback(new SsrfValidationError("DISALLOWED_HOST", "unexpected connection destination"), null);
-        return;
-      }
-      connect({ ...options, servername: isIP(hostname) ? undefined : parsed.hostname }, callback);
-    },
-  });
+  const agent = buildPinnedAgent(hostname, parsed, pinned);
   try {
     const fetchFn = opts.fetchFn ?? globalThis.fetch;
     const requestInit = { ...init, redirect: "manual" as const, dispatcher: agent };

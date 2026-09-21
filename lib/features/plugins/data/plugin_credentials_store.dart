@@ -214,19 +214,64 @@ class PluginCredentialsStore {
     ),
   );
 
+  /// Placeholder agent id that older builds fabricated when no gateway agent
+  /// templates were available. It is never a real template, so it must not be
+  /// sent to the gateway (which rejects it with `template_not_found`).
+  static const fallbackAgentId = 'default';
+
+  /// True when [config] still carries the fabricated [fallbackAgentId] agent
+  /// seeded by older builds.
+  bool hasFallbackAgent(PluginAccountConfiguration config) {
+    final entry = config.plugins[fallbackAgentId];
+    return entry != null && entry.agent?.kind == AgentKind.template;
+  }
+
+  /// True when [config] has no real agent selected and no agent plugin entry,
+  /// so the account should adopt the default catalog agent. The fabricated
+  /// [fallbackAgentId] never counts as an agent.
+  bool needsDefaultAgent(PluginAccountConfiguration config) {
+    if (config.selectedAgent != null &&
+        config.selectedAgent != fallbackAgentId) {
+      return false;
+    }
+    return !config.plugins.entries.any(
+      (entry) => entry.key != fallbackAgentId && entry.value.agent != null,
+    );
+  }
+
   Future<void> ensureDefaultAgent(AuthAccountScope scope, {String? templateId}) =>
       _serialized(() async {
         final config = await _load(scope);
-        if (config.plugins.isNotEmpty) return;
-        final id =
-            (templateId != null && templateId.trim().isNotEmpty)
-            ? templateId
-            : 'default';
+        final id = templateId?.trim();
+        final hasFallback = hasFallbackAgent(config);
+        if (id == null || id.isEmpty) {
+          // No gateway agent templates exist: never fabricate one. Drop any
+          // placeholder a previous build persisted so the app cannot send an
+          // agent id the gateway will reject.
+          if (!hasFallback) return;
+          final plugins = {...config.plugins}..remove(fallbackAgentId);
+          await _save(scope, PluginAccountConfiguration(
+            plugins: plugins,
+            selectedModel: config.selectedModel,
+            selectedAgent: config.selectedAgent == fallbackAgentId
+                ? null
+                : config.selectedAgent,
+          ));
+          return;
+        }
+        // Adopt the default template only when the account has no agent yet;
+        // never clobber an existing selection or a user's custom agent.
+        if (!hasFallback && !needsDefaultAgent(config)) return;
+        final plugins = {...config.plugins}..remove(fallbackAgentId);
         await _save(scope, PluginAccountConfiguration(
-          plugins: {id: PluginConfiguration(
-            enabled: true,
-            agent: AgentConfig(id: id, kind: AgentKind.template),
-          )},
+          plugins: {
+            ...plugins,
+            id: plugins[id] ??
+                PluginConfiguration(
+                  enabled: true,
+                  agent: AgentConfig(id: id, kind: AgentKind.template),
+                ),
+          },
           selectedAgent: id,
           selectedModel: config.selectedModel,
         ));

@@ -529,3 +529,66 @@ describe("isIpAllowed contract", () => {
     assert.equal(isIpAllowed("example.com"), true);
   });
 });
+
+describe("httpAllowedHosts production carve-out", () => {
+  test("http is allowed in production for a listed host", () => {
+    const url = validateStaticUrl(
+      "http://mealie-mcp-sse.productivity.svc.cluster.local:8001/sse",
+      {
+        mode: "production",
+        httpAllowedHosts: ["*.productivity.svc.cluster.local"],
+      },
+    );
+    assert.equal(url.hostname, "mealie-mcp-sse.productivity.svc.cluster.local");
+  });
+
+  test("wildcard matches bare suffix and subdomains", () => {
+    const url = validateStaticUrl("http://ln.health.svc.cluster.local:8080", {
+      mode: "production",
+      httpAllowedHosts: ["*.svc.cluster.local"],
+    });
+    assert.equal(url.hostname, "ln.health.svc.cluster.local");
+  });
+
+  test("http is still rejected in production for an unlisted host", () => {
+    assert.throws(
+      () =>
+        validateStaticUrl("http://example.com/api", {
+          mode: "production",
+          httpAllowedHosts: ["*.productivity.svc.cluster.local"],
+        }),
+      (e: unknown) => e instanceof SsrfValidationError && e.code === "UNSUPPORTED_SCHEME",
+    );
+  });
+
+  test("httpAllowedHosts is a targeted allowlist, not a blanket switch", () => {
+    assert.throws(
+      () =>
+        validateStaticUrl("https://example.com/api", {
+          mode: "production",
+          allowHttp: true,
+          httpAllowedHosts: ["example.com"],
+        }),
+      (e: unknown) =>
+        e instanceof SsrfValidationError &&
+        e.code === "UNSUPPORTED_SCHEME" &&
+        e.message.includes("allowHttp"),
+    );
+  });
+
+  test("empty httpAllowedHosts keeps production http fully refused", () => {
+    assert.throws(
+      () => validateStaticUrl("http://example.com", { mode: "production" }),
+      (e: unknown) => e instanceof SsrfValidationError && e.code === "UNSUPPORTED_SCHEME",
+    );
+  });
+
+  test("trustedHosts bypasses range checks independently of the http carve-out", () => {
+    const url = validateStaticUrl("http://10.43.0.12:8001/sse", {
+      mode: "production",
+      trustedHosts: ["10.43.0.12"],
+      httpAllowedHosts: ["10.43.0.12"],
+    });
+    assert.equal(url.hostname, "10.43.0.12");
+  });
+});

@@ -22,7 +22,25 @@ void main() {
         'https://evil.example',
         environment: BackendEnvironment.production,
       );
-      expect(https.toString(), 'https://evil.example:17600');
+      expect(https.toString(), 'https://evil.example');
+    });
+
+    test('dev keeps the fixed gateway port; production uses the HTTPS origin',
+        () {
+      expect(
+        BackendConfig.gatewayBase(
+          'host',
+          environment: BackendEnvironment.dev,
+        ).toString(),
+        'http://host:17600',
+      );
+      expect(
+        BackendConfig.gatewayBase(
+          'host',
+          environment: BackendEnvironment.production,
+        ).toString(),
+        'https://host',
+      );
     });
 
     test('truncates any path from a URL-like stored host', () {
@@ -61,6 +79,23 @@ void main() {
       expect(
         BackendConfig.files('http://myhost/').toString(),
         'http://myhost:17603',
+      );
+    });
+
+    test('production drops the fixed port (standard HTTPS origin)', () {
+      expect(
+        BackendConfig.mcp(
+          'myhost',
+          environment: BackendEnvironment.production,
+        ).toString(),
+        'https://myhost',
+      );
+      expect(
+        BackendConfig.files(
+          'myhost',
+          environment: BackendEnvironment.production,
+        ).toString(),
+        'https://myhost',
       );
     });
   });

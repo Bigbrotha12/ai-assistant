@@ -39,6 +39,11 @@ class _ScriptedAdapter implements HttpClientAdapter {
           200,
           headers: const {'content-type': ['application/json']},
         ),
+      _ErrorAction(:final status, :final body) => ResponseBody.fromString(
+          jsonEncode(body),
+          status,
+          headers: const {'content-type': ['application/json']},
+        ),
     };
   }
 
@@ -55,6 +60,12 @@ class _StreamAction extends _AdapterAction {
 
 class _JsonAction extends _AdapterAction {
   _JsonAction(this.body);
+  final Map<String, dynamic> body;
+}
+
+class _ErrorAction extends _AdapterAction {
+  _ErrorAction(this.status, this.body);
+  final int status;
   final Map<String, dynamic> body;
 }
 
@@ -153,11 +164,41 @@ void main() {
           throwsA(isA<ChatNetworkError>().having(
             (e) => e.message,
             'message',
-            'Not authenticated',
+            'Plugin configuration is unavailable. Sign in again from Settings to continue.',
           )),
         );
 
         expect(adapter.callCount, 0);
+      });
+
+      test('surfaces the gateway error message from a non-2xx body', () async {
+        final adapter = _ScriptedAdapter(_ErrorAction(400, {
+          'error': 'invalid_request',
+          'message': 'template_not_found: default',
+        }));
+        final client = _client(
+          adapter,
+          credentials: const GatewayCredentials(
+            gatewayKey: 'test-key',
+            modelPluginId: 'openrouter',
+            credentials: {
+              'openrouter': {'apiKey': 'sk-test'},
+            },
+          ),
+        );
+
+        await expectLater(
+          () => client.streamCompletions(messages: messages),
+          throwsA(
+            isA<ChatServerError>()
+                .having((e) => e.statusCode, 'statusCode', 400)
+                .having(
+                  (e) => e.message,
+                  'message',
+                  'template_not_found: default',
+                ),
+          ),
+        );
       });
     });
 
@@ -206,11 +247,41 @@ void main() {
           throwsA(isA<ChatNetworkError>().having(
             (e) => e.message,
             'message',
-            'Not authenticated',
+            'Plugin configuration is unavailable. Sign in again from Settings to continue.',
           )),
         );
 
         expect(adapter.callCount, 0);
+      });
+
+      test('surfaces the gateway error message from a non-2xx body', () async {
+        final adapter = _ScriptedAdapter(_ErrorAction(400, {
+          'error': 'invalid_request',
+          'message': 'template_not_found: default',
+        }));
+        final client = _client(
+          adapter,
+          credentials: const GatewayCredentials(
+            gatewayKey: 'test-key',
+            modelPluginId: 'openrouter',
+            credentials: {
+              'openrouter': {'apiKey': 'sk-test'},
+            },
+          ),
+        );
+
+        await expectLater(
+          () => client.completions(messages: messages),
+          throwsA(
+            isA<ChatServerError>()
+                .having((e) => e.statusCode, 'statusCode', 400)
+                .having(
+                  (e) => e.message,
+                  'message',
+                  'template_not_found: default',
+                ),
+          ),
+        );
       });
     });
   });

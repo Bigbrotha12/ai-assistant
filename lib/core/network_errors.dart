@@ -29,6 +29,27 @@ bool isNetworkError(Object error) {
   return false;
 }
 
+/// Extracts a stable, readable message from a REST error body.
+///
+/// JSON payloads from the gateway carry a flat `{"message"}` (and better-auth
+/// adds a `code`); an outer `{"error": {...}}` wrapper is also tolerated.
+/// Prefers that message over stringifying an entire Map, and maps
+/// null/blank bodies (e.g. a bare 500 with no payload) to `''` so a 5xx
+/// renders as `HTTP 500` instead of the cryptic `HTTP 500: null`.
+String _readableResponseBody(Object? data, int truncate) {
+  if (data is Map) {
+    final message = data['message'];
+    if (message is String && message.trim().isNotEmpty) return message.trim();
+    final error = data['error'];
+    if (error is Map) {
+      final nested = error['message'];
+      if (nested is String && nested.trim().isNotEmpty) return nested.trim();
+    }
+  }
+  final text = truncateText(data, truncate);
+  return text == 'null' ? '' : text.trim();
+}
+
 /// Caps [text] to [limit] characters, appending an ellipsis when truncated.
 String truncateText(Object? text, [int limit = 120]) {
   final s = '$text';
@@ -54,8 +75,14 @@ String describeDioError(Object error, {int truncate = 120}) {
           return 'cancelled';
         case DioExceptionType.badResponse:
           final status = current.response?.statusCode;
-          final body = truncateText(current.response?.data, truncate);
-          return 'HTTP $status${body.isEmpty ? '' : ': $body'}';
+          final data = current.response?.data;
+          // A streaming response exposes a [ResponseBody] that cannot be read
+          // synchronously; never stringify it (that yields "Instance of
+          // 'ResponseBody'"). Callers that need the body read it themselves.
+          if (data is ResponseBody) return 'HTTP $status';
+          final body = _readableResponseBody(data, truncate);
+          if (body.isEmpty) return 'HTTP $status';
+          return 'HTTP $status: $body';
         case DioExceptionType.badCertificate:
         case DioExceptionType.unknown:
         case DioExceptionType.transformTimeout:

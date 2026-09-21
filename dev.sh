@@ -17,9 +17,14 @@
 #   ./dev.sh -- <flutter args...>     # forward extra args to flutter run (e.g. --dart-define=...)
 #
 # Env (see dev.env.example for persistent configuration):
-#   FLUTTER_DEVICE  Device for flutter run -d (default: linux)
-#   HOST_FQDN       Backend host dart-define (default: Tailscale IP, else localhost)
-#   FLUTTER         Flutter SDK binary path (default: $HOME/Projects/mobile/flutter/bin/flutter)
+#   FLUTTER_DEVICE      Device for flutter run -d (default: linux)
+#   HOST_FQDN           Backend host dart-define (default: Tailscale IP, else localhost)
+#   PUBLIC_BACKEND_URL  Public backend URL dart-define; also selects the
+#                       production (https) environment. Default: the cluster
+#                       gateway at https://ai-assistant.fire-chain.com. Set to
+#                       an empty string to keep building against HOST_FQDN over
+#                       dev http (e.g. local-only / --gateway-only setups).
+#   FLUTTER             Flutter SDK binary path (default: $HOME/Projects/mobile/flutter/bin/flutter)
 #   FLUTTER_ARGS    Extra args appended to flutter run (alternative to --)
 
 set -euo pipefail
@@ -105,6 +110,12 @@ if [ -z "${HOST_FQDN:-}" ]; then
   fi
 fi
 
+# Public backend URL baked into the app: the cluster gateway by default. This
+# also flips the app to the production (https) environment, so derived service
+# origins drop their fixed dev ports and use standard 443. Override to "" to
+# fall back to the HOST_FQDN dev-http build.
+PUBLIC_BACKEND_URL="${PUBLIC_BACKEND_URL:-https://ai-assistant.fire-chain.com}"
+
 # Target device for flutter run -d: explicit FLUTTER_DEVICE (env/dev.env) wins,
 # else the Linux desktop.
 FLUTTER_DEVICE="${FLUTTER_DEVICE:-linux}"
@@ -184,6 +195,8 @@ ensure_env_default() {
   fi
 }
 ensure_env_default "BETTER_AUTH_URL" "http://${HOST_FQDN}:17600"
+# Catalog directory (skills/agents/mcp) shipped with the repo for dev.
+ensure_env_default "CONFIG_DIR" "./config"
 
 # 4) npm install (only if node_modules is missing).
 if [ ! -d node_modules ]; then
@@ -267,7 +280,11 @@ if [ "$GATEWAY_ONLY" = "1" ]; then
   exit 0
 fi
 
-echo "Running flutter on '$FLUTTER_DEVICE' against host '$HOST_FQDN' (dev http)…"
+if [ -n "$PUBLIC_BACKEND_URL" ]; then
+  echo "Running flutter on '$FLUTTER_DEVICE' against '$PUBLIC_BACKEND_URL' (production https)…"
+else
+  echo "Running flutter on '$FLUTTER_DEVICE' against host '$HOST_FQDN' (dev http)…"
+fi
 
 # Self-heal wireless adb after a phone reboot: `adb tcpip` does not survive
 # reboots without root. When the configured device is an adb TCP target that
@@ -311,6 +328,7 @@ esac
 "$FLUTTER_BIN" run \
   -d "$FLUTTER_DEVICE" \
   --dart-define=HOST_FQDN="$HOST_FQDN" \
+  --dart-define=PUBLIC_BACKEND_URL="$PUBLIC_BACKEND_URL" \
   "${EXTRA_ARGS[@]}" &
 FLUTTER_PID=$!
 

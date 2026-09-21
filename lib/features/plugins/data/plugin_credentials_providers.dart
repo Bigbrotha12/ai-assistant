@@ -54,8 +54,13 @@ final pluginCredentialsProvider =
   final scope = ref.watch(pluginAccountScopeProvider);
   final store = ref.watch(pluginCredentialsStoreProvider);
   var config = await store.load(scope);
-  if (config.plugins.isEmpty) {
-    await store.ensureDefaultAgent(scope, templateId: await _firstAgentTemplateId(ref));
+  if (config.plugins.isEmpty ||
+      store.hasFallbackAgent(config) ||
+      store.needsDefaultAgent(config)) {
+    await store.ensureDefaultAgent(
+      scope,
+      templateId: await _firstAgentTemplateId(ref),
+    );
     config = await store.load(scope);
   }
   return config;

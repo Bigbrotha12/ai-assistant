@@ -81,9 +81,13 @@ class _AgentEditorScreenState extends ConsumerState<AgentEditorScreen> {
         skills: _selectedSkills.toList()..sort(),
         mcpServers: _selectedMcps.toList()..sort(),
       );
-      final creds = ref.read(scopedPluginCredentialsProvider);
-      await creds.setAgentConfig(id, config);
-      await creds.setSelectedAgent(id);
+      // Re-read the provider before each write: the scoped provider is
+      // autoDispose and its `_invalidate()` bumps the credentials epoch, which
+      // invalidates the provider instance we hold. Reading it fresh per write
+      // avoids handing a stale instance (unmounted ref / stale epoch) to the
+      // next `_write`, which would throw PluginReauthenticationRequired.
+      await ref.read(scopedPluginCredentialsProvider).setAgentConfig(id, config);
+      await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(id);
       if (!mounted) return;
       Navigator.of(context).pop();
     } catch (_) {

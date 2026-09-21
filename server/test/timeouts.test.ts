@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
 import { envSchema } from "../src/env.ts";
-import { bindMcpServers, McpError, mcpCall } from "../src/agents/mcp.ts";
-import type { LookupFn } from "../src/plugins/ssrf.ts";
+import { bindMcpServers } from "../src/agents/mcp.ts";
 
 const REQUIRED = {
   BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
@@ -108,65 +107,29 @@ describe("logger threshold filtering (fresh process)", () => {
   });
 });
 
-const fakeLookup: LookupFn = async () => [{ address: "1.2.3.4", family: 4 }];
-
-describe("MCP per-call timeout", () => {
-  test("mcpCall with an already-aborted signal fails fast with McpError", async () => {
+describe("MCP abort handling", () => {
+  test("bindMcpServers with an already-aborted signal skips servers without connecting", async () => {
     const aborted = AbortSignal.abort();
-    let combinedWasAborted = false;
-
-    await assert.rejects(
-      mcpCall("https://mcp.example.com", "initialize", undefined, {
-        fetchFn: (_url, init) => {
-          combinedWasAborted = init?.signal?.aborted === true;
-          throw new DOMException("aborted", "AbortError");
-        },
-        lookup: fakeLookup,
-        mode: "test",
-        signal: aborted,
-      }),
-      (err: unknown) => {
-        assert.ok(err instanceof McpError, "expected an McpError");
-        assert.match(err.message, /timed out/);
-        return true;
-      },
-    );
-
-    assert.ok(
-      combinedWasAborted,
-      "the combined signal must reflect the aborted caller signal",
-    );
-  });
-
-  test("mcpCall does not wrap non-abort errors as timeouts", async () => {
-    await assert.rejects(
-      mcpCall("https://mcp.example.com", "initialize", undefined, {
-        fetchFn: async () => new Response(null, { status: 500 }),
-        lookup: fakeLookup,
-        mode: "test",
-      }),
-      (err: unknown) => {
-        assert.ok(err instanceof McpError);
-        assert.match(err.message, /MCP server returned 500/);
-        return true;
-      },
-    );
-  });
-
-  test("bindMcpServers with an already-aborted signal skips the server fast", async () => {
-    const aborted = AbortSignal.abort();
-    const tools = await bindMcpServers(
+    let factoryCalled = false;
+    const factory = async () => {
+      factoryCalled = true;
+      return {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {},
+      };
+    };
+    const binding = await bindMcpServers(
       [{ name: "slow-server", url: "https://mcp-slow.example.com" }],
       undefined,
-      {
-        fetchFn: () => {
-          throw new DOMException("aborted", "AbortError");
-        },
-        lookup: fakeLookup,
-        mode: "test",
-        signal: aborted,
-      },
+      { clientFactory: factory, signal: aborted },
     );
-    assert.equal(tools.length, 0);
+    assert.equal(binding.tools.length, 0);
+    assert.equal(
+      factoryCalled,
+      false,
+      "the factory must not run when the signal is already aborted",
+    );
+    await binding.dispose();
   });
 });

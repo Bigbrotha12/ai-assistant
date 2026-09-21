@@ -22,17 +22,20 @@
     "@langchain/langgraph": "^1.4.15",
     "@langchain/langgraph-checkpoint-sqlite": "^1.0.4",
     "@langchain/openai": "^1.5.13",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-auth": "^1.7.2",
     "better-sqlite3": "^12.2.0",
     "better-sqlite3-multiple-ciphers": "^12.11.1",
     "dotenv": "^17.4.2",
     "hono": "^4.13.5",
+    "nodemailer": "^7.0.13",
     "undici": "^6.28.1",
     "zod": "^4.5.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.0.0",
+    "@types/nodemailer": "^6.4.24",
     "auth": "^1.7.2",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3"

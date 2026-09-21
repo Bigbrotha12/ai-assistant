@@ -14,9 +14,12 @@ import '../data/auth_credentials_store.dart';
 /// persists it through [authCredentialsProvider] (secure storage) before
 /// invoking [onSuccess], so the caller only acts once the key is stored.
 ///
-/// Used by the onboarding Account step now and by the Settings re-auth path
-/// later. Renders a bare form (no [Scaffold]); the host screen supplies the
-/// surrounding layout.
+/// Also hosts the forgotten-password sub-flow (email → reset link, reached via
+/// "Forgot password?" on the sign-in segment) and recovers from a duplicate
+/// sign-up by offering to switch straight to sign-in with the email prefilled.
+/// Used by the onboarding Account step, the Settings re-auth path and the
+/// in-conversation re-auth card. Renders a bare form (no [Scaffold]); the host
+/// screen supplies the surrounding layout.
 class AuthFlow extends ConsumerStatefulWidget {
   const AuthFlow({super.key, required this.onSuccess});
 
@@ -37,6 +40,17 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
   bool _obscurePassword = true;
   bool _submitting = false;
   String? _error;
+
+  /// True while the forgot-password sub-flow is shown instead of the form.
+  bool _forgotMode = false;
+
+  /// True when the reset request succeeded (show the "check your email"
+  /// confirmation instead of the form).
+  bool _forgotSent = false;
+
+  /// Set when the last create-account attempt was rejected because the email
+  /// is already registered; surfaces the "Sign in instead" affordance.
+  bool _emailTaken = false;
 
   @override
   void dispose() {
@@ -63,6 +77,7 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
     setState(() {
       _submitting = true;
       _error = null;
+      _emailTaken = false;
     });
     try {
       final auth = ref.read(authClientProvider);
@@ -98,6 +113,7 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
       setState(() {
         _submitting = false;
         _error = _authErrorText(e);
+        _emailTaken = e is AuthEmailTaken;
       });
     } catch (e) {
       if (!mounted) return;
@@ -108,16 +124,78 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
     }
   }
 
+  Future<void> _submitForgot() async {
+    if (_submitting) return;
+    final email = _emailController.text.trim();
+    if (email.isEmpty) {
+      setState(() => _error = 'Enter your email address');
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      await ref.read(authClientProvider).requestPasswordReset(email: email);
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _forgotSent = true;
+      });
+    } on AuthApiError catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _error = _authErrorText(e);
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _error = 'Could not request a password reset. Try again.';
+      });
+    }
+  }
+
+  void _switchToSignIn() {
+    setState(() {
+      _createAccount = false;
+      _forgotMode = false;
+      _forgotSent = false;
+      _emailTaken = false;
+      _error = null;
+    });
+  }
+
   static String _authErrorText(AuthApiError e) => switch (e) {
+    AuthInvalidCredentials(code: final code?)
+        when code == 'PASSWORD_TOO_SHORT' =>
+          'Password must be at least 8 characters',
+    AuthInvalidCredentials(code: final code?)
+        when code == 'PASSWORD_TOO_LONG' =>
+          'Password is too long',
+    AuthInvalidCredentials(code: final code?)
+        when code == 'INVALID_EMAIL' =>
+          'Enter a valid email address',
     AuthInvalidCredentials() => 'Incorrect email or password',
     AuthEmailTaken() => 'An account already exists for this email',
     AuthUnauthorized() => 'This session was rejected. Try signing in again.',
     AuthNetworkError() => 'Could not reach the server. Check your connection.',
+    AuthServerError(statusCode: final status)
+        when status != null && status >= 500 =>
+      'The server hit a problem (HTTP $status). Please try again.',
     AuthServerError() => 'Server error: ${e.message}',
   };
 
   @override
   Widget build(BuildContext context) {
+    if (_forgotMode) {
+      return _buildForgotForm(context);
+    }
+    return _buildCredentialsForm(context);
+  }
+
+  Widget _buildCredentialsForm(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     return Column(
@@ -138,7 +216,11 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
           ],
           selected: {_createAccount},
           onSelectionChanged: (selection) {
-            setState(() => _createAccount = selection.first);
+            setState(() {
+              _createAccount = selection.first;
+              _emailTaken = false;
+              _error = null;
+            });
           },
         ),
         const SizedBox(height: 16),
@@ -187,11 +269,31 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
             ),
           ),
         ),
+        if (!_createAccount)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              key: const Key('auth-forgot-link'),
+              onPressed: () => setState(() {
+                _forgotMode = true;
+                _error = null;
+              }),
+              child: const Text('Forgot password?'),
+            ),
+          ),
         if (_error != null) ...[
           const SizedBox(height: 12),
           Text(
             _error!,
             style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+          ),
+        ],
+        if (_emailTaken) ...[
+          const SizedBox(height: 4),
+          TextButton(
+            key: const Key('auth-signin-instead'),
+            onPressed: _switchToSignIn,
+            child: const Text('Sign in instead'),
           ),
         ],
         const SizedBox(height: 20),
@@ -205,6 +307,86 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
               : Text(_createAccount ? 'Create account' : 'Sign in'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildForgotForm(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    if (_forgotSent) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Icon(Icons.mark_email_read_outlined, size: 40),
+          const SizedBox(height: 12),
+          Text(
+            'If an account exists for ${_emailController.text.trim()}, a '
+            'password reset link is on its way.',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 20),
+          TextButton(
+            key: const Key('auth-forgot-back'),
+            onPressed: _switchToSignIn,
+            child: const Text('Back to sign in'),
+          ),
+        ],
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          'Reset your password',
+          style: theme.textTheme.titleMedium,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Enter the email address on your account and we will send you a '
+          'password reset link.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: scheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          key: const Key('auth-forgot-email'),
+          controller: _emailController,
+          decoration: const InputDecoration(
+            labelText: 'Email address',
+            border: OutlineInputBorder(),
+          ),
+          keyboardType: TextInputType.emailAddress,
+          autocorrect: false,
+          textInputAction: TextInputAction.done,
+          onSubmitted: (_) => _submitForgot(),
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _error!,
+            style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+          ),
+        ],
+        const SizedBox(height: 20),
+        FilledButton(
+          key: const Key('auth-forgot-submit'),
+          onPressed: _submitting ? null : _submitForgot,
+          child: _submitting
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('Send reset link'),
+        ),
+        TextButton(
+          key: const Key('auth-forgot-back'),
+          onPressed: _submitting ? null : _switchToSignIn,
+          child: const Text('Back to sign in'),
         ),
       ],
     );
