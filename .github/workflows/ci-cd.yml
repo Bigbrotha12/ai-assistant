@@ -1,0 +1,59 @@
+name: ci-cd
+
+on:
+  push:
+    # Trim to [main] once the feature branch is merged.
+    branches:
+      - main
+      - feat/gateway-cluster-mcp
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    name: Test, build, push to GHCR, roll out to k3s
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Server tests + typecheck
+        working-directory: server
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npm test
+
+      - name: Build image
+        run: |
+          SHA="${GITHUB_SHA}"
+          podman build \
+            -t ai-assistant-gateway:${SHA} \
+            -t ai-assistant-gateway:latest \
+            -f Dockerfile .
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login --password-stdin -u bigbrotha12 ghcr.io
+
+      - name: Push to GHCR
+        run: |
+          SHA="${GITHUB_SHA}"
+          podman push ai-assistant-gateway:${SHA} docker://ghcr.io/bigbrotha12/ai-assistant-gateway:${SHA}
+          podman push ai-assistant-gateway:latest docker://ghcr.io/bigbrotha12/ai-assistant-gateway:latest
+
+      - name: Roll out to k3s
+        run: |
+          SHA="${GITHUB_SHA}"
+          IMG="ghcr.io/bigbrotha12/ai-assistant-gateway:${SHA}"
+          kubectl set image deployment/ai-assistant -n productivity \
+            ai-assistant="${IMG}" migrate="${IMG}"
+          kubectl rollout status deployment/ai-assistant -n productivity --timeout=180s
