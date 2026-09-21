@@ -2,10 +2,8 @@ name: ci-cd
 
 on:
   push:
-    # Trim to [main] once the feature branch is merged.
     branches:
       - main
-      - feat/gateway-cluster-mcp
   workflow_dispatch:
 
 concurrency:
