@@ -27,6 +27,9 @@ jobs:
 
       - name: Server tests + typecheck
         working-directory: server
+        env:
+          BETTER_AUTH_SECRET: ci-test-only-secret-0123456789abcdef0123456789abcdef
+          BETTER_AUTH_URL: http://localhost:17600
         run: |
           npm ci
           npx tsc --noEmit
