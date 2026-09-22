@@ -50,12 +50,10 @@ app.route("/ledger", ledgerRoutes);
 app.route("/", createResetPasswordRoutes());
 
 // D8 (stateless-gateway): the SQLCipher checkpoint store is gone — no
-// checkpoint DB is ever opened. Remove any legacy checkpoints.db left behind
-// by older deployments so abandoned conversation data does not linger at rest
-// (goal: no long-term user content on disk). The retired CHECKPOINT_DB_PATH
-// env var is still honored here for custom locations; cleanup is best-effort
-// and never fatal.
-for (const base of [process.env.CHECKPOINT_DB_PATH ?? "./data/checkpoints.db"]) {
+// checkpoint DB is ever opened. Remove any checkpoints.db left behind by
+// older deployments so abandoned conversation data does not linger at rest
+// (goal: no long-term user content on disk). Best-effort, never fatal.
+for (const base of ["./data/checkpoints.db"]) {
   for (const path of [base, `${base}-wal`, `${base}-shm`]) {
     try {
       if (existsSync(path)) {
@@ -69,10 +67,10 @@ for (const base of [process.env.CHECKPOINT_DB_PATH ?? "./data/checkpoints.db"]) 
 }
 
 // ntfy push-notification provisioning (plan §Notifications): the topic +
-// access token are encrypted at rest with the NOTIFY_STORE_KEY secret (legacy
-// alias CHECKPOINT_DB_KEY); the NOTIFY_BASE_URL env var (empty = disabled)
-// gates the push hook. The store lazy-loads, so a corrupt notify file
-// degrades provision 500s rather than taking down the gateway.
+// access token are encrypted at rest with the NOTIFY_STORE_KEY secret; the
+// NOTIFY_BASE_URL env var (empty = disabled) gates the push hook. The store
+// lazy-loads, so a corrupt notify file degrades provision 500s rather than
+// taking down the gateway.
 const notifyStore = new NotifyStore({ key: env.NOTIFY_STORE_KEY });
 app.route("/api/notify", createNotifyRoutes({ store: notifyStore }));
 

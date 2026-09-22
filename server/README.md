@@ -61,7 +61,7 @@ the ledger needs migrating.
 | `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
 | `LEDGER_STUCK_TIMEOUT_MS`| no | `10000`               | Heartbeat silence that marks a task `stuck`. **Must be < lease.** |
 | `LEDGER_LEASE_EXPIRY_MS`| no  | `60000`               | Worker lease expiry. Final tuning is Phase 4 (M5).               |
-| `NOTIFY_STORE_KEY`     | prod | *(dev default, warned)* | AES-256-GCM key for the notify store (ntfy topic + access token at rest). **Required when `NODE_ENV=production`** (fail-fast). Legacy alias: `CHECKPOINT_DB_KEY` (same value — already-encrypted stores stay readable). Dev falls back to a stable development-only default with a loud warning. `openssl rand -hex 32`. |
+| `NOTIFY_STORE_KEY`     | prod | *(dev default, warned)* | AES-256-GCM key for the notify store (ntfy topic + access token at rest). **Required when `NODE_ENV=production`** (fail-fast). Dev falls back to a stable development-only default with a loud warning. `openssl rand -hex 32`. |
 | `PLUGINS_STORE_PATH`    | no  | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests (Phase 1). Recreated empty on first boot. |
 | `PLUGINS_TRUSTED_HOSTS` | no  | `""`                  | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin baseUrls (admin-trusted internal hosts, e.g. `vikunja.local`, `*.local`). Scheme enforcement (`https` in production) is never bypassed. |
 | `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute **per user**).            |

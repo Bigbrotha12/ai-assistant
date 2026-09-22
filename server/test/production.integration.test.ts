@@ -44,8 +44,7 @@ test("production context config validates limits and warmups default off", () =>
         BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
         BETTER_AUTH_URL: "http://localhost:17600",
         PORT: "17600",
-        // Legacy alias — the real schema resolves this into NOTIFY_STORE_KEY.
-        CHECKPOINT_DB_KEY: "test-checkpoint-key",
+        NOTIFY_STORE_KEY: "test-notify-store-key",
         PLUGINS_TRUSTED_HOSTS: "",
         ...overrides,
       },
@@ -115,9 +114,7 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     WARMUP_MAX_CONCURRENT: 1,
     WARMUP_TIMEOUT_MS: 1000,
     PLUGINS_TRUSTED_HOSTS: ["tasks.example.test"],
-    // index.ts keys NotifyStore from NOTIFY_STORE_KEY; the spawn-based env in
-    // this file still sets the legacy CHECKPOINT_DB_KEY to cover the alias.
-    NOTIFY_STORE_KEY: "test-checkpoint-key",
+    NOTIFY_STORE_KEY: "test-notify-store-key",
     NOTIFY_BASE_URL: "",
   };
   const modules: Record<string, Record<string, unknown>> = {

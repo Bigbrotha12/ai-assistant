@@ -10,8 +10,7 @@ config({ quiet: true });
  * default is a STABLE literal (never randomly re-derived — a fresh random key
  * per boot would make every previously-written store unreadable). It is a loud
  * anti-pattern named as such; production is fail-fast instead (see the
- * superRefine below). The literal value is unchanged from the old
- * `CHECKPOINT_DB_KEY` dev default so existing dev stores stay decryptable.
+ * superRefine below).
  */
 const NOTIFY_STORE_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
 
@@ -82,11 +81,30 @@ export const envSchema = z.object({
   // Encryption key for the notify store (`notify/store.ts` — ntfy topic +
   // access token at rest, AES-256-GCM via sha256(key)). Required in
   // production (fail-fast below); development falls back to a stable DEV-ONLY
-  // default and warns loudly.
-  NOTIFY_STORE_KEY: z.string().optional(),
-  /** @deprecated Legacy alias for NOTIFY_STORE_KEY — same value, kept so
-   * existing deployments' env + already-encrypted stores keep working. */
-  CHECKPOINT_DB_KEY: z.string().optional(),
+  // default and warns loudly. The transform guarantees a non-undefined value
+  // by export.
+  NOTIFY_STORE_KEY: z
+    .string()
+    .optional()
+    .superRefine((value, ctx) => {
+      if (process.env.NODE_ENV === "production" && !value) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "NOTIFY_STORE_KEY is required when NODE_ENV=production; " +
+            "the notify store is encrypted at rest and refuses a plaintext default",
+        });
+      }
+    })
+    .transform((value) => {
+      if (value) return value;
+      console.warn(
+        "Gateway: NOTIFY_STORE_KEY is unset; using a DEVELOPMENT-ONLY default " +
+          "key for the notify store. Set NOTIFY_STORE_KEY to a real secret " +
+          "(e.g. `openssl rand -hex 32`) before production.",
+      );
+      return NOTIFY_STORE_DEV_DEFAULT_KEY;
+    }),
   // SMTP settings for the password-reset email (better-auth
   // `sendResetPassword`). Empty SMTP_HOST (the default) disables sending and
   // logs the reset link instead — a development fallback so the forgot-password
@@ -160,19 +178,6 @@ export const envSchema = z.object({
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),
-}).superRefine((data, ctx) => {
-  // Production needs SOME key for the notify store (either name) — fail fast
-  // at load. Dev/test fall back to the warned dev default during resolution.
-  if (data.NODE_ENV === "production" && !data.NOTIFY_STORE_KEY && !data.CHECKPOINT_DB_KEY) {
-    ctx.addIssue({
-      code: "custom",
-      path: ["NOTIFY_STORE_KEY"],
-      message:
-        "NOTIFY_STORE_KEY (or its legacy alias CHECKPOINT_DB_KEY) is required " +
-        "when NODE_ENV=production; the notify store is encrypted at rest and " +
-        "refuses a plaintext default",
-    });
-  }
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -184,26 +189,7 @@ if (!parsed.success) {
   process.exit(1);
 }
 
-// Resolve the notify-store key: preferred name, then the legacy alias (same
-// value — sha256 derivation keeps already-encrypted stores readable), then
-// the stable dev default with a loud warning.
-let notifyStoreKey = parsed.data.NOTIFY_STORE_KEY ?? parsed.data.CHECKPOINT_DB_KEY;
-if (parsed.data.CHECKPOINT_DB_KEY && !parsed.data.NOTIFY_STORE_KEY) {
-  console.warn(
-    "Gateway: CHECKPOINT_DB_KEY is deprecated — rename it to NOTIFY_STORE_KEY " +
-      "(keep the same value so encrypted notify stores stay readable).",
-  );
-}
-if (!notifyStoreKey) {
-  console.warn(
-    "Gateway: NOTIFY_STORE_KEY is unset; using a DEVELOPMENT-ONLY default key " +
-      "for the notify store. Set NOTIFY_STORE_KEY to a real secret (e.g. " +
-      "`openssl rand -hex 32`) before production.",
-  );
-  notifyStoreKey = NOTIFY_STORE_DEV_DEFAULT_KEY;
-}
-
-export const env = { ...parsed.data, NOTIFY_STORE_KEY: notifyStoreKey };
+export const env = parsed.data;
 
 // PLUGINS_TRUSTED_HOSTS entries are used verbatim as SSRF trusted-host
 // patterns; a malformed entry (a scheme, port, path, whitespace, bare `*` or
