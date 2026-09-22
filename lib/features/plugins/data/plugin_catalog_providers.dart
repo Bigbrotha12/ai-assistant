@@ -172,7 +172,7 @@ class StagedPluginRequestBuilder {
 
   LangChainRequest build({
     required List<ApiMessage> messages,
-    required String threadId,
+    required String sessionId,
     required String turnId,
   }) {
     _checkCurrent();
@@ -204,7 +204,7 @@ class StagedPluginRequestBuilder {
       credentials: credentials,
       messages: messages,
       managed: true,
-      conversationPublicId: threadId,
+      conversationPublicId: sessionId,
       turnId: turnId,
       enabledPlugins: enabled,
     );

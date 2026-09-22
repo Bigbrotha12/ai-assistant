@@ -15,6 +15,7 @@ class GatewayVisionClient implements VisionClient {
     required this.modelPluginId,
     required this.credentials,
   }) : _endpoint = '${gatewayBase.endsWith('/') ? gatewayBase : '$gatewayBase/'}v1/chat/completions',
+       // ignore: prefer_initializing_formals
        _dio = dio;
 
   final String _endpoint;

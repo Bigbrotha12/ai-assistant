@@ -61,8 +61,7 @@ the ledger needs migrating.
 | `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
 | `LEDGER_STUCK_TIMEOUT_MS`| no | `10000`               | Heartbeat silence that marks a task `stuck`. **Must be < lease.** |
 | `LEDGER_LEASE_EXPIRY_MS`| no  | `60000`               | Worker lease expiry. Final tuning is Phase 4 (M5).               |
-| `CHECKPOINT_DB_PATH`    | no  | `./data/checkpoints.db` | **Dedicated** SQLCipher-encrypted SQLite file for LangGraph conversation checkpoints (Phase 2, Wave B1). |
-| `CHECKPOINT_DB_KEY`     | prod | *(dev default, warned)* | SQLCipher key for the checkpoint DB. **Required when `NODE_ENV=production`** (fail-fast). Dev falls back to a stable development-only default and logs a loud warning. `openssl rand -hex 32`. |
+| `NOTIFY_STORE_KEY`     | prod | *(dev default, warned)* | AES-256-GCM key for the notify store (ntfy topic + access token at rest). **Required when `NODE_ENV=production`** (fail-fast). Legacy alias: `CHECKPOINT_DB_KEY` (same value — already-encrypted stores stay readable). Dev falls back to a stable development-only default with a loud warning. `openssl rand -hex 32`. |
 | `PLUGINS_STORE_PATH`    | no  | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests (Phase 1). Recreated empty on first boot. |
 | `PLUGINS_TRUSTED_HOSTS` | no  | `""`                  | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin baseUrls (admin-trusted internal hosts, e.g. `vikunja.local`, `*.local`). Scheme enforcement (`https` in production) is never bypassed. |
 | `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute **per user**).            |
@@ -227,49 +226,45 @@ introduces a plugin system foundation under `server/src/plugins/`:
 - `index.ts` — composition root wiring env + bundled builtins +
   `availableToolManifests` (both owned by the build artifact).
 
-## Conversation checkpoints (`/v1/threads`, Phase 2 Wave B1)
+## Managed conversations (`/v1/sessions`, stateless gateway)
 
-The LangGraph agent's conversation state is persisted server-side in a
-dedicated SQLite checkpoint store so conversations resume across requests and
-gateway restarts. `src/checkpoints/store.ts` wraps LangGraph's `SqliteSaver`
-with encryption, owner scoping and migrations; `src/agents/compile.ts` provides
-`compileGraphWithCheckpointer(graph, checkpointer)` (the graph from
-`createAgentGraph` is checkpointer-free; the transport recompiles it over
-`store.checkpointer`).
+Conversations run through the stateless-gateway path (plan `docs/stateless-
+gateway-plan.md`). The client owns the conversation history and sends it on
+`POST /v1/chat/completions` with `conversation_mode: "managed"` + a
+client-generated `session_id`; the gateway holds only an in-memory, evictable
+mirror (`src/sessions/store.ts`, no encryption, no durability, no disk) used
+for exactly-once `messageId` dedupe and reply read-back.
 
-**Encryption at rest (decision).** Plain `better-sqlite3` has no encryption, so
-the store opens the DB with `better-sqlite3-multiple-ciphers` — a drop-in fork
-whose `Database` is API-identical to `better-sqlite3` (verified structurally
-compatible with `SqliteSaver`'s `Database` parameter). The DB is created in
-**SQLCipher mode** (`cipher='sqlcipher'` + `legacy=4`) and keyed from
-`CHECKPOINT_DB_KEY`. This was chosen over a transparent
-encrypt-on-close/decrypt-on-open file wrapper because SQLCipher encrypts every
-page as it is written: a crash mid-turn cannot lose state to an un-run encrypt
-pass, and the on-disk file contains no plaintext. A wrong or missing key makes
-the first read throw (`file is not a database`). `CHECKPOINT_DB_KEY` is
-**required in production** (fail-fast in `env.ts`); development falls back to a
-stable, loudly-warned development-only default so dev conversations still
-survive restarts. The DB file (and its `-wal`/`-shm` siblings) is `0600`.
-
-**Schema / ownership.** SqliteSaver creates its own `checkpoints`/`writes`
-tables (kept opaque; the store only hard-deletes/counts them). The store adds a
-parallel `thread_owner` table keyed by the hashed `thread_id`
-(`sha256(userId + clientThreadId)`, see `checkpointThreadId`) recording the
-owning API-key `referenceId`, timestamps and last error. All list/delete/GC
-operations are owner-scoped: a cross-owner or unknown thread is an IDOR-safe
-miss (`[]` / `false` / `0`). Schema versioning uses `PRAGMA user_version`
-(`CURRENT_CHECKPOINT_VERSION`), mirroring the ledger. `redactForCheckpoint`
-masks `Authorization`/`Bearer`/`sk-…` credential material with `***` before
-content reaches checkpoint rows (reusing `CREDENTIAL_REDACTION`).
+- **Establish vs delta** is classified by body shape: a full-history body
+  (more than one message) is an establish — the server seeds/replaces the
+  session's `messages` under `session_id` (this is also the client's §6
+  compaction re-base) and streams `x-conversation-state: seeded`. A
+  single-message body against a live session is a delta append
+  (`x-conversation-state: resumed`); against a missing, non-tombstoned session
+  it is a fresh conversation's first turn and establishes.
+- **Session miss:** a delta against a missing/evicted session returns
+  `409 { error: "session_missing", reason: "evicted" | "restart" }`; the client
+  re-establishes under the SAME `session_id`.
+- **Conversation surface:**
 
 | Endpoint                       | Purpose                                                        |
 | ------------------------------ | -------------------------------------------------------------- |
-| `GET    /v1/threads`           | List the caller's conversations (id, timestamps, message-count proxy). |
-| `DELETE /v1/threads/:threadId` | Owner-scoped hard delete; `404 {"error":"not_found"}` if absent. |
-| `DELETE /v1/threads`           | Per-user GC: delete all of the caller's threads → `{"deleted": N}`. |
+| `GET    /v1/sessions/:id`      | Read back the caller's accumulated messages (owner-scoped; cross-owner → `404`, absent → `409 session_missing`). |
+| `DELETE /v1/sessions/:id`      | Owner-scoped hard delete; `404 {"error":"not_found"}` if absent. |
+
+The legacy checkpoint surface (`/v1/threads`, `compileGraphWithCheckpointer`,
+`checkpointThreadId`) was removed with the sync-path cutover (plan §9); the
+client no longer routes through `thread_id`.
 
 ## Production notes
 
+- **Scale to ONE replica.** Managed-session state (`src/sessions/store.ts`) is
+  in-memory and per-process by design (plan §4/§10): two replicas (or a
+  rolling restart where old and new pods overlap) mean turns land on a process
+  that does not hold the caller's session. Clients recover automatically
+  (`409 session_missing` → same-`session_id` re-establish, bounded retry) but
+  any in-flight stream is lost. There is no sticky-routing or shared-session
+  layer — add one before ever raising the replica count above 1.
 - **Postgres**: swap the SQLite adapter in `src/auth.ts` for a `pg` Pool
   (`import { Pool } from "pg"; database: new Pool({ connectionString: … })`).
   Run `npx auth generate` against a Postgres config, or

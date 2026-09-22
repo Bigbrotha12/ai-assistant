@@ -9,6 +9,7 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
+import type { StreamEvent } from "./openai.ts";
 
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
@@ -18,7 +19,6 @@ import { bindMcpServers } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import { isRecord } from "../util.ts";
 import { createAgentGraph } from "../agents/graph.ts";
-import { compileGraphWithCheckpointer } from "../agents/compile.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
 import type {
   JobErrorCode,
@@ -26,16 +26,11 @@ import type {
   JobRunner,
   RunJobResult,
 } from "../jobs/runner.ts";
-import type { ThreadLockRegistry } from "../jobs/thread_lock.ts";
 import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
-import { admitManagedTurn, inspectManagedTurn, prepareManagedTurn } from "../credentials/managed_admission.ts";
+import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
-import {
-  checkpointThreadId,
-  redactForCheckpoint,
-} from "../checkpoints/store.ts";
-import type { CheckpointStore } from "../checkpoints/store.ts";
+import { redactForCheckpoint } from "../checkpoints/store.ts";
 import {
   credentialFingerprint,
   extractCredentialsFromBody,
@@ -56,18 +51,18 @@ import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.
 import { ContextBudgetError } from "../middleware/context.ts";
 import type { WarmupManager } from "../middleware/warmup.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
-import type {
-  ContextManager,
-} from "../middleware/context.ts";
 import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
 import type {
   PerOwnerRateLimiter,
   RateLimitResult,
 } from "../middleware/rate_limit.ts";
 import type { Ledger, TaskRow } from "../ledger.ts";
+import { SPEC_MAX_LENGTH } from "../ledger.ts";
 import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
+import type { SessionStore, SessionMissingReason } from "../sessions/store.ts";
+import type { AppendDeltaResult, ReestablishResult } from "../sessions/store.ts";
 
 const agentSpecCaps = {
   systemPrompt: env.AGENT_SPEC_MAX_SYSTEM_PROMPT,
@@ -114,10 +109,10 @@ const customAgentSpecSchema = z.object({
  *   4. resolve the model plugin from `body.model` (see MODEL SELECTION)
  *   5. extract + validate the plugin's credentials from `body.credentials`
  *      (see CREDENTIAL SOURCING) -> 400 invalid_credentials
- *   6. thread handling (see SEED/RESUME) under the shared per-thread lock
- *   7. build the model (`transport/model.ts`) + bind the real `ToolExecutor`,
- *      compile the agent graph over the checkpoint store (or checkpointer-free)
- *   8. `graph.streamEvents(input, { version: "v2", ... })` piped through
+ *   6. build the model (`transport/model.ts`) + bind the real `ToolExecutor`,
+ *      compile the agent graph WITHOUT a checkpointer (the sync path never
+ *      reads or writes a checkpoint)
+ *   7. `graph.streamEvents(input, { version: "v2", ... })` piped through
  *      `toOpenAiSse` as an SSE response (`text/event-stream`, `no-cache`).
  *
  * MODEL SELECTION: `body.model` is the model-plugin id (the client sends the id
@@ -134,22 +129,11 @@ const customAgentSpecSchema = z.object({
  * let the gateway's own key leak to the provider and would make per-plugin key
  * rotation impossible. Missing/invalid -> 400 invalid_credentials.
  *
- * SEED/RESUME (conversation identity, plan Phase 3): when `body.thread_id` AND
- * a checkpoint store are both present, the handler maps the thread to an
- * owner-bound key (`checkpointThreadId`) and streams the graph with
- * `{ configurable: { thread_id } }`. The rule:
- *   - NO checkpoint yet for the thread -> SEED: the graph input is the client's
- *     full `messages` (client history creates the checkpoint).
- *   - A checkpoint EXISTS -> RESUME: only the LAST user message is appended
- *     (`{ messages: [lastUserMessage] }`); the client's history is ignored
- *     (checkpointed state is the source of truth). A resume with no user
- *     message degrades to `{ messages: [] }` (the graph re-runs on checkpointed
- *     state). "Has checkpoint" is detected via the CHECKPOINTER's `get`, never
- *     the `thread_owner` metadata row — `touchThread` writes that row before
- *     any checkpoint exists, so it cannot signal "already seeded".
- * When `thread_id` is absent OR no checkpoint store is available (boot
- * degraded, see index.ts), the run is STATELESS: the client's `messages` are
- * used verbatim and no checkpoint is written (documented degradation).
+ * CONVERSATION IDENTITY (plan §5): `thread_id` is replaced by `session_id` on
+ * the sync path. A managed request MUST carry `session_id` (see MANAGED SESSION
+ * PATH); a non-managed sync request is STATELESS — the client's `messages` are
+ * streamed verbatim and no checkpoint is written. `thread_id` survives ONLY as
+ * a worker label on the BACKGROUND path (see ASYNC DELEGATION).
  *
  * SYNC VS ASYNC DECISION RULE (Wave C2):
  *   - `body.background === true` -> ASYNC delegation (below).
@@ -157,21 +141,24 @@ const customAgentSpecSchema = z.object({
  *   - any other value -> 400 invalid_request (`background must be a boolean`),
  *     so a malformed flag can never silently run synchronously.
  *
- * ASYNC DELEGATION (Wave C2): a background request:
+ * ASYNC DELEGATION (Wave C2 / stateless-gateway step 8): a background request:
  *   1. resolves the model plugin + validates credentials (shared with sync);
- *   2. requires `checkpointStore` + `jobRunner` + `ledger` + `pins` -> 503
+ *   2. requires `jobRunner` + `ledger` + `pins` -> 503
  *      `{ error: "background_unavailable" }` when the async path is not wired;
  *   3. requires an idempotency key in `body.messageId` (see IDEMPOTENCY) ->
  *      400 invalid_request when missing;
- *   4. maps `thread_id` (or `messageId` when absent) to the owner-bound
- *      checkpoint thread and records it (`touchThread`);
+ *   4. builds the SNAPSHOT — the request's `messages` converted to LangChain
+ *      messages (same as the stateless sync path) — and ships it to the runner
+ *      as `input: { messages: snapshot }`. The job runs on this snapshot, never
+ *      a live session/checkpoint; the runner persists it as the ledger payload
+ *      for crash-resume (ledger v5);
  *   5. validates + PINS the model-plugin credential and every installed
  *      tool-plugin credential in `body.credentials` -> 400 invalid_credentials
  *      on failure, BEFORE any task is admitted;
  *   6. `getOrCreateTask(ledger, { owner, intentKey: messageId, spec })` —
  *      owner-scoped idempotent admission;
  *   7. `jobRunner.runJob({...})` with the pinned credentials (the runner's
- *      `buildModel` seam resolves the model pin) and the seed/resume input;
+ *      `buildModel` seam resolves the model pin) and the snapshot input;
  *   8. maps the `RunJobResult` to HTTP (see JOB ERROR MAPPING).
  *
  * IDEMPOTENCY: the client generates `body.messageId` ONCE per send and reuses
@@ -180,19 +167,6 @@ const customAgentSpecSchema = z.object({
  * creates a duplicate job. The status-by-key endpoint
  * (`GET /ledger/tasks/by-key/:messageId`) is the client's poll-after-drop
  * surface; this transport reuses it and does NOT duplicate the logic.
- *
- * THREAD LOCK (Wave C2): the sync stream and the `JobRunner` share a single
- * `ThreadLockRegistry` (constructed in index.ts). The sync handler acquires the
- * thread's mutex BEFORE the seed/resume read and holds it until the SSE stream
- * completes or aborts (released in the stream's finally / cancel), so two
- * concurrent requests on the same thread — or a sync stream racing a background
- * job — serialize instead of clobbering checkpoints. After the stream, a
- * best-effort optimistic re-check compares our final checkpoint id with the
- * thread's current id and LOGS a warning if a writer the mutex cannot see
- * (a second process sharing the DB) moved it; full re-evaluation is deferred
- * for the streaming path (the runner's `invoke` path retains it), because the
- * stream is already on the wire. The gateway is single-process (AGENTS.md), so
- * the mutex is the primary protection.
  *
  * JOB ERROR MAPPING (Wave C2; `JobErrorCode` -> HTTP):
  *   credentials_expired  -> 401 { error: "credentials_expired", message }
@@ -211,22 +185,108 @@ const customAgentSpecSchema = z.object({
  *   503 busy                      per-user budget queue full — async path
  *                                 (concurrent-capacity, retryable)
  *   400 invalid_request           invalid JSON; missing/unknown/non-model/
- *                                 non-streaming plugin; missing/empty messages
- *                                 (invalid_request_error)
+ *                                 non-streaming plugin; missing/empty messages;
+ *                                 managed request with a malformed session_id;
+ *                                 session delta whose last message is not a
+ *                                 user message (invalid_request_error)
  *   400 invalid_credentials       missing/invalid model-plugin credentials
  *                                 (auth_error, user-fixable)
+ *   409 conversation_in_flight    a managed-session turn with this messageId is
+ *                                 already running (session dedupe; §4)
+ *   409 session_missing           managed-session session_id is gone — client
+ *                                 re-establishes under the SAME session_id;
+ *                                 reason is the store's "evicted"|"restart"
+ *   413 request_too_large         body exceeds the path's cap: establishes are
+ *                                 bounded by MAX_ESTABLISH_BODY_BYTES (route
+ *                                 bodyLimit), every other request by
+ *                                 MAX_REQUEST_BODY_BYTES (post-read check —
+ *                                 see ESTABLISH BODY CAP below)
  *   502 inference_unavailable     plugin registry unavailable (NOT_LOADED)
  *   503 background_unavailable    async path not wired (no runner/store)
  *   500 internal                  anything else (server_error; logged)
  * Mid-stream failures never change the HTTP status: the SSE adapter emits one
  * error envelope then [DONE] (§5.2).
+ *
+ * MANAGED SESSION PATH (stateless gateway, plan §4/§5): the synchronous managed
+ * path is SESSION-ONLY. A managed request (`conversation_mode: "managed"`) MUST
+ * carry a non-empty `session_id` (400 invalid_request otherwise) and a
+ * `messageId`; it dispatches to `handleManagedSessionStream`, where the
+ * in-memory `sessionStore` is the only state. It NEVER touches the ledger, the
+ * checkpointer, thread locks, or the per-thread context manager. Exactly-once
+ * is the store's per-session `outcomes` map.
+ *
+ *   - ESTABLISH (a full-history body, i.e. more than one message — first turn,
+ *     reseed, or the §6 compaction re-base): the request's messages are the
+ *     full history. We seed the history WITHOUT the trailing user turn, then
+ *     `store.appendDelta(messageId, lastUserMessage)` so the exactly-once
+ *     `outcomes[messageId]` anchor is recorded from the very first turn (a
+ *     retried/concurrent establish is deduped, and a failed establish rolls
+ *     the user turn back). Graph input = the session's accumulated messages;
+ *     `x-conversation-state: seeded`. A compaction re-base is an establish even
+ *     against a LIVE session — the server REPLACES `messages` (§6), exactly
+ *     what a client-trimmed re-base means (F2).
+ *   - SINGLE-MESSAGE ESTABLISH (session MISSING + one message, reason
+ *     `"restart"`/fresh): the FIRST TURN of a brand-new managed conversation is
+ *     a single-message full history, so it establishes (F1) — seeded the same
+ *     way (empty seed + `appendDelta` anchor), `x-conversation-state: seeded`.
+ *   - DELTA (session live + a single-message body): the request must end with a
+ *     single new user message (400 otherwise). `store.appendDelta(...)` appends
+ *     it; graph input = the session's accumulated messages (full context,
+ *     R12); `x-conversation-state: resumed`.
+ *   - MISSING-SESSION DELTA (session missing + a single-message body whose
+ *     store reason is `"evicted"`): a delta-shaped request the store cannot
+ *     apply -> 409 `session_missing` with the `"evicted"` reason (the §4
+ *     eviction signal; the client re-establishes under the SAME session_id
+ *     with a full-history establish). A fresh/`"restart"` single-message body
+ *     is NOT this case — it establishes (above).
+ *   - appendDelta results -> HTTP: resumed/established -> stream (a retry of a
+ *     `failed` messageId also returns `resumed` — a clean re-run per plan §4
+ *     step 6 — so it streams normally as a resumed turn); already_completed
+ *     -> 200 `{ status, sessionId, messageId }` (no
+ *     taskId/terminalStatus/threadId per §5; `x-conversation-state: resumed`);
+ *     in_progress -> 409
+ *     `conversation_in_flight`; session_missing -> 409 `session_missing` with
+ *     the store's reason.
+ *   - Reply persistence: on stream success the transport captures the final
+ *     assistant message (root `on_chain_end`), appends it to the session under
+ *     a synthetic `<messageId>:assistant` id (the store's `appendDelta` is the
+ *     only appender; the synthetic id can never collide with a client UUID),
+ *     then `store.markCompleted(messageId, reply)`. On failure/cancel it calls
+ *     `store.markFailed(messageId)` (rolls the user turn back). The append
+ *     precedes the stream (exactly-once dedupe must be atomic at append time),
+ *     so every PRE-STREAM failure — a model-build error, an MCP bind rejection,
+ *     a budget-busy rejection, or a buildStreamResponse construction error —
+ *     ALSO rolls the turn back with `markFailed` (exactly once per failed turn)
+ *     before its response is returned/rethrown; a half-appended delta is never
+ *     left `in_progress` (plan §4 step 6). Both the reply
+ *     append and the marks carry the generation captured at append time, so a
+ *     mid-turn eviction + re-seed can never stamp the new incarnation (F4);
+ *     the reply append is `evictOnOverflow: false`, so an over-cap reply is
+ *     dropped rather than evicting the session (F5). An evicted-mid-turn mark
+ *     is logged and ignored (client re-establishes).
+ *   - Headers: every session-path response sets `x-session-id`; the stream
+ *     sets `x-conversation-state: seeded|resumed`. `recreated` is never
+ *     emitted on this path.
+ *
+ * ESTABLISH BODY CAP (§5/R6): vision establishes carry full history + base64
+ * images, so the route-level `bodyLimit` is raised to `MAX_ESTABLISH_BODY_BYTES`
+ * (25 MiB default). The establish/delta distinction is only visible from the
+ * parsed body (content-length is the only pre-read signal), so non-establish
+ * requests are re-bounded AFTER reading: a request that is not an establish
+ * (no session_id, a single-message session delta, or a single-message body
+ * against a tombstoned/`"evicted"` session) whose content-length
+ * exceeds `MAX_REQUEST_BODY_BYTES` is rejected post-read with the SAME 413
+ * `request_too_large` shape the bodyLimit middleware emits. An establish is
+ * signalled by `conversation_mode: "managed"` + `session_id` + more than one
+ * message (full history) OR a single-message body against a missing, non-
+ * evicted session (the F1 first turn); a re-sent establish body therefore
+ * keeps the higher cap even when the session already exists (the
+ * already_completed retry).
  */
 
 export type ChatRoutesOptions = {
   registry: PluginRegistry;
   pluginStore: PluginStore;
-  /** Optional — when absent (boot failed), every run is stateless. */
-  checkpointStore?: CheckpointStore;
   /** Optional — required for async delegation (`getOrCreateTask`). */
   ledger?: Ledger;
   /** Optional — the background job runner (Wave C2 async delegation). */
@@ -236,18 +296,6 @@ export type ChatRoutesOptions = {
    * model + tool credentials here; the runner reads them by (owner, pluginId).
    */
   pins?: CredentialPinStore;
-  /**
-   * Per-thread lock registry SHARED with the job runner. When present, sync
-   * streams serialize against every other writer on the same checkpoint thread.
-   */
-  threadLocks?: ThreadLockRegistry;
-  /**
-   * Conversation context manager (Phase 4, Wave C). Applies deterministic
-   * pair-aware truncation to fresh seeds and best-effort post-turn compaction
-   * to resumed threads (see middleware/context.ts). Constructed in index.ts
-   * with the shared threadLocks + the checkpoint store's checkpointer.
-   */
-  contextManager?: ContextManager;
   /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
   verifyKey?: VerifyApiKeyFn;
   /**
@@ -299,6 +347,13 @@ export type ChatRoutesOptions = {
   trustedHosts?: readonly string[];
   /** Agent template catalog (plumbing for Step 6 agent override resolution). */
   catalogs?: Catalogs;
+  /**
+   * In-memory session store (plan §4, step 1). Required for the managed-session
+   * path (`conversation_mode: "managed"` + `session_id`); a managed-session
+   * request with no store is a 503 managed_unavailable (never a silent
+   * stateless run). Constructed in index.ts and shared with createSessionRoutes.
+   */
+  sessionStore?: SessionStore;
 };
 
 /**
@@ -318,6 +373,47 @@ export type JobModelRequestConfig = {
   /** Request parameter overrides (temperature/max_tokens/top_p). */
   requestParameters?: Record<string, unknown>;
 };
+
+/**
+ * Establish-vs-delta body signal (§5/R6, F1/F2): a request is an establish when
+ * it is managed, carries `session_id`, and EITHER has more than one message
+ * (full history — a first turn, a reseed, or a compaction re-base, which is an
+ * establish regardless of session liveness per F2/§6) OR is a SINGLE-message
+ * body against a missing, non-tombstoned session (a brand-new conversation's
+ * first turn per F1). The single-message case needs the store to distinguish a
+ * fresh session (reason `"restart"`) from a tombstoned/`"evicted"` one (409 —
+ * stays under the delta cap so the client re-establishes with a full-history
+ * body). A single-message body against a live session is a delta and stays
+ * under the tighter cap. A re-sent establish body (the already_completed
+ * retry) therefore keeps the higher cap even after the session exists.
+ */
+function isEstablishBody(
+  body: Record<string, unknown>,
+  sessionStore?: SessionStore,
+  owner?: string,
+): boolean {
+  const managed = body["conversation_mode"] === "managed";
+  const sessionId = typeof body["session_id"] === "string" ? body["session_id"].trim() : "";
+  const messages = Array.isArray(body["messages"]) ? body["messages"] : [];
+  if (!managed || sessionId === "") return false;
+  if (messages.length > 1) return true;
+  if (messages.length === 1 && sessionStore && owner) {
+    return sessionStore.missingReason(owner, sessionId) === "restart";
+  }
+  return false;
+}
+
+/**
+ * Wire bytes of a parsed request body for the post-read establish-cap check:
+ * Content-Length when the client sent one (the pre-read signal the route
+ * cannot act on — see the module doc), else the serialized size (chunked
+ * bodies).
+ */
+function requestBodyBytes(c: Context, body: Record<string, unknown>): number {
+  const raw = c.req.raw.headers.get("content-length");
+  if (raw !== null && /^[0-9]+$/.test(raw)) return Number(raw);
+  return new TextEncoder().encode(JSON.stringify(body)).length;
+}
 
 type StreamOptions = { version: "v2"; configurable?: Record<string, unknown> };
 
@@ -362,9 +458,11 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
   // Bounds the request body BEFORE it is buffered by `c.req.json()`. An
   // oversized POST (no Content-Length, chunked) would otherwise stall the
   // event loop and inflate memory for every user. 413 request_too_large.
+  // Raised to the ESTABLISH cap (§5/R6): vision establishes carry full history
+  // + base64 images; non-establish requests are re-bounded post-read below.
   routes.use(
     bodyLimit({
-      maxSize: env.MAX_REQUEST_BODY_BYTES,
+      maxSize: env.MAX_ESTABLISH_BODY_BYTES,
       onError: (c) => c.json({ error: "request_too_large" }, 413),
     }),
   );
@@ -381,6 +479,17 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
 
     const body = await c.req.json().catch(() => null);
     if (!isRecord(body)) return c.json({ error: "invalid_request" }, 400);
+
+    // §5/R6 establish body cap: the route bodyLimit above admits up to the
+    // establish cap for EVERY request, so non-establish requests (no
+    // session_id, or a single-message session delta) are re-bounded here,
+    // post-read, with the same 413 `request_too_large` shape. Content-Length is
+    // the wire-bytes signal (the only pre-read signal — the establish/delta
+    // distinction is only visible from the parsed body); chunked bodies fall
+    // back to the serialized size. See ESTABLISH BODY CAP in the module doc.
+    if (!isEstablishBody(body, opts.sessionStore, owner) && requestBodyBytes(c, body) > env.MAX_REQUEST_BODY_BYTES) {
+      return c.json({ error: "request_too_large" }, 413);
+    }
 
     // Wave C2 sync-vs-async decision (see the module doc): only an explicit
     // boolean `true` selects the async path; `false`/absent is the C1 stream,
@@ -403,7 +512,7 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
 
 /**
  * Resolve + validate the model plugin and its credentials, and normalize the
- * request's messages/parameters/thread id. Shared by the sync and async paths
+ * request's messages/parameters/identity. Shared by the sync and async paths
  * so the two never diverge on selection, credential sourcing, or validation.
  */
 type ResolvedChat = {
@@ -415,7 +524,14 @@ type ResolvedChat = {
   toolCredentialsByPlugin: Record<string, Record<string, string>>;
   rawMessages: unknown[];
   requestParameters: Record<string, unknown>;
+  /** Background-path worker label only (`body.thread_id`, else `messageId`). */
   clientThreadId: string | undefined;
+  /**
+   * Client-generated session id (plan §5) for the managed-session path. Present
+   * exactly when the managed request carried a valid, non-empty `session_id`
+   * (REQUIRED for managed turns). Absent for every other request.
+   */
+  sessionId: string | undefined;
   managed: boolean;
   managedMessageId: string | undefined;
   enabledPlugins: string[] | undefined;
@@ -506,13 +622,15 @@ export function resolveChatRequest(
 
   const rawMessages = Array.isArray(body["messages"]) ? body["messages"] : [];
 
-  // Managed mode is an explicit, opt-in contract (Phase 5 remediation). It
-  // requires a messageId (the idempotency key), MAY carry thread_id, and
-  // always requires a checkpoint store: a managed run is never stateless, so
-  // a degraded boot is a 503, not a silent stateless fallback.
+  // Managed mode is an explicit, opt-in contract (§5): it REQUIRES a messageId
+  // (the idempotency key) and a non-empty `session_id` — the session path is
+  // the ONLY sync conversation mode (the legacy `thread_id`/checkpoint path is
+  // gone). A managed request is never stateless: a missing session store is a
+  // 503, not a silent fallback.
   const conversationMode = body["conversation_mode"];
   let managed = false;
   let managedMessageId: string | undefined;
+  let sessionId: string | undefined;
   if (conversationMode !== undefined) {
     if (conversationMode !== "managed") {
       return {
@@ -535,6 +653,20 @@ export function resolveChatRequest(
       };
     }
     managedMessageId = rawMessageId;
+    // `session_id` is the managed path's conversation identity (§5) and is
+    // REQUIRED: a managed request without it is a 400, never a checkpoint/thread
+    // fallback.
+    const rawSessionId = typeof body["session_id"] === "string" ? body["session_id"].trim() : "";
+    if (rawSessionId === "") {
+      return {
+        ok: false,
+        response: c.json(
+          { error: "invalid_request", message: "session_id required for managed conversations" },
+          400,
+        ),
+      };
+    }
+    sessionId = rawSessionId;
   }
   if (rawMessages.length === 0) {
     return { ok: false, response: c.json({ error: "invalid_request" }, 400) };
@@ -773,6 +905,7 @@ export function resolveChatRequest(
       rawMessages,
       requestParameters,
       clientThreadId,
+      sessionId,
       managed,
       managedMessageId,
       enabledPlugins,
@@ -782,9 +915,13 @@ export function resolveChatRequest(
 }
 
 /**
- * The C1 synchronous streaming path. Builds the agent and streams SSE. When a
- * shared thread lock + checkpoint store are present, the seed/resume read and
- * the whole stream run under the thread's mutex (Wave C2).
+ * The synchronous streaming path. Builds the agent and streams SSE.
+ *
+ * Managed requests (`conversation_mode: "managed"` — which REQUIRES `session_id`
+ * per resolveChatRequest) dispatch to `handleManagedSessionStream`; every other
+ * request is a STATELESS run over the client's `messages` verbatim. Neither
+ * branch touches the checkpointer, thread locks, the ledger, or the context
+ * manager.
  */
 async function handleSyncStream(
   c: Context,
@@ -795,6 +932,23 @@ async function handleSyncStream(
 ): Promise<Response> {
   const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
+  const { managed } = resolved.value;
+
+  // Managed-session path (plan §5): a managed request carries a validated
+  // non-empty `session_id` (required in resolveChatRequest) and dispatches to
+  // the session store — the ledger, checkpointer, thread locks, and context
+  // manager are NOT touched. A managed request with no store is a 503 (never a
+  // silent stateless run).
+  if (managed) {
+    if (!opts.sessionStore) {
+      return c.json(
+        { error: "managed_unavailable", message: "managed session conversations require the session store" },
+        503,
+      );
+    }
+    return handleManagedSessionStream(c, owner, resolved.value, opts, budget);
+  }
+
   const {
     modelPluginId,
     requestModel,
@@ -802,45 +956,9 @@ async function handleSyncStream(
     credentials,
     rawMessages,
     requestParameters,
-    clientThreadId,
   } = resolved.value;
 
   const buildModelFn = opts.buildModel ?? buildModel;
-  const checkpointStore = opts.checkpointStore;
-  const { managed, managedMessageId } = resolved.value;
-  // Managed mode is fail-closed: without a checkpoint store there is no
-  // durable conversation to seed or resume, so the request is a 503 rather
-  // than a silent stateless run.
-  if (managed && (!checkpointStore || !opts.ledger || !opts.threadLocks)) {
-    return c.json(
-      { error: "managed_unavailable", message: "managed conversations require the checkpoint store" },
-      503,
-    );
-  }
-  // Effective client thread id: managed mode generates a public UUID when the
-  // client did not supply one, so the response can always name the thread.
-  let managedTask: TaskRow | undefined;
-  if (managed) {
-    const existing = opts.ledger!.getTaskByIntentKey(owner, managedMessageId!);
-    const publicId = existing?.worker ?? clientThreadId;
-    if (publicId && checkpointStore!.isDeleted?.(checkpointThreadId(owner, publicId))) {
-      return deletedThreadResponse(c, publicId);
-    }
-    managedTask = await prepareManagedTurn(opts.ledger!, {
-      owner, messageId: managedMessageId!, spec: intentSpec(rawMessages), clientThreadId,
-    });
-    const duplicate = inspectManagedTurn(managedTask, clientThreadId);
-    if (duplicate) return managedDuplicateResponse(c, duplicate);
-  }
-  const effectiveClientThreadId = managedTask?.worker ?? clientThreadId;
-  const threadId =
-    effectiveClientThreadId !== undefined && checkpointStore
-      ? checkpointThreadId(owner, effectiveClientThreadId)
-      : undefined;
-
-  // Build the agent: model from the plugin + request, real ToolExecutor
-  // (validatedFetch + pinned IPs + trusted hosts), compiled over the
-  // checkpoint store when available.
   let model;
   try {
     model = buildModelFn({
@@ -921,235 +1039,457 @@ async function handleSyncStream(
   try {
     const mcpTools = mcpBinding?.tools ?? [];
     const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
-    const base = createAgentGraph({
+    const graph = createAgentGraph({
       model,
       tools,
       systemPrompt: resolved.value.agentOverride?.systemPrompt,
-      prepareMessages: opts.contextManager?.prepareMessages,
       beforeModelCall: () => {
         execution.signal.throwIfAborted();
         budget.beforeModelCall(owner, "sync");
       },
     });
-  // H1: compile with the checkpointer ONLY for a threaded (checkpointed) run.
-  // A stateless run (no `thread_id`) streams WITHOUT `configurable.thread_id`;
-  // running that through a checkpointer would throw `Missing "thread_id"` on
-  // the first super-step write and surface as a server_error after partial
-  // content — exactly the crash a normally-configured gateway (checkpoints
-  // enabled) hit for every stateless request.
-  const graph =
-    threadId !== undefined && checkpointStore
-      ? compileGraphWithCheckpointer(base, checkpointStore.checkpointer)
-      : base;
-  const modelId = requestModel ?? plugin.inference.defaultModel;
+    const modelId = requestModel ?? plugin.inference.defaultModel;
 
-  const lock = opts.threadLocks;
-  const lockable =
-    threadId !== undefined && checkpointStore !== undefined && lock !== undefined;
-
-  if (lockable) {
-    // Managed mode: admit the turn against the shared ledger BEFORE the
-    // seed/resume read, so a retried (owner, messageId) can never run twice.
-    // The admission happens INSIDE the thread lock, so two concurrent sends
-    // on the same thread serialize before either reads the checkpoint.
-    let managedAdmission: ManagedAdmission | undefined;
-    let stopHeartbeat: (() => void) | undefined;
-    // Phase 4 Wave A: the per-user budget slot is reserved AFTER the thread
-    // lock is acquired. Reserving before the acquire would let a request
-    // parked on a busy thread (a long stream or a hung tool backend) hold a
-    // budget slot while waiting, so one slow thread could starve every other
-    // thread for the owner. A full pool still rejects with 429 — just after
-    // the (bounded) lock wait instead of before it.
-    const release = await lock.acquire(threadId);
+    // Phase 4 Wave A: reserve the per-user slot at stream admission — after
+    // every pre-stream validation, so a rejected request never holds a slot —
+    // and release it on stream end / client cancel (via buildStreamResponse's
+    // `onRelease`). The reserve/release wrapper releases BEFORE rethrowing if
+    // stream construction throws, so a construction failure can never leak a
+    // reservation.
     const reservation = budget.reserveSync(owner);
     if (!reservation.ok) {
-      release();
       return busy(c, 429, reservation.retryAfterSeconds);
     }
-    let released = false;
-    const releaseOnce = () => {
-      if (released) return;
-      released = true;
-      stopHeartbeat?.();
-      release();
-      reservation.release();
-    };
     try {
-      execution.signal.throwIfAborted();
-      if (managedTask) {
-        if (checkpointStore.isDeleted?.(threadId)) {
-          releaseOnce();
-          return deletedThreadResponse(c, effectiveClientThreadId!);
-        }
-        const duplicate = inspectManagedTurn(opts.ledger!.getTask(managedTask.id, owner)!, clientThreadId);
-        if (duplicate) {
-          releaseOnce();
-          return managedDuplicateResponse(c, duplicate);
-        }
-      }
-      const { input, streamOptions, state } = await computeThreadInput(
-        checkpointStore,
-        threadId,
-        rawMessages,
-        opts.contextManager,
-      );
-      checkpointStore.touchThread(
-        owner,
-        threadId,
-        null,
-        managed ? effectiveClientThreadId! : undefined,
-      );      // Wave C: alongside the existing post-stream checkpoint-diagnostics
-      // check, run best-effort compaction when a context manager is wired.
-      // verifyCheckpointUnmoved runs inline (it catches internally); the
-      // compaction call is a sibling — both run INSIDE the held lock (before
-      // releaseOnce in the stream's finally), so the lockHeld: true flag
-      // prevents the compactor from re-acquiring (AsyncMutex is not reentrant).
-      const afterStream = async (): Promise<void> => {
-        await verifyCheckpointUnmoved(checkpointStore, threadId, graph);
-        await opts.contextManager?.maybeCompactAfterStream({
-          owner,
-          clientThreadId: clientThreadId!,
-          threadId,
-          graph,
-          lockHeld: true,
-        });
-      };
-      execution.signal.throwIfAborted();
-      if (managedTask) {
-        const admission = admitManagedTurn(opts.ledger!, managedTask);
-        if (admission.kind !== "admitted") {
-          releaseOnce();
-          return managedDuplicateResponse(c, admission);
-        }
-        managedAdmission = admission;
-        stopHeartbeat = opts.ledger!.startHeartbeat(admission.task.id, owner, admission.task.fence_token, {
-          onError: () => execution.abort(),
-        }).stop;
-      }
-      execution.signal.throwIfAborted();
       scheduleWarmups(opts, owner, toolCredentialsByPlugin);
       mcpHandedOff = true;
-      const stream = buildStreamResponse(
+      return buildStreamResponse(
         graph,
-        input,
-        streamOptions,
+        { messages: toLangChainMessages(rawMessages) },
+        { version: "v2" },
         modelId,
         execution,
-        releaseOnce,
-        afterStream,
-        managedAdmission ? (outcome) => {
-          opts.ledger!.completeTask(managedAdmission!.task.id, owner, outcome, managedAdmission!.task.fence_token);
-        } : undefined,
+        reservation.release,
+        undefined,
+        undefined,
         disposeMcp,
       );
-      if (managed) {
-        stream.headers.set("x-thread-id", effectiveClientThreadId!);
-        stream.headers.set(
-          "x-conversation-state",
-          state === "resumed" ? "resumed" : state === "recreated" ? "recreated" : "seeded",
-        );
-      }
-      return stream;
     } catch (err) {
-      releaseOnce();
-      if (isResumeConflict(err)) {
-        return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
-      }
-      if (isReseedRequired(err)) {
-        return c.json({ error: "reseed_required", reason: "checkpoint_missing", threadId }, 409);
-      }
-      return preStreamError(c, err);
+      reservation.release();
+      throw err;
     }
-  }
-
-  // Managed mode REQUIRES the serialized path (dedupe + seed/resume under the
-  // shared lock). Without thread locks the run cannot honor the contract, so
-  // it is a 503 — never a silent lock-free managed run.
-  if (managed) {
-    return c.json(
-      { error: "managed_unavailable", message: "managed conversations require the shared thread locks" },
-      503,
-    );
-  }
-
-  // Stateless, or no shared lock wired (existing C1 behavior): no per-thread
-  // serialization beyond the checkpointer itself.
-  let input: Record<string, unknown>;
-  let streamOptions: StreamOptions;
-  let afterStream: (() => Promise<void>) | undefined;
-  if (threadId !== undefined && checkpointStore) {
-    try {
-      const computed = await computeThreadInput(
-        checkpointStore,
-        threadId,
-        rawMessages,
-        opts.contextManager,
-      );
-      input = computed.input;
-      streamOptions = computed.streamOptions;
-    } catch (err) {
-      if (isResumeConflict(err)) {
-        return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
-      }
-      if (isReseedRequired(err)) {
-        return c.json({ error: "reseed_required", reason: "checkpoint_missing", threadId }, 409);
-      }
-      return preStreamError(c, err);
-    }
-    checkpointStore.touchThread(owner, threadId);
-    // Phase 4 Wave C: wire compaction onto the non-lockable threaded branch.
-    // No ThreadLockRegistry is available here, so maybeCompactAfterStream
-    // acquires the thread lock internally (if threadLocks is present via the
-    // context manager) or runs lock-free.
-    afterStream = (): Promise<void> =>
-      opts.contextManager?.maybeCompactAfterStream({
-        owner,
-        clientThreadId: clientThreadId!,
-        threadId,
-        graph,
-      }) ?? Promise.resolve();
-  } else {
-    // Stateless (no thread_id or no checkpoint store): apply pair-aware
-    // truncation to a fresh seed so an oversized client history never
-    // overflows the model context. Truncation is pure (no checkpointer).
-    try {
-      const msgs = toLangChainMessages(rawMessages);
-      input = { messages: opts.contextManager?.truncateSeed(msgs) ?? msgs };
-      streamOptions = { version: "v2" };
-    } catch (err) {
-      return preStreamError(c, err);
-    }
-  }
-  // Phase 4 Wave A: reserve the per-user slot at stream admission — after
-  // every pre-stream validation, so a rejected request never holds a slot —
-  // and release it on stream end / client cancel (via buildStreamResponse's
-  // `onRelease`). The reserve/release wrapper releases BEFORE rethrowing if
-  // stream construction throws, so a construction failure can never leak a
-  // reservation.
-  const reservation = budget.reserveSync(owner);
-  if (!reservation.ok) {
-    return busy(c, 429, reservation.retryAfterSeconds);
-  }
-  try {
-    scheduleWarmups(opts, owner, toolCredentialsByPlugin);
-    mcpHandedOff = true;
-    return buildStreamResponse(
-      graph,
-      input,
-      streamOptions,
-      modelId,
-      execution,
-      reservation.release,
-      afterStream,
-      undefined,
-      disposeMcp,
-    );
-  } catch (err) {
-    reservation.release();
-    throw err;
-  }
   } finally {
     if (!mcpHandedOff) await disposeMcp();
+  }
+}
+
+/**
+ * The stateless managed-session sync path (plan §4/§5). Every managed request
+ * (which REQUIRES `session_id`, validated in resolveChatRequest) lands here: the
+ * in-memory `sessionStore` is the only conversation state, and the graph is
+ * compiled WITHOUT a checkpointer.
+ *
+ * Establish vs delta is classified by BODY SHAPE (F1/F2/§6), not session
+ * liveness alone:
+ *   - a FULL-HISTORY body (more than one message) is an ESTABLISH — the
+ *     request's `messages` replace the session under `session_id`
+ *     (`x-conversation-state: seeded`). This includes the §6 compaction
+ *     re-base, which re-establishes under the SAME live session_id.
+ *   - a single-message body against a MISSING session is an ESTABLISH when the
+ *     store has no tombstone (fresh first turn, `"restart"` reason) and a 409
+ *     `session_missing` when the store reports `"evicted"` (F1).
+ *   - a single-message body against a LIVE session is a DELTA — appended via
+ *     the store's exactly-once `appendDelta` (`x-conversation-state: resumed`);
+ *     the graph runs on the session's accumulated messages (full context, R12).
+ *
+ * The messageId is anchored on every establish (seed WITHOUT the trailing user
+ * turn, then `appendDelta` it), so exactly-once dedupe + failure rollback work
+ * from the first turn. The generation captured at append time is threaded into
+ * finalization so a mid-turn eviction+re-seed cannot stamp the new incarnation.
+ *
+ * On stream success the final assistant message (captured from the root
+ * `on_chain_end`) is appended to the session under a synthetic
+ * `<messageId>:assistant` id and the messageId is marked completed; on
+ * failure/cancel the messageId is marked failed (the store rolls the appended
+ * user turn back). An evicted-mid-turn mark is logged and ignored.
+ */
+async function handleManagedSessionStream(
+  c: Context,
+  owner: string,
+  resolved: ResolvedChat,
+  opts: ChatRoutesOptions,
+  budget: BudgetManager,
+): Promise<Response> {
+  const sessionStore = opts.sessionStore!;
+  const sessionId = resolved.sessionId!; // dispatch gate guarantees non-null
+  const messageId = resolved.managedMessageId!; // validated in resolveChatRequest
+  const { rawMessages } = resolved;
+
+  let state: "seeded" | "resumed";
+  let sessionMessages: BaseMessage[];
+  // The session incarnation this turn was anchored against (F4): threaded into
+  // finalization so a stale turn never writes into a re-seeded session.
+  let turnGeneration: number | undefined;
+  const messages = toLangChainMessages(rawMessages);
+  const existing = sessionStore.getMessages(owner, sessionId);
+  if (existing === null) {
+    // MISSING SESSION (§5, F1): a multi-message body is an establish. A
+    // SINGLE-message body establishes when the store has no tombstone (reason
+    // `"restart"` — a brand-new conversation's first turn, or the first turn
+    // after a gateway restart); only a tombstoned (`"evicted"`) session keeps
+    // the §4 eviction signal (409) so the client re-establishes with a
+    // full-history body.
+    if (
+      messages.length <= 1 &&
+      sessionStore.missingReason(owner, sessionId) === "evicted"
+    ) {
+      return sessionMissingResponse(c, sessionId, "evicted");
+    }
+    if (lastMessageIsUser(rawMessages) && messages.length > 0) {
+      // Anchor the messageId from the very first turn: seed the history
+      // WITHOUT the trailing user turn, then append it as a delta so
+      // `outcomes[messageId]` is recorded (a concurrent/retried establish is
+      // deduped, and a failed establish rolls the user turn back).
+      const seeded = await sessionStore.establish(owner, sessionId, messages.slice(0, -1));
+      if (seeded.status === "session_missing") {
+        return sessionMissingResponse(c, sessionId, seeded.reason);
+      }
+      const userMsg = lastUserMessage(rawMessages)!;
+      const appended = await sessionStore.appendDelta(owner, sessionId, messageId, userMsg);
+      if (appended.status !== "resumed") {
+        return mapSessionAppend(c, sessionId, messageId, appended);
+      }
+      turnGeneration = appended.generation;
+      // Graph input = the full history we just seeded (equivalent to the
+      // store's messages, and immune to a concurrent same-session re-seed).
+      sessionMessages = messages;
+    } else {
+      // No trailing user turn to anchor (protocol edge): plain seed, no dedupe.
+      const seeded = await sessionStore.establish(owner, sessionId, messages);
+      if (seeded.status === "session_missing") {
+        return sessionMissingResponse(c, sessionId, seeded.reason);
+      }
+      turnGeneration = seeded.generation;
+      sessionMessages = messages;
+    }
+    state = "seeded";
+  } else if (messages.length > 1) {
+    // LIVE SESSION + FULL HISTORY (F2/§6): classify by BODY SHAPE, not
+    // liveness. A multi-message body under the SAME session_id is the client's
+    // compaction re-base — `store.reestablish` atomically dedupes the messageId
+    // (a retransmitted body short-circuits to already_completed WITHOUT
+    // clobbering the session) and, on a fresh turn, REPLACES `messages` (that
+    // is exactly what a re-base means) while re-anchoring the messageId. Graph
+    // input = the full body; state `seeded`. The `outcomes` anchor survives the
+    // re-seed (store).
+    if (!lastMessageIsUser(rawMessages)) {
+      return c.json(
+        { error: "invalid_request", message: "session establish requires a trailing user message" },
+        400,
+      );
+    }
+    const reestablished = await sessionStore.reestablish(owner, sessionId, messageId, messages);
+    switch (reestablished.status) {
+      case "reestablished":
+        turnGeneration = reestablished.generation;
+        sessionMessages = messages;
+        state = "seeded";
+        break;
+      case "already_completed":
+      case "in_progress":
+        return mapSessionAppend(c, sessionId, messageId, reestablished);
+      case "session_missing":
+        return sessionMissingResponse(c, sessionId, reestablished.reason);
+    }
+  } else {
+    // LIVE SESSION + single-message body: a delta append (resumed).
+    if (!lastMessageIsUser(rawMessages)) {
+      return c.json(
+        { error: "invalid_request", message: "session delta requires a single user message" },
+        400,
+      );
+    }
+    const userMsg = lastUserMessage(rawMessages)!;
+    const appended = await sessionStore.appendDelta(owner, sessionId, messageId, userMsg);
+    if (appended.status !== "resumed") {
+      return mapSessionAppend(c, sessionId, messageId, appended);
+    }
+    turnGeneration = appended.generation;
+    sessionMessages = sessionStore.getMessages(owner, sessionId) ?? existing;
+    state = "resumed";
+  }
+
+  // Build the agent exactly like the stateless sync branch: model from the
+  // plugin + request, real ToolExecutor (or the test seam), NO checkpointer.
+  //
+  // EXACTLY-ONCE PRE-STREAM ROLLBACK (plan §4 step 6): the user message was
+  // appended and `outcomes[messageId]` set to `in_progress` before this section
+  // (dedupe must be atomic at append time), so EVERY failure before the stream
+  // reaches the wire must roll the turn back with `markFailed` — a model-build
+  // error, an MCP bind rejection, a budget-busy rejection, or a
+  // buildStreamResponse construction error. Otherwise the outcome would sit
+  // `in_progress` forever and a same-messageId retry would 409
+  // conversation_in_flight. The wrapper below guarantees exactly ONE
+  // `markFailed` per failed turn: the buildStreamResponse construction catch
+  // (below) and the stream-side finalization (`finalizeSessionTurn`) already
+  // mark, and they RETURN (or stream) rather than rethrowing into this wrapper,
+  // so no path double-marks.
+  const buildModelFn = opts.buildModel ?? buildModel;
+  const { modelPluginId, requestModel, plugin, credentials, requestParameters } = resolved;
+  // The generation captured at append time (in scope on every path that reaches
+  // this section — all four append/seed branches above set it) keeps the rollback
+  // from stamping a re-seeded incarnation (F4).
+  const rollbackTurn = () =>
+    sessionStore.markFailed(owner, sessionId, messageId, turnGeneration).catch(() => {});
+  let model;
+  try {
+    model = buildModelFn({
+      registry: opts.registry,
+      pluginStore: opts.pluginStore,
+      modelPluginId,
+      requestModel,
+      requestParameters,
+      credentials,
+      trustedHosts: opts.trustedHosts,
+    } satisfies BuildModelInput);
+  } catch (err) {
+    await rollbackTurn();
+    return preStreamError(c, err);
+  }
+
+  try {
+    const toolHandler =
+      opts.toolHandler ??
+      new ToolExecutor({
+        registry: opts.registry,
+        getPinnedIps: opts.pluginStore.getPinnedIps.bind(opts.pluginStore),
+        trustedHosts: opts.trustedHosts,
+      });
+    const toolCredentialsByPlugin = resolved.toolCredentialsByPlugin;
+    const cachedHandler = withToolResultCache({
+      registry: opts.registry,
+      owner,
+      cache: opts.toolCache,
+      handler: toolHandler,
+    });
+    const execution = createStreamExecution(c.req.raw.signal);
+    trackModelExecution(model, execution);
+    const pluginTools = bindPluginTools(opts.registry, {
+      async execute(pluginId, toolName, args) {
+        execution.signal.throwIfAborted();
+        return execution.track(async () => {
+          const result = await cachedHandler.execute(
+            pluginId,
+            toolName,
+            args,
+            toolCredentialsByPlugin[pluginId],
+            execution.signal,
+          );
+          execution.signal.throwIfAborted();
+          return result;
+        });
+      },
+    }, resolved.enabledPlugins);
+    const mcpBinding = resolved.agentOverride?.mcpServers
+      ? await bindMcpServers(resolved.agentOverride.mcpServers, {
+          signal: execution.signal,
+          trustedHosts: env.MCP_TRUSTED_HOSTS,
+        })
+      : undefined;
+    let mcpHandedOff = false;
+    let mcpDisposed = false;
+    const disposeMcp = async (): Promise<void> => {
+      if (!mcpBinding || mcpDisposed) return;
+      mcpDisposed = true;
+      try {
+        await mcpBinding.dispose();
+      } catch (err) {
+        console.warn("chat: MCP binding dispose failed", err);
+      }
+    };
+    try {
+      const mcpTools = mcpBinding?.tools ?? [];
+      const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
+      const graph = createAgentGraph({
+        model,
+        tools,
+        systemPrompt: resolved.agentOverride?.systemPrompt,
+        beforeModelCall: () => {
+          execution.signal.throwIfAborted();
+          budget.beforeModelCall(owner, "sync");
+        },
+      });
+      // Deliberately NO checkpointer: sessions are stateless, compiled per
+      // request, and the graph input is the session's accumulated messages.
+      const modelId = requestModel ?? plugin.inference.defaultModel;
+
+      // The final assistant reply, captured from the root `on_chain_end`.
+      let reply: BaseMessage | undefined;
+
+      const reservation = budget.reserveSync(owner);
+      if (!reservation.ok) {
+        // Budget-busy is a DESIGNED condition under load, not a bug — but the
+        // turn is already appended, so roll it back (a same-messageId retry is
+        // then a clean re-run once a slot frees).
+        await rollbackTurn();
+        return busy(c, 429, reservation.retryAfterSeconds);
+      }
+      try {
+        scheduleWarmups(opts, owner, toolCredentialsByPlugin);
+        mcpHandedOff = true;
+        const stream = buildStreamResponse(
+          graph,
+          { messages: sessionMessages },
+          { version: "v2" },
+          modelId,
+          execution,
+          reservation.release,
+          undefined,
+          (outcome) =>
+            finalizeSessionTurn(sessionStore, owner, sessionId, messageId, outcome, reply, turnGeneration),
+          disposeMcp,
+          (finalReply) => {
+            reply = finalReply;
+          },
+        );
+        stream.headers.set("x-session-id", sessionId);
+        stream.headers.set("x-conversation-state", state);
+        return stream;
+      } catch (err) {
+        reservation.release();
+        // Construction failure (never reached the wire): mark failed so a retry
+        // with the same messageId is a clean re-run (plan §4 step 6) rather than
+        // a half-appended turn.
+        await rollbackTurn();
+        return preStreamError(c, err);
+      }
+    } finally {
+      if (!mcpHandedOff) await disposeMcp();
+    }
+  } catch (err) {
+    // An unexpected pre-stream throw — an MCP bind rejection, or a graph/
+    // tool-merging failure — surfaces exactly as an uncaught handler error
+    // (Hono 500) but FIRST rolls the appended turn back so the same messageId
+    // stays retryable (plan §4 step 6).
+    await rollbackTurn();
+    throw err;
+  }
+}
+
+/**
+ * Persist a session turn's terminal state from the stream's honest outcome
+ * (the `onOutcome` hook of `buildStreamResponse`):
+ *   - succeeded -> append the assistant reply under a synthetic
+ *     `<messageId>:assistant` id (the store's only appender is `appendDelta`;
+ *     the suffix can never collide with a client-generated UUID) so the read-
+ *     back `GET /v1/sessions/:id` includes it, then mark the messageId
+ *     completed;
+ *   - failed/cancelled -> mark the messageId failed (the store rolls the
+ *     appended user turn back; §4 step 6).
+ * `generation` is the session incarnation captured when the turn's user message
+ * was appended. Both the reply append (via `expectedGeneration`) and the marks
+ * no-op against a re-seeded session — an evicted-then-reseeded session must not
+ * receive the stale reply or be stamped by the stale turn (F4). The reply
+ * append is `evictOnOverflow: false`: an over-cap reply is dropped rather than
+ * evicting the session (the client cannot control reply size, F5). An
+ * evicted-mid-turn mark is logged and ignored — the client re-establishes
+ * under the same session_id (§5). Never throws into the stream.
+ */
+async function finalizeSessionTurn(
+  sessionStore: SessionStore,
+  owner: string,
+  sessionId: string,
+  messageId: string,
+  outcome: "succeeded" | "failed" | "cancelled",
+  reply: BaseMessage | undefined,
+  generation?: number,
+): Promise<void> {
+  if (outcome === "succeeded") {
+    const finalReply = reply ?? new AIMessage({ content: "" });
+    const replyAppend = await sessionStore.appendDelta(
+      owner,
+      sessionId,
+      `${messageId}:assistant`,
+      finalReply,
+      { expectedGeneration: generation, evictOnOverflow: false },
+    );
+    if (
+      replyAppend.status === "session_missing" ||
+      replyAppend.status === "generation_changed"
+    ) {
+      console.warn(
+        `chat: session ${sessionId} evicted/replaced mid-turn; completed outcome dropped`,
+      );
+      return;
+    }
+    await sessionStore.markCompleted(owner, sessionId, `${messageId}:assistant`, finalReply, generation);
+    const completed = await sessionStore.markCompleted(owner, sessionId, messageId, finalReply, generation);
+    if (completed.evicted) {
+      console.warn(`chat: session ${sessionId} evicted mid-turn; completed outcome dropped`);
+    }
+  } else {
+    const failed = await sessionStore.markFailed(owner, sessionId, messageId, generation);
+    if (failed.evicted) {
+      console.warn(`chat: session ${sessionId} evicted mid-turn; failure outcome dropped`);
+    }
+  }
+}
+
+/**
+ * 409 `session_missing` (plan §5): the session_id is gone — the client must
+ * re-establish under the SAME session_id (not mint a new one). `reason` is the
+ * store's tombstone-backed `"evicted" | "restart"`.
+ */
+function sessionMissingResponse(c: Context, sessionId: string, reason: SessionMissingReason): Response {
+  const res = c.json({ error: "session_missing", reason }, 409);
+  res.headers.set("x-session-id", sessionId);
+  return res;
+}
+
+/**
+ * Map a non-`resumed` `appendDelta` result to HTTP on the managed-session path:
+ *   - already_completed -> 200 `{ status, sessionId, messageId }` (NO taskId,
+ *     terminalStatus, or threadId per §5) with BOTH `x-session-id` and
+ *     `x-conversation-state: resumed` (F3 — the client requires
+ *     `x-conversation-state` on every managed 2xx); the reply is read back via
+ *     `GET /v1/sessions/:id`;
+ *   - in_progress -> 409 `conversation_in_flight` (a concurrent turn with the
+ *     same messageId is already running);
+ *   - session_missing -> 409 `session_missing` with the store's reason.
+ * `generation_changed` is unreachable on the user-append path (the expected-
+ * generation guard is only passed by `finalizeSessionTurn`, which handles it
+ * itself); it is mapped defensively as a logged 500 invariant guard.
+ * A `failed` outcome is NOT mapped here: `appendDelta` treats it as a clean
+ * re-run (plan §4 step 6) and returns `resumed`, so the retry streams normally.
+ */
+function mapSessionAppend(
+  c: Context,
+  sessionId: string,
+  messageId: string,
+  result:
+    | Exclude<AppendDeltaResult, { status: "resumed" }>
+    | Exclude<ReestablishResult, { status: "reestablished" }>,
+): Response {
+  switch (result.status) {
+    case "already_completed": {
+      const res = c.json({ status: "already_completed", sessionId, messageId }, 200);
+      res.headers.set("x-session-id", sessionId);
+      res.headers.set("x-conversation-state", "resumed");
+      return res;
+    }
+    case "in_progress": {
+      const res = c.json({ error: "conversation_in_flight", sessionId, messageId }, 409);
+      res.headers.set("x-session-id", sessionId);
+      return res;
+    }
+    case "session_missing":
+      return sessionMissingResponse(c, sessionId, result.reason);
+    case "generation_changed":
+      // Invariant guard only: user appends never pass `expectedGeneration`
+      // (that is finalizeSessionTurn's reply-append path, which handles this
+      // itself). If it ever fires, the session was re-seeded under a live turn.
+      console.warn(`chat: session ${sessionId} re-seeded mid-append; turn not anchored`);
+      return c.json({ error: "internal" }, 500);
   }
 }
 
@@ -1226,21 +1566,11 @@ function withToolResultCache(opts: {
 }
 
 /**
- * Wrap a managed stream's lifecycle against the ledger: the admission is
- * claimed synchronously, so the transport (not the runner) completes the task
- * on stream success and fails it on stream error/cancel, using the fence
- * token the claim minted. A cancelled stream completes the task `cancelled`
- * (a later retry with the SAME messageId is a clean already_terminal, not a
- * stuck-resume); an errored stream completes it `failed`. A mid-stream SSE
- * error envelope does NOT abort the HTTP 200, so the ledger follows the
- * stream's honest terminal state.
+ * Background-path helper: `managedDuplicateResponse` maps an
+ * `inspectManagedTurn` duplicate of an ADMITTED background task (running ->
+ * `conversation_in_flight`, terminal -> `already_completed`, wrong worker ->
+ * `message_thread_conflict`).
  */
-function deletedThreadResponse(c: Context, threadId: string): Response {
-  c.header("x-conversation-state", "reseed_required");
-  c.header("cache-control", "no-store");
-  return c.json({ error: "reseed_required", reason: "thread_deleted", threadId }, 409);
-}
-
 function managedDuplicateResponse(c: Context, admission: ManagedAdmission): Response {
   const { task } = admission;
   if (task.worker) c.header("x-thread-id", task.worker);
@@ -1266,10 +1596,11 @@ async function handleBackground(
   opts: ChatRoutesOptions,
   budget: BudgetManager,
 ): Promise<Response> {
-  const { checkpointStore, jobRunner, ledger, pins } = opts;
+  const { jobRunner, ledger, pins } = opts;
   // The async path needs the runner, an owner-scoped ledger to admit against,
-  // a checkpointer for the job thread, and the shared pin store.
-  if (!checkpointStore || !jobRunner || !ledger || !pins) {
+  // and the shared pin store. No checkpoint store — jobs run on a
+  // self-contained snapshot (ledger v5 payload).
+  if (!jobRunner || !ledger || !pins) {
     return c.json({ error: "background_unavailable" }, 503);
   }
 
@@ -1282,7 +1613,6 @@ async function handleBackground(
     rawMessages,
     requestParameters,
     clientThreadId,
-    managed,
   } = resolved.value;
 
   // Idempotency key: the client generates `messageId` once per send and reuses
@@ -1299,66 +1629,28 @@ async function handleBackground(
     );
   }
 
-  // A background request without `thread_id` runs on a thread keyed by its
-  // messageId (deterministic per send); the runner recomputes the same hash.
+  // A background request without `thread_id` runs under a worker label keyed
+  // by its messageId (deterministic per send); the runner stores the label in
+  // the ledger `worker` column at admission.
   const clientThread = clientThreadId ?? messageId;
-  const threadId = checkpointThreadId(owner, clientThread);
-
-  // A background send to a deleted thread must fail cleanly with
-  // `reseed_required` (mirroring the sync managed path) — never a silent 500
-  // when the runner's deferred `touchThread` throws `thread_deleted` mid-job.
-  if (checkpointStore.isDeleted?.(threadId)) {
-    return deletedThreadResponse(c, clientThread);
-  }
-
-  // Snapshot whether this thread was ALREADY known (owner->thread mapping row
-  // present) BEFORE this request admits/touches it. The admission-time
-  // `touchThread` (below) makes the thread "known" to EVERY later reader, so
-  // without this snapshot the job's own deferred `inputFactory` would see a
-  // mapping row it just created and mis-report `reseed_required` for a fresh
-  // seed. The snapshot is threaded into `computeThreadInput` (which re-reads
-  // the CHECKPOINTER live in every case).
-  const knownBefore = (await checkpointStore.getThread(threadId)) !== undefined;
 
   // Idempotent retry (Wave C2 IDEMPOTENCY): a request whose (owner, messageId)
   // already has a ledger task is a re-submit of an admitted job, NOT a fresh
-  // seed. De-dupe BEFORE the seed/resume gate: a running task -> 409
+  // snapshot. De-dupe BEFORE admission: a running task -> 409
   // `conversation_in_flight`, a terminal task -> 200 `already_completed`
-  // (mirrors the sync managed path via `inspectManagedTurn` /
-  // `managedDuplicateResponse`). A queued task falls through — the runner owns
-  // the claim race (in_flight vs. claim) — but its known-mapping/no-checkpoint
-  // state must not trip the `reseed_required` gate either (see below).
+  // (via `inspectManagedTurn` / `managedDuplicateResponse`). A queued task
+  // falls through — the runner owns the claim race (in_flight vs. claim).
   const existing = ledger.getTaskByIntentKey(owner, messageId);
   if (existing) {
     const duplicate = inspectManagedTurn(existing, clientThread);
     if (duplicate) return managedDuplicateResponse(c, duplicate);
   }
 
-  // Seed/resume input (mirrors the sync path): a fresh thread gets the client's
-  // full history; an existing checkpoint gets only the last user message. M3:
-  // a RESUME whose last client message is NOT a user message is a conflict
-  // (returning `{ messages: [] }` would re-run the checkpointed state and
-  // re-execute a pending tool call), so it is rejected 409 BEFORE any pin or
-  // admission — a conflict leaves nothing behind. L5: `touchThread` is
-  // deferred until after every validation so a rejected request never writes a
-  // phantom thread_owner row.
-  try {
-    await computeThreadInput(checkpointStore, threadId, rawMessages, opts.contextManager, knownBefore);
-  } catch (err) {
-    if (isResumeConflict(err)) {
-      return c.json({ error: "resume_conflict", message: "resume with a user message only" }, 409);
-    }
-    // A retry of an admitted (queued/stuck) task legitimately has a mapping
-    // row (written by the first admit) with no checkpoint yet — the runner
-    // claims/terminates it, so `reseed_required` does not apply here.
-    if (isReseedRequired(err)) {
-      if (!existing) {
-        return c.json({ error: "reseed_required", reason: "checkpoint_missing", threadId }, 409);
-      }
-    } else {
-      return preStreamError(c, err);
-    }
-  }
+  // The job's SNAPSHOT: the request's `messages` converted to LangChain the
+  // same way the stateless sync path does. The job runs on THIS snapshot
+  // (never a live session/checkpoint); the runner persists it as the ledger
+  // payload for crash-resume and `resumeStuckJobs` re-runs from it.
+  const snapshot = toLangChainMessages(rawMessages);
 
   // Validate + pin tool credentials first (atomic: all-or-nothing), then the
   // model credential. Any validation failure -> 400 before admission, and no
@@ -1377,12 +1669,12 @@ async function handleBackground(
   };
 
   // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
-  // and thread marking, so a queue-full 503 leaves no phantom task row or
-  // thread_owner row (L5). A queued admission parks in the owner's bounded
-  // FIFO queue and waits (up to the budget's waitMs) for a free slot; the pool
-  // is shared with sync streams. Releasing after `runJob` returns (ANY result)
-  // mirrors the M1 pin-release pattern: a non-claimed duplicate
-  // (in_flight / already_terminal) must not hold a reservation either.
+  // so a queue-full 503 leaves no phantom task row. A queued admission parks
+  // in the owner's bounded FIFO queue and waits (up to the budget's waitMs)
+  // for a free slot; the pool is shared with sync streams. Releasing after
+  // `runJob` returns (ANY result) mirrors the M1 pin-release pattern: a
+  // non-claimed duplicate (in_flight / already_terminal) must not hold a
+  // reservation either.
   const reservation = await budget.reserveAsync(owner);
   if (!reservation.ok) {
     releasePins();
@@ -1396,9 +1688,8 @@ async function handleBackground(
       intentKey: messageId,
       spec: intentSpec(rawMessages),
       // M2: persist the RAW client thread id so a restart-loss replay
-      // (`resumeStuckJobs`) can resume on the SAME checkpoint thread the
-      // original job used instead of re-hashing the intent key onto a
-      // different one.
+      // (`resumeStuckJobs`) resumes under the same worker label instead of
+      // re-deriving one from the intent key.
       worker: clientThread,
     });
   } catch (err) {
@@ -1408,16 +1699,6 @@ async function handleBackground(
     return c.json({ error: "internal" }, 500);
   }
 
-  // L5: the owner->thread mapping is recorded only once the job actually runs,
-  // inside the inputFactory (RIGHT before the graph invoke, under the thread
-  // lock the runner holds). Recording it here at admission would make the
-  // thread "known" to every concurrent writer BEFORE any checkpoint exists, so
-  // a sync request racing the parked job on the same thread would be rejected
-  // as `reseed_required` (a mapping row must never signal "already seeded" —
-  // see the module doc). The public id is recorded on managed requests so the
-  // thread is listable/recoverable via /v1/threads; a legacy (stateless-
-  // threaded) background request keeps a null mapping and stays safely
-  // invisible to the public surface.
   let result: RunJobResult;
   try {
     result = await jobRunner.runJob({
@@ -1435,15 +1716,7 @@ async function handleBackground(
       systemPrompt: resolved.value.agentOverride?.systemPrompt,
       mcpServers: resolved.value.agentOverride?.mcpServers,
       pinHandles,
-      inputFactory: async ({ threadId: lockedThreadId, signal }) => {
-        signal.throwIfAborted();
-        const computed = await computeThreadInput(
-          checkpointStore, lockedThreadId, rawMessages, opts.contextManager, knownBefore,
-        );
-        signal.throwIfAborted();
-        checkpointStore.touchThread(owner, lockedThreadId, null, managed ? clientThread : undefined);
-        return computed.input;
-      },
+      input: { messages: snapshot },
     });
   } catch (err) {
     console.error("chat: background runJob threw", err);
@@ -1546,10 +1819,10 @@ const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 400 | 401 | 409 | 429 | 502 | 
  *   - `failed` -> the JobErrorCode HTTP status with the redacted message.
  *
  * `publicThreadId` is the RAW client thread handle (`clientThreadId ?? messageId`)
- * — the value the client must echo back as `thread_id` to resume. The runner's
- * internal `result.threadId` is the owner-bound hash (`checkpointThreadId`) and
- * would be re-hashed into a different thread on resume, silently orphaning the
- * conversation.
+ * — the value the client must echo back as `thread_id`. The runner's
+ * `result.threadId` is now the same raw client label (there is no checkpoint
+ * thread to hash it into anymore); it is kept for the result type's shape, and
+ * this mapping uses the caller-provided public label directly.
  */
 function mapRunJobResult(c: Context, result: RunJobResult, publicThreadId: string): Response {
   switch (result.status) {
@@ -1580,40 +1853,8 @@ function mapRunJobResult(c: Context, result: RunJobResult, publicThreadId: strin
   }
 }
 
-/** Raised when a resumed thread's LAST client message is not a user message. */
-class ResumeConflictError extends Error {
-  constructor() {
-    super("resume requires the last message to be a user message");
-    this.name = "ResumeConflictError";
-  }
-}
-
-function isResumeConflict(err: unknown): boolean {
-  return err instanceof ResumeConflictError;
-}
-
-/**
- * Raised when a KNOWN thread (owner->thread mapping row present) has no
- * checkpoint AND the client is carrying no prior history to re-seed from.
- * A fresh checkpoint cannot be minted silently without losing prior context,
- * so this forces the explicit `reseed_required` round-trip (409).
- */
-class ReseedRequiredError extends Error {
-  constructor() {
-    super("known thread has no checkpoint and no client history to re-seed from");
-    this.name = "ReseedRequiredError";
-  }
-}
-
-function isReseedRequired(err: unknown): boolean {
-  return err instanceof ReseedRequiredError;
-}
-
-/**
- * True when the client's LAST message on a resumed thread is a `user` message.
- * A resume whose last message is an assistant/tool message cannot be seeded
- * with a user turn (M3) — see `computeThreadInput`.
- */
+/** True when the client's LAST message on a session turn is a `user` message.
+ *  The managed-session path requires a delta to end with a single user turn. */
 function lastMessageIsUser(messages: unknown[]): boolean {
   if (messages.length === 0) return false;
   const last = messages[messages.length - 1];
@@ -1621,93 +1862,11 @@ function lastMessageIsUser(messages: unknown[]): boolean {
 }
 
 /**
- * True when the client is carrying prior conversation context (more than the
- * single current user turn). Distinguishes a `recreated` re-seed (the client
- * has history to restore) from a `reseed_required` round-trip (no history to
- * restore — a silent fresh checkpoint would drop prior context).
- */
-function hasClientHistory(rawMessages: unknown[]): boolean {
-  return rawMessages.length > 1;
-}
-
-/**
- * The seed/resume input for a thread: a fresh thread gets the client's full
- * history; an existing checkpoint gets ONLY the last user message. Callers
- * record the owner->thread mapping (`touchThread`) AFTER validation so a
- * rejected request leaves no phantom thread_owner row (L5).
- *
- * M3: when a checkpoint EXISTS and the client's last message is NOT a user
- * message, the resume cannot be seeded (returning `{ messages: [] }` would
- * re-run the checkpointed state and re-execute a pending tool call). That is a
- * `ResumeConflictError` (409) rather than silent mis-seeding.
- *
- * No-checkpoint states: a fresh thread (no owner->thread mapping row) seeds
- * from the client's full history ("seeded"). A KNOWN thread whose checkpoint
- * is gone is a recreation: with prior client history it re-seeds ("recreated");
- * without it it must not silently mint an empty checkpoint, so it throws
- * `ReseedRequiredError` (409 "reseed_required") for an explicit round-trip.
- */
-async function computeThreadInput(
-  checkpointStore: CheckpointStore,
-  threadId: string,
-  rawMessages: unknown[],
-  contextManager?: ContextManager,
-  knownBefore?: boolean,
-): Promise<{ input: Record<string, unknown>; streamOptions: StreamOptions; state: "seeded" | "resumed" | "recreated" }> {
-  const checkpoint = await checkpointStore.checkpointer.get({
-    configurable: { thread_id: threadId },
-  });
-  if (checkpoint) {
-    if (!lastMessageIsUser(rawMessages)) {
-      throw new ResumeConflictError();
-    }
-    const lastUser = lastUserMessage(rawMessages);
-    return {
-      input: { messages: lastUser ? [lastUser] : [] },
-      streamOptions: { version: "v2", configurable: { thread_id: threadId } },
-      state: "resumed",
-    };
-  }
-  // No checkpoint. A KNOWN thread (owner->thread mapping row present) whose
-  // checkpoint is gone is NOT a brand-new seed: it is a recreation. When the
-  // client is carrying prior history we re-seed from it (state "recreated");
-  // when it is not, we must not silently mint a fresh empty checkpoint, so we
-  // force the explicit reseed round-trip (409 "reseed_required") — never
-  // silent context loss. A brand-new thread (no mapping row) seeds fresh.
-  // Apply pair-aware truncation (contextManager.truncateSeed) so an oversized
-  // seed never overflows the model context even when post-turn compaction
-  // cannot run (deterministic fallback per the approved plan, Layer 2).
-  const msgs = toLangChainMessages(rawMessages);
-  const truncated = contextManager?.truncateSeed(msgs) ?? msgs;
-  // A caller that admits the thread AFTER validation supplies its pre-admission
-  // snapshot (`knownBefore`) so the owner->thread mapping row it writes via
-  // `touchThread` cannot retroactively flip this request into a "known thread"
-  // (and thus a false `reseed_required`). Only a `true` snapshot short-circuits
-  // the live read: a `false` snapshot (mapping absent at admission) falls
-  // through to the live read, since a concurrent same-thread writer may have
-  // created the mapping row by the time this runs (making the thread known).
-  const known = knownBefore === true ? true : await checkpointStore.getThread(threadId);
-  if (known) {
-    if (!hasClientHistory(rawMessages)) {
-      throw new ReseedRequiredError();
-    }
-    return {
-      input: { messages: truncated },
-      streamOptions: { version: "v2", configurable: { thread_id: threadId } },
-      state: "recreated",
-    };
-  }
-  return {
-    input: { messages: truncated },
-    streamOptions: { version: "v2", configurable: { thread_id: threadId } },
-    state: "seeded",
-  };
-}
-
-/**
- * Build the SSE `Response`. `onRelease` (the thread-lock release) is called
- * exactly once when the stream completes, errors, or is cancelled. The
- * post-stream `onAfterStream` hook is best-effort and never fails the stream.
+ * Build the SSE `Response`. `onRelease` is called exactly once when the stream
+ * completes, errors, or is cancelled. The post-stream `onAfterStream` hook is
+ * best-effort and never fails the stream. `onReply` receives the final
+ * assistant `BaseMessage` from the root `on_chain_end` (the managed-session
+ * path persists it as the turn's reply).
  */
 function buildStreamResponse(
   graph: AgentGraph,
@@ -1717,12 +1876,25 @@ function buildStreamResponse(
   execution: StreamExecution,
   onRelease?: () => void,
   onAfterStream?: () => void | Promise<void>,
-  onOutcome?: (outcome: "succeeded" | "failed" | "cancelled") => void,
+  onOutcome?: (outcome: "succeeded" | "failed" | "cancelled") => void | Promise<void>,
   disposeMcp?: () => Promise<void>,
+  onReply?: (reply: BaseMessage) => void,
 ): Response {
   const events = graph.streamEvents(input, { ...streamOptions, signal: execution.signal });
+  // `replyComplete` latches once the root `on_chain_end` has produced the final
+  // assistant message (`captureAssistantReply` fires `onReply` at that point,
+  // which precedes [DONE]). It lets the outcome decision treat a client abort
+  // AFTER the full reply was emitted to the wire as `succeeded` instead of
+  // `cancelled` — a delivered reply must not be rolled back (F4).
+  let replyComplete = false;
+  const eventSource = onReply
+    ? captureAssistantReply(events, (finalReply) => {
+        replyComplete = true;
+        onReply(finalReply);
+      })
+    : events;
   let streamFailed = false;
-  const sse = toOpenAiSse(events, {
+  const sse = toOpenAiSse(eventSource, {
     modelId,
     onOutcome: (outcome) => {
       if (outcome === "failed") streamFailed = true;
@@ -1731,18 +1903,35 @@ function buildStreamResponse(
   const encoder = new TextEncoder();
   let cancelled = false;
   let finalized = false;
-  const finalize = () => {
+  const finalize = async () => {
     // Report the stream's honest terminal state exactly once: a mid-stream
     // SSE error frame marks `failed`, a client cancellation / abort marks
-    // `cancelled`, anything else that ran to completion is `succeeded`.
+    // `cancelled`, anything else that ran to completion is `succeeded`. A
+    // client abort AFTER the full reply was already emitted (F4 —
+    // `replyComplete`; the root `on_chain_end` preceded the abort) is treated
+    // as `succeeded`: the reply was delivered to the wire, so the managed path
+    // must not roll back a delivered reply. Only an abort BEFORE a clean
+    // terminal is `cancelled` (rolls back). The outcome callback may return a
+    // promise (the managed-session path persists the turn's terminal outcome
+    // before the stream terminates) and is awaited so a read-back immediately
+    // after `[DONE]` is consistent; a throwing callback never fails an
+    // already-terminated stream.
     if (finalized) return;
     finalized = true;
-    if (cancelled || execution.signal.aborted) {
-      onOutcome?.("cancelled");
-    } else if (streamFailed) {
-      onOutcome?.("failed");
+    let outcome: "succeeded" | "failed" | "cancelled";
+    if (streamFailed) {
+      outcome = "failed";
+    } else if (replyComplete && (cancelled || execution.signal.aborted)) {
+      outcome = "succeeded";
+    } else if (cancelled || execution.signal.aborted) {
+      outcome = "cancelled";
     } else {
-      onOutcome?.("succeeded");
+      outcome = "succeeded";
+    }
+    try {
+      await onOutcome?.(outcome);
+    } catch (err) {
+      console.warn("chat: outcome callback failed", err);
     }
   };
   const stream = new ReadableStream<Uint8Array>({
@@ -1754,7 +1943,7 @@ function buildStreamResponse(
             if (!cancelled && !execution.signal.aborted) controller.enqueue(encoder.encode(frame));
           }
           await execution.settle();
-          finalize();
+          await finalize();
           if (!execution.signal.aborted && onAfterStream) {
             try {
               await onAfterStream();
@@ -1770,7 +1959,7 @@ function buildStreamResponse(
         } finally {
           execution.abort();
           await execution.settle();
-          finalize();
+          await finalize();
           onRelease?.();
           // A rejected MCP close must never skip the stream's own termination
           // (truncated/hung SSE on the client).
@@ -1797,52 +1986,51 @@ function buildStreamResponse(
 }
 
 /**
- * Best-effort post-stream optimistic check (Wave C2). The shared thread mutex
- * already prevents in-process interleaving; this catches a writer the mutex
- * cannot see (a second process sharing the checkpoint DB) and LOGS it. The
- * stream is already on the wire, so re-evaluation is deferred for the
- * streaming path (the runner's `invoke` path retains full re-evaluation).
+ * Peek the root `on_chain_end` of a `streamEvents` iterable and hand the final
+ * assistant `BaseMessage` (the turn's reply) to `onReply`, then pass every
+ * event through untouched. The managed-session path uses it to persist the
+ * reply for `store.markCompleted` / `GET /v1/sessions/:id`. The final state's
+ * last AIMessage is the assistant's turn output (tool-calling included).
  */
-async function verifyCheckpointUnmoved(
-  checkpointStore: CheckpointStore,
-  threadId: string,
-  graph: AgentGraph,
-): Promise<void> {
-  try {
-    const state = (await graph.getState({
-      configurable: { thread_id: threadId },
-    })) as
-      | { config?: { configurable?: { checkpoint_id?: unknown } } }
-      | undefined;
-    const ownId = state?.config?.configurable?.checkpoint_id;
-    const current = await checkpointStore.checkpointer.get({
-      configurable: { thread_id: threadId },
-    });
-    if (
-      typeof ownId === "string" &&
-      current !== undefined &&
-      current !== null &&
-      typeof current.id === "string" &&
-      ownId !== current.id
-    ) {
-      console.warn(
-        `chat: thread ${threadId}: checkpoint advanced past our stream's write ` +
-          `(${ownId} -> ${current.id}); another writer interleaved ` +
-          "(in-process writers are serialized by the shared thread lock)",
-      );
+async function* captureAssistantReply(
+  events: AsyncIterable<StreamEvent>,
+  onReply: (reply: BaseMessage) => void,
+): AsyncGenerator<StreamEvent> {
+  let rootRunId: string | null = null;
+  for await (const event of events) {
+    if (rootRunId === null && event.event === "on_chain_start") rootRunId = event.run_id;
+    if (rootRunId !== null && event.event === "on_chain_end" && event.run_id === rootRunId) {
+      const output = isRecord(event.data) ? event.data["output"] : undefined;
+      const messages = isRecord(output) ? output["messages"] : undefined;
+      if (Array.isArray(messages)) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const message = messages[i];
+          if (message instanceof AIMessage) {
+            onReply(message);
+            break;
+          }
+          if (isRecord(message) && message["type"] === "ai") {
+            onReply(new AIMessage(message["content"] as string));
+            break;
+          }
+        }
+      }
     }
-  } catch {
-    // Best-effort; never fail a completed stream over the diagnostic check.
+    yield event;
   }
 }
 
-/** Short human-readable intent for the ledger spec (last user message text). */
+/** Short human-readable intent for the ledger spec (last user message text).
+ *  Capped at SPEC_MAX_LENGTH (D4) — the label is non-sensitive, never a
+ *  content store. */
 function intentSpec(rawMessages: unknown[]): string {
   const lastUser = lastUserMessage(rawMessages);
   const content = lastUser?.content;
   if (typeof content === "string" && content.trim() !== "") {
     const trimmed = content.trim();
-    return trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed;
+    return trimmed.length > SPEC_MAX_LENGTH
+      ? trimmed.slice(0, SPEC_MAX_LENGTH)
+      : trimmed;
   }
   return "background chat request";
 }

@@ -73,12 +73,12 @@ class $ConversationsTable extends Conversations
     type: DriftSqlType.string,
     requiredDuringInsert: false,
   );
-  static const VerificationMeta _publicThreadIdMeta = const VerificationMeta(
-    'publicThreadId',
+  static const VerificationMeta _sessionIdMeta = const VerificationMeta(
+    'sessionId',
   );
   @override
-  late final GeneratedColumn<String> publicThreadId = GeneratedColumn<String>(
-    'public_thread_id',
+  late final GeneratedColumn<String> sessionId = GeneratedColumn<String>(
+    'session_id',
     aliasedName,
     true,
     type: DriftSqlType.string,
@@ -92,7 +92,7 @@ class $ConversationsTable extends Conversations
     updatedAt,
     messageCount,
     scopeKey,
-    publicThreadId,
+    sessionId,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -148,13 +148,10 @@ class $ConversationsTable extends Conversations
         scopeKey.isAcceptableOrUnknown(data['scope_key']!, _scopeKeyMeta),
       );
     }
-    if (data.containsKey('public_thread_id')) {
+    if (data.containsKey('session_id')) {
       context.handle(
-        _publicThreadIdMeta,
-        publicThreadId.isAcceptableOrUnknown(
-          data['public_thread_id']!,
-          _publicThreadIdMeta,
-        ),
+        _sessionIdMeta,
+        sessionId.isAcceptableOrUnknown(data['session_id']!, _sessionIdMeta),
       );
     }
     return context;
@@ -190,9 +187,9 @@ class $ConversationsTable extends Conversations
         DriftSqlType.string,
         data['${effectivePrefix}scope_key'],
       ),
-      publicThreadId: attachedDatabase.typeMapping.read(
+      sessionId: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
-        data['${effectivePrefix}public_thread_id'],
+        data['${effectivePrefix}session_id'],
       ),
     );
   }
@@ -210,7 +207,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
   final DateTime updatedAt;
   final int messageCount;
   final String? scopeKey;
-  final String? publicThreadId;
+  final String? sessionId;
   const ConversationRow({
     required this.id,
     required this.title,
@@ -218,7 +215,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     required this.updatedAt,
     required this.messageCount,
     this.scopeKey,
-    this.publicThreadId,
+    this.sessionId,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -231,8 +228,8 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     if (!nullToAbsent || scopeKey != null) {
       map['scope_key'] = Variable<String>(scopeKey);
     }
-    if (!nullToAbsent || publicThreadId != null) {
-      map['public_thread_id'] = Variable<String>(publicThreadId);
+    if (!nullToAbsent || sessionId != null) {
+      map['session_id'] = Variable<String>(sessionId);
     }
     return map;
   }
@@ -247,9 +244,9 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       scopeKey: scopeKey == null && nullToAbsent
           ? const Value.absent()
           : Value(scopeKey),
-      publicThreadId: publicThreadId == null && nullToAbsent
+      sessionId: sessionId == null && nullToAbsent
           ? const Value.absent()
-          : Value(publicThreadId),
+          : Value(sessionId),
     );
   }
 
@@ -265,7 +262,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
       messageCount: serializer.fromJson<int>(json['messageCount']),
       scopeKey: serializer.fromJson<String?>(json['scopeKey']),
-      publicThreadId: serializer.fromJson<String?>(json['publicThreadId']),
+      sessionId: serializer.fromJson<String?>(json['sessionId']),
     );
   }
   @override
@@ -278,7 +275,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
       'messageCount': serializer.toJson<int>(messageCount),
       'scopeKey': serializer.toJson<String?>(scopeKey),
-      'publicThreadId': serializer.toJson<String?>(publicThreadId),
+      'sessionId': serializer.toJson<String?>(sessionId),
     };
   }
 
@@ -289,7 +286,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     DateTime? updatedAt,
     int? messageCount,
     Value<String?> scopeKey = const Value.absent(),
-    Value<String?> publicThreadId = const Value.absent(),
+    Value<String?> sessionId = const Value.absent(),
   }) => ConversationRow(
     id: id ?? this.id,
     title: title ?? this.title,
@@ -297,9 +294,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     updatedAt: updatedAt ?? this.updatedAt,
     messageCount: messageCount ?? this.messageCount,
     scopeKey: scopeKey.present ? scopeKey.value : this.scopeKey,
-    publicThreadId: publicThreadId.present
-        ? publicThreadId.value
-        : this.publicThreadId,
+    sessionId: sessionId.present ? sessionId.value : this.sessionId,
   );
   ConversationRow copyWithCompanion(ConversationsCompanion data) {
     return ConversationRow(
@@ -311,9 +306,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
           ? data.messageCount.value
           : this.messageCount,
       scopeKey: data.scopeKey.present ? data.scopeKey.value : this.scopeKey,
-      publicThreadId: data.publicThreadId.present
-          ? data.publicThreadId.value
-          : this.publicThreadId,
+      sessionId: data.sessionId.present ? data.sessionId.value : this.sessionId,
     );
   }
 
@@ -326,7 +319,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
           ..write('updatedAt: $updatedAt, ')
           ..write('messageCount: $messageCount, ')
           ..write('scopeKey: $scopeKey, ')
-          ..write('publicThreadId: $publicThreadId')
+          ..write('sessionId: $sessionId')
           ..write(')'))
         .toString();
   }
@@ -339,7 +332,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
     updatedAt,
     messageCount,
     scopeKey,
-    publicThreadId,
+    sessionId,
   );
   @override
   bool operator ==(Object other) =>
@@ -351,7 +344,7 @@ class ConversationRow extends DataClass implements Insertable<ConversationRow> {
           other.updatedAt == this.updatedAt &&
           other.messageCount == this.messageCount &&
           other.scopeKey == this.scopeKey &&
-          other.publicThreadId == this.publicThreadId);
+          other.sessionId == this.sessionId);
 }
 
 class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
@@ -361,7 +354,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
   final Value<DateTime> updatedAt;
   final Value<int> messageCount;
   final Value<String?> scopeKey;
-  final Value<String?> publicThreadId;
+  final Value<String?> sessionId;
   final Value<int> rowid;
   const ConversationsCompanion({
     this.id = const Value.absent(),
@@ -370,7 +363,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     this.updatedAt = const Value.absent(),
     this.messageCount = const Value.absent(),
     this.scopeKey = const Value.absent(),
-    this.publicThreadId = const Value.absent(),
+    this.sessionId = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   ConversationsCompanion.insert({
@@ -380,7 +373,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     required DateTime updatedAt,
     this.messageCount = const Value.absent(),
     this.scopeKey = const Value.absent(),
-    this.publicThreadId = const Value.absent(),
+    this.sessionId = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : id = Value(id),
        createdAt = Value(createdAt),
@@ -392,7 +385,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     Expression<DateTime>? updatedAt,
     Expression<int>? messageCount,
     Expression<String>? scopeKey,
-    Expression<String>? publicThreadId,
+    Expression<String>? sessionId,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -402,7 +395,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
       if (updatedAt != null) 'updated_at': updatedAt,
       if (messageCount != null) 'message_count': messageCount,
       if (scopeKey != null) 'scope_key': scopeKey,
-      if (publicThreadId != null) 'public_thread_id': publicThreadId,
+      if (sessionId != null) 'session_id': sessionId,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -414,7 +407,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     Value<DateTime>? updatedAt,
     Value<int>? messageCount,
     Value<String?>? scopeKey,
-    Value<String?>? publicThreadId,
+    Value<String?>? sessionId,
     Value<int>? rowid,
   }) {
     return ConversationsCompanion(
@@ -424,7 +417,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
       updatedAt: updatedAt ?? this.updatedAt,
       messageCount: messageCount ?? this.messageCount,
       scopeKey: scopeKey ?? this.scopeKey,
-      publicThreadId: publicThreadId ?? this.publicThreadId,
+      sessionId: sessionId ?? this.sessionId,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -450,8 +443,8 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
     if (scopeKey.present) {
       map['scope_key'] = Variable<String>(scopeKey.value);
     }
-    if (publicThreadId.present) {
-      map['public_thread_id'] = Variable<String>(publicThreadId.value);
+    if (sessionId.present) {
+      map['session_id'] = Variable<String>(sessionId.value);
     }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
@@ -468,7 +461,7 @@ class ConversationsCompanion extends UpdateCompanion<ConversationRow> {
           ..write('updatedAt: $updatedAt, ')
           ..write('messageCount: $messageCount, ')
           ..write('scopeKey: $scopeKey, ')
-          ..write('publicThreadId: $publicThreadId, ')
+          ..write('sessionId: $sessionId, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -2383,7 +2376,7 @@ typedef $$ConversationsTableCreateCompanionBuilder =
       required DateTime updatedAt,
       Value<int> messageCount,
       Value<String?> scopeKey,
-      Value<String?> publicThreadId,
+      Value<String?> sessionId,
       Value<int> rowid,
     });
 typedef $$ConversationsTableUpdateCompanionBuilder =
@@ -2394,7 +2387,7 @@ typedef $$ConversationsTableUpdateCompanionBuilder =
       Value<DateTime> updatedAt,
       Value<int> messageCount,
       Value<String?> scopeKey,
-      Value<String?> publicThreadId,
+      Value<String?> sessionId,
       Value<int> rowid,
     });
 
@@ -2484,8 +2477,8 @@ class $$ConversationsTableFilterComposer
     builder: (column) => ColumnFilters(column),
   );
 
-  ColumnFilters<String> get publicThreadId => $composableBuilder(
-    column: $table.publicThreadId,
+  ColumnFilters<String> get sessionId => $composableBuilder(
+    column: $table.sessionId,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -2579,8 +2572,8 @@ class $$ConversationsTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
-  ColumnOrderings<String> get publicThreadId => $composableBuilder(
-    column: $table.publicThreadId,
+  ColumnOrderings<String> get sessionId => $composableBuilder(
+    column: $table.sessionId,
     builder: (column) => ColumnOrderings(column),
   );
 }
@@ -2614,10 +2607,8 @@ class $$ConversationsTableAnnotationComposer
   GeneratedColumn<String> get scopeKey =>
       $composableBuilder(column: $table.scopeKey, builder: (column) => column);
 
-  GeneratedColumn<String> get publicThreadId => $composableBuilder(
-    column: $table.publicThreadId,
-    builder: (column) => column,
-  );
+  GeneratedColumn<String> get sessionId =>
+      $composableBuilder(column: $table.sessionId, builder: (column) => column);
 
   Expression<T> messagesRefs<T extends Object>(
     Expression<T> Function($$MessagesTableAnnotationComposer a) f,
@@ -2704,7 +2695,7 @@ class $$ConversationsTableTableManager
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<int> messageCount = const Value.absent(),
                 Value<String?> scopeKey = const Value.absent(),
-                Value<String?> publicThreadId = const Value.absent(),
+                Value<String?> sessionId = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => ConversationsCompanion(
                 id: id,
@@ -2713,7 +2704,7 @@ class $$ConversationsTableTableManager
                 updatedAt: updatedAt,
                 messageCount: messageCount,
                 scopeKey: scopeKey,
-                publicThreadId: publicThreadId,
+                sessionId: sessionId,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -2724,7 +2715,7 @@ class $$ConversationsTableTableManager
                 required DateTime updatedAt,
                 Value<int> messageCount = const Value.absent(),
                 Value<String?> scopeKey = const Value.absent(),
-                Value<String?> publicThreadId = const Value.absent(),
+                Value<String?> sessionId = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => ConversationsCompanion.insert(
                 id: id,
@@ -2733,7 +2724,7 @@ class $$ConversationsTableTableManager
                 updatedAt: updatedAt,
                 messageCount: messageCount,
                 scopeKey: scopeKey,
-                publicThreadId: publicThreadId,
+                sessionId: sessionId,
                 rowid: rowid,
               ),
           withReferenceMapper: (p0) => p0

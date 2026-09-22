@@ -31,6 +31,10 @@ export interface GetOrCreateTaskInput {
   intentKey: string;
   spec: string;
   worker?: string;
+  /** JSON-encoded snapshot messages (ledger v5) — forwarded to `createTask`
+   *  so the runner persists the job's snapshot at admission. Absent on route
+   *  admissions (the routes never store a snapshot). */
+  payload?: string | null;
 }
 
 export interface RecordToolResultInput {

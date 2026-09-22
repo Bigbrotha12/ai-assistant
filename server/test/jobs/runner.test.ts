@@ -17,11 +17,8 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { MemorySaver } from "@langchain/langgraph";
 import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
 import { createAgentGraph } from "../../src/agents/graph.ts";
-import { compileGraphWithCheckpointer } from "../../src/agents/compile.ts";
 import { HumanMessage } from "@langchain/core/messages";
-import { DynamicStructuredTool } from "@langchain/core/tools";
-import { jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
-import { checkpointThreadId } from "../../src/checkpoints/store.ts";
+import { mapChatMessagesToStoredMessages } from "@langchain/core/messages";
 import {
   JobError,
   ToolExecutor,
@@ -47,15 +44,16 @@ import type { ToolPluginDefinition, ModelPluginDefinition } from "../../src/plug
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolCacheKey } from "../../src/middleware/cache.ts";
 import { createBudgetManager } from "../../src/middleware/budget.ts";
-import { createContextManager } from "../../src/middleware/context.ts";
-import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
 
 /**
- * Wave C1 job-runner tests. Everything is fake/in-memory: a real Ledger on an
- * in-memory SQLite DB (honest fence/heartbeat assertions), an in-memory
- * `MemorySaver` checkpointer, a scripted chat model, a recording fake
+ * Wave C1 job-runner tests (stateless-gateway step 8). Everything is
+ * fake/in-memory: a real Ledger on an in-memory SQLite DB (honest
+ * fence/heartbeat assertions), a scripted chat model, a recording fake
  * `ToolCallHandler`, and a real `ToolExecutor` with a stubbed `validatedFetch`.
+ * The graph is compiled WITHOUT a checkpointer and runs on the submitted
+ * snapshot (`descriptor.input`); the snapshot is persisted as the ledger
+ * `payload` for crash-resume.
  */
 
 /** Deterministic gateway clock + manually-driven timers (ledger.test.ts pattern). */
@@ -277,7 +275,6 @@ function baseDeps(
     ledger,
     registry,
     pins,
-    checkpointer: new MemorySaver(),
     ...overrides,
   };
 }
@@ -292,8 +289,15 @@ function descriptor(
     clientThreadId: "thr-1",
     toolPlugins: ["vikunja"],
     modelPluginId: "openrouter",
+    // The job runs on this snapshot; it is persisted as the ledger payload.
+    input: { messages: [new HumanMessage("list my tasks")] },
     ...overrides,
   };
+}
+
+/** The ledger v5 payload format: JSON-encoded stored messages. */
+function storedPayload(messages: BaseMessage[]): string {
+  return JSON.stringify(mapChatMessagesToStoredMessages(messages));
 }
 
 describe("AsyncMutex", () => {
@@ -378,6 +382,65 @@ describe("JobRunner.runJob", () => {
     );
   });
 
+  test("step 9: a succeeded job stores a `reply` step whose content is the assistant reply", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }, "call_reply"),
+        new AIMessage("here are your tasks"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(
+      descriptor({ toolHandler: recordingHandler([]) }),
+    );
+    if (result.status !== "succeeded") {
+      throw new Error(`expected succeeded, got ${JSON.stringify(result)}`);
+    }
+    const replyStep = ledger
+      .listSteps(result.taskId)
+      .find((s) => s.stage === "reply");
+    assert.ok(replyStep, "a reply step must be appended on success");
+    assert.equal(replyStep!.action, "assistant_message");
+    assert.ok(
+      String(replyStep!.result).includes("here are your tasks"),
+      "the reply step's result is the final assistant message content",
+    );
+    assert.equal(ledger.getTask(result.taskId)?.status, "succeeded");
+  });
+
+  test("step 9: a failed job stores no reply step", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    const model = new ScriptedChatModel({
+      responses: [new AIMessage("never")],
+      onGenerate: () => {
+        throw new Error("model exploded");
+      },
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+    const result = await runner.runJob(descriptor());
+    if (result.status !== "failed") {
+      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
+    }
+    assert.equal(
+      ledger.listSteps(result.taskId).some((s) => s.stage === "reply"),
+      false,
+      "a failed job must not store a reply step",
+    );
+  });
+
   test("idempotent admission: a second runJob while the first runs returns in_flight and never double-invokes", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
@@ -423,7 +486,6 @@ describe("JobRunner.runJob", () => {
 
     const calls: RecordedCall[] = [];
     const toolCallId = "call_replay";
-    const checkpointer = new MemorySaver();
     let seeded = false;
     const model = new ScriptedChatModel({
       responses: [
@@ -448,7 +510,6 @@ describe("JobRunner.runJob", () => {
 
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        checkpointer,
         buildModel: () => model,
       }),
     );
@@ -457,18 +518,11 @@ describe("JobRunner.runJob", () => {
     );
     assert.equal(result.status, "succeeded");
     assert.equal(calls.length, 0, "the recorded tool must not execute again");
-
-    const state = await checkpointer.get({
-      configurable: {
-        thread_id: checkpointThreadId("user-1", "thr-1"),
-      },
-    });
-    const messages = (state?.channel_values?.messages ?? []) as Array<{
-      content?: unknown;
-    }>;
     assert.ok(
-      messages.some((m) => String(m.content).includes("stored")),
-      "the stored result is what reached graph state",
+      ledger
+        .listSteps(result.taskId)
+        .some((s) => s.action === "tool:list_tasks" && String(s.result).includes("stored")),
+      "the stored result is recorded as the tool step (replayed, not re-executed)",
     );
   });
 
@@ -539,7 +593,7 @@ describe("JobRunner.runJob", () => {
     assert.ok(String(errorStep.result).includes("Bearer ***"));
   });
 
-  test("mutex: two concurrent runJobs on the same thread serialize (no interleaved invoke, no lost update)", async (t) => {
+  test("stateless: two concurrent runJobs on the same worker label both succeed independently (no shared checkpoint to clobber)", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     const pins = new CredentialPinStore();
@@ -557,10 +611,8 @@ describe("JobRunner.runJob", () => {
           active -= 1;
         },
       });
-    const checkpointer = new MemorySaver();
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        checkpointer,
         buildModel: (_id, config) => buildModel(String(config)),
       }),
     );
@@ -575,19 +627,12 @@ describe("JobRunner.runJob", () => {
     ]);
     assert.equal(a.status, "succeeded");
     assert.equal(b.status, "succeeded");
-    assert.equal(maxActive, 1, "only one invoke may run per thread at a time");
-
-    const checkpoint = await checkpointer.get({
-      configurable: {
-        thread_id: checkpointThreadId("user-1", "shared"),
-      },
-    });
-    const messages = (checkpoint?.channel_values?.messages ?? []) as unknown[];
-    assert.equal(
-      messages.length,
-      4,
-      "both jobs' messages accumulate (no lost update)",
+    assert.ok(
+      maxActive >= 2,
+      "jobs are no longer serialized by a per-thread lock — each runs its own stateless graph",
     );
+    const messagesA = ledger.listSteps(a.taskId).filter((s) => s.action === "tool:list_tasks");
+    void messagesA;
   });
 
   test("getJobStatus is owner-scoped", async (t) => {
@@ -735,11 +780,20 @@ describe("JobRunner.runJob", () => {
     );
   });
 
-  test("H3: a resumed (isReplay) job refuses to re-execute a mutating tool with no stored result → tool_retry_forbidden", async (t) => {
+  test("H3: a resumed (stuck) job refuses to re-execute a mutating tool with no stored result → tool_retry_forbidden", async (t) => {
     const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
+    const { ledger, clock } = makeLedger();
     const pins = new CredentialPinStore();
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
+
+    // A stuck task at admission IS a replay (H3) — no explicit `isReplay` flag
+    // needed. Stage the crash: claim a task, let its heartbeat go stale, and
+    // reconcile it to `stuck`, then run the same intentKey through the runner.
+    const staged = ledger.createTask({ owner: "user-1", intentKey: "mut-replay", spec: "{}" });
+    ledger.claimTask(staged.id, "user-1");
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(staged.id)?.status, "stuck");
 
     const calls: RecordedCall[] = [];
     const model = new ScriptedChatModel({
@@ -752,7 +806,7 @@ describe("JobRunner.runJob", () => {
       baseDeps(ledger, registry, pins, { buildModel: () => model }),
     );
     const result = await runner.runJob(
-      descriptor({ toolHandler: recordingHandler(calls), isReplay: true }),
+      descriptor({ intentKey: "mut-replay", toolHandler: recordingHandler(calls) }),
     );
     if (result.status !== "failed") {
       throw new Error(`expected failed, got ${JSON.stringify(result)}`);
@@ -767,154 +821,42 @@ describe("JobRunner.runJob", () => {
     assert.equal(calls.length, 0, "the mutating tool must not execute during a replay");
   });
 
-  test("M1: runJob records the owner→thread mapping (touchThread) with the hashed thread id", async (t) => {
+  test("the snapshot payload is persisted at admission and backfilled on tasks admitted without one", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     const pins = new CredentialPinStore();
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
-
-    const touched: Array<{ owner: string; threadId: string }> = [];
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
         buildModel: () =>
           new ScriptedChatModel({ responses: [new AIMessage("ok")] }),
-        touchThread: (owner, threadId) => {
-          touched.push({ owner, threadId });
-        },
       }),
     );
-    const result = await runner.runJob(descriptor());
-    assert.equal(result.status, "succeeded");
-    assert.deepEqual(touched, [
-      { owner: "user-1", threadId: checkpointThreadId("user-1", "thr-1") },
-    ]);
-  });
 
-  test("M5: on an optimistic-lock conflict the re-evaluation re-applies the ORIGINAL input (input survives)", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
-    pins.pin("user-1", "vikunja", { apiKey: "tok" });
-
-    // A checkpointer that fabricates a diverging id on the runner's DIRECT
-    // `get` reads (readCheckpointId), simulating another writer having advanced
-    // the thread past our final write. graph internals use getTuple (real), so
-    // only the conflict-detection re-read diverges and the branch fires once.
-    class SimulatedInterleavingSaver extends MemorySaver {
-      override async get(config: Parameters<MemorySaver["get"]>[0]) {
-        const checkpoint = await super.get(config);
-        if (!checkpoint) return checkpoint;
-        return { ...checkpoint, id: `simulated-${checkpoint.id}` };
-      }
-    }
-    const checkpointer = new SimulatedInterleavingSaver();
-
-    // Seed the thread so `beforeId` is non-null (the conflict branch requires it).
-    const threadId = checkpointThreadId("user-1", "thr-1");
-    const seedGraph = compileGraphWithCheckpointer(
-      createAgentGraph({
-        model: new ScriptedChatModel({ responses: [new AIMessage("seed reply")] }),
-        tools: [],
-      }),
-      checkpointer,
+    // A fresh admission persists the snapshot as the ledger payload.
+    const input = { messages: [new HumanMessage("snapshot message")] };
+    const fresh = await runner.runJob(
+      descriptor({ intentKey: "payload-1", input }),
     );
-    await seedGraph.invoke(
-      { messages: [new HumanMessage("seed")] },
-      { configurable: { thread_id: threadId } },
-    );
-
-    let generateCalls = 0;
-    const model = new ScriptedChatModel({
-      responses: [new AIMessage("reply")],
-      onGenerate: () => {
-        generateCalls += 1;
-      },
-    });
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        checkpointer,
-        buildModel: () => model,
-      }),
-    );
-    const result = await runner.runJob(
-      descriptor({ input: { messages: [new HumanMessage("original user input")] } }),
-    );
-    assert.equal(result.status, "succeeded");
-    assert.equal(generateCalls, 2, "the conflict re-evaluation must have run once");
-
-    const state = await checkpointer.get({
-      configurable: { thread_id: threadId },
-    });
-    const messages = (state?.channel_values?.messages ?? []) as Array<{
-      content?: unknown;
-    }>;
+    assert.equal(fresh.status, "succeeded");
+    const stored = ledger.getTask(fresh.taskId);
+    assert.ok(stored?.payload, "the snapshot payload must be persisted");
     assert.ok(
-      messages.some((m) => String(m.content) === "original user input"),
-      "the original input must survive the conflict re-evaluation",
+      stored.payload.includes("snapshot message"),
+      "the payload holds the snapshot's message content",
     );
-  });
 
-  test("LOW: the per-thread mutex is GC'd from the map once a job finishes", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
+    // A task admitted by a caller that stored no payload (the transport's
+    // pre-run `getOrCreateTask`) is backfilled once the runner claims it.
+    // (The first runJob released the tool pin in its finally, so re-pin.)
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        buildModel: () =>
-          new ScriptedChatModel({ responses: [new AIMessage("ok")] }),
-      }),
+    const preAdmitted = ledger.createTask({ owner: "user-1", intentKey: "payload-2", spec: "{}" });
+    const resumed = await runner.runJob(
+      descriptor({ intentKey: "payload-2", input }),
     );
-    await runner.runJob(descriptor({ intentKey: "gc-1" }));
-    const internals = runner as unknown as { mutexes: Map<string, AsyncMutex> };
-    assert.equal(
-      internals.mutexes.size,
-      0,
-      "a finished job's per-thread mutex must be evicted",
-    );
-  });
-
-  test("LOW: per-thread mutexes are GC'd after concurrent jobs on the same thread both finish (no split lock)", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
-    pins.pin("user-1", "vikunja", { apiKey: "tok" });
-
-    let active = 0;
-    let maxActive = 0;
-    const buildModel = (label: string) =>
-      new ScriptedChatModel({
-        responses: [new AIMessage(`reply-${label}`)],
-        onGenerate: async () => {
-          active += 1;
-          maxActive = Math.max(maxActive, active);
-          await new Promise((resolve) => setTimeout(resolve, 25));
-          active -= 1;
-        },
-      });
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        buildModel: (_id, config) => buildModel(String(config)),
-      }),
-    );
-
-    const [a, b] = await Promise.all([
-      runner.runJob(
-        descriptor({ intentKey: "gc-a", clientThreadId: "shared-gc", modelRequestConfig: "a" }),
-      ),
-      runner.runJob(
-        descriptor({ intentKey: "gc-b", clientThreadId: "shared-gc", modelRequestConfig: "b" }),
-      ),
-    ]);
-    assert.equal(a.status, "succeeded");
-    assert.equal(b.status, "succeeded");
-    assert.equal(maxActive, 1, "the shared-thread lock must never split");
-    const internals = runner as unknown as { mutexes: Map<string, AsyncMutex> };
-    assert.equal(
-      internals.mutexes.size,
-      0,
-      "both finished jobs' shared-thread mutex must be evicted",
-    );
+    assert.equal(resumed.status, "succeeded");
+    const backfilled = ledger.getTask(preAdmitted.id);
+    assert.ok(backfilled?.payload, "the pre-admitted task's payload must be backfilled");
   });
 
   test("Wave C2: the buildModel seam resolves the PINNED model credential by owner and builds the model", async (t) => {
@@ -1149,7 +1091,7 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
     assert.deepEqual(calls[0]?.credentials, { apiKey: "tok-mine" });
   });
 
-  test("pin expiry at dispatch (inputFactory seam): a pin that dies mid-run fails credentials_expired, not a leaked tool call", async (t) => {
+  test("pin expiry at dispatch: a pin that dies mid-run fails credentials_expired, not a leaked tool call", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     let pinNow = 1_000_000;
@@ -1172,10 +1114,7 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
         intentKey: "exp-1",
         clientThreadId: "thr-exp",
         toolHandler: recordingHandler(calls),
-        inputFactory: async () => {
-          pinNow += 2000;
-          return { messages: [new HumanMessage("go")] };
-        },
+        input: { messages: [new HumanMessage("go")] },
       }),
     );
     if (result.status !== "failed") {
@@ -1188,140 +1127,36 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
     );
   });
 
-  test("async seed runs inside the runner's thread lock: inputFactory observes graph + threadId and the model is built before it fires", async (t) => {
+  test("the job runs on the snapshot input: the model sees exactly the descriptor's messages (no checkpoint re-read)", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     const pins = new CredentialPinStore();
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
     pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
 
-    const events: string[] = [];
-    let modelBuilt = false;
-    const checkpointer = new MemorySaver();
+    const seen: BaseMessage[][] = [];
+    const snapshot = [new HumanMessage("snapshot first"), new HumanMessage("snapshot last")];
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        checkpointer,
-        buildModel: () => {
-          modelBuilt = true;
-          return new ScriptedChatModel({ responses: [new AIMessage("ok")] });
-        },
+        buildModel: () =>
+          new ScriptedChatModel({
+            responses: [new AIMessage("ok")],
+            onGenerateMessages: (messages) => seen.push(messages),
+          }),
       }),
     );
     const result = await runner.runJob(
       descriptor({
-        intentKey: "seed-1",
-        clientThreadId: "thr-seed",
-        inputFactory: async ({ graph, threadId, isReplay, signal }) => {
-          events.push(`factory:${modelBuilt}:${threadId === checkpointThreadId("user-1", "thr-seed")}:${isReplay}:${!signal.aborted}`);
-          void graph;
-          return { messages: [new HumanMessage("factory input")] };
-        },
+        intentKey: "snapshot-1",
+        clientThreadId: "thr-snapshot",
+        input: { messages: snapshot },
       }),
     );
     assert.equal(result.status, "succeeded");
-    assert.equal(events[0], "factory:true:true:false:true");
-
-    const state = await checkpointer.get({
-      configurable: { thread_id: checkpointThreadId("user-1", "thr-seed") },
-    });
-    const messages = (state?.channel_values?.messages ?? []) as Array<{ content?: unknown }>;
-    assert.ok(
-      messages.some((m) => String(m.content) === "factory input"),
-      "the factory's input seeded the checkpoint",
-    );
-    assert.ok(
-      !messages.some((m) => String(m.content) === "seed-1"),
-      "the spec-based default input is NOT used when a factory is wired",
-    );
-  });
-
-  test("interrupted checkpoint recovery: a replay onto a thread with a pending interrupt re-invokes with null input (no duplicate user message)", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
-    pins.pin("user-1", "vikunja", { apiKey: "tok" });
-    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
-
-    const threadId = checkpointThreadId("user-1", "thr-resume");
-    const checkpointer = new MemorySaver();
-    const calls: RecordedCall[] = [];
-
-    // Stage an interrupted turn directly against the checkpointer: the model
-    // emits a tool call, the tool handler hangs until aborted — leaving
-    // `next: ["toolExecutor"]` on the thread's latest checkpoint.
-    let stagingGenerated = false;
-    const stagingModel = new ScriptedChatModel({
-      responses: [toolCallMessage("list_tasks", { projectId: "p" }, "call_interrupted")],
-      onGenerate: () => {
-        stagingGenerated = true;
-      },
-    });
-    const hangingTool = new DynamicStructuredTool({
-      name: "list_tasks",
-      description: "hangs until aborted",
-      schema: jsonSchemaToZod({
-        type: "object",
-        properties: { projectId: { type: "string" } },
-        required: ["projectId"],
-      }),
-      func: async () => {
-        await new Promise(() => {});
-        return "never";
-      },
-    });
-    const stagingGraph = compileGraphWithCheckpointer(
-      createAgentGraph({ model: stagingModel, tools: [hangingTool] }),
-      checkpointer,
-    );
-    const stagingAc = new AbortController();
-    const staged = stagingGraph.invoke(
-      { messages: [new HumanMessage("seed")] },
-      { configurable: { thread_id: threadId }, signal: stagingAc.signal },
-    );
-    await waitFor(() => stagingGenerated);
-    stagingAc.abort();
-    await staged.catch(() => {});
-    const stagedGraph = compileGraphWithCheckpointer(
-      createAgentGraph({ model: stagingModel, tools: [hangingTool] }),
-      checkpointer,
-    );
-    const stagedState = await stagedGraph.getState({ configurable: { thread_id: threadId } });
-    assert.equal(stagedState?.next?.[0], "toolExecutor", "the staged turn is interrupted mid-tool-round");
-
-    // Replay through the runner: a pending interrupt must resume with null
-    // input — the tool executes (via the runner's bound tools) and the turn
-    // completes WITHOUT appending a duplicate user message.
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        checkpointer,
-        buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("resumed")] }),
-      }),
-    );
-    const result = await runner.runJob(
-      descriptor({
-        intentKey: "resume-1",
-        clientThreadId: "thr-resume",
-        toolHandler: recordingHandler(calls),
-        isReplay: true,
-        inputFactory: async () => {
-          throw new Error("inputFactory must NOT run when a pending interrupt exists");
-        },
-      }),
-    );
-    assert.equal(result.status, "succeeded");
-    assert.equal(calls.length, 1, "the interrupted tool call executed exactly once on resume");
-
-    const finalState = await stagedGraph.getState({ configurable: { thread_id: threadId } });
-    const messages = (finalState?.values?.messages ?? []) as Array<{ content?: unknown }>;
-    assert.equal(
-      messages.filter((m) => String(m.content) === "seed").length,
-      1,
-      "the replay must not append a duplicate user message",
-    );
-    assert.ok(
-      messages.some((m) => String(m.content) === "resumed"),
-      "the resumed turn completed with the model's final answer",
-    );
+    const contents = seen[0]?.map((m) => String(m.content)) ?? [];
+    assert.ok(contents.includes("snapshot first"), "the snapshot's first message reaches the model");
+    assert.ok(contents.includes("snapshot last"), "the snapshot's last message reaches the model");
+    assert.equal(ledger.getTask(result.taskId)?.payload, storedPayload(snapshot), "the snapshot is persisted as the ledger payload");
   });
 
   test("descriptor signal aborts the graph mid-run and fails the job", async (t) => {
@@ -1370,7 +1205,6 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
     ledger.reconcileOrphans();
 
     const calls: RecordedCall[] = [];
-    const checkpointer = new MemorySaver();
     const model = new ScriptedChatModel({
       responses: [
         toolCallMessage("list_tasks", { projectId: "p" }, "call_fence"),
@@ -1378,14 +1212,13 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
       ],
     });
     const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, { checkpointer, buildModel: () => model }),
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
     );
     const result = await runner.runJob(
       descriptor({
         intentKey: "fence-1",
         clientThreadId: "thr-fence",
         toolHandler: recordingHandler(calls),
-        isReplay: true,
       }),
     );
     assert.equal(result.status, "succeeded");
@@ -1396,7 +1229,7 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
 describe("JobRunner execution drain", () => {
   for (const kind of ["model", "tool"] as const) {
     for (const rejects of [false, true]) {
-      test(`cancellation retains lock, pins and budget until uncooperative ${kind} ${rejects ? "rejects" : "resolves"}`, async (t) => {
+      test(`cancellation retains pins and budget until uncooperative ${kind} ${rejects ? "rejects" : "resolves"}`, async (t) => {
         const { registry } = await makeRegistry(t);
         const { ledger, scheduler } = makeLedger();
         const pins = new CredentialPinStore();
@@ -1412,7 +1245,6 @@ describe("JobRunner execution drain", () => {
         let started = false;
         let settled = false;
         let returned = false;
-        let entered = false;
         let modelCalls = 0;
         const delayed = async () => {
           started = true;
@@ -1448,18 +1280,12 @@ describe("JobRunner execution drain", () => {
           returned = true;
           reservation.release();
         });
-        let waiter: Promise<void> | undefined;
         try {
           await waitFor(() => started);
-          const mutex = runner.mutexes.get(checkpointThreadId("user-1", "thr-1"));
-          assert.ok(mutex);
-          waiter = mutex.runExclusive(async () => { entered = true; });
           ac.abort();
           await new Promise((resolve) => setTimeout(resolve, 30));
           assert.equal(settled, false);
           assert.equal(returned, false, "runJob must await actual execution");
-          assert.equal(entered, false, "the next thread writer must remain blocked");
-          assert.equal(mutex.isIdle, false);
           assert.equal(budget.activeCount("user-1"), 1);
           assert.equal(scheduler.count(), 1, "heartbeat stays alive during drain");
           for (const [pluginId, handle] of Object.entries(pinHandles)) {
@@ -1468,8 +1294,6 @@ describe("JobRunner execution drain", () => {
           release();
           const result = await job;
           assert.equal(result.status, "failed");
-          await waiter;
-          assert.equal(entered, true);
           assert.equal(settled, true);
           assert.equal(modelCalls, 1);
           assert.equal(scheduler.count(), 0);
@@ -1481,14 +1305,13 @@ describe("JobRunner execution drain", () => {
         } finally {
           release();
           await job;
-          await waiter;
           runner.dispose();
         }
       });
     }
   }
 
-  test("a failed parallel tool drains every uncooperative sibling before releasing lock and pins", async (t) => {
+  test("a failed parallel tool drains every uncooperative sibling before releasing pins", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger, scheduler } = makeLedger();
     const pins = new CredentialPinStore();
@@ -1501,7 +1324,6 @@ describe("JobRunner execution drain", () => {
     const started = new Set<number>();
     const signals: AbortSignal[] = [];
     let returned = false;
-    let entered = false;
     let modelCalls = 0;
     const runner = createJobRunner(baseDeps(ledger, registry, pins, {
       buildModel: () => new ScriptedChatModel({
@@ -1526,17 +1348,12 @@ describe("JobRunner execution drain", () => {
         },
       },
     })).finally(() => { returned = true; });
-    let waiter: Promise<void> | undefined;
     try {
       await waitFor(() => started.size === 3);
-      const mutex = runner.mutexes.get(checkpointThreadId("user-1", "thr-1"));
-      assert.ok(mutex);
-      waiter = mutex.runExclusive(async () => { entered = true; });
       releases[0]!();
       await waitFor(() => returned || signals.every((signal) => signal.aborted));
       const assertRetained = () => {
         assert.equal(returned, false);
-        assert.equal(entered, false);
         assert.equal(scheduler.count(), 1);
         for (const [pluginId, handle] of Object.entries(pinHandles)) {
           assert.equal(pins.get("user-1", pluginId, handle).handle, handle);
@@ -1550,8 +1367,6 @@ describe("JobRunner execution drain", () => {
       const result = await job;
       assert.equal(result.status, "failed");
       if (result.status === "failed") assert.match(result.error, /sibling failure 0/);
-      await waiter;
-      assert.equal(entered, true);
       assert.equal(modelCalls, 1);
       assert.equal(scheduler.count(), 0);
       assert.equal(ledger.listSteps(result.taskId).some((step) => step.action === "tool:list_tasks"), false);
@@ -1561,7 +1376,6 @@ describe("JobRunner execution drain", () => {
     } finally {
       releases.forEach((release) => release());
       await job;
-      await waiter;
       runner.dispose();
     }
   });
@@ -1608,26 +1422,47 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     assert.equal(notifications[0]?.taskId, task.id);
   });
 
-  test("with a credentialSource that re-establishes pins, the task is repinned and resumed", async (t) => {
+  test("with a credentialSource that re-establishes pins and a buildModel seam, a stuck task resumes from its STORED payload (model re-invoked with the snapshot messages)", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger, clock } = makeLedger();
     const pins = new CredentialPinStore();
-    const task = ledger.createTask({ owner: "user-1", intentKey: "orphan-2", spec: "{}" });
+    const snapshot = [new HumanMessage("snapshot turn")];
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "orphan-2",
+      spec: "{}",
+      worker: "original-client-thread",
+      payload: storedPayload(snapshot),
+    });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000);
     ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(task.id)?.status, "stuck");
 
+    const seen: BaseMessage[][] = [];
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        credentialSource: () => ({ vikunja: { apiKey: "restored" } }),
+        buildModel: () =>
+          new ScriptedChatModel({
+            responses: [new AIMessage("resumed")],
+            onGenerateMessages: (messages) => seen.push(messages),
+          }),
+        credentialSource: () => ({
+          openrouter: { apiKey: "sk-model" },
+          vikunja: { apiKey: "restored" },
+        }),
       }),
     );
     const result = await runner.resumeStuckJobs();
     assert.equal(result.outcomes[0]?.outcome, "repinned");
-    assert.equal(ledger.getTask(task.id)?.status, "running");
-    assert.deepEqual(pins.get("user-1", "vikunja").credentials, {
-      apiKey: "restored",
-    });
+    assert.equal(ledger.getTask(task.id)?.status, "succeeded");
+    const contents = seen[0]?.map((m) => String(m.content)) ?? [];
+    assert.ok(
+      contents.includes("snapshot turn"),
+      "the resume re-invokes the model with the STORED snapshot messages",
+    );
+    const resumed = ledger.getTask(task.id);
+    assert.equal(resumed?.worker, "original-client-thread", "the resume kept the stored worker label");
   });
 
   test("H3: with a model seam wired and the model plugin identifiable among the restored pins, a repinned stuck task is re-run through runJob as a replay (mutating tool → tool_retry_forbidden)", async (t) => {
@@ -1638,9 +1473,8 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       owner: "user-1",
       intentKey: "orphan-replay",
       spec: "{}",
-      // M2: the transport stores the ORIGINAL raw client thread id in the
-      // task's `worker` column; a replay must resume on that thread.
       worker: "original-client-thread",
+      payload: storedPayload([new HumanMessage("snapshot turn")]),
     });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000);
@@ -1648,7 +1482,6 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     assert.equal(ledger.getTask(task.id)?.status, "stuck");
 
     const calls: RecordedCall[] = [];
-    const checkpointer = new MemorySaver();
     const model = new ScriptedChatModel({
       responses: [
         toolCallMessage("create_task", { title: "x" }, "call_replay_resume"),
@@ -1657,7 +1490,6 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     });
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        checkpointer,
         buildModel: () => model,
         credentialSource: () => ({
           openrouter: { apiKey: "sk-model" },
@@ -1674,29 +1506,6 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
         .some((s) => s.action === "error:tool_retry_forbidden"),
     );
     assert.equal(calls.length, 0, "the mutating tool must not re-execute during a replay");
-
-    // M2: the replay ran on the STORED client thread (worker column), not on a
-    // re-hash of the intent key — the original thread now holds the replay's
-    // checkpoint, proving the resume was not mis-threaded.
-    const state = await checkpointer.get({
-      configurable: {
-        thread_id: checkpointThreadId("user-1", "original-client-thread"),
-      },
-    });
-    assert.ok(
-      state !== undefined,
-      "the replay wrote to the ORIGINAL checkpoint thread (worker column)",
-    );
-    const wrongThread = await checkpointer.get({
-      configurable: {
-        thread_id: checkpointThreadId("user-1", "orphan-replay"),
-      },
-    });
-    assert.equal(
-      wrongThread,
-      undefined,
-      "the replay must NOT checkpoint the intent-key thread",
-    );
   });
 
   test("M2: a repinned stuck task whose restored pins carry NO model plugin fails plugin_unavailable (never credentials_expired, never a wrong-thread resume)", async (t) => {
@@ -1707,6 +1516,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       owner: "user-1",
       intentKey: "orphan-nomodel",
       spec: "{}",
+      payload: storedPayload([new HumanMessage("snapshot")]),
     });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000);
@@ -1728,6 +1538,92 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
         .listSteps(task.id)
         .some((s) => s.action === "error:plugin_unavailable"),
       "the honest code is plugin_unavailable, not credentials_expired",
+    );
+  });
+
+  test("a stuck task WITHOUT a stored payload is marked failed — the resume never fabricates input", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "orphan-nopayload", spec: "{}" });
+    ledger.claimTask(task.id, "user-1");
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(task.id)?.status, "stuck");
+
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("never")] }),
+        credentialSource: () => ({
+          openrouter: { apiKey: "sk-model" },
+          vikunja: { apiKey: "restored" },
+        }),
+      }),
+    );
+    const result = await runner.resumeStuckJobs();
+    assert.equal(result.outcomes[0]?.outcome, "job_failed");
+    assert.equal(ledger.getTask(task.id)?.status, "failed");
+    const errorStep = ledger
+      .listSteps(task.id)
+      .find((s) => s.action === "error:job_failed");
+    assert.ok(errorStep, "a job_failed error step records the missing payload");
+    assert.match(
+      String(errorStep?.result),
+      /no stored message snapshot to resume from/,
+      "the error names the missing snapshot payload",
+    );
+  });
+
+  test("replay dedupe survives a resume: a tool already executed is not re-executed across the stuck/resume boundary", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
+
+    // Stage a crash mid-job: a task whose FIRST (partial) run already
+    // recorded the tool's result, then went silent and was marked stuck. The
+    // stored result is the crash-resume correctness anchor — the resumed run
+    // must serve it, not re-execute.
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "dedupe-resume",
+      spec: "{}",
+      payload: storedPayload([new HumanMessage("snapshot")]),
+    });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    recordToolResult(ledger, {
+      taskId: task.id,
+      owner: "user-1",
+      fenceToken: claimed.fence_token,
+      toolCallId: "call_dedupe",
+      toolName: "list_tasks",
+      result: '{"stored":true}',
+    });
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(task.id)?.status, "stuck");
+
+    const calls: RecordedCall[] = [];
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () =>
+          new ScriptedChatModel({
+            responses: [
+              toolCallMessage("list_tasks", { projectId: "p" }, "call_dedupe"),
+              new AIMessage("done"),
+            ],
+          }),
+      }),
+    );
+    const result = await runner.runJob(
+      descriptor({ intentKey: "dedupe-resume", toolHandler: recordingHandler(calls) }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(
+      calls.length,
+      0,
+      "the resumed run replayed the stored result — the tool must NOT execute again",
     );
   });
 });
@@ -1942,21 +1838,21 @@ describe("ToolExecutor (real validatedFetch path)", () => {
     );
   });
 
-  test("the optimistic-lock re-evaluation idiom: on conflict the graph re-runs with the ORIGINAL input re-applied (M5 — input survives)", async () => {
+  test("graph-level: re-invoking a compiled graph re-applies the ORIGINAL input on top of existing state (M5 — input survives)", async () => {
     const checkpointer = new MemorySaver();
     const model = new ScriptedChatModel({
       responses: [new AIMessage("first"), new AIMessage("re-evaluated")],
     });
-    const graph = compileGraphWithCheckpointer(
-      createAgentGraph({ model, tools: [] }),
-      checkpointer,
-    );
+    const graph = createAgentGraph({ model, tools: [] })
+      .builder.compile({ checkpointer });
     await graph.invoke(
       { messages: [new HumanMessage("base")] },
       { configurable: { thread_id: "t" } },
     );
-    // A conflict detected after our write re-invokes with the ORIGINAL input —
-    // never a blind `{ messages: [] }` re-evaluation (M5).
+    // A re-evaluation re-applies the ORIGINAL input — never a blind
+    // `{ messages: [] }` re-run (M5). (The runner itself no longer uses a
+    // checkpointer or optimistic locking — this documents the graph idiom the
+    // old conflict branch relied on.)
     const input = { messages: [new HumanMessage("original user input")] };
     const result = await graph.invoke(input, { configurable: { thread_id: "t" } });
     const contents = result.messages.map((m: BaseMessage) => String(m.content));
@@ -2062,12 +1958,10 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
     const pins = new CredentialPinStore();
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
     const toolCache = createToolResultCache();
-    const checkpointer = new MemorySaver();
     const calls: RecordedCall[] = [];
 
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        checkpointer,
         toolCache,
         buildModel: modelFactory("list_tasks", "call_ro_1", "done", { projectId: "p1" }),
       }),
@@ -2098,19 +1992,14 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
     assert.equal(calls.length, 1, "the second run served from the cache, not the handler");
     assert.equal(toolCache.size, 1);
 
-    // The redacted cached result reached the second job's checkpoint state.
-    const state = await checkpointer.get({
-      configurable: {
-        thread_id: checkpointThreadId("user-1", "thr-cache-b"),
-      },
-    });
-    const messages = (state?.channel_values?.messages ?? []) as Array<{
-      content?: unknown;
-    }>;
-    const redacted = redactForCheckpoint(RAW_RESULT);
-    assert.ok(
-      messages.some((m) => String(m.content) === redacted),
-      "the second job's checkpoint contains the redacted cached result",
+    // A cached serve SKIPS recordToolResult (the per-task ledger stays
+    // untouched for a cache hit) — the replay-dedupe step for the SECOND job
+    // is absent, but the first job's tool step carried the raw result redacted.
+    const steps = ledger.listSteps(r2.taskId);
+    assert.equal(
+      steps.some((s) => s.action === "tool:list_tasks"),
+      false,
+      "a cache hit does not append a tool step to the second job",
     );
   });
 
@@ -2161,7 +2050,6 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
 
     const calls: RecordedCall[] = [];
     const toolCallId = "call_dedupe_wins";
-    const checkpointer = new MemorySaver();
     let seeded = false;
     const model = new ScriptedChatModel({
       responses: [
@@ -2198,7 +2086,6 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
 
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
-        checkpointer,
         toolCache,
         buildModel: () => model,
       }),
@@ -2209,21 +2096,17 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
     assert.equal(result.status, "succeeded");
     assert.equal(calls.length, 0, "neither the cache nor the ledger path called the handler");
 
-    const state = await checkpointer.get({
-      configurable: {
-        thread_id: checkpointThreadId("user-1", "thr-1"),
-      },
-    });
-    const messages = (state?.channel_values?.messages ?? []) as Array<{
-      content?: unknown;
-    }>;
-    assert.ok(
-      messages.some((m) => String(m.content).includes('"from":"ledger"')),
-      "the ledger's stored result is what reached graph state, not the cached value",
+    const toolStep = ledger
+      .listSteps(result.taskId)
+      .find((s) => s.action === "tool:list_tasks");
+    assert.equal(
+      toolStep?.result,
+      '{"from":"ledger"}',
+      "the ledger's stored result is what served the tool (dedupe wins over the warm cache)",
     );
     assert.ok(
-      !messages.some((m) => String(m.content).includes("sk-secret999")),
-      "the cache's raw (unredacted) value never reached graph state",
+      !String(toolStep?.result).includes("sk-secret999"),
+      "the cache's raw (unredacted) value never reached the ledger or graph state",
     );
   });
 
@@ -2351,137 +2234,7 @@ describe("JobRunner.runJob — context + budget integration (phase 4 review)", (
     assert.ok(observed.every(([owner, kind]) => owner === "user-1" && kind === "async"));
   });
 
-  test("context gate: prepareMessages truncation to the token limit runs before the model", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
-    pins.pin("user-1", "vikunja", { apiKey: "tok" });
-    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
-
-    const contextManager = createContextManager({ limitTokens: 140 });
-    let sawMessages: unknown[] | undefined;
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        contextManager,
-        buildModel: () =>
-          new ScriptedChatModel({
-            responses: [new AIMessage("done")],
-            onGenerateMessages: (messages) => {
-              sawMessages = messages;
-            },
-          }),
-      }),
-    );
-    const result = await runner.runJob(
-      descriptor({
-        intentKey: "ctx-1",
-        clientThreadId: "thr-ctx",
-        input: {
-          messages: [
-            new HumanMessage("old message ".repeat(60)),
-            new HumanMessage("final question"),
-          ],
-        },
-      }),
-    );
-    assert.equal(result.status, "succeeded");
-    assert.ok(sawMessages, "the model ran");
-    const contents = sawMessages!.map((m) => String((m as { content?: unknown }).content));
-    assert.ok(
-      contents.some((c) => c === "final question"),
-      "the latest user message must survive truncation",
-    );
-    assert.ok(
-      !contents.some((c) => c === "old message old message old message"),
-      "the oversized old message is truncated away by prepareMessages",
-    );
-  });
-
-  test("context gate: an oversized required tail (system + latest user) fails the job context_length_exceeded", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
-    pins.pin("user-1", "vikunja", { apiKey: "tok" });
-    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
-
-    const contextManager = createContextManager({ limitTokens: 100 });
-    let modelCalls = 0;
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        contextManager,
-        buildModel: () =>
-          new ScriptedChatModel({
-            responses: [new AIMessage("never")],
-            onGenerate: () => {
-              modelCalls += 1;
-            },
-          }),
-      }),
-    );
-    const result = await runner.runJob(
-      descriptor({
-        intentKey: "ctx-over",
-        clientThreadId: "thr-ctx-over",
-        input: { messages: [new HumanMessage("x".repeat(600))] },
-      }),
-    );
-    if (result.status !== "failed") {
-      throw new Error(`expected failed, got ${JSON.stringify(result)}`);
-    }
-    assert.equal(result.code, "context_length_exceeded");
-    assert.equal(modelCalls, 0, "the oversized input must never reach the model");
-    assert.ok(
-      ledger.listSteps(result.taskId).some((s) => s.action === "error:context_length_exceeded"),
-    );
-    assert.equal(ledger.getTask(result.taskId)?.status, "failed");
-  });
-
-  test("maybeCompactAfterStream runs inside the SAME thread lock after a successful invoke (compacted marker latched)", async (t) => {
-    const { registry } = await makeRegistry(t);
-    const { ledger } = makeLedger();
-    const pins = new CredentialPinStore();
-    pins.pin("user-1", "vikunja", { apiKey: "tok" });
-    pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
-
-    const checkpointer = new MemorySaver();
-    const contextManager = createContextManager({ limitTokens: 200 });
-    const runner = createJobRunner(
-      baseDeps(ledger, registry, pins, {
-        checkpointer,
-        contextManager,
-        buildModel: modelFactory("list_tasks", "call_compact", "done", { projectId: "p" }),
-      }),
-    );
-
-    const threadId = checkpointThreadId("user-1", "thr-compact");
-    const seedGraph = compileGraphWithCheckpointer(
-      createAgentGraph({ model: new ScriptedChatModel({ responses: [new AIMessage("seed")] }), tools: [] }),
-      checkpointer,
-    );
-    await seedGraph.invoke(
-      { messages: [new HumanMessage("x".repeat(1200))] },
-      { configurable: { thread_id: threadId } },
-    );
-
-    const result = await runner.runJob(
-      descriptor({
-        intentKey: "compact-1",
-        clientThreadId: "thr-compact",
-        input: { messages: [new HumanMessage("short")] },
-        toolHandler: recordingHandler([]),
-      }),
-    );
-    assert.equal(result.status, "succeeded");
-
-    const state = await seedGraph.getState({ configurable: { thread_id: threadId } });
-    assert.equal(
-      (state.values as { compacted?: boolean }).compacted,
-      true,
-      "the post-invoke compaction latched the compacted marker on the job's thread",
-    );
-  });
-
-  test("no contextManager wired: jobs run without truncation or compaction (back-compat)", async (t) => {
+  test("the snapshot input runs verbatim (no server-side truncation or compaction in the runner)", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     const pins = new CredentialPinStore();
@@ -2501,6 +2254,6 @@ describe("JobRunner.runJob — context + budget integration (phase 4 review)", (
         toolHandler: recordingHandler([]),
       }),
     );
-    assert.equal(result.status, "succeeded", "an oversized input without a contextManager must still run");
+    assert.equal(result.status, "succeeded", "an oversized snapshot input must still run (no runner-side context cap)");
   });
 });

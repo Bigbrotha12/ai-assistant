@@ -264,9 +264,9 @@ void main() {
   });
 
   test(
-    'schemaVersion is 6 and a fresh database round-trips a FileRow',
+    'schemaVersion is 7 and a fresh database round-trips a FileRow',
     () async {
-      expect(db.schemaVersion, 6);
+      expect(db.schemaVersion, 7);
 
       await store.saveConversation(conversation(id: 'c1'));
       final fileStore = DriftFileStore(db);
@@ -552,7 +552,7 @@ void main() {
         .customSelect('PRAGMA table_info(conversations)')
         .get();
     final names = columns.map((r) => r.read<String>('name')).toSet();
-    expect(names, containsAll(['scope_key', 'public_thread_id']));
+    expect(names, containsAll(['scope_key', 'session_id']));
 
     final pendingTables = await upgraded
         .customSelect(
@@ -592,5 +592,137 @@ void main() {
     await scoped.saveConversation(scopedConversation);
     expect(await scoped.loadConversation('scoped'), isNotNull);
     expect(await scoped.loadConversation('legacy'), isNull);
+  });
+
+  test('migrating a v6 database renames public_thread_id to session_id and '
+      'preserves the mapping', () async {
+    final dir = await Directory.systemTemp.createTemp('migration_v7_test');
+    final file = File('${dir.path}/app.db');
+    addTearDown(() async {
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    // Build a v6 database: the full managed schema with the legacy
+    // `public_thread_id` column on conversations, seeded with a live
+    // conversationId → session_id mapping, then reopen at v7.
+    final v6 = AppDatabase(
+      NativeDatabase(
+        file,
+        setup: (raw) {
+          raw.execute(
+            'CREATE TABLE conversations ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'title TEXT NOT NULL DEFAULT \'\', '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'message_count INTEGER NOT NULL DEFAULT 0, '
+            'scope_key TEXT, '
+            'public_thread_id TEXT)',
+          );
+          raw.execute(
+            'CREATE TABLE messages ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT NOT NULL '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'role TEXT NOT NULL, '
+            'content TEXT NOT NULL DEFAULT \'\', '
+            'tool_calls TEXT, '
+            'tool_call_id TEXT, '
+            'created_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE TABLE files ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'server_file_id TEXT NOT NULL, '
+            'local_path TEXT NOT NULL, '
+            'filename TEXT NOT NULL, '
+            'size_bytes INTEGER NOT NULL, '
+            'mime_type TEXT NOT NULL, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'description TEXT)',
+          );
+          raw.execute(
+            'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
+          );
+          raw.execute(
+            'CREATE TABLE memories ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'content TEXT NOT NULL, '
+            'source TEXT, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE INDEX memories_updated_at_idx ON memories (updated_at)',
+          );
+          raw.execute(
+            'CREATE VIRTUAL TABLE memories_fts USING '
+            "fts5(content, content='memories', content_rowid='rowid')",
+          );
+          raw.execute(
+            'CREATE INDEX messages_conversation_id_idx '
+            'ON messages (conversation_id)',
+          );
+          raw.execute(
+            'CREATE TABLE managed_pending_turns ('
+            'conversation_id TEXT NOT NULL, '
+            'scope_key TEXT NOT NULL, '
+            'message_id TEXT NOT NULL, '
+            'envelope TEXT NOT NULL, '
+            'reconcile_only INTEGER NOT NULL DEFAULT 0, '
+            'PRIMARY KEY (conversation_id, scope_key))',
+          );
+          raw.execute(
+            "INSERT INTO conversations "
+            "(id, title, created_at, updated_at, scope_key, public_thread_id) "
+            "VALUES ('c1', 'T', 0, 0, 'scope-a', 'sess-123')",
+          );
+          raw.execute('PRAGMA user_version = 6;');
+        },
+      ),
+    );
+    // Force the lazy-open so the setup callback (table creation + seed insert)
+    // actually runs before the file is closed and reopened at v7.
+    await v6.customSelect('SELECT 1').get();
+    await v6.close();
+
+    final upgraded = AppDatabase(NativeDatabase(file));
+    addTearDown(upgraded.close);
+    await upgraded.customSelect('SELECT 1').get();
+
+    // (a) the legacy column is renamed in place to session_id...
+    final columns = await upgraded
+        .customSelect('PRAGMA table_info(conversations)')
+        .get();
+    final names = columns.map((r) => r.read<String>('name')).toSet();
+    expect(names, containsAll(['scope_key', 'session_id']));
+    expect(names, isNot(contains('public_thread_id')));
+
+    // (b) ...and the seeded mapping survives the rename.
+    final mapping = await upgraded
+        .customSelect("SELECT session_id FROM conversations WHERE id = 'c1'")
+        .get();
+    expect(mapping, hasLength(1));
+    expect(mapping.single.read<String>('session_id'), 'sess-123');
+
+    // (c) PRAGMA user_version reaches 7.
+    final version = await upgraded.customSelect('PRAGMA user_version').get();
+    expect(version.single.read<int>('user_version'), 7);
+
+    // A fresh onCreate schema uses session_id and never emits the legacy name.
+    final fresh = AppDatabase(NativeDatabase.memory());
+    addTearDown(fresh.close);
+    await fresh.customSelect('SELECT 1').get();
+    final freshColumns = await fresh
+        .customSelect('PRAGMA table_info(conversations)')
+        .get();
+    final freshNames = freshColumns.map((r) => r.read<String>('name')).toSet();
+    expect(freshNames, contains('session_id'));
+    expect(freshNames, isNot(contains('public_thread_id')));
   });
 }

@@ -1,8 +1,5 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   AIMessage,
   AIMessageChunk,
@@ -23,15 +20,13 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import { MemorySaver, Overwrite } from "@langchain/langgraph";
-import { compileGraphWithCheckpointer } from "../../src/agents/compile.ts";
-import { createCheckpointStore } from "../../src/checkpoints/store.ts";
 import { SUPERVISOR_PROMPT } from "../../src/agents/prompts.ts";
+import { ContextBudgetError } from "../../src/middleware/context.ts";
 import {
-  ContextBudgetError,
-  createContextManager,
-  estimateMessagesTokens,
-} from "../../src/middleware/context.ts";
-import { createAgentGraph, MAX_TOOL_ROUNDS } from "../../src/agents/graph.ts";
+  createAgentGraph,
+  MAX_TOOL_ROUNDS,
+  type PrepareMessages,
+} from "../../src/agents/graph.ts";
 import { jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
 
 /**
@@ -232,9 +227,8 @@ describe("agent graph Phase 4 state and dispatch", () => {
     const model = new ScriptedChatModel({
       responses: Array.from({ length: 6 }, () => toolCallMessage("list_tasks", { projectId: "p1" })),
     });
-    const graph = compileGraphWithCheckpointer(
-      createAgentGraph({ model, tools: [listTasksTool()], maxIterations: 1 }), saver,
-    );
+    const graph = createAgentGraph({ model, tools: [listTasksTool()], maxIterations: 1 })
+      .builder.compile({ checkpointer: saver });
     const config = { configurable: { thread_id: "round-reset" } };
     for (let turn = 0; turn < 3; turn++) {
       const result = await graph.invoke({ messages: [new HumanMessage(`turn ${turn}`)] }, config);
@@ -262,81 +256,25 @@ describe("agent graph Phase 4 state and dispatch", () => {
     const pending = await interrupted.getState(config);
     assert.deepEqual(pending.next, ["orchestrator"]);
     assert.equal(pending.values.toolRounds, 1);
-    const recovered = compileGraphWithCheckpointer(base, saver);
+    const recovered = base.builder.compile({ checkpointer: saver });
     const result = await recovered.invoke(null, config);
     assert.equal(result.toolRounds, 1);
     assert.equal(dispatches, 1);
     assert.match(String(result.messages.at(-1)?.content), /Tool round limit reached/);
   });
 
-  test("context preparation bounds every tool loop and resumed turn even after compaction", async () => {
-    const limitTokens = Math.ceil(SUPERVISOR_PROMPT.length / 4) + 100;
-    const context = createContextManager({ limitTokens });
-    const dispatches: BaseMessage[][] = [];
-    const graph = compileGraphWithCheckpointer(createAgentGraph({
-      model: new ScriptedChatModel({ responses: Array.from({ length: 16 }, (_, i) =>
-        i % 2 === 0 ? toolCallMessage("list_tasks", { projectId: "p".repeat(2000) }) : new AIMessage("answer".repeat(1000))),
-      }),
-      tools: [listTasksTool()],
-      prepareMessages: context.prepareMessages,
-      beforeModelCall: (messages) => {
-        assert.equal(messages[0]?.content, SUPERVISOR_PROMPT);
-        assert.ok(estimateMessagesTokens(messages) <= limitTokens);
-        dispatches.push(messages);
-      },
-    }), new MemorySaver());
-    const config = { configurable: { thread_id: "bounded-growth" } };
-    for (let turn = 0; turn < 8; turn++) {
-      await graph.invoke({ messages: [new HumanMessage(`turn ${turn}`)] }, config);
-      await context.maybeCompactAfterStream({
-        graph, owner: "owner", clientThreadId: "growth", threadId: "bounded-growth", lockHeld: true,
-      });
-      assert.equal((await graph.getState(config)).values.compacted, true);
-    }
-    assert.equal(dispatches.length, 16);
-    assert.ok(estimateMessagesTokens((await graph.getState(config)).values.messages) > limitTokens);
-  });
-
-  test("compaction persists once through SQLite reopen and later growth stays request-bounded", async (t) => {
-    const dir = await mkdtemp(join(tmpdir(), "context-checkpoint-"));
-    const options = { dbPath: join(dir, "context.db"), dbKey: "12".repeat(32) };
-    let store = await createCheckpointStore(options);
-    t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
-    const context = createContextManager({ limitTokens: 100 });
-    const makeGraph = () => compileGraphWithCheckpointer(createAgentGraph({
-      model: new ScriptedChatModel({ responses: [new AIMessage("done")] }), tools: [listTasksTool()],
-    }), store.checkpointer);
-    let graph = makeGraph();
-    const config = { configurable: { thread_id: "durable-context" } };
-    await graph.invoke({ messages: [new HumanMessage("old".repeat(1000)), new AIMessage("old answer"), new HumanMessage("live")] }, config);
-    const before = await graph.getState(config);
-    await context.maybeCompactAfterStream({ graph, owner: "owner", clientThreadId: "client", threadId: "durable-context", lockHeld: true });
-    const compacted = await graph.getState(config);
-    assert.equal(compacted.values.compacted, true);
-    assert.equal(compacted.values.messages.length, 2);
-    assert.deepEqual(compacted.next, []);
-    assert.notEqual(compacted.config.configurable?.checkpoint_id, before.config.configurable?.checkpoint_id);
-    assert.ok(compacted.metadata?.parents);
-    assert.equal(compacted.metadata?.source, "update");
-    await store.close();
-    store = await createCheckpointStore(options);
-    graph = makeGraph();
-    assert.equal((await graph.getState(config)).values.compacted, true);
-    await graph.invoke({ messages: [new HumanMessage("new"), new AIMessage("growth".repeat(1000))] }, config);
-    const grown = await graph.getState(config);
-    await context.maybeCompactAfterStream({ graph, owner: "owner", clientThreadId: "client", threadId: "durable-context", lockHeld: true });
-    assert.equal((await graph.getState(config)).config.configurable?.checkpoint_id, grown.config.configurable?.checkpoint_id);
-    assert.ok(estimateMessagesTokens(await context.prepareMessages(grown.values.messages, {})) <= 100);
-    assert.ok(estimateMessagesTokens(grown.values.messages) > 100);
-  });
-
   test("preparation failure and dispatch budget failure stop before model invocation", async () => {
     let dispatches = 0;
-    const context = createContextManager({ limitTokens: 1 });
+    // The server-side context manager was removed with the sync-path cutover
+    // (plan §9 / F8); the graph's `prepareMessages` seam still surfaces a
+    // ContextBudgetError from the preparation hook before any model dispatch.
+    const prepareMessages: PrepareMessages = async () => {
+      throw new ContextBudgetError(1000, 100);
+    };
     const graph = createAgentGraph({
       model: new ScriptedChatModel({ responses: [new AIMessage("must not run")] }),
       tools: [listTasksTool()],
-      prepareMessages: context.prepareMessages,
+      prepareMessages,
       beforeModelCall: () => { dispatches++; },
     });
     await assert.rejects(graph.invoke({ messages: [new HumanMessage("oversize")] }), ContextBudgetError);
@@ -405,9 +343,9 @@ describe("agent graph Phase 4 state and dispatch", () => {
   });
 
   test("graph-supported message replacement preserves unrelated state", async () => {
-    const graph = compileGraphWithCheckpointer(createAgentGraph({
+    const graph = createAgentGraph({
       model: new ScriptedChatModel({ responses: [new AIMessage("done")] }), tools: [listTasksTool()],
-    }), new MemorySaver());
+    }).builder.compile({ checkpointer: new MemorySaver() });
     const config = { configurable: { thread_id: "overwrite" } };
     await graph.invoke({ messages: [new HumanMessage("old")], toolResults: ["diagnostic"] }, config);
     await graph.updateState(config, { messages: new Overwrite([new HumanMessage("kept")]), compacted: true }, "orchestrator");

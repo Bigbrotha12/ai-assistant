@@ -147,13 +147,13 @@ void main() {
           return ResponseBody.fromString(
             jsonEncode({
               'status': 'already_completed',
-              'threadId': 'thread-test',
-              'taskId': 'task-test',
+              'sessionId': 'session-test',
+              'messageId': 'turn-test',
             }),
             200,
             headers: {
               'content-type': ['application/json'],
-              'x-thread-id': ['thread-test'],
+              'x-session-id': ['session-test'],
               'x-conversation-state': ['resumed'],
             },
           );
@@ -225,7 +225,7 @@ void main() {
         messages: [
           const ApiMessage(role: 'user', content: 'Fake HTTP test only'),
         ],
-        threadId: 'thread-test',
+        sessionId: 'session-test',
         turnId: 'turn-test',
       );
       final resultFuture = LangChainClient(
@@ -234,7 +234,7 @@ void main() {
       ).managedTurn(request);
       await tester.pump(const Duration(milliseconds: 100));
       final result = await resultFuture;
-      expect(result.threadId, 'thread-test');
+      expect(result.sessionId, 'session-test');
       final sent = adapter.requests.last;
       expect(sent.data['model'], 'openrouter');
       expect(sent.data['credentials'], {
@@ -261,7 +261,7 @@ void main() {
       expect(
         () => builder.build(
           messages: [const ApiMessage(role: 'user', content: 'stale')],
-          threadId: 'thread-test',
+          sessionId: 'session-test',
           turnId: 'turn-test',
         ),
         throwsA(anything),

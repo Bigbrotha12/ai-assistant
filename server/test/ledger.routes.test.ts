@@ -152,6 +152,46 @@ describe("ledger routes — status by idempotency key", () => {
   });
 });
 
+describe("ledger routes — snapshot payload never leaks (v5)", () => {
+  test("a task with a stored payload is returned WITHOUT the payload on every route", async () => {
+    const { app, ledger } = makeApp();
+    // The route API never sets a payload; the runner does. Seed one directly to
+    // prove job-status delivery strips it.
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "msg-payload",
+      spec: "spec",
+      payload: JSON.stringify([{ role: "user", content: "private snapshot" }]),
+    });
+    assert.ok(task.payload, "the stored task carries the payload");
+
+    const byId = await app.request(`/ledger/tasks/${task.id}`, { headers: auth });
+    assert.equal(byId.status, 200);
+    const idBody = (await byId.json()) as Record<string, unknown>;
+    assert.equal("payload" in idBody, false, "GET /tasks/:id must not echo the payload");
+    assert.equal(idBody["spec"], "spec", "the non-sensitive spec still rides the response");
+
+    const byKey = await app.request("/ledger/tasks/by-key/msg-payload", { headers: auth });
+    const keyBody = (await byKey.json()) as Record<string, unknown>;
+    assert.equal("payload" in keyBody, false, "by-key (the client poll surface) must not echo the payload");
+
+    const list = await app.request("/ledger/tasks", { headers: auth });
+    const listBody = (await list.json()) as Array<Record<string, unknown>>;
+    assert.equal(
+      listBody.some((row) => "payload" in row),
+      false,
+      "GET /tasks must not echo payloads",
+    );
+
+    const claim = await app.request(`/ledger/tasks/${task.id}/claim`, {
+      method: "POST",
+      headers: auth,
+    });
+    const claimBody = (await claim.json()) as Record<string, unknown>;
+    assert.equal("payload" in claimBody, false, "claim must not echo the payload");
+  });
+});
+
 describe("ledger routes — fence enforcement on running tasks (M8)", () => {
   async function claimTask(app: Hono, taskId: string): Promise<string> {
     const res = await app.request(`/ledger/tasks/${taskId}/claim`, {

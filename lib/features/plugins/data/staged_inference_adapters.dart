@@ -358,6 +358,14 @@ class _CurrentManagedClient implements LangChainClient {
   );
 
   @override
+  Future<BackgroundTurnResult> backgroundTurn(
+    LangChainRequest request, {
+    CancelToken? cancelToken,
+  }) => _current(
+    () => client.backgroundTurn(request, cancelToken: cancelToken),
+  );
+
+  @override
   Future<ChatResult> streamTurn(
     LangChainRequest request, {
     CancelToken? cancelToken,
@@ -367,34 +375,26 @@ class _CurrentManagedClient implements LangChainClient {
   }) => throw UnsupportedError('Managed voice turns only.');
 
   @override
-  Future<List<ManagedThreadSummary>> listThreads({
+  Future<ManagedSessionHistory> loadSession(
+    String sessionId, {
     required String gatewayKey,
     CancelToken? cancelToken,
   }) => _current(
-    () => client.listThreads(gatewayKey: gatewayKey, cancelToken: cancelToken),
-  );
-
-  @override
-  Future<ManagedThreadHistory> loadThread(
-    String threadId, {
-    required String gatewayKey,
-    CancelToken? cancelToken,
-  }) => _current(
-    () => client.loadThread(
-      threadId,
+    () => client.loadSession(
+      sessionId,
       gatewayKey: gatewayKey,
       cancelToken: cancelToken,
     ),
   );
 
   @override
-  Future<void> deleteThread(
-    String threadId, {
+  Future<void> deleteSession(
+    String sessionId, {
     required String gatewayKey,
     CancelToken? cancelToken,
   }) => _current(
-    () => client.deleteThread(
-      threadId,
+    () => client.deleteSession(
+      sessionId,
       gatewayKey: gatewayKey,
       cancelToken: cancelToken,
     ),

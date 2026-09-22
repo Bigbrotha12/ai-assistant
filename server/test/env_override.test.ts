@@ -45,6 +45,12 @@ describe("immutable-image env overrides (env schema)", () => {
     assert.deepEqual(parse().MCP_TRUSTED_HOSTS, []);
   });
 
+  test("MAX_ESTABLISH_BODY_BYTES defaults to 25 MiB and is overridable", () => {
+    assert.equal(parse().MAX_ESTABLISH_BODY_BYTES, 25_000_000);
+    assert.equal(parse({ MAX_ESTABLISH_BODY_BYTES: "10000000" }).MAX_ESTABLISH_BODY_BYTES, 10_000_000);
+    assert.ok(parse().MAX_ESTABLISH_BODY_BYTES > parse().MAX_REQUEST_BODY_BYTES);
+  });
+
   test("MCP_TRUSTED_HOSTS parses a comma-separated list", () => {
     const env = parse({
       MCP_TRUSTED_HOSTS: "*.productivity.svc.cluster.local, ln.health.svc.cluster.local ",
@@ -68,6 +74,17 @@ describe("immutable-image env overrides (env schema)", () => {
     assert.equal(env.AGENT_SPEC_MAX_SKILLS, 75);
     assert.equal(env.AGENT_SPEC_MAX_MCPS, 30);
     assert.equal(env.AGENT_SPEC_MAX_TOOLS, 150);
+  });
+
+  test("LEDGER_RETENTION_MS / LEDGER_SWEEP_INTERVAL_MS default to 24h / 1h and are overridable", () => {
+    assert.equal(parse().LEDGER_RETENTION_MS, 86_400_000);
+    assert.equal(parse().LEDGER_SWEEP_INTERVAL_MS, 3_600_000);
+    const env = parse({
+      LEDGER_RETENTION_MS: "3600000",
+      LEDGER_SWEEP_INTERVAL_MS: "600000",
+    });
+    assert.equal(env.LEDGER_RETENTION_MS, 3_600_000);
+    assert.equal(env.LEDGER_SWEEP_INTERVAL_MS, 600_000);
   });
 });
 

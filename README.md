@@ -139,7 +139,7 @@ docker run \
   -v /host/ai-assistant-config:/config \   # skills/, mcp.json, agents/ catalogs (seeded default agent on first boot)
   -e BETTER_AUTH_SECRET=... \
   -e BETTER_AUTH_URL=https://gateway.example.com \
-  -e CHECKPOINT_DB_KEY=... \
+  -e NOTIFY_STORE_KEY=... \
   -p 17600:17600 \
   <image>
 ```

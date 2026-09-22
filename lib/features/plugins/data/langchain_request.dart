@@ -11,6 +11,7 @@ class LangChainRequest {
     this.conversationPublicId,
     this.turnId,
     this.managed = false,
+    this.background = false,
     List<String> enabledPlugins = const [],
   }) : enabledPlugins = List.unmodifiable(enabledPlugins),
        credentials = Map.unmodifiable(
@@ -27,7 +28,9 @@ class LangChainRequest {
     for (final id in enabledPlugins) {
       pluginJsonId(id);
     }
-    if (managed && (turnId == null || turnId!.trim().isEmpty)) {
+    // Both managed and background requests carry a client-minted idempotency
+    // key (`messageId`); a background request without one is a 400 server-side.
+    if ((managed || background) && (turnId == null || turnId!.trim().isEmpty)) {
       throw const PluginClientException('invalid_request');
     }
     for (final id in credentials.keys) {
@@ -47,14 +50,28 @@ class LangChainRequest {
   final String modelPluginId;
   final Map<String, Map<String, String>> credentials;
   final List<ApiMessage> messages;
+
+  /// Session id (was public thread id). The gateway keys its in-memory session
+  /// store on this; sent as `session_id` on the wire. Absent for background
+  /// submissions — an async job runs on the submitted snapshot and must NOT
+  /// carry a session dependency (plan §5).
   final String? conversationPublicId;
+
   final String? turnId;
   final bool managed;
+
+  /// Async submission (plan §5): the gateway admits an idempotent background
+  /// task (keyed by `messageId`) instead of streaming; the client polls the
+  /// ledger for the terminal status and reads the reply back. Background
+  /// requests ship the FULL trimmed history as `messages` and never include a
+  /// `session_id`/`conversation_mode`.
+  final bool background;
   final List<String> enabledPlugins;
 
   Map<String, dynamic> toJson() => {
     'model': modelPluginId,
     'stream': true,
+    if (background) 'background': true,
     if (managed) 'conversation_mode': 'managed',
     if (managed || enabledPlugins.isNotEmpty) 'enabled_plugins': enabledPlugins,
     'credentials': credentials,
@@ -68,7 +85,7 @@ class LangChainRequest {
           },
         )
         .toList(),
-    if (conversationPublicId != null) 'thread_id': conversationPublicId,
+    if (conversationPublicId != null) 'session_id': conversationPublicId,
     if (turnId != null) 'messageId': turnId,
   };
 

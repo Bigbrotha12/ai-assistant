@@ -34,9 +34,9 @@ class _ConnectionFailure implements Exception {
 class GatewayChatClient implements ChatClient {
   GatewayChatClient({
     required this.baseUrl,
-    // ignore: prefer_initializing_formals
     required Dio dio,
     required this.credentialResolver,
+    // ignore: prefer_initializing_formals
   }) : _dio = dio;
 
   final String baseUrl;

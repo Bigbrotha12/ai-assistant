@@ -308,7 +308,63 @@ void main() {
     }
   });
 
-  test(
+  test('steps parsing: reply extraction + missing steps tolerated', () {
+  final withSteps = LedgerTask.fromJson({
+    ...taskJson(status: 'succeeded'),
+    'steps': [
+      {
+        'id': 's1',
+        'task_id': 'task',
+        'seq': 1,
+        'stage': 'tool',
+        'action': 'tool:list_tasks',
+        'result': '{"ok":true}',
+        'ts': 1,
+        'tool_call_id': 'call_1',
+      },
+      {
+        'id': 's2',
+        'task_id': 'task',
+        'seq': 2,
+        'stage': 'reply',
+        'action': 'assistant_message',
+        'result': 'the assistant reply',
+        'ts': 2,
+        'tool_call_id': null,
+      },
+    ],
+  });
+  expect(withSteps.steps, hasLength(2));
+  expect(withSteps.steps.first.stage, 'tool');
+  expect(withSteps.steps.first.toolCallId, 'call_1');
+  expect(withSteps.steps.last.action, 'assistant_message');
+  expect(withSteps.reply, 'the assistant reply');
+
+  // The status-by-messageId endpoint carries no steps key — tolerated.
+  final withoutSteps = LedgerTask.fromJson(taskJson(status: 'succeeded'));
+  expect(withoutSteps.steps, isEmpty);
+  expect(withoutSteps.reply, isNull);
+
+  // A reply step without a string result yields a null reply.
+  final nullResult = LedgerTask.fromJson({
+    ...taskJson(status: 'succeeded'),
+    'steps': [
+      {'stage': 'reply', 'action': 'assistant_message', 'result': null},
+    ],
+  });
+  expect(nullResult.reply, isNull);
+
+  // A reply step with a non-string result yields a null reply.
+  final nonString = LedgerTask.fromJson({
+    ...taskJson(status: 'succeeded'),
+    'steps': [
+      {'stage': 'reply', 'action': 'assistant_message', 'result': 42},
+    ],
+  });
+  expect(nonString.reply, isNull);
+});
+
+test(
     'all server statuses stay distinct; review and stuck are not terminal',
     () {
       final statuses = {
@@ -376,6 +432,23 @@ void main() {
       expect(result.task, isNull);
       expect(result.error?.code, 'not_found');
       expect(rig.adapter.requests.every((r) => r.method == 'GET'), isTrue);
+    },
+  );
+
+  test(
+    '413 request_too_large is retryable (backoff then exhausts, no replay)',
+    () async {
+      final rig = Rig(
+        (_) => jsonResponse({'error': 'request_too_large'}, status: 413),
+        maxAttempts: 5,
+      );
+      final handle = rig.poller.watch(const LedgerLookup.byMessageId('msg'));
+      rig.poller.setForeground(true);
+      await rig.clock.advance(const Duration(seconds: 20));
+      expect(rig.times, [0, 1, 3, 6, 9]);
+      final result = await handle.done;
+      expect(result.end, LedgerPollEnd.exhausted);
+      expect(result.error?.code, 'request_too_large');
     },
   );
 
@@ -556,7 +629,7 @@ void main() {
       }
       historyReads++;
       return jsonResponse({
-        'threadId': request.uri.pathSegments.last,
+        'sessionId': request.uri.pathSegments.last,
         'messages': [
           {'role': 'user', 'content': 'hi'},
           {'role': 'assistant', 'content': 'checkpoint answer'},

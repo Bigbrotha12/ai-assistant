@@ -21,13 +21,13 @@ class FakeLangChainClient implements LangChainClient {
 
   final Future<ManagedTurnResult> Function(LangChainRequest) respond;
   final requests = <LangChainRequest>[];
-  final threadLoads = <String>[];
-  final deletedThreads = <String>[];
-  Object? loadThreadError;
+  final sessionLoads = <String>[];
+  final deletedSessions = <({String sessionId, String gatewayKey})>[];
+  Object? loadSessionError;
 
-  /// When set, returns this scripted checkpoint for [loadThread] instead of
+  /// When set, returns this scripted session for [loadSession] instead of
   /// the default fixed history.
-  ManagedThreadHistory Function(String threadId)? historyBuilder;
+  ManagedSessionHistory Function(String sessionId)? historyBuilder;
 
   @override
   Future<ManagedTurnResult> managedTurn(
@@ -51,17 +51,25 @@ class FakeLangChainClient implements LangChainClient {
   }
 
   @override
-  Future<ManagedThreadHistory> loadThread(
-    String threadId, {
+  Future<BackgroundTurnResult> backgroundTurn(
+    LangChainRequest request, {
+    CancelToken? cancelToken,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<ManagedSessionHistory> loadSession(
+    String sessionId, {
     required String gatewayKey,
     CancelToken? cancelToken,
   }) async {
-    if (loadThreadError != null) throw loadThreadError!;
-    threadLoads.add(threadId);
+    if (loadSessionError != null) throw loadSessionError!;
+    sessionLoads.add(sessionId);
     final builder = historyBuilder;
-    if (builder != null) return builder(threadId);
-    return ManagedThreadHistory.fromJson({
-      'threadId': threadId,
+    if (builder != null) return builder(sessionId);
+    return ManagedSessionHistory.fromJson({
+      'sessionId': sessionId,
       'messages': [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'from server'},
@@ -70,22 +78,12 @@ class FakeLangChainClient implements LangChainClient {
   }
 
   @override
-  Future<List<ManagedThreadSummary>> listThreads({
+  Future<void> deleteSession(
+    String sessionId, {
     required String gatewayKey,
     CancelToken? cancelToken,
   }) async {
-    return [
-      ManagedThreadSummary.fromJson({'threadId': 'pub-1', 'messageCount': 3}),
-    ];
-  }
-
-  @override
-  Future<void> deleteThread(
-    String threadId, {
-    required String gatewayKey,
-    CancelToken? cancelToken,
-  }) async {
-    deletedThreads.add(threadId);
+    deletedSessions.add((sessionId: sessionId, gatewayKey: gatewayKey));
   }
 }
 
@@ -100,7 +98,7 @@ void main() {
   var respondWith = (LangChainRequest request) async {
     turns++;
     return ManagedTurnResult(
-      threadId: request.conversationPublicId!,
+      sessionId: request.conversationPublicId!,
       state: turns == 1 ? 'seeded' : 'resumed',
       result: const ChatResult(
         content: 'local reply',
@@ -131,53 +129,74 @@ void main() {
   tearDown(() async => db.close());
 
   test('seed turn persists messageId + envelope BEFORE dispatch and binds the '
-      'client-minted thread id', () async {
+      'client-minted session id', () async {
     final outcome = await service.sendTurn(
       'c1',
       history: const [],
       userText: 'hi',
     );
-    expect(outcome.threadId, isNotEmpty);
+    expect(outcome.sessionId, isNotEmpty);
     expect(outcome.state, 'seeded');
     expect(client.requests.single.turnId, isNotNull);
-    expect(client.requests.single.conversationPublicId, outcome.threadId);
+    expect(client.requests.single.conversationPublicId, outcome.sessionId);
     expect(client.requests.single.toJson()['conversation_mode'], 'managed');
     expect(client.requests.single.toJson()['enabled_plugins'], ['web']);
     final pending = await repo.pending(scope, 'c1');
     expect(pending, isNull);
-    final mapped = await repo.mappedThread('c1');
-    expect(mapped, outcome.threadId);
+    final mapped = await repo.mappedSession('c1');
+    expect(mapped, outcome.sessionId);
   });
 
-  test(
-    'resume turn reuses the mapped thread and carries the user message',
-    () async {
-      final first = await service.sendTurn(
-        'c1',
-        history: const [],
-        userText: 'hi',
-      );
-      final outcome = await service.sendTurn(
-        'c1',
-        history: const [
-          Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-          Message(
-            id: 'm2',
-            role: MessageRole.assistant,
-            content: 'local reply',
-          ),
-        ],
-        userText: 'second',
-      );
-      expect(outcome.threadId, first.threadId);
-      expect(outcome.state, 'resumed');
-      final last = client.requests.last;
-      expect(last.messages.last.role, 'user');
-      expect(last.messages.last.content, 'second');
-    },
-  );
+  test('establish sends the FULL local history and the server seeds', () async {
+    final outcome = await service.sendTurn(
+      'c1',
+      history: const [
+        Message(id: 'm1', role: MessageRole.user, content: 'earlier'),
+        Message(
+          id: 'm2',
+          role: MessageRole.assistant,
+          content: 'earlier reply',
+        ),
+      ],
+      userText: 'hi',
+    );
+    expect(outcome.state, 'seeded');
+    final body = client.requests.single.toJson();
+    expect(body['session_id'], outcome.sessionId);
+    expect((body['messages'] as List).map((m) => m['content']), [
+      'earlier',
+      'earlier reply',
+      'hi',
+    ]);
+    expect(await repo.mappedSession('c1'), outcome.sessionId);
+  });
 
-  test('duplicate inflight 409 throws ManagedTurnError with thread id, keeps '
+  test('a subsequent turn on a mapped session sends a single-message delta '
+      'and is resumed', () async {
+    final first = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
+    final outcome = await service.sendTurn(
+      'c1',
+      history: const [
+        Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+        Message(
+          id: 'm2',
+          role: MessageRole.assistant,
+          content: 'local reply',
+        ),
+      ],
+      userText: 'second',
+    );
+    expect(outcome.sessionId, first.sessionId);
+    expect(outcome.state, 'resumed');
+    final last = client.requests.last.toJson();
+    expect((last['messages'] as List).map((m) => m['content']), ['second']);
+  });
+
+  test('duplicate inflight 409 throws ManagedTurnError with session id, keeps '
       'pending row for explicit retry', () async {
     respondWith = (request) {
       throw const PluginClientException(
@@ -198,10 +217,10 @@ void main() {
     final pending = await repo.pending(scope, 'c1');
     expect(pending, isNotNull);
     final messageId = pending!.messageId;
-    final thread = await repo.mappedThread('c1');
+    final session = await repo.mappedSession('c1');
 
     respondWith = (request) async => ManagedTurnResult(
-      threadId: thread!,
+      sessionId: session!,
       state: 'resumed',
       result: const ChatResult(
         content: 'late reply',
@@ -212,14 +231,12 @@ void main() {
     final outcome = await service.retryTurn('c1');
     expect(outcome.state, 'resumed');
     expect(client.requests.last.turnId, messageId);
-    expect(client.requests.last.conversationPublicId, thread);
+    expect(client.requests.last.conversationPublicId, session);
     expect(await repo.pending(scope, 'c1'), isNull);
   });
 
   test('already_completed duplicate success returns no result and clears the '
       'pending row without a second inference body', () async {
-    // Stage a turn that fails on the wire (pending row survives), then the
-    // explicit retry hits a turn the server already completed.
     respondWith = (request) {
       throw const PluginClientException('network_error');
     };
@@ -227,20 +244,19 @@ void main() {
       service.sendTurn('c1', history: const [], userText: 'hi'),
       throwsA(isA<ManagedTurnError>()),
     );
-    final thread = await repo.mappedThread('c1');
+    final session = await repo.mappedSession('c1');
     respondWith = (request) async => ManagedTurnResult(
-      threadId: thread!,
+      sessionId: session!,
       state: 'resumed',
-      taskId: 'task-1',
+      alreadyCompleted: true,
     );
     final outcome = await service.retryTurn('c1');
     expect(outcome, isA<ManagedAlreadyCompleted>());
-    expect((outcome as ManagedAlreadyCompleted).taskId, 'task-1');
     final pending = await repo.pending(scope, 'c1');
     expect(pending, isNull);
   });
 
-  test('retryTurn re-sends the EXACT same envelope (messageId, thread, '
+  test('retryTurn re-sends the EXACT same envelope (messageId, session, '
       'messages) after a network drop', () async {
     respondWith = (request) {
       throw const PluginClientException('network_error');
@@ -253,7 +269,7 @@ void main() {
     final firstBody = client.requests.single.toJson();
 
     respondWith = (request) async => ManagedTurnResult(
-      threadId: request.conversationPublicId!,
+      sessionId: request.conversationPublicId!,
       state: 'resumed',
       result: const ChatResult(
         content: 'ok',
@@ -264,19 +280,35 @@ void main() {
     await service.retryTurn('c1');
     final secondRequest = client.requests.last;
     expect(secondRequest.turnId, before!.messageId);
-    expect(secondRequest.conversationPublicId, firstBody['thread_id']);
+    expect(secondRequest.conversationPublicId, firstBody['session_id']);
     final secondBody = secondRequest.toJson();
     expect(secondBody['messages'], firstBody['messages']);
-    expect(secondBody['thread_id'], firstBody['thread_id']);
+    expect(secondBody['session_id'], firstBody['session_id']);
     expect(secondBody['messageId'], firstBody['messageId']);
   });
 
-  test('reconcileFromServer replaces local history from the checkpoint without '
+  test('the persisted retry envelope stores session_id', () async {
+    respondWith = (request) {
+      throw const PluginClientException('network_error');
+    };
+    await expectLater(
+      service.sendTurn('c1', history: const [], userText: 'hi'),
+      throwsA(isA<ManagedTurnError>()),
+    );
+    final pending = await repo.pending(scope, 'c1');
+    final envelope = jsonDecode(pending!.envelope) as Map<String, dynamic>;
+    expect(envelope['session_id'], await repo.mappedSession('c1'));
+    expect(envelope.containsKey('threadId'), isFalse);
+    expect(envelope.containsKey('taskId'), isFalse);
+    expect(envelope.containsKey('terminalStatus'), isFalse);
+  });
+
+  test('reconcileFromServer replaces local history from the session without '
       'inference', () async {
     await service.sendTurn('c1', history: const [], userText: 'hi');
-    final thread = await repo.mappedThread('c1');
+    final session = await repo.mappedSession('c1');
     final messages = await service.reconcileFromServer('c1');
-    expect(client.threadLoads, [thread]);
+    expect(client.sessionLoads, [session]);
     expect(messages, hasLength(2));
     expect(messages.last.content, 'from server');
     final loaded = await repo.access(
@@ -291,7 +323,7 @@ void main() {
 
   test('reconcileFromServer surfaces reseed_required explicitly', () async {
     await service.sendTurn('c1', history: const [], userText: 'hi');
-    client.loadThreadError = const PluginClientException(
+    client.loadSessionError = const PluginClientException(
       'reseed_required',
       statusCode: 409,
     );
@@ -305,6 +337,19 @@ void main() {
         ),
       ),
     );
+  });
+
+  test('reconcileFromServer on session_missing returns local history and '
+      'clears the marker without dropping the mapping', () async {
+    await service.sendTurn('c1', history: const [], userText: 'hi');
+    client.loadSessionError = const PluginClientException(
+      'session_missing',
+      statusCode: 409,
+    );
+    final messages = await service.reconcileFromServer('c1');
+    expect(messages.map((m) => m.content), ['hi', 'local reply']);
+    expect(await repo.pending(scope, 'c1'), isNull);
+    expect(await repo.mappedSession('c1'), isNotNull);
   });
 
   test(
@@ -321,8 +366,6 @@ void main() {
         scope: scopeB,
         credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
       );
-      // Primary keys are global in the shared DB, so account B uses its own
-      // conversation id — mirroring the app, where ids are random UUIDs.
       await serviceB.sendTurn('c2', history: const [], userText: 'other user');
       final a = await repo.access(
         scope,
@@ -342,19 +385,18 @@ void main() {
       expect(b.messages.first.content, 'other user');
       expect(await repo.pending(scope, 'c1'), isNull);
       expect(await repo.pending(scopeB, 'c2'), isNull);
-      expect(await repo.mappedThread('c1'), isNotNull);
-      expect(await repo.mappedThread('c2'), isNotNull);
+      expect(await repo.mappedSession('c1'), isNotNull);
+      expect(await repo.mappedSession('c2'), isNotNull);
     },
   );
 
   test('clearAccountData cancels in-flight writes and prevents late history '
       'repopulation', () async {
     final sent = service.sendTurn('c1', history: const [], userText: 'hi');
-    // Simulate a scope clear while the send is awaiting the response.
     respondWith = (request) async {
       await service.clearAccountData();
       return ManagedTurnResult(
-        threadId: request.conversationPublicId!,
+        sessionId: request.conversationPublicId!,
         state: 'seeded',
         result: const ChatResult(
           content: 'late reply',
@@ -368,18 +410,18 @@ void main() {
     expect(rows, isEmpty);
   });
 
-  test('listThreads and deleteThread pass the gateway key through', () async {
-    final threads = await service.listThreads();
-    expect(threads.single.threadId, 'pub-1');
-    expect(threads.single.messageCount, 3);
-    await service.deleteThread('pub-1');
-    expect(client.deletedThreads, ['pub-1']);
+  test('deleteSession passes the gateway key through and hits the session '
+      'path', () async {
+    await service.deleteSession('session-1');
+    expect(client.deletedSessions, [
+      (sessionId: 'session-1', gatewayKey: 'gateway-secret'),
+    ]);
   });
 
   test('reconciliation persists distinct stable message ids and keeps tool '
       'linkage (no row collapse, no cross-conversation bleed)', () async {
-    client.historyBuilder = (threadId) => ManagedThreadHistory.fromJson({
-      'threadId': threadId,
+    client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+      'sessionId': sessionId,
       'messages': [
         {'role': 'user', 'content': 'hi'},
         {
@@ -409,7 +451,6 @@ void main() {
     expect(ids.toSet(), hasLength(first.length));
     expect(first.any((m) => m.id.contains('call_1')), isFalse);
 
-    // Re-reconciling is stable: the same ids come back.
     final second = await service.reconcileFromServer('c1');
     expect(second.map((m) => m.id).toList(), ids);
 
@@ -424,9 +465,8 @@ void main() {
     final tool = loaded.messages.firstWhere((m) => m.role == MessageRole.tool);
     expect(tool.toolCallId, 'call_1');
 
-    // A second thread's reconciliation never shares rows with this one.
-    final other = ManagedThreadHistory.fromJson({
-      'threadId': 'thread-other',
+    final other = ManagedSessionHistory.fromJson({
+      'sessionId': 'session-other',
       'messages': [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'hello'},
@@ -442,12 +482,10 @@ void main() {
   test('logout mid-send cancels the turn and leaves no pending row or '
       'conversation behind (admission + clear atomicity)', () async {
     final sent = service.sendTurn('c1', history: const [], userText: 'hi');
-    // The server replies only after a scope-wide clear has run: the clear
-    // must win the race — no pending row, no conversation may resurge.
     respondWith = (request) async {
       await service.clearAccountData();
       return ManagedTurnResult(
-        threadId: request.conversationPublicId!,
+        sessionId: request.conversationPublicId!,
         state: 'seeded',
         result: const ChatResult(
           content: 'late reply',
@@ -463,10 +501,10 @@ void main() {
 
   test('a second send while a turn is unresolved throws pending_turn_exists '
       'and the first completion owns its pending row', () async {
-    var dispatchedThread = '';
+    var dispatchedSession = '';
     final gate = Completer<ManagedTurnResult>();
     respondWith = (request) {
-      dispatchedThread = request.conversationPublicId!;
+      dispatchedSession = request.conversationPublicId!;
       return gate.future;
     };
     final first = service.sendTurn('c1', history: const [], userText: 'first');
@@ -482,7 +520,6 @@ void main() {
             .having((e) => e.code, 'code', 'pending_turn_exists'),
       ),
     );
-    // The rejected send neither replaced the pending row nor appended.
     expect((await repo.pending(scope, 'c1'))!.messageId, messageId);
     final conversation = await repo.access(
       scope,
@@ -494,7 +531,7 @@ void main() {
 
     gate.complete(
       ManagedTurnResult(
-        threadId: dispatchedThread,
+        sessionId: dispatchedSession,
         state: 'seeded',
         result: const ChatResult(
           content: 'ok',
@@ -507,32 +544,29 @@ void main() {
     expect(await repo.pending(scope, 'c1'), isNull);
   });
 
-  test('already_completed reconciles server history and surfaces a failed task '
-      'status without fabricating an assistant reply', () async {
+  test('already_completed reconciles server history via loadSession without '
+      'fabricating an assistant reply', () async {
     respondWith = (_) => throw const PluginClientException('network_error');
     await expectLater(
       service.sendTurn('c1', history: const [], userText: 'hi'),
       throwsA(isA<ManagedTurnError>()),
     );
-    final thread = await repo.mappedThread('c1');
-    client.historyBuilder = (id) => ManagedThreadHistory.fromJson({
-      'threadId': id,
+    final session = await repo.mappedSession('c1');
+    client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+      'sessionId': sessionId,
       'messages': [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'checkpoint reply'},
       ],
     });
     respondWith = (request) async => ManagedTurnResult(
-      threadId: thread!,
+      sessionId: session!,
       state: 'resumed',
-      taskId: 'task-1',
-      terminalStatus: parseManagedTerminalStatus('failed'),
+      alreadyCompleted: true,
     );
     final outcome = await service.retryTurn('c1');
     expect(outcome, isA<ManagedAlreadyCompleted>());
-    final completed = outcome as ManagedAlreadyCompleted;
-    expect(completed.taskId, 'task-1');
-    expect(completed.taskStatus, ManagedTerminalStatus.failed);
+    expect(client.sessionLoads, [session]);
     expect(await repo.pending(scope, 'c1'), isNull);
     final loaded = await repo.access(
       scope,
@@ -550,21 +584,19 @@ void main() {
     );
   });
 
-  test('a mid-reconcile failure persists a reconcileOnly marker carrying the '
-      'terminal status; retry is refused and explicit reconcile completes it',
-      () async {
+  test('a mid-reconcile failure persists a reconcileOnly marker; retry is '
+      'refused and explicit reconcile completes it', () async {
     respondWith = (_) => throw const PluginClientException('network_error');
     await expectLater(
       service.sendTurn('c1', history: const [], userText: 'hi'),
       throwsA(isA<ManagedTurnError>()),
     );
-    final thread = await repo.mappedThread('c1');
-    client.loadThreadError = const PluginClientException('network_error');
+    final session = await repo.mappedSession('c1');
+    client.loadSessionError = const PluginClientException('network_error');
     respondWith = (request) async => ManagedTurnResult(
-      threadId: thread!,
+      sessionId: session!,
       state: 'resumed',
-      taskId: 'task-1',
-      terminalStatus: parseManagedTerminalStatus('failed'),
+      alreadyCompleted: true,
     );
     await expectLater(service.retryTurn('c1'), throwsA(isA<PluginClientException>()));
 
@@ -572,10 +604,10 @@ void main() {
     expect(pending, isNotNull);
     expect(pending!.reconcileOnly, isTrue);
     final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
-    expect(envelope['taskId'], 'task-1');
-    expect(envelope['terminalStatus'], 'failed');
+    expect(envelope['session_id'], session);
+    expect(envelope.containsKey('taskId'), isFalse);
+    expect(envelope.containsKey('terminalStatus'), isFalse);
 
-    // Inference replay of an already-reconciled turn is explicit, not silent.
     await expectLater(
       service.retryTurn('c1'),
       throwsA(
@@ -584,9 +616,9 @@ void main() {
       ),
     );
 
-    client.loadThreadError = null;
-    client.historyBuilder = (id) => ManagedThreadHistory.fromJson({
-      'threadId': id,
+    client.loadSessionError = null;
+    client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+      'sessionId': sessionId,
       'messages': [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'checkpoint reply'},
@@ -595,7 +627,7 @@ void main() {
     final history = await service.reconcileFromServer('c1');
     expect(history, hasLength(2));
     expect(await repo.pending(scope, 'c1'), isNull);
-    expect(await repo.mappedThread('c1'), thread);
+    expect(await repo.mappedSession('c1'), session);
   });
 
   test('retryTurn replays the persisted envelope config, never the current '
@@ -615,7 +647,7 @@ void main() {
       enabledPlugins: const ['images'],
     );
     respondWith = (request) async => ManagedTurnResult(
-      threadId: request.conversationPublicId!,
+      sessionId: request.conversationPublicId!,
       state: 'resumed',
       result: const ChatResult(
         content: 'ok',
@@ -647,23 +679,113 @@ void main() {
             .having((e) => e.code, 'code', 'invalid_config'),
       ),
     );
-    // The pending row survives an invalid config so a repair can replace it.
     expect((await repo.pending(scope, 'c1'))!.messageId, 'msg-broken');
   });
 
+  test('session_missing re-establishes under the SAME session_id with full '
+      'history and a fresh messageId (bounded single retry)', () async {
+    final first = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
+    final session = first.sessionId;
+    var calls = 0;
+    final messageIds = <String>[];
+    respondWith = (request) {
+      calls++;
+      messageIds.add(request.turnId!);
+      if (calls == 1) {
+        throw const PluginClientException('session_missing', statusCode: 409);
+      }
+      return Future.value(
+        ManagedTurnResult(
+          sessionId: request.conversationPublicId!,
+          state: 'resumed',
+          result: const ChatResult(
+            content: 'ok',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        ),
+      );
+    };
+    final outcome = await service.sendTurn(
+      'c1',
+      history: const [
+        Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+        Message(
+          id: 'm2',
+          role: MessageRole.assistant,
+          content: 'local reply',
+        ),
+      ],
+      userText: 'second',
+    );
+    expect(calls, 2);
+    expect(outcome.sessionId, session);
+    expect(outcome.state, 'resumed');
+    final bodies = client.requests.map((r) => r.toJson()).toList();
+    expect(bodies[0]['session_id'], session);
+    expect((bodies[0]['messages'] as List).map((m) => m['content']), ['second']);
+    expect(bodies[1]['session_id'], session);
+    expect(
+      (bodies[1]['messages'] as List).map((m) => m['content']),
+      ['hi', 'local reply', 'second'],
+    );
+    expect(messageIds.toSet(), hasLength(2));
+    expect(await repo.pending(scope, 'c1'), isNull);
+    expect(await repo.mappedSession('c1'), session);
+  });
+
+  test('session_missing on the re-establish itself surfaces the error '
+      'instead of looping', () async {
+    await service.sendTurn('c1', history: const [], userText: 'hi');
+    respondWith = (_) =>
+        throw const PluginClientException('session_missing', statusCode: 409);
+    await expectLater(
+      service.sendTurn(
+        'c1',
+        history: const [
+          Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+          Message(
+            id: 'm2',
+            role: MessageRole.assistant,
+            content: 'local reply',
+          ),
+        ],
+        userText: 'second',
+      ),
+      throwsA(
+        isA<ManagedTurnError>().having(
+          (e) => e.code,
+          'code',
+          'session_missing',
+        ),
+      ),
+    );
+    expect(client.requests, hasLength(2));
+    expect(await repo.mappedSession('c1'), isNotNull);
+    expect(await repo.pending(scope, 'c1'), isNotNull);
+  });
+
   test('deleted-thread reseed clears the stale mapping + pending and the next '
-      'send mints a fresh thread retaining local history', () async {
-    final first = await service.sendTurn('c1', history: const [], userText: 'hi');
-    final deadThread = first.threadId;
+      'send mints a fresh session retaining local history', () async {
+    final first = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
+    final deadSession = first.sessionId;
     var calls = 0;
     respondWith = (request) {
       calls++;
-      if (calls == 2) {
+      if (calls == 1) {
         throw const PluginClientException('reseed_required', statusCode: 409);
       }
       return Future.value(
         ManagedTurnResult(
-          threadId: request.conversationPublicId!,
+          sessionId: request.conversationPublicId!,
           state: calls == 1 ? 'seeded' : 'resumed',
           result: const ChatResult(
             content: 'ok',
@@ -691,8 +813,7 @@ void main() {
       ),
     );
 
-    // Stale mapping + pending dropped; local history retained.
-    expect(await repo.mappedThread('c1'), isNull);
+    expect(await repo.mappedSession('c1'), isNull);
     expect(await repo.pending(scope, 'c1'), isNull);
     final retained = await repo.access(
       scope,
@@ -703,13 +824,13 @@ void main() {
     expect(retained!.messages, hasLength(3));
     expect(retained.messages.last.content, 'second');
 
-    // The next send seeds a brand-new thread.
     final reseeded = await service.sendTurn(
       'c1',
       history: retained.messages,
       userText: 'third',
     );
-    expect(reseeded.threadId, isNot(deadThread));
-    expect(await repo.mappedThread('c1'), reseeded.threadId);
+    expect(reseeded.sessionId, isNot(deadSession));
+    expect(reseeded.state, 'seeded');
+    expect(await repo.mappedSession('c1'), reseeded.sessionId);
   });
 }

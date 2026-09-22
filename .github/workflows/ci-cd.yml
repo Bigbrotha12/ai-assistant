@@ -15,6 +15,24 @@ permissions:
   packages: write
 
 jobs:
+  flutter-checks:
+    name: Flutter analyze + tests
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Flutter analyze + tests
+        run: |
+          command -v flutter >/dev/null || {
+            echo "flutter not found on the self-hosted runner. Install the project's Flutter SDK and add it to PATH." >&2
+            exit 1
+          }
+          flutter pub get
+          flutter analyze
+          flutter test
+
   build-and-deploy:
     name: Test, build, push to GHCR, roll out to k3s
     runs-on: [self-hosted, linux]

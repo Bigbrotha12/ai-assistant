@@ -7,6 +7,7 @@ import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
 import { requireApiKey, unauthorized } from "./inference.ts";
 import { Ledger, LedgerError, migrateLedger } from "./ledger.ts";
+import type { TaskRow } from "./ledger.ts";
 import type { VerifyApiKeyFn } from "./plugins/routes.ts";
 
 /**
@@ -28,6 +29,7 @@ chmodSync(env.LEDGER_DB_PATH, 0o600);
 export const ledger = new Ledger(ledgerDb, {
   stuckTimeoutMs: env.LEDGER_STUCK_TIMEOUT_MS,
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,
+  terminalRetentionMs: env.LEDGER_RETENTION_MS,
 });
 // One-time startup orphan reconciliation: tasks left `running` by a crash or
 // restart with a lapsed lease / stale heartbeat become `stuck` before the
@@ -39,6 +41,13 @@ if (orphanedCount > 0) {
     `ledger: reconciled ${orphanedCount} orphaned running task(s) as stuck`,
   );
 }
+// D6: periodic retention sweep purges terminal tasks (and their steps/chain)
+// once they have sat past LEDGER_RETENTION_MS. Tick errors are logged, never
+// crash the timer; the timer is unref'd inside the Ledger so it cannot keep
+// the process alive.
+ledger.startRetentionSweep(env.LEDGER_SWEEP_INTERVAL_MS, {
+  onError: (err) => console.error("ledger: retention sweep failed", err),
+});
 
 export function createLedgerRoutes(
   l: Ledger,
@@ -69,13 +78,13 @@ export function createLedgerRoutes(
       spec: JSON.stringify(body.spec ?? {}),
       worker: typeof body.worker === "string" ? body.worker : undefined,
     });
-    return c.json(task, created ? 201 : 200);
+    return c.json(toPublicTask(task), created ? 201 : 200);
   });
 
   routes.get("/tasks", async (c) => {
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
-    return c.json(l.listTasks(owner));
+    return c.json(l.listTasks(owner).map(toPublicTask));
   });
 
   // Status-by-idempotency-key: the client's poll-after-drop endpoint (plan
@@ -87,7 +96,7 @@ export function createLedgerRoutes(
     if (!owner) return unauthorized(c);
     const task = l.getTaskByIntentKey(owner, c.req.param("intentKey"));
     if (!task) return c.json({ error: "not_found" }, 404);
-    return c.json(task);
+    return c.json(toPublicTask(task));
   });
 
   routes.get("/tasks/:id", async (c) => {
@@ -98,7 +107,7 @@ export function createLedgerRoutes(
     const task = l.getTask(id, owner);
     if (!task) return c.json({ error: "not_found" }, 404);
     return c.json({
-      ...task,
+      ...toPublicTask(task),
       steps: l.listSteps(task.id, owner),
       chain: l.readChain(task.id, owner),
     });
@@ -108,7 +117,7 @@ export function createLedgerRoutes(
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     try {
-      return c.json(l.claimTask(c.req.param("id"), owner));
+      return c.json(toPublicTask(l.claimTask(c.req.param("id"), owner)));
     } catch (e) {
       return ledgerError(c, e);
     }
@@ -177,7 +186,7 @@ export function createLedgerRoutes(
       return c.json({ error: "fence_conflict" }, 403);
     }
     try {
-      return c.json(l.heartbeat(id, owner, fenceToken));
+      return c.json(toPublicTask(l.heartbeat(id, owner, fenceToken)));
     } catch (e) {
       return ledgerError(c, e);
     }
@@ -187,7 +196,7 @@ export function createLedgerRoutes(
     const owner = await verifyKey(c);
     if (!owner) return unauthorized(c);
     try {
-      return c.json(l.resumeTask(c.req.param("id"), owner));
+      return c.json(toPublicTask(l.resumeTask(c.req.param("id"), owner)));
     } catch (e) {
       return ledgerError(c, e);
     }
@@ -209,13 +218,23 @@ export function createLedgerRoutes(
       return c.json({ error: "invalid_request" }, 400);
     }
     try {
-      return c.json(l.completeTask(c.req.param("id"), owner, status));
+      return c.json(toPublicTask(l.completeTask(c.req.param("id"), owner, status)));
     } catch (e) {
       return ledgerError(c, e);
     }
   });
 
   return routes;
+}
+
+/** A `TaskRow` as returned to clients: the internal snapshot `payload` column
+ *  (ledger v5) is stripped. Job-status delivery must never echo the client's
+ *  own message snapshot — the client already owns it; the ledger holds it
+ *  transiently ONLY for the runner's crash-resume, purged with the task by the
+ *  retention sweep (plan §10). */
+function toPublicTask(task: TaskRow): Omit<TaskRow, "payload"> {
+  const { payload: _payload, ...publicTask } = task;
+  return publicTask;
 }
 
 function ledgerError(c: Context, e: unknown): Response {

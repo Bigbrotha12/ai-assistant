@@ -2,35 +2,18 @@ import '../../chat/data/chat_client.dart';
 import '../../chat/data/message_model.dart';
 import 'plugin_dto.dart';
 
-/// Terminal status of a task referenced by `200 already_completed`, carried
-/// verbatim from the server so failed/cancelled tasks are never conflated with
-/// a successful turn.
-enum ManagedTerminalStatus { succeeded, failed, cancelled, unknown }
-
-ManagedTerminalStatus parseManagedTerminalStatus(Object? value) {
-  return switch (value) {
-    'succeeded' => ManagedTerminalStatus.succeeded,
-    'failed' => ManagedTerminalStatus.failed,
-    'cancelled' => ManagedTerminalStatus.cancelled,
-    _ => ManagedTerminalStatus.unknown,
-  };
-}
-
 class ManagedTurnResult {
   const ManagedTurnResult({
-    required this.threadId,
+    required this.sessionId,
     required this.state,
     this.result,
-    this.taskId,
-    this.terminalStatus = ManagedTerminalStatus.unknown,
+    this.alreadyCompleted = false,
   });
 
-  final String threadId;
+  final String sessionId;
   final String state;
   final ChatResult? result;
-  final String? taskId;
-  final ManagedTerminalStatus terminalStatus;
-  bool get alreadyCompleted => taskId != null;
+  final bool alreadyCompleted;
 }
 
 String managedPublicId(Object? value) {
@@ -43,37 +26,27 @@ String managedPublicId(Object? value) {
   return value;
 }
 
-class ManagedThreadSummary {
-  ManagedThreadSummary.fromJson(Object? value) {
+/// Accumulated conversation read back from `GET /v1/sessions/:id`. Keys
+/// stable local ids off the session id (`'$sessionId-msg-$index'`).
+class ManagedSessionHistory {
+  ManagedSessionHistory.fromJson(Object? value) {
     final json = pluginJsonObject(value);
-    threadId = managedPublicId(json['threadId']);
-    final count = json['messageCount'];
-    if (count is! int || count < 0) throw const PluginProtocolException();
-    messageCount = count;
-  }
-
-  late final String threadId;
-  late final int messageCount;
-}
-
-class ManagedThreadHistory {
-  ManagedThreadHistory.fromJson(Object? value) {
-    final json = pluginJsonObject(value);
-    threadId = managedPublicId(json['threadId']);
+    sessionId = managedPublicId(json['sessionId']);
     final raw = json['messages'];
     if (raw is! List) throw const PluginProtocolException();
     messages = List.unmodifiable(
       raw.indexed.map((entry) {
         // Distinct, stable local ids: every recovered message keyed to this
-        // thread's position so store upserts never collapse the history to a
+        // session's position so store upserts never collapse the history to a
         // single row (a bare '' primary key) and two conversations can never
         // share message rows. Tool messages keep their server `tool_call_id`
         // linkage untouched.
         final (index, value) = entry;
         final m = pluginJsonObject(value);
         final role = m['role'];
+        final content = m['content'];
         if (!['user', 'assistant', 'system', 'tool'].contains(role) ||
-            m['content'] != null && m['content'] is! String) {
+            content != null && content is! String && content is! List) {
           throw const PluginProtocolException();
         }
         final calls = m['tool_calls'];
@@ -94,9 +67,9 @@ class ManagedThreadHistory {
         final linkage = m['tool_call_id'];
         if (role == 'tool') managedPublicId(linkage);
         return Message(
-          id: '$threadId-msg-$index',
+          id: '$sessionId-msg-$index',
           role: MessageRole.values.byName(role as String),
-          content: m['content'] as String? ?? '',
+          content: flattenMessageContent(content),
           toolCalls: tools,
           toolCallId: linkage as String?,
         );
@@ -104,6 +77,27 @@ class ManagedThreadHistory {
     );
   }
 
-  late final String threadId;
+  late final String sessionId;
   late final List<Message> messages;
+}
+
+/// Reduces a wire message's `content` to the local String model. A String
+/// passes through; a List (multimodal `{type: 'text'|'image_url', ...}`
+/// blocks, or a tool's array result) is flattened by concatenating the `text`
+/// fields of its text blocks — image blocks are ignored for the local
+/// `Message.content` string model. Anything else is a protocol error.
+String flattenMessageContent(Object? content) {
+  if (content == null) return '';
+  if (content is String) return content;
+  if (content is List) {
+    final buffer = StringBuffer();
+    for (final block in content) {
+      if (block is Map<String, dynamic> && block['type'] == 'text') {
+        final text = block['text'];
+        if (text is String) buffer.write(text);
+      }
+    }
+    return buffer.toString();
+  }
+  throw const PluginProtocolException();
 }

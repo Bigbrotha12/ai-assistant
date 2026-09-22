@@ -54,10 +54,12 @@ abstract class Conversation with _$Conversation {
 }
 
 /// Wire format for the OpenAI-compatible API. NOT persisted — maps domain
-/// Message to the API message contract.
+/// Message to the API message contract. `content` is a String for plain text
+/// or a `List` of multimodal blocks (`{type: 'text'|'image_url', ...}`) for
+/// vision messages.
 class ApiMessage {
   final String role;
-  final String? content;
+  final Object? content;
   final List<Map<String, dynamic>>? toolCalls;
   final String? toolCallId;
 

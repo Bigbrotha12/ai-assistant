@@ -54,6 +54,20 @@ LangChainRequest request() => LangChainRequest(
   messages: [const ApiMessage(role: 'user', content: 'Hello')],
 );
 
+LangChainRequest backgroundRequest() => LangChainRequest(
+  gatewayKey: 'gateway-secret',
+  modelPluginId: 'openrouter',
+  credentials: {
+    'openrouter': {'apiKey': 'provider-secret'},
+  },
+  messages: [
+    const ApiMessage(role: 'user', content: 'earlier'),
+    const ApiMessage(role: 'user', content: 'current'),
+  ],
+  turnId: 'msg-1',
+  background: true,
+);
+
 Map<String, dynamic> modelJson() => {
   'id': 'openrouter',
   'object': 'model',
@@ -222,7 +236,7 @@ void main() {
       expect(body['credentials']['openrouter']['apiKey'], 'original');
       expect(body['messages'][0]['tool_calls'][0]['function']['name'], 'list');
       expect(body['messages'][1]['tool_call_id'], 'call');
-      expect(body['thread_id'], 'raw-client-uuid');
+      expect(body['session_id'], 'raw-client-uuid');
       expect(body['messageId'], 'turn-uuid');
       expect(body['model'], 'openrouter');
       expect(body.containsKey('gatewayKey'), isFalse);
@@ -233,7 +247,7 @@ void main() {
         () => dto.credentials['openrouter']!['apiKey'] = 'bad',
         throwsUnsupportedError,
       );
-      expect(request().toJson().containsKey('thread_id'), isFalse);
+      expect(request().toJson().containsKey('session_id'), isFalse);
       expect(
         () => LangChainRequest(
           gatewayKey: '',
@@ -391,6 +405,205 @@ void main() {
     },
   );
 
+  test(
+    'background request shape: background true, messageId, full history, '
+    'NO session_id / conversation_mode',
+    () {
+      final body = backgroundRequest().toJson();
+      expect(body['background'], isTrue);
+      expect(body['messageId'], 'msg-1');
+      expect((body['messages'] as List).map((m) => m['content']), [
+        'earlier',
+        'current',
+      ]);
+      expect(body.containsKey('session_id'), isFalse);
+      expect(body.containsKey('conversation_mode'), isFalse);
+      expect(body['model'], 'openrouter');
+      expect(body['stream'], isTrue);
+      expect(
+        () => LangChainRequest(
+          gatewayKey: 'gateway-secret',
+          modelPluginId: 'openrouter',
+          credentials: {},
+          messages: const [ApiMessage(role: 'user', content: 'hi')],
+          background: true,
+        ),
+        errorCode('invalid_request'),
+      );
+    },
+  );
+
+  test('backgroundTurn accepts 202 accepted with taskId', () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({
+          'status': 'accepted',
+          'taskId': 'task-1',
+          'threadId': 'thread-1',
+        }),
+        202,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    final result = await client.backgroundTurn(backgroundRequest());
+    expect(result.status, 'accepted');
+    expect(result.accepted, isTrue);
+    expect(result.taskId, 'task-1');
+    expect(result.threadId, 'thread-1');
+    final request = adapter.requests.single;
+    expect(request.method, 'POST');
+    expect(request.path, 'https://gateway.test/v1/chat/completions');
+    expect(request.data['background'], isTrue);
+    expect(request.data['messageId'], 'msg-1');
+    expect(request.data.containsKey('session_id'), isFalse);
+  });
+
+  test('backgroundTurn accepts a 200 terminal status (job already finished)',
+      () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({'status': 'succeeded', 'taskId': 'task-2'}),
+        200,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    final result = await client.backgroundTurn(backgroundRequest());
+    expect(result.status, 'succeeded');
+    expect(result.accepted, isFalse);
+    expect(result.taskId, 'task-2');
+    expect(result.threadId, isNull);
+  });
+
+  test('backgroundTurn maps already_completed + terminalStatus onto the '
+      'terminal result instead of a protocol error', () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({
+          'status': 'already_completed',
+          'terminalStatus': 'failed',
+          'taskId': 'task-3',
+          'threadId': 'thread-3',
+        }),
+        200,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    final result = await client.backgroundTurn(backgroundRequest());
+    expect(result.status, 'failed');
+    expect(result.accepted, isFalse);
+    expect(result.taskId, 'task-3');
+    expect(result.threadId, 'thread-3');
+  });
+
+  test('backgroundTurn rejects already_completed without a known '
+      'terminalStatus', () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({
+          'status': 'already_completed',
+          'terminalStatus': 'future',
+          'taskId': 'task-x',
+        }),
+        200,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      client.backgroundTurn(backgroundRequest()),
+      errorCode('invalid_response'),
+    );
+    expect(adapter.requests, hasLength(1));
+  });
+
+  test('backgroundTurn rejects unknown statuses and missing taskId', () async {
+    for (final body in [
+      {'status': 'future', 'taskId': 'task-x'},
+      {'status': 'accepted'},
+      {'status': 'busy', 'taskId': 'task-x'},
+    ]) {
+      final adapter = FakePluginAdapter(
+        (_) => ResponseBody.fromString(
+          jsonEncode(body),
+          200,
+          headers: {
+            'content-type': ['application/json'],
+          },
+        ),
+      );
+      final client = LangChainClient(
+        dio: Dio()..httpClientAdapter = adapter,
+        baseUrl: 'https://gateway.test/v1',
+      );
+      await expectLater(
+        client.backgroundTurn(backgroundRequest()),
+        errorCode('invalid_response'),
+      );
+      expect(adapter.requests, hasLength(1));
+    }
+  });
+
+  test('backgroundTurn refuses a non-background request and surfaces errors',
+      () async {
+    final client = LangChainClient(
+      dio: Dio(),
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      client.backgroundTurn(request()),
+      errorCode('invalid_request'),
+    );
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({'error': 'job_failed', 'message': 'gateway-secret'}),
+        500,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      ),
+    );
+    final failing = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      failing.backgroundTurn(backgroundRequest()),
+      throwsA(
+        isA<PluginClientException>()
+            .having((e) => e.code, 'code', 'job_failed')
+            .having((e) => e.statusCode, 'status', 500)
+            .having(
+              (e) => e.toString(),
+              'safe text',
+              isNot(contains('gateway-secret')),
+            ),
+      ),
+    );
+  });
+
   test('full server-executed tool/text turn uses a single POST', () async {
     final text = [
       ': keepalive\n\n',
@@ -511,12 +724,12 @@ void main() {
     expect(adapter.requests, hasLength(1));
   });
 
-  test('managed turn in recreated state resolves as a success', () async {
+  test('managed turn in seeded state resolves as a success', () async {
     final text = [
       frame({
         'choices': [
           {
-            'delta': {'content': 'recreated reply'},
+            'delta': {'content': 'seeded reply'},
             'finish_reason': null,
           },
         ],
@@ -536,8 +749,8 @@ void main() {
         200,
         headers: {
           'content-type': ['text/event-stream'],
-          'x-thread-id': ['thread-uuid'],
-          'x-conversation-state': ['recreated'],
+          'x-session-id': ['session-uuid'],
+          'x-conversation-state': ['seeded'],
         },
       ),
     );
@@ -553,16 +766,317 @@ void main() {
           'openrouter': {'apiKey': 'provider-secret'},
         },
         messages: [const ApiMessage(role: 'user', content: 'Hello')],
-        conversationPublicId: 'thread-uuid',
+        conversationPublicId: 'session-uuid',
         turnId: 'turn-uuid',
         managed: true,
       ),
     );
-    expect(result.state, 'recreated');
-    expect(result.threadId, 'thread-uuid');
-    expect(result.result!.content, 'recreated reply');
+    expect(result.state, 'seeded');
+    expect(result.sessionId, 'session-uuid');
+    expect(result.result!.content, 'seeded reply');
+    expect(result.alreadyCompleted, isFalse);
     expect(adapter.requests, hasLength(1));
     expect(adapter.requests.single.method, 'POST');
+    expect(
+      adapter.requests.single.data['session_id'],
+      'session-uuid',
+    );
+  });
+
+  test('managed state outside {seeded, resumed} is a protocol error', () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody(
+        Stream.fromIterable(
+          utf8.encode('data: [DONE]\n\n').map(
+            (byte) => Uint8List.fromList([byte]),
+          ),
+        ),
+        200,
+        headers: {
+          'content-type': ['text/event-stream'],
+          'x-session-id': ['session-uuid'],
+          'x-conversation-state': ['recreated'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      client.managedTurn(
+        LangChainRequest(
+          gatewayKey: 'gateway-secret',
+          modelPluginId: 'openrouter',
+          credentials: {
+            'openrouter': {'apiKey': 'provider-secret'},
+          },
+          messages: [const ApiMessage(role: 'user', content: 'Hello')],
+          conversationPublicId: 'session-uuid',
+          turnId: 'turn-uuid',
+          managed: true,
+        ),
+      ),
+      errorCode('invalid_response'),
+    );
+    expect(adapter.requests, hasLength(1));
+  });
+
+  test('managed x-session-id mismatch is a protocol error', () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody(
+        Stream.fromIterable(
+          utf8.encode('data: [DONE]\n\n').map(
+            (byte) => Uint8List.fromList([byte]),
+          ),
+        ),
+        200,
+        headers: {
+          'content-type': ['text/event-stream'],
+          'x-session-id': ['other-uuid'],
+          'x-conversation-state': ['seeded'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      client.managedTurn(
+        LangChainRequest(
+          gatewayKey: 'gateway-secret',
+          modelPluginId: 'openrouter',
+          credentials: {
+            'openrouter': {'apiKey': 'provider-secret'},
+          },
+          messages: [const ApiMessage(role: 'user', content: 'Hello')],
+          conversationPublicId: 'session-uuid',
+          turnId: 'turn-uuid',
+          managed: true,
+        ),
+      ),
+      errorCode('invalid_response'),
+    );
+    expect(adapter.requests, hasLength(1));
+  });
+
+  test('already_completed JSON carries status + sessionId + messageId only',
+      () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({
+          'status': 'already_completed',
+          'sessionId': 'session-uuid',
+          'messageId': 'turn-uuid',
+        }),
+        200,
+        headers: {
+          'content-type': ['application/json'],
+          'x-session-id': ['session-uuid'],
+          'x-conversation-state': ['resumed'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    final result = await client.managedTurn(
+      LangChainRequest(
+        gatewayKey: 'gateway-secret',
+        modelPluginId: 'openrouter',
+        credentials: {
+          'openrouter': {'apiKey': 'provider-secret'},
+        },
+        messages: [const ApiMessage(role: 'user', content: 'Hello')],
+        conversationPublicId: 'session-uuid',
+        turnId: 'turn-uuid',
+        managed: true,
+      ),
+    );
+    expect(result.alreadyCompleted, isTrue);
+    expect(result.result, isNull);
+    expect(result.state, 'resumed');
+    expect(result.sessionId, 'session-uuid');
+    expect(adapter.requests, hasLength(1));
+  });
+
+  test('already_completed with a mismatched sessionId is a protocol error',
+      () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({
+          'status': 'already_completed',
+          'sessionId': 'other-uuid',
+          'messageId': 'turn-uuid',
+        }),
+        200,
+        headers: {
+          'content-type': ['application/json'],
+          'x-session-id': ['session-uuid'],
+          'x-conversation-state': ['resumed'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      client.managedTurn(
+        LangChainRequest(
+          gatewayKey: 'gateway-secret',
+          modelPluginId: 'openrouter',
+          credentials: {
+            'openrouter': {'apiKey': 'provider-secret'},
+          },
+          messages: [const ApiMessage(role: 'user', content: 'Hello')],
+          conversationPublicId: 'session-uuid',
+          turnId: 'turn-uuid',
+          managed: true,
+        ),
+      ),
+      errorCode('invalid_response'),
+    );
+    expect(adapter.requests, hasLength(1));
+  });
+
+  test('loadSession reads a session back over GET /v1/sessions/:id', () async {
+    final adapter = FakePluginAdapter(
+      (options) {
+        expect(options.method, 'GET');
+        expect(
+          options.path,
+          'https://gateway.test/v1/sessions/session-uuid',
+        );
+        return ResponseBody.fromString(
+          jsonEncode({
+            'sessionId': 'session-uuid',
+            'messages': [
+              {'role': 'user', 'content': 'hi'},
+              {'role': 'assistant', 'content': 'hello'},
+            ],
+          }),
+          200,
+          headers: {
+            'content-type': ['application/json'],
+          },
+        );
+      },
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    final history = await client.loadSession(
+      'session-uuid',
+      gatewayKey: 'gateway-secret',
+    );
+    expect(history.sessionId, 'session-uuid');
+    expect(history.messages.map((m) => m.id), [
+      'session-uuid-msg-0',
+      'session-uuid-msg-1',
+    ]);
+    expect(history.messages.map((m) => m.content), ['hi', 'hello']);
+    expect(
+      adapter.requests.single.headers['Authorization'],
+      'Bearer gateway-secret',
+    );
+  });
+
+  test('loadSession rejects a mismatched sessionId and malformed messages',
+      () async {
+    for (final body in [
+      {
+        'sessionId': 'other-uuid',
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+        ],
+      },
+      {
+        'sessionId': 'session-uuid',
+        'messages': [
+          {'role': 'robot', 'content': 'hi'},
+        ],
+      },
+      {
+        'sessionId': 'session-uuid',
+        'messages': 'not-a-list',
+      },
+    ]) {
+      final adapter = FakePluginAdapter(
+        (_) => ResponseBody.fromString(
+          jsonEncode(body),
+          200,
+          headers: {
+            'content-type': ['application/json'],
+          },
+        ),
+      );
+      final client = LangChainClient(
+        dio: Dio()..httpClientAdapter = adapter,
+        baseUrl: 'https://gateway.test/v1',
+      );
+      await expectLater(
+        client.loadSession('session-uuid', gatewayKey: 'gateway-secret'),
+        errorCode('invalid_response'),
+      );
+      expect(adapter.requests, hasLength(1));
+    }
+  });
+
+  test('deleteSession deletes over DELETE /v1/sessions/:id and accepts a '
+      'status ok payload', () async {
+    final adapter = FakePluginAdapter(
+      (options) {
+        expect(options.method, 'DELETE');
+        expect(
+          options.path,
+          'https://gateway.test/v1/sessions/session-uuid',
+        );
+        return ResponseBody.fromString(
+          jsonEncode({'status': 'ok'}),
+          200,
+          headers: {
+            'content-type': ['application/json'],
+          },
+        );
+      },
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await client.deleteSession(
+      'session-uuid',
+      gatewayKey: 'gateway-secret',
+    );
+    expect(
+      adapter.requests.single.headers['Authorization'],
+      'Bearer gateway-secret',
+    );
+  });
+
+  test('deleteSession rejects a non-ok payload', () async {
+    final adapter = FakePluginAdapter(
+      (_) => ResponseBody.fromString(
+        jsonEncode({'status': 'error'}),
+        200,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      ),
+    );
+    final client = LangChainClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gateway.test/v1',
+    );
+    await expectLater(
+      client.deleteSession('session-uuid', gatewayKey: 'gateway-secret'),
+      errorCode('invalid_response'),
+    );
+    expect(adapter.requests, hasLength(1));
   });
 
   test('malformed/incomplete streams never retry or fall back', () async {

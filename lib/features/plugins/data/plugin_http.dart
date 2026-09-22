@@ -48,6 +48,8 @@ const _safeCodes = {
   'tool_execution_failed',
   'server_error',
   'auth_error',
+  'session_missing',
+  'request_too_large',
 };
 
 String safePluginErrorCode(Object? envelope) {

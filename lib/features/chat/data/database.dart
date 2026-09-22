@@ -10,7 +10,7 @@ class Conversations extends Table {
   DateTimeColumn get updatedAt => dateTime()();
   IntColumn get messageCount => integer().withDefault(const Constant(0))();
   TextColumn get scopeKey => text().nullable()();
-  TextColumn get publicThreadId => text().nullable()();
+  TextColumn get sessionId => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {id};
@@ -105,7 +105,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 6;
+  int get schemaVersion => 7;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -133,12 +133,26 @@ class AppDatabase extends _$AppDatabase {
       }
       if (from < 6) {
         await m.addColumn(conversations, conversations.scopeKey);
-        await m.addColumn(conversations, conversations.publicThreadId);
+        await m.addColumn(conversations, conversations.sessionId);
         await m.createTable(managedPendingTurns);
+      }
+      if (from < 7) {
+        // v6 installs physically carry the legacy public_thread_id column; the
+        // data it holds is the live conversationId → session_id mapping. Rename
+        // in place ONLY from exactly v6 (those are the only DBs with the old
+        // name — stores that upgraded from < 6 already created session_id via
+        // the block above, so the rename must not run for them).
+        if (from == 6) {
+          await m.database.customStatement(
+            'ALTER TABLE conversations RENAME COLUMN public_thread_id TO session_id',
+          );
+        }
       }
       // v4: memories table + FTS5 full-text search (see DriftMemoryStore).
       // v5: index on messages.conversationId (per-conversation message
       // loads and watchConversations scan no longer table-scan).
+      // v6: scopeKey + session_id on conversations and managed_pending_turns.
+      // v7: legacy public_thread_id renamed to session_id in place.
     },
     beforeOpen: (details) async {
       // SQLite does NOT enable FK enforcement by default — without this

@@ -6,6 +6,19 @@ import '../../auth/data/auth_credentials_store.dart';
 import 'plugin_dto.dart';
 import 'plugin_http.dart';
 
+/// Terminal statuses a background submission can echo (matches the server's
+/// `TERMINAL_TASK_STATUSES` in `server/src/ledger.ts`). `awaiting_review` IS
+/// terminal on the job wire — a re-submitted job in review cannot accept the
+/// submission — but NOT terminal for client reconciliation
+/// ([LedgerTaskStatus.isTerminal] excludes it so a review task keeps its
+/// pending marker for an explicit retry).
+const terminalTaskStatuses = <String>{
+  'succeeded',
+  'failed',
+  'cancelled',
+  'awaiting_review',
+};
+
 enum LedgerTaskStatus {
   queued,
   running,
@@ -16,6 +29,9 @@ enum LedgerTaskStatus {
   awaitingReview,
   unknown;
 
+  /// Terminal for client reconciliation: the job's outcome is final and the
+  /// service clears the pending marker (reads the reply back on `succeeded`).
+  /// `awaiting_review` is deliberately excluded — see [terminalTaskStatuses].
   bool get isTerminal =>
       this == succeeded || this == failed || this == cancelled;
 
@@ -41,6 +57,18 @@ class LedgerTask {
     createdTs = _timestamp(json['created_ts']);
     updatedTs = _timestamp(json['updated_ts']);
     lastHeartbeatTs = _timestamp(json['last_heartbeat_ts']);
+    // `GET /ledger/tasks/:id` carries the task's steps (tool results +
+    // the transient `reply` step); `GET /ledger/tasks/by-key/:messageId` does
+    // NOT (status-only). A missing `steps` key is tolerated as an empty list,
+    // and a malformed step is skipped rather than failing the whole task read.
+    final rawSteps = json['steps'];
+    steps = rawSteps is List
+        ? List.unmodifiable(
+            rawSteps
+                .map((e) => LedgerStep.fromJson(e))
+                .where((step) => step.stage.isNotEmpty),
+          )
+        : const <LedgerStep>[];
   }
 
   late final String id;
@@ -49,6 +77,44 @@ class LedgerTask {
   late final int createdTs;
   late final int updatedTs;
   late final int lastHeartbeatTs;
+  late final List<LedgerStep> steps;
+
+  /// The transient `reply` step's result (the background job's final assistant
+  /// message), or null when the task carries none. Only the full-task endpoint
+  /// (`GET /ledger/tasks/:id`) includes steps, so poll-by-messageId must be
+  /// followed by a full-task fetch to read the reply back.
+  String? get reply {
+    for (final step in steps) {
+      if (step.stage == 'reply') {
+        final result = step.result;
+        return result is String ? result : null;
+      }
+    }
+    return null;
+  }
+}
+
+/// One transient ledger step (plan §7): a tool result (`stage == 'tool'`), a
+/// redacted error (`stage == 'error'`), or the job's final assistant reply
+/// (`stage == 'reply'`). `result` is the raw serialized content. Parsing is
+/// lenient: a step missing its `stage`/`action` strings yields empty values
+/// (filtered out by [LedgerTask.fromJson]) instead of failing the task read.
+class LedgerStep {
+  LedgerStep.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    final rawStage = json['stage'];
+    final rawAction = json['action'];
+    stage = rawStage is String ? rawStage : '';
+    action = rawAction is String ? rawAction : '';
+    result = json['result'];
+    final rawCallId = json['tool_call_id'];
+    toolCallId = rawCallId is String && rawCallId.isNotEmpty ? rawCallId : null;
+  }
+
+  late final String stage;
+  late final String action;
+  late final Object? result;
+  late final String? toolCallId;
 }
 
 String _publicId(Object? value) {
@@ -297,6 +363,7 @@ class LedgerPollHandle {
     if (status != null) {
       return status == 404 ||
           status == 408 ||
+          status == 413 ||
           status == 429 ||
           status >= 500 && status <= 599;
     }

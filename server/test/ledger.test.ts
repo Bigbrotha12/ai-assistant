@@ -8,14 +8,16 @@ import {
   applyMigrations,
   CURRENT_LEDGER_VERSION,
   heartbeatIntervalMs,
-  findLoop,
+  SPEC_MAX_LENGTH,
 } from "../src/ledger.ts";
 import type { Database as DatabaseType } from "better-sqlite3";
+import type { TaskRow } from "../src/ledger.ts";
 
 function makeLedger(
   opts: {
     stuck?: number;
     lease?: number;
+    retention?: number;
     now?: () => number;
     setInterval?: typeof setInterval;
     clearInterval?: typeof clearInterval;
@@ -26,6 +28,7 @@ function makeLedger(
   const ledger = new Ledger(db, {
     stuckTimeoutMs: opts.stuck ?? 10_000,
     leaseExpiryMs: opts.lease ?? 60_000,
+    terminalRetentionMs: opts.retention,
     now: opts.now ?? Date.now,
     setInterval: opts.setInterval,
     clearInterval: opts.clearInterval,
@@ -282,24 +285,6 @@ describe("heartbeat + lease + stuck ordering", () => {
         }),
       (e: unknown) => e instanceof LedgerError && e.code === "INVALID_CONFIG",
     );
-  });
-});
-
-describe("sequence-aware loop detection", () => {
-  test("A,B,A,B fires", () => {
-    assert.deepEqual(findLoop(["A", "B", "A", "B"]), ["A", "B"]);
-  });
-  test("A,B,C,A,B,C fires", () => {
-    assert.deepEqual(findLoop(["A", "B", "C", "A", "B", "C"]), ["A", "B", "C"]);
-  });
-  test("A,A adjacent retry does NOT fire", () => {
-    assert.equal(findLoop(["A", "A"]), null);
-  });
-  test("A,B,B adjacent retry does NOT fire", () => {
-    assert.equal(findLoop(["A", "B", "B"]), null);
-  });
-  test("A,B plays once does NOT fire", () => {
-    assert.equal(findLoop(["A", "B"]), null);
   });
 });
 
@@ -722,6 +707,428 @@ describe("startup orphan reconciliation", () => {
     assert.deepEqual(ledger.reconcileOrphans().marked, [task.id]);
     assert.deepEqual(ledger.reconcileOrphans().marked, []);
     assert.equal(ledger.getTask(task.id)!.status, "stuck");
+  });
+});
+
+describe("spec cap (D4)", () => {
+  test("a spec longer than 80 chars is stored truncated to 80 at the write boundary", () => {
+    const { ledger } = makeLedger();
+    const long = "x".repeat(500);
+    const task = ledger.createTask({ owner: "o", intentKey: "k", spec: long });
+    assert.equal(task.spec.length, SPEC_MAX_LENGTH);
+    assert.equal(task.spec, "x".repeat(SPEC_MAX_LENGTH));
+  });
+
+  test("a spec at or under 80 chars is stored verbatim", () => {
+    const { ledger } = makeLedger();
+    const exact = "a".repeat(SPEC_MAX_LENGTH);
+    assert.equal(
+      ledger.createTask({ owner: "o", intentKey: "k", spec: exact }).spec,
+      exact,
+    );
+    assert.equal(
+      ledger.createTask({ owner: "o", intentKey: "k2", spec: "short" }).spec,
+      "short",
+    );
+  });
+
+  test("getOrCreateTask's spec flows through the same 80-char cap", async () => {
+    const { ledger } = makeLedger();
+    const { getOrCreateTask } = await import("../src/credentials/idempotency.ts");
+    const task = await getOrCreateTask(ledger, {
+      owner: "o",
+      intentKey: "k",
+      spec: "y".repeat(300),
+    });
+    assert.equal(task.spec.length, SPEC_MAX_LENGTH);
+  });
+});
+
+describe("terminal-task retention purge (D6)", () => {
+  const complete = (
+    ledger: Ledger,
+    owner: string,
+    intentKey: string,
+    to: "succeeded" | "failed" | "cancelled" | "awaiting_review",
+  ): TaskRow => {
+    const task = ledger.createTask({ owner, intentKey, spec: "s" });
+    ledger.claimTask(task.id, owner);
+    return ledger.completeTask(task.id, owner, to);
+  };
+
+  test("a terminal task older than retention is purged along with its steps and chain", () => {
+    let now = 1_000_000;
+    const { db, ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 86_400_000,
+      now: () => now,
+    });
+    const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
+    ledger.claimTask(task.id, "o");
+    ledger.appendStep(task.id, "o", { stage: "s", action: "A", result: "r1" });
+    ledger.appendStep(task.id, "o", { stage: "s", action: "B", result: "r2" });
+    ledger.completeTask(task.id, "o", "succeeded");
+    now += 86_400_000 + 1;
+
+    assert.equal(ledger.purgeTerminalTasks(), 1);
+    assert.equal(ledger.getTask(task.id), null);
+    const stepCount = (
+      db.prepare("SELECT COUNT(*) AS c FROM ledger_step WHERE task_id = ?").get(task.id) as { c: number }
+    ).c;
+    const chainCount = (
+      db.prepare("SELECT COUNT(*) AS c FROM ledger_chain WHERE task_id = ?").get(task.id) as { c: number }
+    ).c;
+    assert.equal(stepCount, 0, "steps of the purged task must be deleted");
+    assert.equal(chainCount, 0, "chain rows of the purged task must be deleted");
+  });
+
+  test("a terminal task younger than retention is kept", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 86_400_000,
+      now: () => now,
+    });
+    const task = complete(ledger, "o", "k", "succeeded");
+    now += 86_400_000 - 1; // still inside the window
+
+    assert.equal(ledger.purgeTerminalTasks(), 0);
+    assert.equal(ledger.getTask(task.id)!.status, "succeeded");
+  });
+
+  test("running/queued/stuck tasks are never purged however old", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+    });
+    const queued = ledger.createTask({ owner: "o", intentKey: "q", spec: "s" });
+    const running = ledger.createTask({ owner: "o", intentKey: "r", spec: "s" });
+    ledger.claimTask(running.id, "o");
+    const stuck = ledger.createTask({ owner: "o", intentKey: "st", spec: "s" });
+    ledger.claimTask(stuck.id, "o");
+    now += 2000; // heartbeat stale past stuck-timeout
+    ledger.markStuckIfHeartbeatStale(stuck.id);
+    now += 100_000; // everything far past the retention window
+
+    assert.equal(ledger.purgeTerminalTasks(), 0);
+    assert.equal(ledger.getTask(queued.id)!.status, "queued");
+    assert.equal(ledger.getTask(running.id)!.status, "running");
+    assert.equal(ledger.getTask(stuck.id)!.status, "stuck");
+  });
+
+  test("all terminal statuses are purged after the window", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+    });
+    const succeeded = complete(ledger, "o", "s", "succeeded");
+    const failed = complete(ledger, "o", "f", "failed");
+    const cancelled = complete(ledger, "o", "c", "cancelled");
+    const awaiting = complete(ledger, "o", "a", "awaiting_review");
+    now += 2000;
+
+    assert.equal(ledger.purgeTerminalTasks(), 4);
+    for (const t of [succeeded, failed, cancelled, awaiting]) {
+      assert.equal(ledger.getTask(t.id), null, `${t.status} task must be purged`);
+    }
+  });
+
+  test("cross-owner: purging owner A's expired tasks leaves owner B's intact", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+    });
+    const a = complete(ledger, "A", "a", "succeeded");
+    now += 2000; // A's task is now expired
+    const b = complete(ledger, "B", "b", "succeeded"); // B's task is fresh
+
+    assert.equal(ledger.purgeTerminalTasks(), 1);
+    assert.equal(ledger.getTask(a.id), null);
+    assert.equal(ledger.getTask(b.id)!.status, "succeeded");
+  });
+
+  test("append-only delete guard is restored after a purge", () => {
+    let now = 1_000_000;
+    const { db, ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+    });
+    const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
+    ledger.claimTask(task.id, "o");
+    ledger.appendStep(task.id, "o", { stage: "s", action: "A", result: "r" });
+    ledger.completeTask(task.id, "o", "succeeded");
+    now += 2000;
+    assert.equal(ledger.purgeTerminalTasks(), 1);
+
+    const t2 = ledger.createTask({ owner: "o", intentKey: "k2", spec: "s" });
+    ledger.claimTask(t2.id, "o");
+    ledger.appendStep(t2.id, "o", { stage: "s", action: "A", result: "r" });
+    assert.throws(() =>
+      db.prepare("DELETE FROM ledger_step WHERE task_id = ?").run(t2.id),
+      /append-only/,
+    );
+    assert.throws(() =>
+      db.prepare("DELETE FROM ledger_chain WHERE task_id = ?").run(t2.id),
+      /append-only/,
+    );
+  });
+
+  test("purgeTerminalTasks() uses the injected now by default", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+    });
+    const task = complete(ledger, "o", "k", "failed");
+    now += 2000;
+    assert.equal(ledger.purgeTerminalTasks(), 1);
+    assert.equal(ledger.getTask(task.id), null);
+  });
+});
+
+describe("retention sweep timer (D6)", () => {
+  test("startRetentionSweep purges expired terminal tasks per tick and stops cleanly", () => {
+    let now = 1_000_000;
+    const scheduler = makeFakeScheduler();
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+      setInterval: scheduler.setInterval,
+      clearInterval: scheduler.clearInterval,
+    });
+    const errors: unknown[] = [];
+    const sweep = ledger.startRetentionSweep(1000, {
+      onError: (err) => errors.push(err),
+    });
+    assert.equal(scheduler.count(), 1, "sweep registers one interval");
+
+    const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
+    ledger.claimTask(task.id, "o");
+    ledger.completeTask(task.id, "o", "succeeded");
+    now += 2000; // terminal + past retention
+
+    scheduler.fireAll();
+    assert.equal(ledger.getTask(task.id), null, "sweep purges expired tasks");
+    assert.deepEqual(errors, []);
+
+    sweep.stop();
+    assert.equal(scheduler.count(), 0, "stop() clears the interval");
+  });
+
+  test("a tick that throws is forwarded to onError, never escaping the timer", () => {
+    let now = 1_000_000;
+    const scheduler = makeFakeScheduler();
+    const { db, ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+      setInterval: scheduler.setInterval,
+      clearInterval: scheduler.clearInterval,
+    });
+    const errors: unknown[] = [];
+    ledger.startRetentionSweep(1000, { onError: (err) => errors.push(err) });
+
+    // Poison the DB so the purge select throws mid-tick.
+    db.close();
+    scheduler.fireAll();
+    assert.equal(errors.length, 1);
+  });
+
+  test("startRetentionSweep rejects interval <= 0", () => {
+    const { ledger } = makeLedger();
+    assert.throws(
+      () => ledger.startRetentionSweep(0),
+      (e: unknown) => e instanceof LedgerError && e.code === "INVALID_CONFIG",
+    );
+  });
+
+  test("startRetentionSweep is guarded against a double start", () => {
+    const scheduler = makeFakeScheduler();
+    const { ledger } = makeLedger({
+      setInterval: scheduler.setInterval,
+      clearInterval: scheduler.clearInterval,
+    });
+    const sweep = ledger.startRetentionSweep(1000);
+    assert.throws(
+      () => ledger.startRetentionSweep(1000),
+      (e: unknown) => e instanceof LedgerError && e.code === "INVALID_CONFIG",
+    );
+    assert.equal(scheduler.count(), 1, "a double start registers only one timer");
+    sweep.stop();
+    assert.equal(scheduler.count(), 0);
+  });
+
+  test("stop() is idempotent and a stale handle cannot clear a new sweep", () => {
+    const scheduler = makeFakeScheduler();
+    const { ledger } = makeLedger({
+      setInterval: scheduler.setInterval,
+      clearInterval: scheduler.clearInterval,
+    });
+    const first = ledger.startRetentionSweep(1000);
+    first.stop();
+    first.stop(); // second stop is a no-op
+    assert.equal(scheduler.count(), 0);
+
+    const second = ledger.startRetentionSweep(1000);
+    assert.equal(scheduler.count(), 1);
+    first.stop(); // stale handle must not clear the new sweep
+    assert.equal(scheduler.count(), 1);
+    second.stop();
+    assert.equal(scheduler.count(), 0);
+  });
+});
+
+describe("snapshot payload (v5)", () => {
+  test("createTask stores the payload and every read path returns it", () => {
+    const { ledger } = makeLedger();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "k",
+      spec: "s",
+      payload: JSON.stringify([{ role: "user", content: "hello" }]),
+    });
+    assert.equal(task.payload, JSON.stringify([{ role: "user", content: "hello" }]));
+    assert.equal(ledger.getTask(task.id)?.payload, task.payload);
+    assert.equal(ledger.getTaskByIntentKey("user-1", "k")?.payload, task.payload);
+    assert.equal(ledger.listTasks("user-1")[0]?.payload, task.payload);
+  });
+
+  test("a task created without a payload reads back null (routes never store one)", () => {
+    const { ledger } = makeLedger();
+    const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
+    assert.equal(task.payload, null);
+    assert.equal(ledger.getTask(task.id)?.payload, null);
+  });
+
+  test("updateTaskPayload backfills an admitted-without-payload task, owner-scoped", () => {
+    const { ledger } = makeLedger();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "k", spec: "s" });
+    assert.equal(task.payload, null);
+    const updated = ledger.updateTaskPayload(
+      task.id,
+      "user-1",
+      JSON.stringify([{ role: "user", content: "snapshot" }]),
+    );
+    assert.equal(updated.payload, JSON.stringify([{ role: "user", content: "snapshot" }]));
+    assert.equal(ledger.getTask(task.id)?.payload, updated.payload);
+    assert.throws(
+      () => ledger.updateTaskPayload(task.id, "intruder", "{}"),
+      (e: unknown) => e instanceof LedgerError && e.code === "FORBIDDEN",
+    );
+  });
+
+  test("the payload is purged WITH the task by the retention sweep (no separate purge)", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({
+      stuck: 1000,
+      lease: 5000,
+      retention: 1000,
+      now: () => now,
+    });
+    const task = ledger.createTask({
+      owner: "o",
+      intentKey: "k",
+      spec: "s",
+      payload: JSON.stringify([{ role: "user", content: "transient" }]),
+    });
+    ledger.claimTask(task.id, "o");
+    ledger.completeTask(task.id, "o", "succeeded");
+    now += 2000;
+    assert.equal(ledger.purgeTerminalTasks(), 1);
+    assert.equal(ledger.getTask(task.id), null, "the task (and its payload) is purged");
+  });
+
+  test("v5 migration adds the payload column with a null default over existing data", () => {
+    // Rebuild the full v1 ledger_task schema (the real chain's v2-v5 ALTERs
+    // and the v4 dedupe reference columns the real v1 defines), seed a row,
+    // then run the REAL migration chain through v5.
+    const db = new Database(":memory:") as DatabaseType;
+    const v1 = (d: DatabaseType) => {
+      d.exec(`
+        CREATE TABLE ledger_task (
+          id               TEXT PRIMARY KEY,
+          owner            TEXT NOT NULL,
+          intent_key       TEXT NOT NULL,
+          spec             TEXT NOT NULL,
+          worker           TEXT,
+          status           TEXT NOT NULL CHECK (
+            status IN ('queued','running','succeeded','failed','cancelled','stuck','awaiting_review')
+          ),
+          created_ts       INTEGER NOT NULL,
+          updated_ts       INTEGER NOT NULL,
+          lease_expires_at INTEGER,
+          lease_owner      TEXT
+        );
+        CREATE TABLE ledger_step (
+          id      TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES ledger_task(id),
+          seq     INTEGER NOT NULL,
+          stage   TEXT NOT NULL,
+          action  TEXT NOT NULL,
+          result  TEXT,
+          ts      INTEGER NOT NULL,
+          UNIQUE (task_id, seq)
+        );
+        CREATE TABLE ledger_chain (
+          seq         INTEGER NOT NULL,
+          task_id     TEXT NOT NULL,
+          step_id     TEXT NOT NULL,
+          digest      TEXT NOT NULL,
+          prev_digest TEXT,
+          ts          INTEGER NOT NULL,
+          PRIMARY KEY (task_id, seq),
+          UNIQUE (task_id, step_id)
+        );
+        CREATE TRIGGER ledger_step_append_only_update
+        BEFORE UPDATE ON ledger_step
+        BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
+        CREATE TRIGGER ledger_step_append_only_delete
+        BEFORE DELETE ON ledger_step
+        BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
+        CREATE TRIGGER ledger_chain_append_only_update
+        BEFORE UPDATE ON ledger_chain
+        BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
+        CREATE TRIGGER ledger_chain_append_only_delete
+        BEFORE DELETE ON ledger_chain
+        BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
+      `);
+    };
+    applyMigrations(db, [v1], 1);
+    db.prepare(
+      `INSERT INTO ledger_task (id, owner, intent_key, spec, status, created_ts, updated_ts)
+       VALUES ('t1', 'o', 'k', 's', 'queued', 1, 1)`,
+    ).run();
+    migrateLedger(db); // upgrades v1 -> current (incl. the v5 payload column)
+    assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
+    const row = db
+      .prepare("SELECT id, payload FROM ledger_task WHERE id = 't1'")
+      .get() as { id: string; payload: string | null };
+    assert.equal(row.payload, null, "existing rows get a NULL payload");
+    const fresh = new Database(":memory:");
+    migrateLedger(fresh);
+    const cols = fresh
+      .prepare("PRAGMA table_info(ledger_task)")
+      .all()
+      .map((r) => (r as { name: string }).name);
+    assert.ok(cols.includes("payload"), "fresh DB must have the payload column");
   });
 });
 

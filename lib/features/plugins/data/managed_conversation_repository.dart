@@ -12,7 +12,7 @@ import '../../chat/data/message_model.dart';
 import 'plugin_http.dart';
 
 /// Account-scoped persistence for managed conversations: the local Drift
-/// history (via scoped [DriftChatStore] instances), the raw public thread-id
+/// history (via scoped [DriftChatStore] instances), the raw public session-id
 /// mapping, and the pending-turn row that makes a send retryable without a
 /// second inference.
 class ManagedConversationRepository {
@@ -134,33 +134,33 @@ class ManagedConversationRepository {
     return query.go();
   }
 
-  Future<String?> mappedThread(String conversationId) async {
+  Future<String?> mappedSession(String conversationId) async {
     final row = await (db.select(
       db.conversations,
     )..where((t) => t.id.equals(conversationId))).getSingleOrNull();
-    return row?.publicThreadId;
+    return row?.sessionId;
   }
 
-  Future<void> mapThread(String conversationId, String threadId) =>
+  Future<void> mapSession(String conversationId, String sessionId) =>
       (db.update(db.conversations)..where((t) => t.id.equals(conversationId)))
-          .write(ConversationsCompanion(publicThreadId: Value(threadId)));
+          .write(ConversationsCompanion(sessionId: Value(sessionId)));
 
-  /// Drops a stale public thread mapping (server-side thread gone) so the next
-  /// send mints a fresh thread. Local history is untouched.
-  Future<void> clearThreadMapping(String conversationId) =>
+  /// Drops a stale public session-id mapping (server-side session gone) so the
+  /// next send mints a fresh session. Local history is untouched.
+  Future<void> clearSessionMapping(String conversationId) =>
       (db.update(db.conversations)..where((t) => t.id.equals(conversationId)))
-          .write(ConversationsCompanion(publicThreadId: const Value(null)));
+          .write(ConversationsCompanion(sessionId: const Value(null)));
 
   /// Swaps the conversation's local history for the server's messages under a
   /// transaction, bumps updatedAt, and clears pending state. Called only after
-  /// a successful [LangChainClient.loadThread]; rethrow surfaces reseed 409s.
+  /// a successful [LangChainClient.loadSession]; rethrow surfaces reseed 409s.
   /// [expectedMessageId] narrows the pending delete to the turn being
   /// reconciled so a concurrent newer turn is never cleared.
   Future<void> replaceHistory(
     AuthAccountScope scope,
     DriftChatStore store,
     Conversation previous,
-    String threadId,
+    String sessionId,
     List<Message> messages, {
     String? expectedMessageId,
   }) async {
@@ -170,7 +170,7 @@ class ManagedConversationRepository {
     await store.saveConversation(
       previous.copyWith(updatedAt: DateTime.now(), messages: List.of(messages)),
     );
-    await mapThread(previous.id, threadId);
+    await mapSession(previous.id, sessionId);
     await clearPending(scope, previous.id, messageId: expectedMessageId);
   }
 }

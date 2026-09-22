@@ -28,12 +28,12 @@ import { isRecord } from "../util.ts";
  *    benign (it is returned to the owner on later reads), but pairing it with
  *    the token makes the record a publish/subscribe credential, so the whole
  *    record is stored encrypted.
- *  - **Keying reuses the CHECKPOINT_DB_KEY pattern** (DI-friendly — no `env`
- *    import here): the caller injects the key string (production supplies it
- *    via `CHECKPOINT_DB_KEY`; development has the same warned default the env
- *    schema guarantees). The AES-256-GCM key is derived deterministically
- *    (`sha256(key)`) so previously-written files stay decryptable across
- *    restarts, mirroring how the checkpoints store keys its SQLCipher DB.
+ *  - **Keying is DI-friendly** (no `env` import here): the caller injects the
+ *    key string (production supplies it via `NOTIFY_STORE_KEY`; the legacy
+ *    `CHECKPOINT_DB_KEY` alias is accepted by the env layer; development has
+ *    the same warned default the env schema guarantees). The AES-256-GCM key
+ *    is derived deterministically (`sha256(key)`) so previously-written files
+ *    stay decryptable across restarts and key-name migrations.
  *  - **0600 permissions + atomic write.** Persist writes the JSON to a temp
  *    file in the same directory, chmods it `0600`, then renames over the
  *    target (same as `plugins/store.ts`). A crash never leaves a partial file.
@@ -83,9 +83,8 @@ export type NotifyStoreOptions = {
   /** JSON file path. Default `./data/notify.json`. */
   storePath?: string;
   /**
-   * Encryption key — the CHECKPOINT_DB_KEY secret pattern. Required: the store
-   * refuses to operate with a blank key (`KEY_REQUIRED`), matching
-   * `createCheckpointStore`'s refusal to open an unencrypted DB.
+   * Encryption key — `NOTIFY_STORE_KEY` (legacy alias `CHECKPOINT_DB_KEY`).
+   * Required: the store refuses to operate with a blank key (`KEY_REQUIRED`).
    */
   key: string;
 };
@@ -107,7 +106,7 @@ export class NotifyStore {
         "KEY_REQUIRED",
         "NotifyStore: an encryption key is required — ntfy credentials are " +
           "encrypted at rest and the store refuses a blank key. Supply the " +
-          "CHECKPOINT_DB_KEY secret (the env layer guarantees a dev default).",
+          "NOTIFY_STORE_KEY secret (the env layer guarantees a dev default).",
       );
     }
     this.aesKey = deriveAesKey(opts.key);

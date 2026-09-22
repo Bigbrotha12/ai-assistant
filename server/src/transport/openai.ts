@@ -398,8 +398,11 @@ export async function* toOpenAiSse(
   // without delivering an `on_chain_error` event (the v2 tracer implements no
   // `onLLMError` and Pregel aborts the run before flushing error events). If a
   // terminator was never emitted, surface the failure as a root chain error
-  // envelope so the stream still terminates per I4 / §5.2.
+  // envelope so the stream still terminates per I4 / §5.2 — and report the
+  // honest failure outcome so the transport's terminal state (ledger task /
+  // session outcome) is `failed`, never a mis-reported `succeeded`.
   if (!terminated && lastError !== undefined) {
+    opts.onOutcome?.("failed");
     yield errorFrame(redact(errorMessage(lastError)), ERROR_TYPE_SERVER, exhaustionCode(lastError));
     yield DONE_FRAME;
     terminated = true;

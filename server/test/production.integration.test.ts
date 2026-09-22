@@ -3,7 +3,6 @@ import { registerHooks } from "node:module";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { Hono } from "hono";
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import type { ChatRoutesOptions } from "../src/transport/chat.ts";
 import type { JobRunnerDeps } from "../src/jobs/runner.ts";
 import type { BuildModelInput } from "../src/transport/model.ts";
@@ -45,6 +44,7 @@ test("production context config validates limits and warmups default off", () =>
         BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
         BETTER_AUTH_URL: "http://localhost:17600",
         PORT: "17600",
+        // Legacy alias — the real schema resolves this into NOTIFY_STORE_KEY.
         CHECKPOINT_DB_KEY: "test-checkpoint-key",
         PLUGINS_TRUSTED_HOSTS: "",
         ...overrides,
@@ -115,7 +115,9 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     WARMUP_MAX_CONCURRENT: 1,
     WARMUP_TIMEOUT_MS: 1000,
     PLUGINS_TRUSTED_HOSTS: ["tasks.example.test"],
-    CHECKPOINT_DB_KEY: "test-checkpoint-key",
+    // index.ts keys NotifyStore from NOTIFY_STORE_KEY; the spawn-based env in
+    // this file still sets the legacy CHECKPOINT_DB_KEY to cover the alias.
+    NOTIFY_STORE_KEY: "test-checkpoint-key",
     NOTIFY_BASE_URL: "",
   };
   const modules: Record<string, Record<string, unknown>> = {
@@ -134,10 +136,6 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     "./transport/models.ts": { createModelsRoutes: () => new Hono() },
     "./transport/skills.ts": { createSkillsRoutes: () => new Hono() },
     "./transport/mcps.ts": { createMcpRoutes: () => new Hono() },
-    "./checkpoints/routes.ts": { createCheckpointRoutes: () => new Hono() },
-    "./checkpoints/store.ts": {
-      createCheckpointStore: async () => ({ checkpointer: {}, touchThread() {}, async close() {} }),
-    },
     "./transport/chat.ts": {
       createChatRoutes: (options: ChatRoutesOptions) => { chat = options; return new Hono(); },
     },
@@ -148,7 +146,6 @@ test("production boot shares phase 4 services and uses scoped model credentials"
       createJobRunner: (deps: JobRunnerDeps) => {
         runner = deps;
         assert.ok(deps.budget);
-        assert.ok(deps.contextManager);
         return { async resumeStuckJobs() {}, dispose() { cleanup.push("runner"); } };
       },
       JobError: class extends Error {
@@ -189,8 +186,8 @@ test("production boot shares phase 4 services and uses scoped model credentials"
   });
   await import("../src/index.ts");
   assert.equal(runner.budget, chat.budget);
-  assert.equal(runner.contextManager, chat.contextManager);
-  assert.equal(runner.threadLocks, chat.threadLocks);
+  // No checkpointer / thread locks / context manager are wired anymore: the
+  // runner is fully stateless and the chat options carry none of them.
   assert.equal(runner.toolCache, chat.toolCache);
   assert.equal(runner.pins, chat.pins);
   assert.equal(executorOptions.registry, registry);
@@ -204,13 +201,6 @@ test("production boot shares phase 4 services and uses scoped model credentials"
   assert.equal(denied.ok, false);
   if (!denied.ok) assert.ok(denied.retryAfterSeconds > 60);
   assert.equal(budget.reserveModelCall("bob").ok, true);
-  assert.deepEqual(chat.contextManager!.truncateSeed([
-    new HumanMessage("x".repeat(200)),
-    new HumanMessage("latest"),
-  ]).map((message) => message.content), ["latest"]);
-  assert.throws(() => chat.contextManager!.prepareMessages([
-    new SystemMessage("x".repeat(100)), new HumanMessage("latest"),
-  ], {}), { code: "context_length_exceeded" });
 
   const credentials = Object.freeze({ apiKey: "admission-scoped-test-key" });
   let checked = 0;

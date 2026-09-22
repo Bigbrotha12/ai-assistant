@@ -22,11 +22,8 @@ import type { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager
 import { ChatGenerationChunk } from "@langchain/core/outputs";
 import type { ChatResult } from "@langchain/core/outputs";
 import type { StructuredToolInterface } from "@langchain/core/tools";
-import { MemorySaver } from "@langchain/langgraph";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
-import type { CheckpointStore } from "../../src/checkpoints/store.ts";
-import { checkpointThreadId } from "../../src/checkpoints/store.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
@@ -49,7 +46,6 @@ import type { BuildModelInput } from "../../src/transport/model.ts";
 import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
 import { Ledger, migrateLedger } from "../../src/ledger.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
-import { ThreadLockRegistry } from "../../src/jobs/thread_lock.ts";
 import type {
   JobDescriptor,
   JobErrorCode,
@@ -63,22 +59,15 @@ import type { BudgetManager } from "../../src/middleware/budget.ts";
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolResultCache } from "../../src/middleware/cache.ts";
 import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
-import { createContextManager, estimateMessagesTokens } from "../../src/middleware/context.ts";
-import type { ContextManager } from "../../src/middleware/context.ts";
 import { createWarmupManager } from "../../src/middleware/warmup.ts";
 import type { WarmupManager } from "../../src/middleware/warmup.ts";
-import { JobRunner as RealJobRunner } from "../../src/jobs/runner.ts";
-import { SUPERVISOR_PROMPT } from "../../src/agents/prompts.ts";
-import { SystemMessage } from "@langchain/core/messages";
 
 /**
  * Wave C1 chat-transport tests. Everything is fake/in-memory: a real
- * `PluginStore` over a temp dir (OpenRouter builtin + a tool plugin), an
- * optional fake checkpoint store wrapping an in-memory `MemorySaver`, and a
+ * `PluginStore` over a temp dir (OpenRouter builtin + a tool plugin), and a
  * **fake model injected via the `buildModel` seam** (records the `BuildModelInput`
- * it received AND the message history the graph fed the model, so the seed/
- * resume rule and the body-credential sourcing are assertable without any
- * network).
+ * it received AND the message history the graph fed the model, so the snapshot
+ * rule and the body-credential sourcing are assertable without any network).
  */
 
 function openRouterPlugin(): ModelPluginDefinition {
@@ -177,67 +166,6 @@ async function makeEnv(
   return { store, registry: new PluginRegistry(store) };
 }
 
-/**
- * Fake checkpoint store: an in-memory `MemorySaver` checkpointer (so the
- * seed/resume detection via `checkpointer.get` is real) + a minimal
- * `thread_owner` metadata table.
- */
-function fakeCheckpointStore(): CheckpointStore {
-  const checkpointer = new MemorySaver();
-  const threads = new Map<string, { owner: string; lastError: string | null; publicId?: string | null; deleted?: boolean }>();
-  return {
-    checkpointer,
-    async close() {},
-    touchThread(owner, threadId, lastError = null, publicId) {
-      if (threads.get(threadId)?.deleted) throw new Error("thread_deleted");
-      const existing = threads.get(threadId);
-      if (existing && existing.owner !== owner) throw new Error("thread_mapping_conflict");
-      if (publicId !== undefined && existing && existing.publicId !== publicId) {
-        throw new Error("thread_mapping_conflict");
-      }
-      threads.set(threadId, { owner, lastError, publicId: publicId ?? existing?.publicId ?? null });
-    },
-    getThread(threadId) {
-      const t = threads.get(threadId);
-      return t
-        ? { threadId, publicId: t.publicId, owner: t.owner, createdAt: 0, updatedAt: 0, lastError: t.lastError }
-        : undefined;
-    },
-    listThreads(owner) {
-      return [...threads.entries()]
-        .filter(([, t]) => t.owner === owner)
-        .map(([threadId, t]) => ({
-          threadId,
-          publicId: t.publicId,
-          owner: t.owner,
-          createdAt: 0,
-          updatedAt: 0,
-          lastError: t.lastError,
-          messageCount: 0,
-        }));
-    },
-    deleteThread(owner, threadId) {
-      const t = threads.get(threadId);
-      if (!t || t.owner !== owner) return false;
-      threads.set(threadId, { ...t, deleted: true });
-      return true;
-    },
-    deleteThreadsForOwner(owner) {
-      let n = 0;
-      for (const [threadId, t] of threads) {
-        if (t.owner === owner) {
-          threads.set(threadId, { ...t, deleted: true });
-          n++;
-        }
-      }
-      return n;
-    },
-    isDeleted(threadId) {
-      return threads.get(threadId)?.deleted === true;
-    },
-  };
-}
-
 type FakeBuildModel = {
   buildModelFn: typeof buildModel;
   /** Every `BuildModelInput` handed to the seam, in call order. */
@@ -317,89 +245,17 @@ class RecordingChatModel extends BaseChatModel<BaseChatModelCallOptions> {
   }
 }
 
-/**
- * Scripted streaming model whose `_streamResponseChunks` serializes on an
- * injected `active` tracker while it runs. Used by the per-thread-lock tests to
- * prove two concurrent streams on one thread never overlap a model turn.
- */
-class SlowScriptedChatModel extends BaseChatModel<BaseChatModelCallOptions> {
-  private turns: Array<Array<Record<string, unknown>>>;
-  readonly recordedInputs: BaseMessage[][];
-  private readonly delayMs: number;
-  private readonly active: { current: number; max: number };
-
-  constructor(opts: {
-    turns: Array<Array<Record<string, unknown>>>;
-    recordedInputs: BaseMessage[][];
-    delayMs: number;
-    active: { current: number; max: number };
-  }) {
-    super({});
-    this.turns = opts.turns.map((turn) => [...turn]);
-    this.recordedInputs = opts.recordedInputs;
-    this.delayMs = opts.delayMs;
-    this.active = opts.active;
-  }
-
-  _llmType(): string {
-    return "slow-scripted";
-  }
-
-  bindTools(tools: StructuredToolInterface[]) {
-    const next = new SlowScriptedChatModel({
-      turns: this.turns,
-      recordedInputs: this.recordedInputs,
-      delayMs: this.delayMs,
-      active: this.active,
-    });
-    return next.withConfig({ tools } as BaseChatModelCallOptions);
-  }
-
-  async _generate(_messages: BaseMessage[]): Promise<ChatResult> {
-    this.recordedInputs.push(_messages);
-    return { generations: [{ message: new AIMessage("(scripted)"), text: "" }] };
-  }
-
-  async *_streamResponseChunks(
-    _messages: BaseMessage[],
-    _options: this["ParsedCallOptions"],
-    runManager?: CallbackManagerForLLMRun,
-  ): AsyncGenerator<ChatGenerationChunk> {
-    this.active.current += 1;
-    this.active.max = Math.max(this.active.max, this.active.current);
-    try {
-      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
-      this.recordedInputs.push(_messages);
-      const turn = this.turns.shift() ?? [];
-      for (const fields of turn) {
-        const chunk = new AIMessageChunk(fields);
-        const text = typeof chunk.content === "string" ? chunk.content : "";
-        const generation = new ChatGenerationChunk({ message: chunk, text });
-        await runManager?.handleLLMNewToken(text, undefined, undefined, undefined, undefined, {
-          chunk: generation,
-        });
-        yield generation;
-      }
-    } finally {
-      this.active.current -= 1;
-    }
-  }
-}
-
 type AppOptions = {
   verifyKey?: VerifyApiKeyFn;
   limiter?: (key: string) => boolean;
   rateLimiter?: PerOwnerRateLimiter;
   budget?: BudgetManager;
-  checkpointStore?: CheckpointStore;
   buildModel?: typeof buildModel;
   toolHandler?: ToolCallHandler;
   jobRunner?: JobRunner;
   pins?: CredentialPinStore;
   ledger?: Ledger;
-  threadLocks?: ThreadLockRegistry;
   toolCache?: ToolResultCache;
-  contextManager?: ContextManager;
   warmups?: WarmupManager;
 };
 
@@ -440,7 +296,6 @@ async function makeApp(
     createChatRoutes({
       registry,
       pluginStore: store,
-      checkpointStore: opts.checkpointStore,
       verifyKey: opts.verifyKey ?? (async () => "test-user"),
       limiter: opts.limiter ?? (() => true),
       rateLimiter: opts.rateLimiter,
@@ -450,9 +305,7 @@ async function makeApp(
       jobRunner: opts.jobRunner,
       pins: opts.pins,
       ledger: opts.ledger,
-      threadLocks: opts.threadLocks,
       toolCache: opts.toolCache,
-      contextManager: opts.contextManager,
       warmups: opts.warmups,
       trustedHosts: [],
       catalogs: buildCatalogs(extraPlugins),
@@ -621,15 +474,13 @@ describe("POST /v1/chat/completions — pre-stream errors (§5.1)", () => {
 });
 
 describe("POST /v1/chat/completions — async delegation (background: true, Wave C2)", () => {
-  test("happy path: admits a task, pins model + tool credentials, delegates runJob with the right descriptor", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
+  test("happy path: admits a task, pins model + tool credentials, delegates runJob with the right descriptor + snapshot input", async (t) => {
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([
-      { status: "succeeded", taskId: "task-1", threadId: "thr-hash" },
+      { status: "succeeded", taskId: "task-1", threadId: "thread-1" },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore,
       pins,
       ledger,
       jobRunner: fake as unknown as JobRunner,
@@ -665,15 +516,10 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.deepEqual(d.toolPlugins, ["vikunja"]);
     const requestConfig = d.modelRequestConfig as JobModelRequestConfig;
     assert.equal(requestConfig.owner, "test-user");
-    assert.equal(typeof d.inputFactory, "function", "execution re-evaluates the seed under the runner lock");
-    assert.equal(d.input, undefined, "no stale seed is shipped in the descriptor");
-    const seed = await d.inputFactory!({
-      graph: {} as never,
-      threadId: checkpointThreadId("test-user", "thread-1"),
-      isReplay: false,
-      signal: new AbortController().signal,
-    }) as { messages: BaseMessage[] };
-    assert.equal(seed.messages.length, 1, "fresh thread seeds from client history");
+    assert.ok(d.input, "the snapshot input is shipped in the descriptor");
+    const snapshot = (d.input as { messages: BaseMessage[] }).messages;
+    assert.equal(snapshot.length, 1, "snapshot = the request's messages converted to LangChain");
+    assert.equal(String(snapshot[0]?.content), "list my tasks");
 
     // Model + tool credentials are pinned for the job (the runner resolves them).
     assert.deepEqual(pins.get("test-user", "openrouter").credentials, {
@@ -694,7 +540,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       { status: "succeeded", taskId: "task-1", threadId: "thr-1" },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
       pins: new CredentialPinStore(),
       ledger: makeLedger(),
       jobRunner: fake as unknown as JobRunner,
@@ -706,7 +551,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
   });
 
   test("idempotent retry: the same messageId admits ONE task; the second delegate returns already_terminal", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([
@@ -719,7 +563,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore,
       pins,
       ledger,
       jobRunner: fake as unknown as JobRunner,
@@ -748,7 +591,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       { status: "in_flight", taskId: "task-1", threadId: "thr-1" },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
       pins: new CredentialPinStore(),
       ledger: makeLedger(),
       jobRunner: fake as unknown as JobRunner,
@@ -763,14 +605,12 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
   });
 
   test("M1: a background duplicate (in_flight) releases the transport's model + tool pins (the runner never claimed them)", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([
       { status: "in_flight", taskId: "task-1", threadId: "thr-1" },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore,
       pins,
       ledger,
       jobRunner: fake as unknown as JobRunner,
@@ -801,7 +641,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
   });
 
   test("M1: an already_terminal re-submit also releases the transport's pins", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([
@@ -813,7 +652,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore,
       pins,
       ledger,
       jobRunner: fake as unknown as JobRunner,
@@ -849,7 +687,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
   test("missing messageId -> 400 invalid_request, runJob never called", async (t) => {
     const fake = makeFakeJobRunner([]);
     const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
       pins: new CredentialPinStore(),
       ledger: makeLedger(),
       jobRunner: fake as unknown as JobRunner,
@@ -863,58 +700,28 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     assert.equal(fake.calls.length, 0);
   });
 
-  test("a background send to a deleted thread -> 409 reseed_required, runJob never called", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
-    const pins = new CredentialPinStore();
-    const ledger = makeLedger();
-    const fake = makeFakeJobRunner([]);
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      pins,
-      ledger,
-      jobRunner: fake as unknown as JobRunner,
-    });
-    // Seed + delete the thread so `isDeleted` returns true.
-    await (await postChat(app, chatBody({ thread_id: "deleted-thread", messages: [{ role: "user", content: "hi" }] }))).text();
-    checkpointStore.deleteThread("test-user", checkpointThreadId("test-user", "deleted-thread"));
-
-    const res = await postChat(app, chatBody({
-      background: true,
-      messageId: "msg-deleted",
-      thread_id: "deleted-thread",
-      credentials: { openrouter: { apiKey: "sk-test-123" } },
-    }));
-    assert.equal(res.status, 409);
-    assert.deepEqual(await res.json(), {
-      error: "reseed_required",
-      reason: "thread_deleted",
-      threadId: "deleted-thread",
-    });
-    assert.equal(fake.calls.length, 0, "runJob must never run for a deleted thread");
-    assert.equal(ledger.getTaskByIntentKey("test-user", "msg-deleted"), null);
-  });
-
-  test("async path not wired (no runner/checkpointer/ledger/pins) -> 503 background_unavailable", async (t) => {
-    const { app } = await makeApp(t); // no checkpointStore/jobRunner/pins/ledger
+  test("async path not wired (no runner/ledger/pins) -> 503 background_unavailable", async (t) => {
+    const { app } = await makeApp(t); // no jobRunner/pins/ledger
     const res = await postChat(app, chatBody({ background: true, messageId: "msg-x" }));
     assert.equal(res.status, 503);
     assert.deepEqual(await res.json(), { error: "background_unavailable" });
   });
 
-  test("checkpointStore present but jobRunner absent -> 503 background_unavailable", async (t) => {
-    const { app } = await makeApp(t, { checkpointStore: fakeCheckpointStore() });
+  test("jobRunner absent -> 503 background_unavailable", async (t) => {
+    const { app } = await makeApp(t, {
+      pins: new CredentialPinStore(),
+      ledger: makeLedger(),
+    });
     const res = await postChat(app, chatBody({ background: true, messageId: "msg-x" }));
     assert.equal(res.status, 503);
     assert.deepEqual(await res.json(), { error: "background_unavailable" });
   });
 
   test("an invalid tool-plugin credential -> 400 invalid_credentials before admission, nothing pinned, no task", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([]);
     const { app } = await makeApp(t, {
-      checkpointStore,
       pins,
       ledger,
       jobRunner: fake as unknown as JobRunner,
@@ -936,13 +743,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       (e: unknown) => (e as { code?: string }).code === "pin_not_found",
       "a rejected admission must not leave a model pin behind",
     );
-    // L5: touchThread runs AFTER validation, so a 400 must not leave a phantom
-    // thread_owner row.
-    assert.equal(
-      checkpointStore.getThread(checkpointThreadId("test-user", "msg-bad-tool")),
-      undefined,
-      "a rejected request must not write a phantom thread_owner row",
-    );
   });
 
   test("runJob failed: JobErrorCode -> HTTP mapping", async (t) => {
@@ -960,7 +760,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
         { status: "failed", taskId: "t", threadId: "thr", code, error: `boom-${code}` },
       ]);
       const { app } = await makeApp(t, {
-        checkpointStore: fakeCheckpointStore(),
         pins: new CredentialPinStore(),
         ledger: makeLedger(),
         jobRunner: fake as unknown as JobRunner,
@@ -974,7 +773,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
   test("a non-boolean background value is rejected, never silently run synchronously", async (t) => {
     const fake = makeFakeJobRunner([]);
     const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
       pins: new CredentialPinStore(),
       ledger: makeLedger(),
       jobRunner: fake as unknown as JobRunner,
@@ -986,84 +784,6 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       message: "background must be a boolean",
     });
     assert.equal(fake.calls.length, 0);
-  });
-});
-
-describe("POST /v1/chat/completions — sync path per-thread lock (Wave C2)", () => {
-  test("two concurrent streams on the same thread serialize under the shared lock (no interleaved model turn)", async (t) => {
-    const tracker = { current: 0, max: 0 };
-    const recordedInputs: BaseMessage[][] = [];
-    const buildModelFn = ((_input: BuildModelInput) =>
-      new SlowScriptedChatModel({
-        turns: [[{ content: "reply" }]],
-        recordedInputs,
-        delayMs: 40,
-        active: tracker,
-      })) as typeof buildModel;
-    const locks = new ThreadLockRegistry();
-    const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
-      buildModel: buildModelFn,
-      threadLocks: locks,
-    });
-
-    // Both requests are dispatched before either body is consumed. The first
-    // handler acquires the thread's mutex and returns its Response; the second
-    // handler blocks on the mutex until the first stream has fully completed.
-    const res1Promise = postChat(
-      app,
-      chatBody({ thread_id: "shared", messages: [{ role: "user", content: "one" }] }),
-    );
-    const res2Promise = postChat(
-      app,
-      chatBody({ thread_id: "shared", messages: [{ role: "user", content: "two" }] }),
-    );
-    const res1 = await res1Promise;
-    const text1Promise = res1.text();
-    const res2 = await res2Promise;
-    const text2Promise = res2.text();
-    const [text1, text2] = await Promise.all([text1Promise, text2Promise]);
-
-    assert.equal(res1.status, 200);
-    assert.equal(res2.status, 200);
-    assert.ok(text1.includes("data: [DONE]"));
-    assert.ok(text2.includes("data: [DONE]"));
-    assert.equal(tracker.max, 1, "only one stream may run per thread at a time");
-    assert.ok(
-      recordedInputs.some((turn) =>
-        turn.some((m) => String(m.content) === "one"),
-      ),
-      "the first request's message reached the model",
-    );
-    assert.ok(
-      recordedInputs.some((turn) =>
-        turn.some((m) => String(m.content) === "two"),
-      ),
-      "the second request's message reached the model (after the first stream completed)",
-    );
-  });
-
-  test("a finished sync stream releases the thread's mutex (lock registry GCs it)", async (t) => {
-    const buildModelFn = ((_input: BuildModelInput) =>
-      new SlowScriptedChatModel({
-        turns: [[{ content: "hi" }]],
-        recordedInputs: [],
-        delayMs: 5,
-        active: { current: 0, max: 0 },
-      })) as typeof buildModel;
-    const locks = new ThreadLockRegistry();
-    const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
-      buildModel: buildModelFn,
-      threadLocks: locks,
-    });
-    const res = await postChat(
-      app,
-      chatBody({ thread_id: "gc-1", messages: [{ role: "user", content: "x" }] }),
-    );
-    assert.equal(res.status, 200);
-    await res.text();
-    assert.equal(locks.size, 0, "the finished stream's mutex must be evicted");
   });
 });
 
@@ -1215,20 +935,18 @@ describe("POST /v1/chat/completions — happy path (stateless)", () => {
     assert.ok(contents.includes("second"));
   });
 
-  test("H1: a stateless request (no thread_id) streams cleanly to a finish chunk + [DONE] even when a checkpoint store is wired", async (t) => {
-    // The checkpoint store is a real in-memory checkpointer whose `put` throws
-    // `Missing "thread_id"` (the same contract SqliteSaver enforces). Before
-    // the fix the graph was compiled WITH the checkpointer unconditionally, so
-    // a stateless run's first super-step write threw mid-stream and the adapter
-    // surfaced server_error + partial content — breaking every stateless
-    // request on a normally-configured gateway.
+  test("a stateless sync request streams cleanly even when it carries a legacy thread_id (never compiled with a checkpointer)", async (t) => {
+    // The sync path NEVER compiles a checkpointer (sessions are the only sync
+    // conversation state), so a request carrying `thread_id` still streams
+    // verbatim. Before the cutover this was the H1 regression: a stateless run
+    // compiled with the checkpointer threw `Missing "thread_id"` mid-stream and
+    // surfaced server_error + partial content.
     const fake = makeFakeBuildModel([[{ content: "Hello" }, { content: " world" }]]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
 
     const res = await postChat(
       app,
-      chatBody({ messages: [{ role: "user", content: "hello" }] }),
+      chatBody({ thread_id: "ignored-on-sync", messages: [{ role: "user", content: "hello" }] }),
     );
     assert.equal(res.status, 200);
     const text = await res.text();
@@ -1338,379 +1056,14 @@ describe("POST /v1/chat/completions — sync path tool credentials (H2)", () => 
   });
 });
 
-describe("POST /v1/chat/completions — seed/resume with a checkpoint store", () => {
-  test("first call seeds from client history; second call with the same thread_id resumes with ONLY the last user message", async (t) => {
-    const fake = makeFakeBuildModel([
-      [{ content: "First reply" }],
-      [{ content: "Second reply" }],
-    ]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
-
-    // Call 1 — SEED: the client's full history creates the checkpoint.
-    const res1 = await postChat(
-      app,
-      chatBody({
-        thread_id: "thread-1",
-        messages: [
-          { role: "user", content: "first" },
-          { role: "user", content: "second" },
-        ],
-      }),
-    );
-    assert.equal(res1.status, 200);
-    const text1 = await res1.text();
-    assert.ok(text1.includes("data: [DONE]"), "seed call streams");
-
-    assert.equal(fake.calls.length, 1);
-    const seedTurn = fake.recordedInputs[0]!;
-    const seedContents = contentsOf(seedTurn);
-    assert.deepEqual(seedContents, ["first", "second"], "seed = client history");
-
-    // Call 2 — RESUME: the client now sends only its latest message; the server
-    // ignores the (shorter) client history and appends ONLY the last user
-    // message on top of the checkpointed state.
-    const res2 = await postChat(
-      app,
-      chatBody({
-        thread_id: "thread-1",
-        messages: [{ role: "user", content: "third" }],
-      }),
-    );
-    assert.equal(res2.status, 200);
-    const text2 = await res2.text();
-    assert.ok(text2.includes("data: [DONE]"), "resume call streams");
-
-    assert.equal(fake.calls.length, 2);
-    const resumeTurn = fake.recordedInputs[1]!;
-    const resumeContents = contentsOf(resumeTurn);
-    assert.deepEqual(
-      resumeContents,
-      ["first", "second", "First reply", "third"],
-      "resume = checkpointed history + ONLY the last user message",
-    );
-  });
-
-  test("resumed: client-supplied history is ignored — only the last user message is appended", async (t) => {
-    const fake = makeFakeBuildModel([
-      [{ content: "First reply" }],
-      [{ content: "Second reply" }],
-    ]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
-
-    // Seed the thread so a checkpoint exists.
-    const res1 = await postChat(
-      app,
-      chatBody({
-        thread_id: "resume-history",
-        messages: [{ role: "user", content: "first" }],
-      }),
-    );
-    assert.equal(res1.status, 200);
-    await res1.text();
-
-    // Resume carrying the FULL client history, with a TAMPERED assistant turn
-    // so any leak of client-supplied history into the model input is visible.
-    const res2 = await postChat(
-      app,
-      chatBody({
-        thread_id: "resume-history",
-        messages: [
-          { role: "user", content: "first" },
-          { role: "assistant", content: "tampered-by-client" },
-          { role: "user", content: "new" },
-        ],
-      }),
-    );
-    assert.equal(res2.status, 200);
-    const text2 = await res2.text();
-    assert.ok(text2.includes("data: [DONE]"), "resume call streams");
-
-    const resumeTurn = fake.recordedInputs[1]!;
-    assert.deepEqual(
-      contentsOf(resumeTurn),
-      ["first", "First reply", "new"],
-      "resume = checkpointed state + ONLY the last user message (client history ignored)",
-    );
-  });
-
-  test("distinct owners map to distinct threads (owner-scoped hashing)", async (t) => {
-    const fake = makeFakeBuildModel([
-      [{ content: "A reply" }],
-      [{ content: "B reply" }],
-    ]);
-    const checkpointStore = fakeCheckpointStore();
-    // Second owner: a verifyKey stub that returns owner B on the 2nd call.
-    let calls = 0;
-    const verifyKey = async () => {
-      calls += 1;
-      return calls === 1 ? "owner-a" : "owner-b";
-    };
-    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn, verifyKey });
-
-    const res1 = await postChat(
-      app,
-      chatBody({ thread_id: "thread-1", messages: [{ role: "user", content: "a" }] }),
-    );
-    assert.equal(res1.status, 200);
-    await res1.text();
-
-    const res2 = await postChat(
-      app,
-      chatBody({ thread_id: "thread-1", messages: [{ role: "user", content: "b" }] }),
-    );
-    assert.equal(res2.status, 200);
-    await res2.text();
-
-    const turn2 = fake.recordedInputs[1]!;
-    const contents = contentsOf(turn2);
-    assert.deepEqual(
-      contents,
-      ["b"],
-      "owner B starts a FRESH thread (no checkpoint from owner A's thread)",
-    );
-  });
-
-  test("M3: resume with a non-user last message → 409 resume_conflict (never a silent re-seed)", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "First reply" }]]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
-
-    // Seed the thread so a checkpoint exists.
-    const res1 = await postChat(
-      app,
-      chatBody({ thread_id: "mid-tool", messages: [{ role: "user", content: "first" }] }),
-    );
-    assert.equal(res1.status, 200);
-    await res1.text();
-
-    // Resume mid-tool-loop: the LAST message is an assistant/tool message.
-    // Seeding with an older user message would drop tool results and re-run a
-    // pending tool call; the honest answer is a 409.
-    for (const messages of [
-      [
-        { role: "user", content: "continue" },
-        { role: "assistant", content: "let me check", tool_calls: [] },
-      ],
-      [{ role: "tool", tool_call_id: "call_1", content: "[]" }],
-    ]) {
-      const res = await postChat(
-        app,
-        chatBody({ thread_id: "mid-tool", messages }),
-      );
-      assert.equal(res.status, 409, `409 for last role ${messages.at(-1)!.role}`);
-      assert.deepEqual(await res.json(), {
-        error: "resume_conflict",
-        message: "resume with a user message only",
-      });
-    }
-  });
-
-  test("M3: a fresh thread (no checkpoint) accepts a seed whose last message is not a user message", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "hi" }]]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, { checkpointStore, buildModel: fake.buildModelFn });
-
-    const res = await postChat(
-      app,
-      chatBody({
-        thread_id: "fresh",
-        messages: [
-          { role: "system", content: "sys" },
-          { role: "user", content: "u1" },
-          { role: "assistant", content: "assistant reply" },
-          { role: "user", content: "last" },
-        ],
-      }),
-    );
-    assert.equal(res.status, 200);
-    const text = await res.text();
-    assert.ok(text.includes("data: [DONE]"));
-    const turn = fake.recordedInputs[0]!;
-    const contents = contentsOf(turn);
-    assert.deepEqual(
-      contents,
-      ["u1", "assistant reply", "last"],
-      "a fresh seed uses the client's full history verbatim",
-    );
-  });
-});
-
-describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", () => {
-  test("managed with no thread_id generates a public UUID and returns it via x-thread-id", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
-    const ledger = makeLedger();
-    const checkpointStore = fakeCheckpointStore();
-    const threadLocks = new ThreadLockRegistry();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      ledger,
-      threadLocks,
-      buildModel: fake.buildModelFn,
-    });
+describe("POST /v1/chat/completions — managed conversation mode (session_id validation)", () => {
+  test("managed requires a non-empty session_id (absent → 400 invalid_request)", async (t) => {
+    const { app } = await makeApp(t);
     const res = await postChat(
       app,
       chatBody({
         conversation_mode: "managed",
         messageId: "msg-1",
-        messages: [{ role: "user", content: "hello" }],
-      }),
-    );
-    assert.equal(res.status, 200);
-    const text = await res.text();
-    assert.ok(text.includes("data: [DONE]"));
-    const threadId = res.headers.get("x-thread-id");
-    assert.ok(threadId, "x-thread-id header present");
-    assert.match(threadId!, /^[0-9a-f-]{36}$/, "generated thread id is a UUID");
-    assert.equal(res.headers.get("x-conversation-state"), "seeded");
-    // The ledger records the turn so a retry is deduped.
-    const task = ledger.getTaskByIntentKey("test-user", "msg-1");
-    assert.ok(task);
-    assert.equal(task!.status, "succeeded");
-  });
-
-  test("client-supplied thread_id is honored and echoed back", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
-    const ledger = makeLedger();
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      ledger,
-      threadLocks: new ThreadLockRegistry(),
-      buildModel: fake.buildModelFn,
-    });
-    const res = await postChat(
-      app,
-      chatBody({
-        conversation_mode: "managed",
-        messageId: "msg-1",
-        thread_id: "11111111-2222-3333-4444-555555555555",
-        messages: [{ role: "user", content: "hello" }],
-      }),
-    );
-    assert.equal(res.status, 200);
-    await res.text();
-    assert.equal(res.headers.get("x-thread-id"), "11111111-2222-3333-4444-555555555555");
-    assert.equal(res.headers.get("x-conversation-state"), "seeded");
-  });
-
-  test("retry with the SAME messageId after success returns already_completed, never a second run", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "only reply" }]]);
-    const ledger = makeLedger();
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      ledger,
-      threadLocks: new ThreadLockRegistry(),
-      buildModel: fake.buildModelFn,
-    });
-    const body = chatBody({
-      conversation_mode: "managed",
-      messageId: "msg-1",
-      thread_id: "22222222-2222-3333-4444-555555555555",
-      messages: [{ role: "user", content: "hello" }],
-    });
-    const res1 = await postChat(app, body);
-    assert.equal(res1.status, 200);
-    await res1.text();
-
-    const res2 = await postChat(app, body);
-    assert.equal(res2.status, 200);
-    const json = (await res2.json()) as { status: string; taskId: string };
-    assert.equal(json.status, "already_completed");
-    assert.equal(fake.recordedInputs.length, 1, "the model ran exactly once");
-  });
-
-  test("recreated: a known thread with a missing checkpoint re-seeds from client history", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
-    const ledger = makeLedger();
-    const checkpointStore = fakeCheckpointStore();
-    const threadLocks = new ThreadLockRegistry();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      ledger,
-      threadLocks,
-      buildModel: fake.buildModelFn,
-    });
-    // A KNOWN thread whose checkpoint is gone: the owner->thread mapping row
-    // exists but no checkpoint does (e.g. the first stream failed before the
-    // checkpointer wrote). Simulate by touching the mapping row directly.
-    const publicId = "44444444-2222-3333-4444-555555555555";
-    checkpointStore.touchThread(
-      "test-user",
-      checkpointThreadId("test-user", publicId),
-      null,
-      publicId,
-    );
-
-    const res = await postChat(
-      app,
-      chatBody({
-        conversation_mode: "managed",
-        messageId: "msg-recreate",
-        thread_id: publicId,
-        messages: [
-          { role: "user", content: "first" },
-          { role: "user", content: "second" },
-        ],
-      }),
-    );
-    assert.equal(res.status, 200);
-    const text = await res.text();
-    assert.ok(text.includes("data: [DONE]"));
-    assert.equal(res.headers.get("x-thread-id"), publicId);
-    assert.equal(res.headers.get("x-conversation-state"), "recreated");
-    // A recreation re-seeds from the FULL client history, not just the last turn.
-    assert.deepEqual(contentsOf(fake.recordedInputs[0]!), ["first", "second"]);
-  });
-
-  test("reseed_required: a known thread with a missing checkpoint and no client history → 409", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
-    const ledger = makeLedger();
-    const checkpointStore = fakeCheckpointStore();
-    const threadLocks = new ThreadLockRegistry();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      ledger,
-      threadLocks,
-      buildModel: fake.buildModelFn,
-    });
-    const publicId = "55555555-2222-3333-4444-555555555555";
-    checkpointStore.touchThread(
-      "test-user",
-      checkpointThreadId("test-user", publicId),
-      null,
-      publicId,
-    );
-
-    const res = await postChat(
-      app,
-      chatBody({
-        conversation_mode: "managed",
-        messageId: "msg-reseed",
-        thread_id: publicId,
-        messages: [{ role: "user", content: "only" }],
-      }),
-    );
-    assert.equal(res.status, 409);
-    const json = (await res.json()) as { error: string; reason?: string };
-    assert.equal(json.error, "reseed_required");
-    assert.equal(json.reason, "checkpoint_missing");
-  });
-
-  test("managed without messageId → 400 invalid_request", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
-    const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(),
-      ledger: makeLedger(),
-      threadLocks: new ThreadLockRegistry(),
-      buildModel: fake.buildModelFn,
-    });
-    const res = await postChat(
-      app,
-      chatBody({
-        conversation_mode: "managed",
         messages: [{ role: "user", content: "hello" }],
       }),
     );
@@ -1718,19 +1071,45 @@ describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", ()
     assert.equal((await res.json() as { error: string }).error, "invalid_request");
   });
 
-  test("managed without a checkpoint store → 503 managed_unavailable (never silent stateless)", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
-    const { app } = await makeApp(t, {
-      ledger: makeLedger(),
-      threadLocks: new ThreadLockRegistry(),
-      buildModel: fake.buildModelFn,
-    });
+  test("managed with a blank session_id → 400 invalid_request", async (t) => {
+    const { app } = await makeApp(t);
     const res = await postChat(
       app,
       chatBody({
         conversation_mode: "managed",
+        session_id: "   ",
         messageId: "msg-1",
-        thread_id: "33333333-2222-3333-4444-555555555555",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    );
+    assert.equal(res.status, 400);
+    assert.equal((await res.json() as { error: string }).error, "invalid_request");
+  });
+
+  test("managed without messageId → 400 invalid_request", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        session_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    );
+    assert.equal(res.status, 400);
+    assert.equal((await res.json() as { error: string }).error, "invalid_request");
+  });
+
+  test("managed without a session store → 503 managed_unavailable (never silent stateless)", async (t) => {
+    const fake = makeFakeBuildModel([[{ content: "reply" }]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        session_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        messageId: "msg-1",
         messages: [{ role: "user", content: "hello" }],
       }),
     );
@@ -1747,19 +1126,15 @@ describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", ()
     );
     assert.equal(res.status, 400);
   });
+});
 
+describe("POST /v1/chat/completions — stateless sync: vision content + tool scoping", () => {
   test("structured image content (vision SSE shape) is accepted on the same endpoint", async (t) => {
     const fake = makeFakeBuildModel([[{ content: "image described" }]]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      threadLocks: new ThreadLockRegistry(),
-      buildModel: fake.buildModelFn,
-    });
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
     const res = await postChat(
       app,
       chatBody({
-        thread_id: "44444444-2222-3333-4444-555555555555",
         messages: [
           {
             role: "user",
@@ -1778,17 +1153,12 @@ describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", ()
 
   test("enabled_plugins limits which tool plugins are bound (absent preserves legacy)", async (t) => {
     const fake = makeFakeBuildModel([[{ content: "ok" }], [{ content: "ok again" }]]);
-    const checkpointStore = fakeCheckpointStore();
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      threadLocks: new ThreadLockRegistry(),
-      buildModel: fake.buildModelFn,
-    });
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
 
     // Absent enabled_plugins: legacy behavior (no 400, request streams).
     const legacy = await postChat(
       app,
-      chatBody({ thread_id: "sel-1", messages: [{ role: "user", content: "hi" }] }),
+      chatBody({ messages: [{ role: "user", content: "hi" }] }),
     );
     assert.equal(legacy.status, 200);
     await legacy.text();
@@ -1797,7 +1167,6 @@ describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", ()
     const selected = await postChat(
       app,
       chatBody({
-        thread_id: "sel-2",
         enabled_plugins: ["vikunja"],
         messages: [{ role: "user", content: "hi" }],
       }),
@@ -1809,7 +1178,6 @@ describe("POST /v1/chat/completions — managed conversation mode (Phase 5)", ()
     const malformed = await postChat(
       app,
       chatBody({
-        thread_id: "sel-3",
         enabled_plugins: "vikunja",
         messages: [{ role: "user", content: "hi" }],
       }),
@@ -2310,7 +1678,6 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
 
   describe("async budget", () => {
     test("503 { error: busy } + Retry-After when the async queue is full", async (t) => {
-      const checkpointStore = fakeCheckpointStore();
       const pins = new CredentialPinStore();
       const ledger = makeLedger();
       const budget = createBudgetManager({
@@ -2319,7 +1686,6 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
       });
       const fake = makeBlockingJobRunner();
       const { app } = await makeApp(t, {
-        checkpointStore,
         pins,
         ledger,
         budget,
@@ -2377,7 +1743,6 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
     });
 
     test("M1 in_flight duplicate releases the budget reservation", async (t) => {
-      const checkpointStore = fakeCheckpointStore();
       const pins = new CredentialPinStore();
       const ledger = makeLedger();
       const budget = createBudgetManager({ maxConcurrentPerUser: 2 });
@@ -2394,7 +1759,6 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
         },
       ]);
       const { app } = await makeApp(t, {
-        checkpointStore,
         pins,
         ledger,
         budget,
@@ -2590,12 +1954,6 @@ describe("Phase 4, Wave B — sync path tool-result cache", () => {
   });
 });
 
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => { resolve = done; });
-  return { promise, resolve };
-}
-
 function toolTurns(): Array<Array<Record<string, unknown>>> {
   return [
     [{ content: "", tool_call_chunks: [{ index: 0, id: "call_1", name: "list_tasks", args: "{}" }] }],
@@ -2604,114 +1962,15 @@ function toolTurns(): Array<Array<Record<string, unknown>>> {
 }
 
 describe("transport integration regressions", () => {
-  test("cancel during a delayed model holds the thread lock and prevents tool dispatch", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
-    const threadLocks = new ThreadLockRegistry();
-    const budget = createBudgetManager();
-    const active = { current: 0, max: 0 };
-    const recorded: BaseMessage[][] = [];
-    let calls = 0;
-    let builds = 0;
-    const { app } = await makeApp(t, {
-      checkpointStore, threadLocks, budget,
-      buildModel: (() => new SlowScriptedChatModel({
-        turns: builds++ === 0 ? toolTurns() : [[{ content: "second" }]],
-        recordedInputs: recorded, delayMs: 100, active,
-      })) as typeof buildModel,
-      toolHandler: { async execute() { calls++; return "[]"; } },
-    });
-    const first = await postChat(app, chatBody({ thread_id: "cancel-model" }));
-    await waitFor(() => active.current === 1);
-    await first.body!.cancel();
-    assert.equal(budget.activeCount("test-user"), 1);
-    assert.equal(threadLocks.mutexes.size, 1);
-    let secondStarted = false;
-    const second = postChat(app, chatBody({ thread_id: "cancel-model" })).then((response) => {
-      secondStarted = true;
-      return response;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(secondStarted, false);
-    await (await second).text();
-    assert.equal(active.max, 1);
-    assert.equal(calls, 0);
-    assert.equal(budget.activeCount("test-user"), 0);
-    assert.equal(threadLocks.mutexes.size, 0);
-    const config = { configurable: { thread_id: checkpointThreadId("test-user", "cancel-model") } };
-    const checkpoint = await checkpointStore.checkpointer.get(config);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    assert.equal((await checkpointStore.checkpointer.get(config))?.id, checkpoint?.id);
-  });
-
-  test("cancel during a delayed tool forwards abort and holds admission until the side effect settles", async (t) => {
-    const gate = deferred();
-    t.after(() => gate.resolve());
-    const checkpointStore = fakeCheckpointStore();
-    const threadLocks = new ThreadLockRegistry();
-    const budget = createBudgetManager();
-    const recorded: BaseMessage[][] = [];
-    let signal: AbortSignal | undefined;
-    let toolActive = false;
-    let writes = 0;
-    let builds = 0;
-    let overlap = false;
-    const { app } = await makeApp(t, {
-      checkpointStore, threadLocks, budget,
-      buildModel: (() => new RecordingChatModel(builds++ === 0 ? toolTurns() : [[{ content: "second" }]], recorded)) as typeof buildModel,
-      toolHandler: {
-        async execute(_pluginId, _toolName, _args, _credentials, abortSignal?: AbortSignal) {
-          signal = abortSignal;
-          toolActive = true;
-          await gate.promise;
-          writes++;
-          toolActive = false;
-          return "[]";
-        },
-      },
-      contextManager: {
-        truncateSeed: (messages) => messages,
-        prepareMessages(messages) { overlap ||= toolActive; return messages; },
-        async maybeCompactAfterStream() {},
-      },
-    });
-    const first = await postChat(app, chatBody({ thread_id: "cancel-tool" }));
-    await waitFor(() => toolActive);
-    await first.body!.cancel();
-    assert.equal(signal?.aborted, true);
-    assert.equal(budget.activeCount("test-user"), 1);
-    let admitted = false;
-    const second = postChat(app, chatBody({ thread_id: "cancel-tool" })).then((response) => {
-      admitted = true;
-      return response;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(admitted, false);
-    assert.equal(writes, 0);
-    gate.resolve();
-    await (await second).text();
-    assert.equal(writes, 1);
-    assert.equal(overlap, false);
-    assert.equal(recorded.length, 2, "cancelled run never dispatches its second model turn");
-    assert.equal(budget.activeCount("test-user"), 0);
-    assert.equal(threadLocks.mutexes.size, 0);
-  });
-
-  test("every model dispatch prepares context and consumes budget; exhaustion has an explicit SSE code", async (t) => {
+  test("every model dispatch consumes budget; exhaustion has an explicit SSE code", async (t) => {
     const budget = createBudgetManager({ maxModelCallsPerWindow: 1 });
     const recorded: BaseMessage[][] = [];
-    let prepared = 0;
     const { app } = await makeApp(t, {
       budget,
       buildModel: (() => new RecordingChatModel(toolTurns(), recorded)) as typeof buildModel,
       toolHandler: { async execute() { return "[]"; } },
-      contextManager: {
-        truncateSeed: (messages) => messages,
-        prepareMessages(messages) { prepared++; return messages; },
-        async maybeCompactAfterStream() {},
-      },
     });
     const frames = parseFrames(await (await postChat(app, chatBody())).text());
-    assert.equal(prepared, 2);
     assert.equal(recorded.length, 1);
     assert.equal(budget.modelCallCount("test-user"), 1);
     const errors = frames.filter((frame) => frame?.error);
@@ -2719,144 +1978,6 @@ describe("transport integration regressions", () => {
     assert.equal((errors[0]!.error as { code: string }).code, "budget_exhausted");
     assert.equal(frames.filter((frame) => frame === null).length, 1);
     assert.equal(budget.activeCount("test-user"), 0);
-  });
-
-  test("context bounds include the supervisor on every resumed and tool round; compaction receives the graph", async (t) => {
-    const threadLocks = new ThreadLockRegistry();
-    const limitTokens = estimateMessagesTokens([new SystemMessage(SUPERVISOR_PROMPT)]) + 100;
-    const context = createContextManager({ limitTokens, threadLocks });
-    const recorded: BaseMessage[][] = [];
-    let compactions = 0;
-    const { app } = await makeApp(t, {
-      checkpointStore: fakeCheckpointStore(), threadLocks,
-      contextManager: {
-        ...context,
-        async maybeCompactAfterStream(args) {
-          assert.ok(args.graph);
-          assert.equal(args.checkpointer, undefined);
-          assert.equal(args.lockHeld, true);
-          compactions++;
-          await context.maybeCompactAfterStream(args);
-        },
-      },
-      buildModel: (() => new RecordingChatModel(toolTurns(), recorded)) as typeof buildModel,
-      toolHandler: { async execute() { return "x".repeat(2000); } },
-    });
-    for (const content of ["first", "second"]) {
-      const response = await postChat(app, chatBody({ thread_id: "context", messages: [{ role: "user", content }] }));
-      const frames = parseFrames(await response.text());
-      assert.equal(frames.some((frame) => frame?.error), false);
-    }
-    assert.equal(recorded.length, 4);
-    assert.equal(compactions, 2);
-    for (const messages of recorded) assert.ok(estimateMessagesTokens(messages) <= limitTokens);
-    assert.ok(recorded[2]!.some((message) => message.content === "second"));
-  });
-
-  test("context exhaustion is explicit before streaming and when the supervisor exceeds the limit", async (t) => {
-    const fake = makeFakeBuildModel([[{ content: "unused" }]]);
-    const { app } = await makeApp(t, {
-      buildModel: fake.buildModelFn,
-      contextManager: createContextManager({ limitTokens: 2 }),
-    });
-    const rejected = await postChat(app, chatBody({ messages: [{ role: "user", content: "too long to fit" }] }));
-    assert.equal(rejected.status, 400);
-    assert.equal((await rejected.json() as { error: string }).error, "context_length_exceeded");
-    const streamed = await postChat(app, chatBody({ messages: [{ role: "user", content: "hi" }] }));
-    const errors = parseFrames(await streamed.text()).filter((frame) => frame?.error);
-    assert.equal((errors[0]!.error as { code: string }).code, "context_length_exceeded");
-    assert.equal(fake.recordedInputs.length, 0);
-  });
-
-  test("background inputFactory re-reads after another writer seeds the thread while awaiting the runner lock", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
-    const threadLocks = new ThreadLockRegistry();
-    const pins = new CredentialPinStore();
-    const ledger = makeLedger();
-    const recorded: BaseMessage[][] = [];
-    const env = await makeEnv(await makeTempDir(t));
-    const runner = new RealJobRunner({
-      ledger, pins, registry: env.registry, checkpointer: checkpointStore.checkpointer,
-      threadLocks, buildModel: () => new RecordingChatModel([], recorded),
-    });
-    t.after(() => runner.dispose());
-    const { app } = await makeApp(t, { checkpointStore, threadLocks, pins, ledger, jobRunner: runner });
-    const threadId = checkpointThreadId("test-user", "seed-race");
-    const unlock = await threadLocks.acquire(threadId);
-    t.after(unlock);
-    const response = postChat(app, chatBody({
-      background: true, messageId: "seed-race", thread_id: "seed-race",
-      messages: [{ role: "user", content: "stale history" }, { role: "assistant", content: "stale reply" }, { role: "user", content: "new turn" }],
-    }));
-    await waitFor(() => ledger.getTaskByIntentKey("test-user", "seed-race")?.status === "running");
-    const seed = await makeApp(t, {
-      checkpointStore,
-      buildModel: makeFakeBuildModel([[{ content: "checkpoint reply" }]]).buildModelFn,
-    });
-    await (await postChat(seed.app, chatBody({ thread_id: "seed-race", messages: [{ role: "user", content: "checkpoint history" }] }))).text();
-    unlock();
-    assert.equal((await response).status, 200);
-    const contents = recorded[0]!.map((message) => message.content);
-    assert.ok(contents.includes("checkpoint history"));
-    assert.ok(contents.includes("new turn"));
-    assert.equal(contents.includes("stale history"), false);
-    assert.equal(contents.includes("stale reply"), false);
-  });
-
-  test("background inputFactory re-reads after a false admission snapshot: a mapping row created by a concurrent writer between admission and inputFactory yields a recreated turn, not a stale seed", async (t) => {
-    // The admission-time snapshot (getThread call 1) and the pre-admission
-    // validation re-read (call 2) both miss; the mapping row materialises only
-    // by the time the deferred inputFactory computes the seed (call 3+),
-    // mimicking a concurrent same-thread writer racing admission.
-    let reads = 0;
-    const checkpointStore: CheckpointStore = {
-      checkpointer: new MemorySaver(),
-      async close() {},
-      touchThread() {},
-      getThread(threadId) {
-        reads++;
-        if (reads < 3) return undefined;
-        return { threadId, publicId: null, owner: "test-user", createdAt: 0, updatedAt: 0, lastError: null };
-      },
-      listThreads: () => [],
-      deleteThread: () => false,
-      deleteThreadsForOwner: () => 0,
-    };
-    const pins = new CredentialPinStore();
-    const ledger = makeLedger();
-    const fake = makeFakeJobRunner([
-      { status: "succeeded", taskId: "task-1", threadId: "thr-1" },
-    ]);
-    const { app } = await makeApp(t, {
-      checkpointStore,
-      pins,
-      ledger,
-      jobRunner: fake as unknown as JobRunner,
-    });
-    // Single user turn: no client history — a "recreated" (known) thread with a
-    // missing checkpoint must force the reseed round-trip (reseed_required)
-    // rather than silently seed.
-    const res = await postChat(app, chatBody({
-      background: true, messageId: "mapping-race", thread_id: "mapping-race",
-      messages: [{ role: "user", content: "hello" }],
-    }));
-    assert.equal(res.status, 200, "admission validation saw no mapping and seeded");
-    const d = fake.calls[0]!;
-    const seedContext = {
-      graph: {} as never,
-      threadId: checkpointThreadId("test-user", "mapping-race"),
-      isReplay: false,
-      signal: new AbortController().signal,
-    };
-    // The stale `false` snapshot must NOT suppress the live re-read: now that
-    // the concurrent writer's mapping row exists, the turn is recreated
-    // (reseed_required), never a fresh seed.
-    await assert.rejects(
-      async () => d.inputFactory!(seedContext),
-      { name: "ReseedRequiredError" },
-      "known thread with no checkpoint and no client history forces reseed_required",
-    );
-    assert.equal(reads, 3, "snapshot + validation + one inputFactory live read");
   });
 
   test("duplicate and rejected admissions release only their exact pins", async (t) => {
@@ -2868,7 +1989,7 @@ describe("transport integration regressions", () => {
       const held = reject ? budget.reserveSync("test-user") : undefined;
       const runner = makeFakeJobRunner([{ status: "in_flight", taskId: "duplicate", threadId: "thread" }]);
       const { app } = await makeApp(t, {
-        pins, budget, checkpointStore: fakeCheckpointStore(), ledger: makeLedger(), jobRunner: runner as unknown as JobRunner,
+        pins, budget, ledger: makeLedger(), jobRunner: runner as unknown as JobRunner,
       });
       const response = await postChat(app, chatBody({ background: true, messageId: "duplicate", credentials: {
         openrouter: { apiKey: "replacement-model" }, vikunja: { apiKey: "replacement-tool" },
@@ -3019,14 +2140,12 @@ describe("POST /v1/chat/completions — agent resolution (Wave 1, Step 4)", () =
   });
 
   test("background (async) path with agent: systemPrompt threads through to the runner", async (t) => {
-    const checkpointStore = fakeCheckpointStore();
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const runner = makeFakeJobRunner([
       { status: "succeeded", taskId: "task-agent", threadId: "thr-agent" },
     ]);
     const { app } = await makeApp(t, {
-      checkpointStore,
       pins,
       ledger,
       jobRunner: runner as unknown as JobRunner,

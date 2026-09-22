@@ -13,6 +13,28 @@ export const TASK_STATUSES = [
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /**
+ * Terminal statuses (D6): tasks in one of these are eligible for the retention
+ * purge once they have sat past the retention window. `queued`/`running`/
+ * `stuck` are NON-terminal and must NEVER be purged.
+ */
+export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = [
+  "succeeded",
+  "failed",
+  "cancelled",
+  "awaiting_review",
+];
+
+/**
+ * Cap for the job label (D4): `spec` is a short, non-sensitive label (notify
+ * title / future job list), never user content. Enforced at the ledger write
+ * boundary so every caller (sync async-admission, the JobRunner, the routes)
+ * is capped in one place.
+ */
+export const SPEC_MAX_LENGTH = 80;
+
+export const DEFAULT_TERMINAL_RETENTION_MS = 86_400_000;
+
+/**
  * Threshold ordering is FIXED and stated here: stuck-timeout must be strictly
  * shorter than lease-expiry so the watchdog never marks a task `stuck` and
  * then deadlocks waiting for the lease to lapse before it can relaunch the
@@ -27,6 +49,9 @@ export const LEDGER_GENESIS_PREFIX = "ledger-genesis:";
 export type LedgerConfig = {
   stuckTimeoutMs?: number;
   leaseExpiryMs?: number;
+  /** How long a terminal task (and its steps/chain) is retained before the
+   *  periodic sweep purges it (D6). Defaults to 24 h. */
+  terminalRetentionMs?: number;
   /** Gateway clock; defaults to Date.now. Injectable for tests. */
   now?: () => number;
   /** Timer factory for `startHeartbeat`. Injectable for tests; defaults to the
@@ -54,6 +79,16 @@ export type TaskRow = {
    *  worker's writes/heartbeats are rejected with `FENCE_CONFLICT`. The empty
    *  string means "no fence held" (pre-v3 rows, or a call with no token). */
   fence_token: string;
+  /**
+   * JSON-encoded snapshot messages (v5) the job runs on. Written by the
+   * JobRunner at admission and read by `resumeStuckJobs` to re-run a stuck
+   * task from the STORED snapshot (the checkpointer is gone). Transient user
+   * content (plan §10): it is purged WITH the task by the step-7 retention
+   * sweep — never exposed on the ledger routes (job-status delivery must not
+   * echo the client's own snapshot). Null for tasks admitted before v5 or
+   * through routes that never store a payload.
+   */
+  payload?: string | null;
 };
 
 export type StepRow = {
@@ -133,31 +168,6 @@ function canonicalStepContent(step: {
   result: string | null;
 }): string {
   return `${step.seq}|${step.stage}|${step.action}|${String(step.result ?? "")}`;
-}
-
-/**
- * Detects a repeated action *sequence* in the given action list. A "loop" is a
- * block of length >= 2 appearing as two identical adjacent blocks. Single
- * adjacent repeats (A,A; A,B,B) are NOT detected because they need at least
- * two full repeats of a length-2-or-more pattern. Returns the repeating block,
- * or null if no loop is present.
- */
-export function findLoop(actions: readonly string[]): readonly string[] | null {
-  const n = actions.length;
-  for (let start = 0; start < n; start++) {
-    const maxLen = Math.floor((n - start) / 2);
-    for (let p = 2; p <= maxLen; p++) {
-      let matches = true;
-      for (let i = 0; i < p; i++) {
-        if (actions[start + i] !== actions[start + p + i]) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) return actions.slice(start, start + p);
-    }
-  }
-  return null;
 }
 
 /** Migration list index 0 == schema version 1. */
@@ -303,6 +313,19 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
         WHERE tool_call_id IS NOT NULL;
     `);
   },
+  // v5 — job snapshot payload (stateless-gateway §7, targeted runner rewrite).
+  // `ledger_task.payload` stores the JSON-encoded snapshot messages a job runs
+  // on. The JobRunner writes it at admission (it is the ONLY durable place a
+  // snapshot can live once the checkpointer is gone) and `resumeStuckJobs`
+  // reads it to re-run a stuck task from the stored snapshot. It is transient
+  // user content (plan §10): purged WITH the task by the step-7 retention
+  // sweep (no separate purge), and never exposed on the ledger routes.
+  // Data-preserving (existing rows get NULL payload).
+  (db) => {
+    db.exec(`
+      ALTER TABLE ledger_task ADD COLUMN payload TEXT;
+    `);
+  },
 ];
 
 export const CURRENT_LEDGER_VERSION = LEDGER_MIGRATIONS.length;
@@ -349,6 +372,11 @@ export interface CreateTaskInput {
   intentKey: string;
   spec: string;
   worker?: string;
+  /** JSON-encoded snapshot messages (v5) the job runs on. The JobRunner writes
+   *  it at admission so `resumeStuckJobs` can re-run from the stored snapshot;
+   *  routes never set it. Transient — purged with the task by the retention
+   *  sweep. */
+  payload?: string | null;
 }
 
 export interface AppendStepInput {
@@ -364,14 +392,18 @@ export class Ledger {
   private readonly db: DatabaseType;
   private readonly stuckTimeoutMs: number;
   private readonly leaseExpiryMs: number;
+  private readonly terminalRetentionMs: number;
   private readonly now: () => number;
   private readonly appendTx: (fn: () => void) => void;
   private readonly setInterval: typeof setInterval;
   private readonly clearInterval: typeof clearInterval;
+  private retentionSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(db: DatabaseType, config: LedgerConfig = {}) {
     const stuckTimeoutMs = config.stuckTimeoutMs ?? DEFAULT_STUCK_TIMEOUT_MS;
     const leaseExpiryMs = config.leaseExpiryMs ?? DEFAULT_LEASE_EXPIRY_MS;
+    const terminalRetentionMs =
+      config.terminalRetentionMs ?? DEFAULT_TERMINAL_RETENTION_MS;
     if (!(stuckTimeoutMs < leaseExpiryMs)) {
       throw new LedgerError(
         "INVALID_CONFIG",
@@ -379,9 +411,16 @@ export class Ledger {
           `must be < leaseExpiryMs (${leaseExpiryMs})`,
       );
     }
+    if (!(terminalRetentionMs > 0)) {
+      throw new LedgerError(
+        "INVALID_CONFIG",
+        `terminalRetentionMs (${terminalRetentionMs}) must be > 0`,
+      );
+    }
     this.db = db;
     this.stuckTimeoutMs = stuckTimeoutMs;
     this.leaseExpiryMs = leaseExpiryMs;
+    this.terminalRetentionMs = terminalRetentionMs;
     this.now = config.now ?? Date.now;
     this.appendTx = db.transaction((fn: () => void) => fn());
     this.setInterval = config.setInterval ?? globalThis.setInterval.bind(globalThis);
@@ -393,20 +432,27 @@ export class Ledger {
     const id = randomUUID();
     const ts = this.now();
     const worker = input.worker ?? null;
+    // D4: cap the job label at the write boundary so no caller can persist
+    // user content as the ledger's `spec`.
+    const spec =
+      input.spec.length > SPEC_MAX_LENGTH
+        ? input.spec.slice(0, SPEC_MAX_LENGTH)
+        : input.spec;
     this.db
       .prepare(
         `INSERT INTO ledger_task
           (id, owner, intent_key, spec, worker, status, created_ts, updated_ts,
-           last_heartbeat_ts)
+           last_heartbeat_ts, payload)
          VALUES (@id, @owner, @intentKey, @spec, @worker, 'queued', @ts, @ts,
-                 @ts)`,
+                 @ts, @payload)`,
       )
       .run({
         id,
         owner: input.owner,
         intentKey: input.intentKey,
-        spec: input.spec,
+        spec,
         worker,
+        payload: input.payload ?? null,
         ts,
       });
     const row = this.getTask(id);
@@ -424,7 +470,7 @@ export class Ledger {
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                 updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token
+                fence_token, payload
          FROM ledger_task WHERE id = ?`,
       )
       .get(id) as TaskRow | undefined;
@@ -444,7 +490,7 @@ export class Ledger {
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                 updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token
+                fence_token, payload
          FROM ledger_task WHERE owner = ? AND intent_key = ?`,
       )
       .get(owner, intentKey) as TaskRow | undefined;
@@ -485,7 +531,7 @@ export class Ledger {
         .prepare(
           `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                   updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                  fence_token
+                  fence_token, payload
            FROM ledger_task WHERE owner = ? ORDER BY created_ts`,
         )
         .all(owner) as TaskRow[];
@@ -494,7 +540,7 @@ export class Ledger {
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                 updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token
+                fence_token, payload
          FROM ledger_task ORDER BY created_ts`,
       )
       .all() as TaskRow[];
@@ -812,6 +858,100 @@ export class Ledger {
   }
 
   /**
+   * D6 retention purge: deletes every terminal task (`succeeded`/`failed`/
+   * `cancelled`/`awaiting_review`) whose last transition (`updated_ts`) is
+   * older than `terminalRetentionMs` before [now], along with its
+   * `ledger_step` and `ledger_chain` rows. NEVER touches `queued`/`running`/
+   * `stuck` tasks, however old. The chain (D5) survives everywhere except on
+   * tasks that are themselves purged.
+   *
+   * The append-only delete triggers would abort the delete, so they are
+   * dropped, the child rows then the task rows deleted, and the triggers
+   * recreated — all inside ONE transaction, so a failure rolls the trigger
+   * recreation back too. Child rows (steps/chain) are deleted before the task
+   * row. Returns the number of purged tasks.
+   */
+  purgeTerminalTasks(now?: number): number {
+    const cutoff = (now ?? this.now()) - this.terminalRetentionMs;
+    const placeholders = TERMINAL_TASK_STATUSES.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM ledger_task
+         WHERE status IN (${placeholders}) AND updated_ts <= ?`,
+      )
+      .all(...TERMINAL_TASK_STATUSES, cutoff) as { id: string }[];
+    if (rows.length === 0) return 0;
+
+    const purge = this.db.transaction((ids: string[]) => {
+      this.db.exec("DROP TRIGGER IF EXISTS ledger_step_append_only_delete");
+      this.db.exec("DROP TRIGGER IF EXISTS ledger_chain_append_only_delete");
+      for (const id of ids) {
+        this.db.prepare("DELETE FROM ledger_chain WHERE task_id = ?").run(id);
+        this.db.prepare("DELETE FROM ledger_step WHERE task_id = ?").run(id);
+        this.db.prepare("DELETE FROM ledger_task WHERE id = ?").run(id);
+      }
+      this.db.exec(`
+        CREATE TRIGGER ledger_step_append_only_delete
+        BEFORE DELETE ON ledger_step
+        BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
+      `);
+      this.db.exec(`
+        CREATE TRIGGER ledger_chain_append_only_delete
+        BEFORE DELETE ON ledger_chain
+        BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
+      `);
+    });
+    purge(rows.map((r) => r.id));
+    return rows.length;
+  }
+
+  /**
+   * Starts the D6 periodic retention sweep: every [intervalMs] it calls
+   * `purgeTerminalTasks()`. Mirrors the JobRunner `sweepPins` timer pattern:
+   * tick errors are forwarded to [onError] and never escape the timer, and the
+   * timer is `unref()`ed (when the underlying handle supports it) so it can
+   * never keep the process alive. Injectable timers (`LedgerConfig.setInterval`/
+   * `clearInterval`) let tests drive ticks explicitly.
+   *
+   * Guards against a double start (`INVALID_CONFIG`). Returns a handle whose
+   * `stop()` clears the timer (idempotent).
+   */
+  startRetentionSweep(
+    intervalMs: number,
+    options: { onError?: (err: unknown) => void } = {},
+  ): { stop(): void } {
+    if (!(intervalMs > 0)) {
+      throw new LedgerError(
+        "INVALID_CONFIG",
+        `retention sweep interval ${intervalMs}ms must be > 0`,
+      );
+    }
+    if (this.retentionSweepTimer !== null) {
+      throw new LedgerError(
+        "INVALID_CONFIG",
+        "retention sweep already started",
+      );
+    }
+    const handle = this.setInterval(() => {
+      try {
+        this.purgeTerminalTasks();
+      } catch (err) {
+        options.onError?.(err);
+      }
+    }, intervalMs);
+    if (typeof handle.unref === "function") handle.unref();
+    this.retentionSweepTimer = handle;
+    return {
+      stop: () => {
+        if (this.retentionSweepTimer === handle) {
+          this.clearInterval(handle);
+          this.retentionSweepTimer = null;
+        }
+      },
+    };
+  }
+
+  /**
    * Resumes a task on behalf of the task owner. Non-owners are rejected.
    * Clears the broken lease, grants it to the resumer and ROTATES the fence
    * token (a resumed task gets a NEW token), so any superseded worker holding
@@ -864,6 +1004,27 @@ export class Ledger {
     this.requireOwnership(task, owner);
     this.requireFence(task, fenceToken);
     this.setStatus(taskId, task.status, to);
+    const row = this.getTask(taskId);
+    if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
+    return row;
+  }
+
+  /**
+   * Backfills a task's snapshot payload (v5). The JobRunner writes the payload
+   * at admission via `createTask`/`getOrCreateTask`; a task admitted by a
+   * caller that predates the column (or the transport's pre-run admission) is
+   * updated here so `resumeStuckJobs` always has the snapshot it needs.
+   * Owner-scoped; a non-owner is rejected. Also bumps `updated_ts` (the
+   * retention sweep only considers terminal tasks, so a running job's payload
+   * backfill never trips the purge).
+   */
+  updateTaskPayload(taskId: string, owner: string, payload: string | null): TaskRow {
+    const task = this.getTask(taskId);
+    if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
+    this.requireOwnership(task, owner);
+    this.db
+      .prepare(`UPDATE ledger_task SET payload = ?, updated_ts = ? WHERE id = ?`)
+      .run(payload, this.now(), taskId);
     const row = this.getTask(taskId);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     return row;

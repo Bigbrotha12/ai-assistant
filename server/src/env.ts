@@ -5,13 +5,15 @@ import { parseTrustedHostEntries } from "./plugins/ssrf.ts";
 config({ quiet: true });
 
 /**
- * Development-only encryption key for the checkpoint store. Conversations must
- * survive gateway restarts in dev too, so this default is a STABLE literal
- * (never randomly re-derived — a fresh random key per boot would make every
- * previously-written checkpoint DB unreadable). It is a loud anti-pattern
- * named as such; production is fail-fast instead (see the superRefine below).
+ * Development-only encryption key for the notify store (ntfy credentials at
+ * rest). Encrypted records must survive gateway restarts in dev too, so this
+ * default is a STABLE literal (never randomly re-derived — a fresh random key
+ * per boot would make every previously-written store unreadable). It is a loud
+ * anti-pattern named as such; production is fail-fast instead (see the
+ * superRefine below). The literal value is unchanged from the old
+ * `CHECKPOINT_DB_KEY` dev default so existing dev stores stay decryptable.
  */
-const CHECKPOINT_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
+const NOTIFY_STORE_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
 
 export const envSchema = z.object({
   BETTER_AUTH_SECRET: z
@@ -57,40 +59,34 @@ export const envSchema = z.object({
   // Per-call timeout (ms) for MCP server JSON-RPC (initialize/tools/list/
   // tools/call). A hung MCP server must not block the request forever.
   MCP_CALL_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
-  // Max accepted request body for `POST /v1/chat/completions` (bytes). Bounds
+  // Max accepted request body for `POST /v1/chat/completions` (bytes) on the
+  // NON-establish paths (stateless, threaded, and session DELTA turns). Bounds
   // the body buffered before validation so an oversized POST cannot stall the
   // event loop or inflate memory for all users. Large enough for inline
   // base64 vision images.
   MAX_REQUEST_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(10_000_000),
+  // Max accepted request body for a SESSION ESTABLISH (§5/R6): full history +
+  // base64 images ride the establish body, so it gets a higher ceiling than the
+  // delta/stateless paths. The route-level `bodyLimit` is raised to this value;
+  // non-establish requests are still bounded by MAX_REQUEST_BODY_BYTES,
+  // enforced post-read with the same 413 `request_too_large` shape (the
+  // establish/delta distinction is only visible from the parsed body).
+  MAX_ESTABLISH_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(25_000_000),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),
-  CHECKPOINT_DB_PATH: z.string().default("./data/checkpoints.db"),
-  // Encrypted-at-rest key for the checkpoint store. Required in production
-  // (fail-fast below); development falls back to a stable DEV-ONLY default and
-  // warns loudly. The transform guarantees a non-undefined value by export.
-  CHECKPOINT_DB_KEY: z
-    .string()
-    .optional()
-    .superRefine((value, ctx) => {
-      if (process.env.NODE_ENV === "production" && !value) {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "CHECKPOINT_DB_KEY is required when NODE_ENV=production; " +
-            "the checkpoint DB is encrypted at rest and refuses a plaintext default",
-        });
-      }
-    })
-    .transform((value) => {
-      if (value) return value;
-      console.warn(
-        "Gateway: CHECKPOINT_DB_KEY is unset; using a DEVELOPMENT-ONLY default " +
-          "key for the checkpoint store. Set CHECKPOINT_DB_KEY to a real secret " +
-          "(e.g. `openssl rand -hex 32`) before production.",
-      );
-      return CHECKPOINT_DEV_DEFAULT_KEY;
-    }),
+  // D6: how long a terminal task (and its steps/chain) is retained before the
+  // periodic sweep purges it, and how often that sweep runs.
+  LEDGER_RETENTION_MS: z.coerce.number().int().positive().default(86_400_000),
+  LEDGER_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
+  // Encryption key for the notify store (`notify/store.ts` — ntfy topic +
+  // access token at rest, AES-256-GCM via sha256(key)). Required in
+  // production (fail-fast below); development falls back to a stable DEV-ONLY
+  // default and warns loudly.
+  NOTIFY_STORE_KEY: z.string().optional(),
+  /** @deprecated Legacy alias for NOTIFY_STORE_KEY — same value, kept so
+   * existing deployments' env + already-encrypted stores keep working. */
+  CHECKPOINT_DB_KEY: z.string().optional(),
   // SMTP settings for the password-reset email (better-auth
   // `sendResetPassword`). Empty SMTP_HOST (the default) disables sending and
   // logs the reset link instead — a development fallback so the forgot-password
@@ -164,6 +160,19 @@ export const envSchema = z.object({
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),
+}).superRefine((data, ctx) => {
+  // Production needs SOME key for the notify store (either name) — fail fast
+  // at load. Dev/test fall back to the warned dev default during resolution.
+  if (data.NODE_ENV === "production" && !data.NOTIFY_STORE_KEY && !data.CHECKPOINT_DB_KEY) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["NOTIFY_STORE_KEY"],
+      message:
+        "NOTIFY_STORE_KEY (or its legacy alias CHECKPOINT_DB_KEY) is required " +
+        "when NODE_ENV=production; the notify store is encrypted at rest and " +
+        "refuses a plaintext default",
+    });
+  }
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -175,7 +184,26 @@ if (!parsed.success) {
   process.exit(1);
 }
 
-export const env = parsed.data;
+// Resolve the notify-store key: preferred name, then the legacy alias (same
+// value — sha256 derivation keeps already-encrypted stores readable), then
+// the stable dev default with a loud warning.
+let notifyStoreKey = parsed.data.NOTIFY_STORE_KEY ?? parsed.data.CHECKPOINT_DB_KEY;
+if (parsed.data.CHECKPOINT_DB_KEY && !parsed.data.NOTIFY_STORE_KEY) {
+  console.warn(
+    "Gateway: CHECKPOINT_DB_KEY is deprecated — rename it to NOTIFY_STORE_KEY " +
+      "(keep the same value so encrypted notify stores stay readable).",
+  );
+}
+if (!notifyStoreKey) {
+  console.warn(
+    "Gateway: NOTIFY_STORE_KEY is unset; using a DEVELOPMENT-ONLY default key " +
+      "for the notify store. Set NOTIFY_STORE_KEY to a real secret (e.g. " +
+      "`openssl rand -hex 32`) before production.",
+  );
+  notifyStoreKey = NOTIFY_STORE_DEV_DEFAULT_KEY;
+}
+
+export const env = { ...parsed.data, NOTIFY_STORE_KEY: notifyStoreKey };
 
 // PLUGINS_TRUSTED_HOSTS entries are used verbatim as SSRF trusted-host
 // patterns; a malformed entry (a scheme, port, path, whitespace, bare `*` or

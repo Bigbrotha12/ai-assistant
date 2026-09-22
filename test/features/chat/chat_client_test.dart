@@ -613,7 +613,7 @@ void main() {
   });
 
   group('GatewayChatClient agent field', () {
-    GatewayChatClient _gatewayClient(
+    GatewayChatClient gatewayClient(
       _ScriptedAdapter adapter, {
       String? agent,
     }) {
@@ -644,7 +644,7 @@ void main() {
           ],
         }),
       ]);
-      final client = _gatewayClient(adapter, agent: 'my-agent');
+      final client = gatewayClient(adapter, agent: 'my-agent');
 
       await client.completions(messages: [ApiMessage(role: 'user', content: 'Hi')]);
 
@@ -661,7 +661,7 @@ void main() {
           frame(chunk(finishReason: 'stop')),
         ]),
       ]);
-      final client = _gatewayClient(adapter, agent: null);
+      final client = gatewayClient(adapter, agent: null);
 
       await client.streamCompletions(messages: [ApiMessage(role: 'user', content: 'Hi')]);
 

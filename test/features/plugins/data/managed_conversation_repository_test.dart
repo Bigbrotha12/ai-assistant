@@ -38,7 +38,7 @@ void main() {
     await repo.access(scope, repo.epoch(scope), () {}, (store) async {
       await store.saveConversation(conversation);
     });
-    if (thread.isNotEmpty) await repo.mapThread(id, thread);
+    if (thread.isNotEmpty) await repo.mapSession(id, thread);
     return conversation;
   }
 

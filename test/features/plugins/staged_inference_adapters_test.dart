@@ -53,7 +53,7 @@ class _Wire implements HttpClientAdapter {
           status == 200 ? 'text/event-stream' : 'application/json',
         ],
         if (body['conversation_mode'] == 'managed') ...{
-          'x-thread-id': [body['thread_id'] as String],
+          'x-session-id': [body['session_id'] as String],
           'x-conversation-state': ['seeded'],
         },
       },
@@ -246,7 +246,7 @@ void main() {
   });
 
   test(
-    'voice then managed chat preserves conversation and thread history',
+    'voice then managed chat preserves conversation and session history',
     () async {
       final voice = await adapters.sendVoiceTurn(
         'conversation',
@@ -277,14 +277,18 @@ void main() {
         history: history,
         userText: 'Typed',
       );
-      expect(text.threadId, voice.threadId);
+      expect(text.sessionId, voice.sessionId);
       final bodies = wire.requests.map((r) => r.data as Map).toList();
       expect(bodies[0]['messageId'], isNot(bodies[1]['messageId']));
-      expect((bodies[1]['messages'] as List).map((m) => m['content']), [
+      // Voice established the session with the full history; the chat turn on
+      // the mapped session is a single-message delta.
+      expect((bodies[0]['messages'] as List).map((m) => m['content']), [
         'Spoken',
-        'A picture',
+      ]);
+      expect((bodies[1]['messages'] as List).map((m) => m['content']), [
         'Typed',
       ]);
+      expect(bodies[1]['session_id'], bodies[0]['session_id']);
       expect(bodies.every((b) => !b.containsKey('tools')), isTrue);
       expect(await repo.pending(scope, 'conversation'), isNull);
     },
