@@ -1,9 +1,10 @@
 # AI Assistant Gateway (`server/`)
 
-Thin, text-only gateway for the AI Assistant Flutter app. It owns **authentication**
-(better-auth at `/api/auth/*`) and **text inference** (an OpenAI-compatible proxy at
-`/v1/*` that authenticates and forwards to the engine configured via `INFERENCE_URL`).
-The gateway never sees audio.
+LangChain gateway for the AI Assistant Flutter app. It owns **authentication**
+(better-auth at `/api/auth/*`) and **inference orchestration**: an OpenAI-compatible
+`/v1/*` surface backed by a LangGraph agent graph (plugin model + tool execution,
+budget, idempotency). It resolves model/tool plugins from the request body and calls
+provider APIs itself — there is no upstream proxy. The gateway never sees audio.
 
 - Runtime: Node 20+ (Hono + TypeScript, executed with `tsx`)
 - Auth: better-auth (`emailAndPassword`), `apiKey` plugin from `@better-auth/api-key`,
@@ -20,7 +21,7 @@ The primary dev workflow is a single command from the repo root:
 ```
 
 It creates `server/.env` (generating `BETTER_AUTH_SECRET` and defaulting
-`BETTER_AUTH_URL`/`INFERENCE_URL` for a local stack), installs dependencies,
+`BETTER_AUTH_URL` for a local stack), installs dependencies,
 runs the migrations, starts the gateway in the background, and tears the whole
 stack down on exit. See the root [README](../README.md).
 
@@ -55,7 +56,6 @@ the ledger needs migrating.
 | ------------------- | -------- | ---------------------- | ------------------------------------------------------------------------------ |
 | `BETTER_AUTH_SECRET`| yes      | —                      | HMAC/verification secret, **≥ 32 chars**. `openssl rand -base64 32`.           |
 | `BETTER_AUTH_URL`   | yes      | —                      | Public base URL of the gateway, e.g. `http://localhost:17600`.                   |
-| `INFERENCE_URL`     | yes      | `http://localhost:9090` | Base URL of the OpenAI-compatible engine (llama.cpp proxy; 9090 = Qwen3-14B, see `~/Documents/homelab/podman/queues`). Must NOT equal this gateway's port. Edit in `server/.env` to override. |
 | `PORT`              | no       | `17600`                | Gateway port (the Flutter app derives this as its backend base).                |
 | `DB_PATH`           | no       | `./data/gateway.db`    | SQLite file for better-auth (dev only).                          |
 | `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
@@ -117,7 +117,7 @@ not the session token):
 | Endpoint                  | Purpose                                                              |
 | ------------------------- | -------------------------------------------------------------------- |
 | `GET  /v1/auth/check`     | API-key validity check (no upstream call). `200 {"status":"ok"}` with a valid key, else `401 {"error":"unauthorized"}`. |
-| `POST /v1/chat/completions` | Forwarded to `${INFERENCE_URL}/v1/chat/completions`. SSE passthrough. |
+| `POST /v1/chat/completions` | LangGraph agent run streamed as OpenAI-compatible SSE (see `docs/wire-spec.md`). |
 | `GET  /v1/models`         | Lists installed MODEL plugins (id + capability flags incl. `visionCapable`); never leaks provider endpoints. |
 
 Invalid or missing key → `401 {"error":"unauthorized"}`. Upstream unreachable →
@@ -129,11 +129,10 @@ are set (this is a desktop/mobile client, not a browser).
 
 ### Streaming (SSE)
 
-`POST /v1/chat/completions` forwards the original JSON body verbatim (so
-`"stream": true` reaches the engine) and returns the **raw upstream response**
-`ReadableStream`, status, and `content-type` (`text/event-stream`) without
-buffering. The Flutter client consumes the SSE events (`data: {…}` lines, `[DONE]`
-terminator) directly; nothing is re-encoded or accumulated.
+`POST /v1/chat/completions` runs the LangGraph agent graph and translates its
+events into OpenAI-compatible SSE frames (`server/src/transport/openai.ts`),
+emitting a single terminal `data: [DONE]`. The byte-level contract lives in
+`docs/wire-spec.md`; the Flutter client parses those frames directly.
 
 ## Typical app flow
 
@@ -146,9 +145,12 @@ terminator) directly; nothing is re-encoded or accumulated.
 
 ## Task ledger (`/ledger/*`)
 
-The gateway owns a durable, gateway-side task ledger (M1 of
-`docs/production-grade-improvement-plan.md` §3.3). It records worker steps,
-heartbeats/lease, a write-once hash chain, and owner binding.
+The gateway owns a gateway-side task ledger (M1 of
+`docs/archive/production-grade-improvement-plan.md` §3.3). It records worker steps,
+heartbeats/lease, a write-once hash chain, and owner binding. Since the stateless
+cutover it is a **transient journal**: terminal tasks (and their steps/chain rows)
+are swept after the retention window (`LEDGER_TERMINAL_RETENTION_MS`, default 24h);
+it is not a durable audit log.
 
 **Dedicated DB (decision).** The ledger lives in its own SQLite file
 (`LEDGER_DB_PATH`, default `./data/ledger.db`), *separate* from the better-auth
@@ -197,13 +199,13 @@ user id):
 
 **Tests.** `npm test` runs the suite with Node's built-in runner via `tsx`
 (`tsx --test test/**/*.test.ts`). It covers lifecycle transitions,
-stuck<lease ordering, sequence-aware loop detection (`findLoop`), hash-chain
+stuck<lease ordering, hash-chain
 verification + tamper detection, owner binding, and migration (fresh + upgrade
 + idempotency). `npm run typecheck` covers `src/` and `test/`.
 
 ## Plugin store (`/v1/plugins`, Phase 1)
 
-Phase 1 of the backend LangChain plan (`docs/backend-langchain-plan.md`)
+Phase 1 of the backend LangChain plan (`docs/archive/backend-langchain-plan.md`)
 introduces a plugin system foundation under `server/src/plugins/`:
 
 - `types.ts` — zod-validated `PluginDefinition` (tool + model) + store schema.
@@ -228,8 +230,7 @@ introduces a plugin system foundation under `server/src/plugins/`:
 
 ## Managed conversations (`/v1/sessions`, stateless gateway)
 
-Conversations run through the stateless-gateway path (plan `docs/stateless-
-gateway-plan.md`). The client owns the conversation history and sends it on
+Conversations run through the stateless-gateway path (plan `docs/archive/stateless-gateway-plan.md`). The client owns the conversation history and sends it on
 `POST /v1/chat/completions` with `conversation_mode: "managed"` + a
 client-generated `session_id`; the gateway holds only an in-memory, evictable
 mirror (`src/sessions/store.ts`, no encryption, no durability, no disk) used

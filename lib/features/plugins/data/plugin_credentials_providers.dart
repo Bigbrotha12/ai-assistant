@@ -86,10 +86,6 @@ final selectedModelProvider = Provider<String?>((ref) {
   return ref.watch(pluginCredentialsProvider).value?.selectedModel;
 });
 
-final selectedAgentProvider = Provider<String?>((ref) {
-  return ref.watch(pluginCredentialsProvider).value?.selectedAgent;
-});
-
 final scopedPluginCredentialsProvider =
     Provider.autoDispose<ScopedPluginCredentials>((ref) {
       final scope = ref.watch(pluginAccountScopeProvider);

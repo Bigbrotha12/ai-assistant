@@ -519,24 +519,6 @@ void main() {
     expect(await repo.pending(scope, 'c1'), isNull);
   });
 
-  test('reconcileFromServer surfaces reseed_required explicitly', () async {
-    await service.sendTurn('c1', history: const [], userText: 'hi');
-    client.loadSessionError = const PluginClientException(
-      'reseed_required',
-      statusCode: 409,
-    );
-    await expectLater(
-      service.reconcileFromServer('c1'),
-      throwsA(
-        isA<PluginClientException>().having(
-          (e) => e.code,
-          'code',
-          'reseed_required',
-        ),
-      ),
-    );
-  });
-
   test('reconcileFromServer on session_missing returns local history and '
       'clears the marker without dropping the mapping', () async {
     await service.sendTurn('c1', history: const [], userText: 'hi');
@@ -1319,72 +1301,6 @@ void main() {
     expect(replay['session_id'], firstBody['session_id']);
     expect(replay['messageId'], firstBody['messageId']);
     expect(replay['messageId'], before!.messageId);
-  });
-
-  test('deleted-thread reseed clears the stale mapping + pending and the next '
-      'send mints a fresh session retaining local history', () async {
-    final first = await service.sendTurn(
-      'c1',
-      history: const [],
-      userText: 'hi',
-    );
-    final deadSession = first.sessionId;
-    var calls = 0;
-    respondWith = (request) {
-      calls++;
-      if (calls == 1) {
-        throw const PluginClientException('reseed_required', statusCode: 409);
-      }
-      return Future.value(
-        ManagedTurnResult(
-          sessionId: request.conversationPublicId!,
-          state: calls == 1 ? 'seeded' : 'resumed',
-          result: const ChatResult(
-            content: 'ok',
-            toolCalls: [],
-            finishReason: 'stop',
-          ),
-        ),
-      );
-    };
-    await expectLater(
-      service.sendTurn(
-        'c1',
-        history: const [
-          Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-          Message(
-            id: 'm2',
-            role: MessageRole.assistant,
-            content: 'ok',
-          ),
-        ],
-        userText: 'second',
-      ),
-      throwsA(
-        isA<ManagedTurnError>().having((e) => e.code, 'code', 'reseed_required'),
-      ),
-    );
-
-    // Stale mapping + pending dropped; local history retained.
-    expect(await repo.mappedSession('c1'), isNull);
-    expect(await repo.pending(scope, 'c1'), isNull);
-    final retained = await repo.access(
-      scope,
-      repo.epoch(scope),
-      () {},
-      (store) => store.loadConversation('c1'),
-    );
-    expect(retained!.messages, hasLength(3));
-    expect(retained.messages.last.content, 'second');
-
-    // The next send seeds a brand-new session (full history).
-    final reseeded = await service.sendTurn(
-      'c1',
-      history: retained.messages,
-      userText: 'third',
-    );
-    expect(reseeded.sessionId, isNot(deadSession));
-    expect(await repo.mappedSession('c1'), reseeded.sessionId);
   });
 
   test('submitBackground persists a background pending envelope, watches the '

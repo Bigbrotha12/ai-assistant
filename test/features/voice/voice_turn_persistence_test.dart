@@ -160,6 +160,7 @@ _ManagedHarness _managedContainer({
     authStore: auth,
     pluginStore: plugins,
     loadModels: ({required gatewayKey, cancelToken}) async => [_model('text')],
+    loadAgents: ({required gatewayKey, cancelToken}) async => const [],
     lifecycle: lifecycle,
   );
   final store = DriftChatStore(db, scopeKey: scope.storageId);

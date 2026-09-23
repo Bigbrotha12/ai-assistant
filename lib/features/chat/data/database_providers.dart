@@ -22,7 +22,7 @@ final databaseProvider = Provider<AppDatabase>((ref) {
 const String pendingScopeKey = '__pending__';
 
 /// Deletes the conversations written by the old unscoped UI path
-/// (`scope_key IS NULL`). Plan decision (docs/managed-ui-wiring-plan.md, P0 /
+/// (`scope_key IS NULL`). Plan decision (docs/archive/managed-ui-wiring-plan.md, P0 /
 /// §5 decision 7): **delete, don't backfill — null-scope legacy rows** are
 /// test data only. Messages go with them via the conversations FK
 /// (`ON DELETE CASCADE`, enforced by `PRAGMA foreign_keys = ON` in

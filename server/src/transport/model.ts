@@ -134,7 +134,7 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
 
   // The client may select a base-URL instance from the plugin's allowlisted
   // `baseUrls` via the non-secret `baseUrlEntry` routing credential (the
-  // per-plugin `{ apiKey, baseUrlEntry }` contract, docs/backend-langchain-plan.md
+  // per-plugin `{ apiKey, baseUrlEntry }` contract, docs/archive/backend-langchain-plan.md
   // §329-335). Resolve the id against the plugin's OWN allowlist; an
   // unknown/blank id — e.g. a stale client selection after the admin rotated
   // the plugin — FALLS BACK to `plugin.inference.endpoint` rather than

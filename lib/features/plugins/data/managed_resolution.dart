@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 import '../../../core/backend_probe.dart';
 import '../../auth/data/auth_credentials_store.dart';
 import '../../chat/data/context_trimmer.dart';
+import 'agent_config.dart';
 import 'langchain_client.dart';
 import 'ledger_client.dart';
 import 'managed_conversation_repository.dart';
@@ -16,11 +17,13 @@ import 'staged_inference_adapters.dart';
 
 /// Freshly-resolved selection for ONE managed send: the model id and enabled
 /// tool plugins frozen at dispatch start, plus the credentials resolved at
-/// that instant.
+/// that instant and the agent reference to send on the wire (`null` = default
+/// supervisor prompt).
 typedef ManagedSelection = ({
   String modelId,
   List<String> enabledPlugins,
   ManagedCredentials credentials,
+  Object? agent,
 });
 
 /// Resolves the model/plugin/credential selection for one managed send —
@@ -54,6 +57,11 @@ Future<ManagedSelection> resolveManagedSelection({
     CancelToken? cancelToken,
   })
   loadModels,
+  required Future<List<AgentDto>> Function({
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  })
+  loadAgents,
   CancelToken? cancelToken,
   bool vision = false,
   void Function()? check,
@@ -115,6 +123,7 @@ Future<ManagedSelection> resolveManagedSelection({
           gatewayKey: auth.apiKey,
           provider: {model.id: fields},
         ),
+        agent: null,
       );
     }
     throw const StagedInferenceUnavailable(
@@ -123,8 +132,44 @@ Future<ManagedSelection> resolveManagedSelection({
     );
   }
 
+  // Agent resolution (catalog plan C.2): a selected agent may pin the model
+  // (`modelRef`) and scope tool plugins. Its model + grant-tool credentials
+  // must ride the request body or the gateway fail-closes with
+  // `invalid_credentials`. Templates are sent as their string id and resolved
+  // against the gateway catalog (fresh fetch, like [loadModels]); custom agents
+  // carry their full spec object. A stale selection (template deleted
+  // server-side, or no persisted AgentConfig) degrades to no agent — the
+  // gateway then runs the default supervisor prompt.
+  Object? agentWire;
+  String? agentModelRef;
+  final agentToolPlugins = <String>[];
+  final selectedAgentId = config.selectedAgent;
+  if (selectedAgentId != null && selectedAgentId.isNotEmpty) {
+    final agentConfig = config.plugins[selectedAgentId]?.agent;
+    if (agentConfig != null) {
+      if (agentConfig.kind == AgentKind.custom) {
+        agentWire = agentConfig.toWireObject();
+        agentModelRef = agentConfig.modelRef;
+        agentToolPlugins.addAll(agentConfig.tools.map((t) => t.pluginId));
+      } else {
+        final agents = await loadAgents(
+          gatewayKey: auth.apiKey,
+          cancelToken: cancelToken,
+        );
+        check?.call();
+        final template = agents.where((a) => a.id == selectedAgentId).firstOrNull;
+        if (template != null) {
+          agentWire = selectedAgentId;
+          agentModelRef = template.defaultModel;
+          agentToolPlugins.addAll(template.toolGrants.map((g) => g.pluginId));
+        }
+      }
+    }
+  }
+
+  final requestedModel = agentModelRef ?? config.selectedModel;
   final model = models
-      .where((m) => m.id == config.selectedModel && m.supportsStreaming)
+      .where((m) => m.id == requestedModel && m.supportsStreaming)
       .firstOrNull;
   if (model == null) {
     throw const StagedInferenceUnavailable(
@@ -146,16 +191,27 @@ Future<ManagedSelection> resolveManagedSelection({
       .map((entry) => entry.key)
       .toList()
     ..sort();
+  final provider = <String, Map<String, String>>{
+    model.id: fields,
+    for (final id in enabled) id: config.plugins[id]!.credentials,
+  };
+  // Agent model + grant-tool credentials ride along when stored (best-effort:
+  // the gateway re-validates required grants against each tool manifest and
+  // fail-closes with `invalid_credentials` if a required key is absent).
+  for (final id in [?agentModelRef, ...agentToolPlugins]) {
+    final stored = config.plugins[id]?.credentials;
+    if (stored != null && stored.isNotEmpty && !provider.containsKey(id)) {
+      provider[id] = stored;
+    }
+  }
   return (
     modelId: model.id,
     enabledPlugins: enabled,
     credentials: ManagedCredentials(
       gatewayKey: auth.apiKey,
-      provider: {
-        model.id: fields,
-        for (final id in enabled) id: config.plugins[id]!.credentials,
-      },
+      provider: provider,
     ),
+    agent: agentWire,
   );
 }
 
@@ -182,6 +238,7 @@ ManagedConversationService buildManagedService({
   scope: scope,
   modelPluginId: selection.modelId,
   enabledPlugins: selection.enabledPlugins,
+  agent: selection.agent,
   trimmer: trimmer,
   poller: poller,
   credentials: () async {
@@ -189,9 +246,44 @@ ManagedConversationService buildManagedService({
     if (stableSelection &&
         (fresh.modelId != selection.modelId ||
             jsonEncode(fresh.enabledPlugins) !=
-                jsonEncode(selection.enabledPlugins))) {
+                jsonEncode(selection.enabledPlugins) ||
+            jsonEncode(fresh.agent) != jsonEncode(selection.agent))) {
       throw const PluginClientException('configuration_changed');
     }
     return fresh.credentials;
   },
 );
+
+/// Resolves the selected agent (if any) into its wire value and the plugin ids
+/// whose credentials must ride the request:
+/// - template agent → its string id (gateway resolves the full template) plus
+///   the template's `defaultModel` (a `modelRef`) and `toolGrants`;
+/// - custom agent → its full spec object plus its own `modelRef`/tool grants.
+///
+/// Returns null when no agent is selected, the persisted [AgentConfig] is
+/// missing, or a template reference no longer exists in the gateway catalog —
+/// callers then send no `agent` and the gateway runs the default supervisor
+/// prompt.
+({Object? wire, String? modelRef, List<String> toolPlugins})? resolveAgentForSend({
+  required String? selectedAgentId,
+  required PluginAccountConfiguration config,
+  required List<AgentDto> agents,
+}) {
+  if (selectedAgentId == null || selectedAgentId.isEmpty) return null;
+  final agentConfig = config.plugins[selectedAgentId]?.agent;
+  if (agentConfig == null) return null;
+  if (agentConfig.kind == AgentKind.custom) {
+    return (
+      wire: agentConfig.toWireObject(),
+      modelRef: agentConfig.modelRef,
+      toolPlugins: agentConfig.tools.map((t) => t.pluginId).toList(),
+    );
+  }
+  final template = agents.where((a) => a.id == selectedAgentId).firstOrNull;
+  if (template == null) return null;
+  return (
+    wire: selectedAgentId,
+    modelRef: template.defaultModel,
+    toolPlugins: template.toolGrants.map((g) => g.pluginId).toList(),
+  );
+}

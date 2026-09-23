@@ -115,6 +115,7 @@ class ManagedConversationService {
     required this.credentials,
     this.modelPluginId = 'openrouter',
     this.enabledPlugins = const [],
+    this.agent,
     this.trimmer = const ContextTrimmer(),
     this._poller,
     this._dio,
@@ -127,6 +128,11 @@ class ManagedConversationService {
   final String modelPluginId;
   final List<String> enabledPlugins;
   final ContextTrimmer trimmer;
+
+  /// Agent reference frozen at send construction (plan §3): a template id
+  /// string or a custom spec object, sent as `body.agent` on every dispatch and
+  /// persisted in the retry envelope so a retry replays the identical agent.
+  final Object? agent;
 
   /// Injectable poller for background-job watches. When null, one is built
   /// lazily from [LedgerClient] over [_dio] (defaults to a fresh [Dio]) with a
@@ -254,6 +260,7 @@ class ManagedConversationService {
       history: localHistory,
       modelPluginId: modelPluginId,
       enabledPlugins: enabledPlugins,
+      agent: agent,
       delta: prepared.delta,
       onContent: onContent,
     );
@@ -299,6 +306,7 @@ class ManagedConversationService {
         history: _historyFromApi(resumed.messages),
         modelPluginId: resumed.modelPluginId,
         enabledPlugins: resumed.enabledPlugins,
+        agent: resumed.agent,
       );
       return ManagedBackgroundResubmitted(handle, userMessageId);
     }
@@ -312,6 +320,7 @@ class ManagedConversationService {
       history: _historyFromApi(resumed.messages),
       modelPluginId: resumed.modelPluginId,
       enabledPlugins: resumed.enabledPlugins,
+      agent: resumed.agent,
       delta: resumed.delta,
       onContent: onContent,
     );
@@ -409,6 +418,7 @@ class ManagedConversationService {
       history: localHistory,
       modelPluginId: modelPluginId,
       enabledPlugins: enabledPlugins,
+      agent: agent,
     );
   }
 
@@ -457,6 +467,7 @@ class ManagedConversationService {
     required List<Message> history,
     required String modelPluginId,
     required List<String> enabledPlugins,
+    Object? agent,
     bool reestablishAttempted = false,
     bool delta = false,
     bool tooLargeRetried = false,
@@ -483,6 +494,7 @@ class ManagedConversationService {
       turnId: messageId,
       managed: true,
       enabledPlugins: enabledPlugins,
+      agent: agent,
     );
     final token = repo.registerDispatch(scope, conversationId);
     try {
@@ -523,6 +535,7 @@ class ManagedConversationService {
             userMessageId: userMessageId,
             modelPluginId: modelPluginId,
             enabledPlugins: enabledPlugins,
+            agent: agent,
             onContent: onContent,
           );
         }
@@ -567,6 +580,7 @@ class ManagedConversationService {
           userMessageId: userMessageId,
           modelPluginId: modelPluginId,
           enabledPlugins: enabledPlugins,
+          agent: agent,
           onContent: onContent,
         );
       }
@@ -588,19 +602,13 @@ class ManagedConversationService {
             history: history,
             modelPluginId: modelPluginId,
             enabledPlugins: enabledPlugins,
+            agent: agent,
             reestablishAttempted: reestablishAttempted,
             delta: delta,
             tooLargeRetried: true,
             onContent: onContent,
           );
         }
-      }
-      if (error.code == ManagedErrorCodes.reseedRequired) {
-        await _dropStaleThread(
-          conversationId,
-          threadId: sessionId,
-          messageId: messageId,
-        );
       }
       throw ManagedTurnError(
         error.code,
@@ -667,6 +675,7 @@ class ManagedConversationService {
     required List<Message> history,
     required String modelPluginId,
     required List<String> enabledPlugins,
+    Object? agent,
   }) async {
     _checkEpoch(epoch);
     final resolved = await credentials();
@@ -682,6 +691,7 @@ class ManagedConversationService {
       turnId: messageId,
       background: true,
       enabledPlugins: enabledPlugins,
+      agent: agent,
     );
     final token = repo.register(scope);
     try {
@@ -902,6 +912,7 @@ class ManagedConversationService {
     required String userMessageId,
     required String modelPluginId,
     required List<String> enabledPlugins,
+    Object? agent,
     void Function(String delta)? onContent,
   }) async {
     _checkEpoch(epoch);
@@ -945,6 +956,7 @@ class ManagedConversationService {
       history: trimmed,
       modelPluginId: modelPluginId,
       enabledPlugins: enabledPlugins,
+      agent: agent,
       reestablishAttempted: true,
       onContent: onContent,
     );
@@ -1223,9 +1235,7 @@ class ManagedConversationService {
   /// mapped session id. No inference happens here. A reconciliation marker is
   /// persisted before the fetch so a failure leaves an explicit, retryable
   /// state, and the marker is cleared only after the history is committed. A
-  /// `409 reseed_required` (mapped thread deleted server-side) clears the stale
-  /// mapping and marker so the next send mints a fresh thread while local
-  /// history is retained. A `409 session_missing` means there is nothing on the
+  /// `409 session_missing` means there is nothing on the
   /// server to reconcile — the client store is authoritative — so the local
   /// messages are returned and the reconcile marker cleared WITHOUT dropping
   /// the session mapping.
@@ -1268,14 +1278,6 @@ class ManagedConversationService {
         );
         _checkEpoch(epoch);
       } on PluginClientException catch (error) {
-        if (error.code == ManagedErrorCodes.reseedRequired) {
-          await _dropStaleThread(
-            conversationId,
-            threadId: sessionId,
-            messageId: messageId,
-          );
-          rethrow;
-        }
         if (error.code == ManagedErrorCodes.sessionMissing) {
           await repo.clearPending(scope, conversationId, messageId: messageId);
           _checkEpoch(epoch);
@@ -1327,20 +1329,6 @@ class ManagedConversationService {
     await repo.clearScope(scope);
   }
 
-  /// Drops the stale mapping + this turn's pending marker after a server-side
-  /// thread deletion. The mapping is only cleared if it still points at the
-  /// dead thread, so a concurrent fresh send cannot be clobbered.
-  Future<void> _dropStaleThread(
-    String conversationId, {
-    required String threadId,
-    required String messageId,
-  }) async {
-    await repo.clearPending(scope, conversationId, messageId: messageId);
-    if (await repo.mappedSession(conversationId) == threadId) {
-      await repo.clearSessionMapping(conversationId);
-    }
-  }
-
   void _checkEpoch(int epoch) {
     if (repo.epoch(scope) != epoch) {
       throw const PluginClientException(ManagedErrorCodes.cancelled);
@@ -1364,6 +1352,7 @@ class ManagedConversationService {
     'enabledPlugins': enabledPlugins,
     'messages': _encodeMessages(messages),
     'delta': delta,
+    if (agent != null) 'agent': agent,
     // Omitted when unknown so pre-P1b envelopes stay byte-identical;
     // `_decodeEnvelope` reads it as null and `retryTurn` derives it.
     if (userMessageId.isNotEmpty) 'userMessageId': userMessageId,
@@ -1382,6 +1371,7 @@ class ManagedConversationService {
     'enabledPlugins': enabledPlugins,
     'messages': _encodeMessages(messages),
     'background': true,
+    if (agent != null) 'agent': agent,
     if (userMessageId.isNotEmpty) 'userMessageId': userMessageId,
   };
 
@@ -1440,6 +1430,12 @@ class ManagedConversationService {
         rawUserMessageId is String && rawUserMessageId.isNotEmpty
         ? rawUserMessageId
         : null; // pre-P1b envelope — retryTurn derives it.
+    final rawAgent = decoded['agent'];
+    final agent = rawAgent is String || rawAgent is Map<String, dynamic>
+        ? rawAgent
+        : rawAgent == null
+              ? null
+              : throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     if (!background && (sessionId is! String || sessionId.trim().isEmpty)) {
       throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     }
@@ -1484,6 +1480,7 @@ class ManagedConversationService {
       delta: delta,
       modelPluginId: model,
       enabledPlugins: plugins.cast<String>(),
+      agent: agent,
       messages: messages,
       userMessageId: userMessageId,
     );
@@ -1497,6 +1494,7 @@ class _ResumedTurn {
     this.delta = false,
     required this.modelPluginId,
     required this.enabledPlugins,
+    this.agent,
     required this.messages,
     this.userMessageId,
   });
@@ -1506,6 +1504,7 @@ class _ResumedTurn {
   final bool delta;
   final String modelPluginId;
   final List<String> enabledPlugins;
+  final Object? agent;
   final List<ApiMessage> messages;
 
   /// The admitted user-message id stored in the envelope (null for pre-P1b

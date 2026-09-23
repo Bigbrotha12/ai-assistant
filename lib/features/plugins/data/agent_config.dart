@@ -38,6 +38,24 @@ class AgentConfig {
     if (inference != null) 'inference': inference!.toJson(),
   };
 
+  /// The custom-spec object sent as `body.agent` for a CUSTOM agent (gateway
+  /// `customAgentSpecSchema`): the server resolves skills/mcp names against its
+  /// catalogs and treats `tools`/`modelRef`/`inference` as authoritative. A
+  /// TEMPLATE agent is instead sent as its string id — the gateway resolves the
+  /// full template server-side.
+  Map<String, dynamic> toWireObject() => {
+    'name': name,
+    if (description != null && description!.isNotEmpty)
+      'description': description,
+    if (systemPrompt != null && systemPrompt!.isNotEmpty)
+      'systemPrompt': systemPrompt,
+    'skills': skills,
+    'mcpServers': mcpServers.map((name) => {'name': name}).toList(),
+    'tools': tools.map((t) => t.toJson()).toList(),
+    if (modelRef != null) 'modelRef': modelRef,
+    if (inference != null) 'inference': inference!.toJson(),
+  };
+
   factory AgentConfig.fromJson(Map<String, dynamic> json) => AgentConfig(
     id: json['id'] as String,
     kind: AgentKind.values.firstWhere((k) => k.name == json['kind']),

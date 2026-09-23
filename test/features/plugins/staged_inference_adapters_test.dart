@@ -163,6 +163,7 @@ void main() {
         modelLoads++;
         return models;
       },
+      loadAgents: ({required gatewayKey, cancelToken}) async => const [],
     );
   });
 
@@ -548,6 +549,7 @@ void main() {
           'text': {'apiKey': 'text-test'},
         },
       ),
+      agent: null,
     );
     final service = buildManagedService(
       client: client,
@@ -564,6 +566,7 @@ void main() {
             'eyes': {'apiKey': 'eyes-test'},
           },
         ),
+        agent: null,
       ),
       stableSelection: true,
     );

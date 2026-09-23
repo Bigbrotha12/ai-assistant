@@ -35,6 +35,11 @@ StagedInferenceAdapters createStagedInferenceAdapters({
     CancelToken? cancelToken,
   })
   loadModels,
+  required Future<List<AgentDto>> Function({
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  })
+  loadAgents,
   required AccountLifecycle lifecycle,
 }) => StagedInferenceAdapters._(
   client,
@@ -45,6 +50,7 @@ StagedInferenceAdapters createStagedInferenceAdapters({
   authStore,
   pluginStore,
   loadModels,
+  loadAgents,
   lifecycle,
 );
 
@@ -68,6 +74,7 @@ class StagedInferenceAdapters implements VisionClient {
     this._authStore,
     this._pluginStore,
     this._loadModels,
+    this._loadAgents,
     this._lifecycle,
   ) : _lifecycleEpoch = _lifecycle.epoch {
     _unregister = _lifecycle.register(
@@ -103,6 +110,11 @@ class StagedInferenceAdapters implements VisionClient {
     CancelToken? cancelToken,
   })
   _loadModels;
+  final Future<List<AgentDto>> Function({
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  })
+  _loadAgents;
   final AccountLifecycle _lifecycle;
   final int _lifecycleEpoch;
   late final void Function() _unregister;
@@ -132,6 +144,7 @@ class StagedInferenceAdapters implements VisionClient {
     authStore: _authStore,
     pluginStore: _pluginStore,
     loadModels: _loadModels,
+    loadAgents: _loadAgents,
     cancelToken: token,
     vision: vision,
     check: () => _check(epoch, token),

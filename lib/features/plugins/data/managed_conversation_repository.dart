@@ -207,15 +207,9 @@ class ManagedConversationRepository {
       (db.update(db.conversations)..where((t) => t.id.equals(conversationId)))
           .write(ConversationsCompanion(sessionId: Value(sessionId)));
 
-  /// Drops a stale public session-id mapping (server-side session gone) so the
-  /// next send mints a fresh session. Local history is untouched.
-  Future<void> clearSessionMapping(String conversationId) =>
-      (db.update(db.conversations)..where((t) => t.id.equals(conversationId)))
-          .write(ConversationsCompanion(sessionId: const Value(null)));
-
   /// Swaps the conversation's local history for the server's messages under a
   /// transaction, bumps updatedAt, and clears pending state. Called only after
-  /// a successful [LangChainClient.loadSession]; rethrow surfaces reseed 409s.
+  /// a successful [LangChainClient.loadSession].
   /// [expectedMessageId] narrows the pending delete to the turn being
   /// reconciled so a concurrent newer turn is never cleared.
   Future<void> replaceHistory(

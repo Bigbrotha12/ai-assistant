@@ -175,16 +175,17 @@ flutter test                 # client unit tests (700+)
       launcher shortcuts, error/retry ergonomics.
 - [x] **Phase 6 — LangChain cutover** — plugin architecture (model + tool
       plugins), managed conversation service, server-side agent graph with tool
-      execution, checkpoint store, encrypted ntfy provisioning, conversation
-      identity state machine (seeded/resumed/recreated/reseed_required), async
-      alerting, cross-device conversation ids, server-side tools and budget.
-      Inference now routes through the LangChain gateway; the old `LLM_*`
-      dart-define path has been retired.
+      execution, encrypted ntfy provisioning, async job ledger, server-side
+      tools and budget. The gateway is stateless: the client owns conversation
+      history and sends it per turn with a client-minted `session_id`
+      (seeded/resumed; no server checkpoint store). Inference routes through the
+      LangChain gateway; the old `LLM_*` dart-define path has been retired.
 
 **In progress / planned**
 
-- [ ] **Multi-device / cross-device conversations** via server-issued
-      conversation ids and a list-conversations endpoint.
+- [ ] **Multi-device / cross-device conversations** — post-cutover there are no
+      server-issued conversation ids (sessions are client-minted); a sync design
+      is still open.
 - [ ] **Background audio** — Android foreground service / iOS background
       entitlement for screen-off voice (currently foreground-only).
 
@@ -194,13 +195,14 @@ flutter test                 # client unit tests (700+)
   flow per-request in the request body over HTTPS and are never persisted.
   The client stores them in the OS secure storage.
 - **Encrypted ntfy tokens.** Notification credentials are AES-256-GCM
-  encrypted at rest, derived from the checkpoint DB key, and never logged.
+  encrypted at rest, keyed by `NOTIFY_STORE_KEY`, and never logged.
 - **SSRF-hardened outbound calls.** Plugin endpoints are validated against an
   admin-curated allowlist; DNS-rebinding pinning prevents host-name reuse
   attacks; redirects are not followed.
 - **Budget and rate limiting.** Per-user budget gates prevent runaway spending;
   per-owner rate limiters prevent abuse of the inference endpoint.
-- Full details are in the (local-only) planning docs under `docs/`.
+- Full details are in the (local-only) planning docs under `docs/`; the
+  outstanding-work list lives in `docs/open-gaps.md`.
 
 ## License
 

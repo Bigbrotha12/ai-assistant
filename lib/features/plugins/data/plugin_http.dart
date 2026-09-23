@@ -36,7 +36,6 @@ const _safeCodes = {
   'conversation_in_flight',
   'managed_unavailable',
   'message_thread_conflict',
-  'reseed_required',
   'not_found',
   'task_conflict',
   'tool_retry_forbidden',

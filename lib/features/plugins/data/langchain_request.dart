@@ -13,7 +13,9 @@ class LangChainRequest {
     this.managed = false,
     this.background = false,
     List<String> enabledPlugins = const [],
+    Object? agent,
   }) : enabledPlugins = List.unmodifiable(enabledPlugins),
+       agent = _normalizeAgent(agent),
        credentials = Map.unmodifiable(
          credentials.map(
            (id, fields) =>
@@ -68,12 +70,28 @@ class LangChainRequest {
   final bool background;
   final List<String> enabledPlugins;
 
+  /// Agent reference on the wire (`body.agent`): a template agent's string id
+  /// or a custom agent's spec object (see [agent_config.dart] `toWireObject`).
+  /// Absent means the gateway runs the default supervisor prompt. Normalized in
+  /// the constructor: string ids are id-validated, spec objects are deep-frozen
+  /// (copied) so a later mutation of the source config can never leak into a
+  /// dispatched request.
+  final Object? agent;
+
+  static Object? _normalizeAgent(Object? value) {
+    if (value == null) return null;
+    if (value is String) return pluginJsonId(value);
+    if (value is Map<String, dynamic>) return freezePluginJson(value);
+    throw const PluginClientException('invalid_request');
+  }
+
   Map<String, dynamic> toJson() => {
     'model': modelPluginId,
     'stream': true,
     if (background) 'background': true,
     if (managed) 'conversation_mode': 'managed',
     if (managed || enabledPlugins.isNotEmpty) 'enabled_plugins': enabledPlugins,
+    if (agent != null) 'agent': agent,
     'credentials': credentials,
     'messages': messages
         .map(

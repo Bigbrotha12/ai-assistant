@@ -9,7 +9,7 @@ import { isRecord } from "../util.ts";
  * request over HTTPS, the server uses them for a single outbound call, then
  * discards them. This module NEVER stores, caches, or pins credentials — the
  * in-memory pin mechanism is Phase 2's admitted-background-jobs feature and
- * explicitly out of scope here (docs/backend-langchain-plan.md line 64,
+ * explicitly out of scope here (docs/archive/backend-langchain-plan.md line 64,
  * Phase 2 §211-218).
  *
  * BODY CONTRACT (standardized) — transport (Phase 3) and client (Phase 5)
@@ -103,7 +103,7 @@ const INVALID_KEY_MATERIAL = /[\x00-\x1f\x7f\s]/;
  *   declares — unknown/extra input fields are never echoed.
  * - A MODEL plugin (`options.isModel`) may also carry `baseUrlEntry`, a ROUTING
  *   field (not a credential secret) that selects a base-URL instance from the
- *   plugin's allowlisted `baseUrls` (docs/backend-langchain-plan.md §329-335).
+ *   plugin's allowlisted `baseUrls` (docs/archive/backend-langchain-plan.md §329-335).
  *   It is passed through untrimmed-validated here — resolved against the
  *   allowlist only at model build time; a blank entry counts as absent, and it
  *   never receives the key-material check above.

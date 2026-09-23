@@ -8,6 +8,7 @@ import '../../auth/data/auth_credentials_store.dart';
 import '../../chat/data/message_model.dart';
 import '../../settings/data/settings_providers.dart';
 import 'langchain_request.dart';
+import 'managed_resolution.dart';
 import 'plugin_credentials_providers.dart';
 import 'plugin_credentials_store.dart';
 import 'plugin_dto.dart';
@@ -176,7 +177,12 @@ class StagedPluginRequestBuilder {
     required String turnId,
   }) {
     _checkCurrent();
-    final model = _configuration.selectedModel;
+    final agent = resolveAgentForSend(
+      selectedAgentId: _configuration.selectedAgent,
+      config: _configuration,
+      agents: _catalog.agents,
+    );
+    final model = agent?.modelRef ?? _configuration.selectedModel;
     if (model == null || !_catalog.models.any((item) => item.id == model)) {
       throw const PluginClientException('plugin_unavailable');
     }
@@ -198,6 +204,17 @@ class StagedPluginRequestBuilder {
       }
       if (fields.isNotEmpty) credentials[id] = fields;
     }
+    // Agent grant-tool credentials ride along (catalog plan C.2); required
+    // grants without a key fail the send — the gateway would fail-closed too.
+    for (final id in agent?.toolPlugins ?? const <String>[]) {
+      final fields =
+          _configuration.plugins[id]?.credentials ?? const <String, String>{};
+      if (_catalog.installedPlugin(id)?.credentials?.required == true &&
+          (fields['apiKey']?.trim().isEmpty ?? true)) {
+        throw const PluginClientException('invalid_credentials');
+      }
+      if (fields.isNotEmpty) credentials[id] = fields;
+    }
     return LangChainRequest(
       gatewayKey: _gatewayKey,
       modelPluginId: model,
@@ -207,6 +224,7 @@ class StagedPluginRequestBuilder {
       conversationPublicId: sessionId,
       turnId: turnId,
       enabledPlugins: enabled,
+      agent: agent?.wire,
     );
   }
 }

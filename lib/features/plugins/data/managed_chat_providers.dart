@@ -67,6 +67,8 @@ final managedChatAdapterProvider = Provider<ManagedChatAdapter>((ref) {
       pluginStore: pluginStore,
       loadModels: ({required gatewayKey, cancelToken}) =>
           registry.listModels(gatewayKey: gatewayKey, cancelToken: cancelToken),
+      loadAgents: ({required gatewayKey, cancelToken}) =>
+          registry.listAgents(gatewayKey: gatewayKey, cancelToken: cancelToken),
     ),
   );
 });
@@ -100,6 +102,7 @@ final stagedInferenceAdaptersProvider = Provider<StagedInferenceAdapters>((
     authStore: ref.watch(authCredentialsStoreProvider),
     pluginStore: ref.watch(pluginCredentialsStoreProvider),
     loadModels: registry.listModels,
+    loadAgents: registry.listAgents,
     lifecycle: ref.watch(accountLifecycleProvider),
   );
   ref.onDispose(adapters.dispose);

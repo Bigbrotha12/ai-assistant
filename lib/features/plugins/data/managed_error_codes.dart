@@ -13,7 +13,6 @@ abstract final class ManagedErrorCodes {
   static const missingGatewayKey = 'missing_gateway_key';
   static const invalidConfig = 'invalid_config';
   static const reconcileRequired = 'reconcile_required';
-  static const reseedRequired = 'reseed_required';
   static const sessionMissing = 'session_missing';
   static const requestTooLarge = 'request_too_large';
   static const cancelled = 'cancelled';
