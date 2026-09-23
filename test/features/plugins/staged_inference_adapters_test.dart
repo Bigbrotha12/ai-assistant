@@ -5,10 +5,13 @@ import 'dart:typed_data';
 import 'package:ai_assistant/core/backend_probe.dart';
 import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
+import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/chat/data/context_trimmer.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_client.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_repository.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_service.dart';
+import 'package:ai_assistant/features/plugins/data/managed_resolution.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_dto.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
@@ -26,12 +29,35 @@ class _Wire implements HttpClientAdapter {
   final received = StreamController<void>.broadcast();
   int status = 200;
 
+  /// Error envelope returned for non-200 statuses (mirrors the gateway's
+  /// `{"error": "<code>"}` shape that `safePluginErrorCode` classifies).
+  String errorBody = '{"error":"inference_unavailable"}';
+
   @override
   Future<ResponseBody> fetch(
     RequestOptions options,
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    // Session reads (abandonTurn's terminal check) are NOT part of the gated
+    // turn stream: let them resolve immediately, like the real gateway serving
+    // a GET /v1/sessions/:id while a POST stream is still in flight. The
+    // returned history mirrors the admitted user row, so the terminal check
+    // answers "not finished" and abandon falls through to the partial-clear.
+    final path = options.uri.path;
+    if (path.contains('/sessions/') && options.method == 'GET') {
+      final sessionId = path.split('/').last;
+      return ResponseBody.fromString(
+        jsonEncode({
+          'sessionId': sessionId,
+          'messages': [
+            {'role': 'user', 'content': 'Spoken'},
+          ],
+        }),
+        200,
+        headers: {'content-type': ['application/json']},
+      );
+    }
     requests.add(options);
     received.add(null);
     await gate?.future;
@@ -46,7 +72,7 @@ class _Wire implements HttpClientAdapter {
                 },
               ],
             })}\n\ndata: [DONE]\n\n'
-          : '{"error":"inference_unavailable"}',
+          : errorBody,
       status,
       headers: {
         'content-type': [
@@ -127,6 +153,7 @@ void main() {
       client: client,
       repository: repo,
       scope: scope,
+      trimmer: const ContextTrimmer(),
       currentScope: () => current,
       authStore: auth,
       pluginStore: plugins,
@@ -415,5 +442,153 @@ void main() {
     );
     wire.gate!.complete();
     await assertion;
+  });
+
+  test(
+    'barge-in abandon clears the pending row WITHOUT an epoch bump and the '
+    'next sendVoiceTurn succeeds (wedge regression)',
+    () async {
+      wire.gate = Completer<void>();
+      final token = CancelToken();
+      final received = wire.received.stream.first;
+      final inFlight = adapters.sendVoiceTurn(
+        'wedge',
+        userText: 'Spoken',
+        cancelToken: token,
+      );
+      final assertion = expectLater(
+        inFlight,
+        throwsA(isA<PluginClientException>()),
+      );
+      await received;
+      // The turn is mid-flight: a pending row exists.
+      expect(await repo.pending(scope, 'wedge'), isNotNull);
+      final epochBefore = repo.epoch(scope);
+
+      // P2 interrupt sequence: abandon FIRST (clears the pending row and
+      // cancels the conversation's dispatch token WITHOUT an epoch bump), then
+      // cancel the per-turn stream token.
+      final service = ManagedConversationService(
+        client: client,
+        repo: repo,
+        scope: scope,
+        modelPluginId: 'text',
+        credentials: () async => const ManagedCredentials(
+          gatewayKey: 'gateway-test',
+          provider: {
+            'text': {'apiKey': 'text-test'},
+          },
+        ),
+      );
+      await service.abandonTurn('wedge');
+      token.cancel();
+      wire.gate!.complete();
+      await assertion;
+
+      // The wedge regression: neither the abandon NOR the token cancel may
+      // bump the scope epoch (a bump would have failed the abandon's guarded
+      // write and stranded the pending row → the next send would throw
+      // `pending_turn_exists` forever).
+      expect(repo.epoch(scope), epochBefore);
+      expect(await repo.pending(scope, 'wedge'), isNull);
+
+      // A following send succeeds: the row was cleared under the current epoch.
+      final next = await adapters.sendVoiceTurn(
+        'wedge',
+        userText: 'Again',
+      );
+      expect(next, isA<ManagedStreamedTurn>());
+      expect(await repo.pending(scope, 'wedge'), isNull);
+    },
+  );
+
+  test('voice resolution failures surface as typed PluginClientExceptions',
+      () async {
+    // No selected model.
+    await plugins.setSelectedModel(scope, null);
+    await expectLater(
+      adapters.sendVoiceTurn('no-model', userText: 'hi'),
+      throwsA(
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'no_selected_model',
+        ),
+      ),
+    );
+    expect(wire.requests, isEmpty);
+
+    // Model selected but its apiKey never saved.
+    await plugins.setSelectedModel(scope, 'text');
+    await plugins.setCredentials(scope, 'text', <String, String>{});
+    await expectLater(
+      adapters.sendVoiceTurn('no-creds', userText: 'hi'),
+      throwsA(
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'no_credentials',
+        ),
+      ),
+    );
+    expect(wire.requests, isEmpty);
+  });
+
+  test('stableSelection freezes the model: mid-turn drift surfaces '
+      'configuration_changed (shared construction path)', () async {
+    // Build the SAME service shape sendVoiceTurn uses (buildManagedService with
+    // stableSelection: true) but with a resolve that drifts to a different
+    // model on the dispatch's credential re-resolve.
+    final selection = (
+      modelId: 'text',
+      enabledPlugins: <String>[],
+      credentials: const ManagedCredentials(
+        gatewayKey: 'gateway-test',
+        provider: {
+          'text': {'apiKey': 'text-test'},
+        },
+      ),
+    );
+    final service = buildManagedService(
+      client: client,
+      repo: repo,
+      scope: scope,
+      trimmer: const ContextTrimmer(),
+      selection: selection,
+      resolve: () async => (
+        modelId: 'eyes',
+        enabledPlugins: <String>[],
+        credentials: const ManagedCredentials(
+          gatewayKey: 'gateway-test',
+          provider: {
+            'eyes': {'apiKey': 'eyes-test'},
+          },
+        ),
+      ),
+      stableSelection: true,
+    );
+    await expectLater(
+      service.sendTurn('drift', history: const [], userText: 'hi'),
+      throwsA(
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'configuration_changed',
+        ),
+      ),
+    );
+    expect(wire.requests, isEmpty);
+  });
+
+  test('voice 401 surfaces an auth-required error (error parity)', () async {
+    wire.status = 401;
+    wire.errorBody = '{"error":"unauthorized"}';
+    try {
+      await adapters.sendVoiceTurn('auth', userText: 'hi');
+      fail('expected a PluginClientException');
+    } on PluginClientException catch (error) {
+      expect(error.statusCode, 401);
+      expect(isAuthRequiredError(error), isTrue);
+    }
   });
 }

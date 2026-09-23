@@ -6,7 +6,6 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/chat/data/chat_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
@@ -15,6 +14,7 @@ import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/ui/message_bubble.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
+import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 
 import '../../fakes.dart';
@@ -24,22 +24,27 @@ class _FixedActiveId extends ActiveConversationNotifier {
   String? build() => 'c1';
 }
 
-class _SlowClient implements ChatClient {
+class _SlowClient extends FakeChatClient {
   final List<(String, Duration)> _deltas;
 
-  _SlowClient(this._deltas);
+  _SlowClient(this._deltas) : super();
 
   @override
-  Future<ChatResult> streamCompletions({
-    required List<ApiMessage> messages,
+  Future<ChatResult> sendTurn(
+    String conversationId, {
+    required List<Message> history,
+    required String userText,
+    String? sessionId,
+    void Function(String delta)? onContent,
+    List<ApiMessage>? messages,
     String? systemPrompt,
     int maxTokens = 4096,
     int? temperature,
     List<Map<String, Object?>>? tools,
     bool enableThinking = false,
-    void Function(String text)? onContent,
-    void Function(int index, String name, String argsFragment)? onToolCallDelta,
     CancelToken? cancelToken,
+    void Function(int index, String name, String argsFragment)?
+        onToolCallDelta,
     void Function()? onReceived,
   }) async {
     for (final (text, delay) in _deltas) {
@@ -47,20 +52,6 @@ class _SlowClient implements ChatClient {
       onContent?.call(text);
     }
     return const ChatResult(content: 'SECOND ANSWER', toolCalls: [], finishReason: 'stop');
-  }
-
-  @override
-  Future<ChatResult> completions({
-    required List<ApiMessage> messages,
-    String? systemPrompt,
-    int maxTokens = 4096,
-    int? temperature,
-    List<Map<String, Object?>>? tools,
-    bool enableThinking = false,
-    CancelToken? cancelToken,
-    void Function()? onReceived,
-  }) {
-    throw UnimplementedError();
   }
 }
 
@@ -102,7 +93,9 @@ void main() {
         ),
         backendProbeProvider.overrideWithValue(FakeProbe()),
         chatStoreProvider.overrideWithValue(chatStore),
-        chatApiClientProvider.overrideWithValue(client),
+        managedChatAdapterProvider.overrideWithValue(
+          FakeManagedChatAdapter(store: chatStore, script: client),
+        ),
         activeConversationIdProvider.overrideWith(_FixedActiveId.new),
         filesStoreProvider.overrideWithValue(FakeFileStore()),
       ],
@@ -146,5 +139,14 @@ void main() {
     expect(bubbles().where((b) => b == 'user:SECOND Q'), hasLength(1));
     expect(bubbles().where((b) => b.contains('SECOND ANSWER')), hasLength(1));
     expect(bubbles(), hasLength(4));
+
+    // Explicitly unmount the tree inside the test body and pump once so the
+    // drift stream-query close timer (scheduled on store-watch cancellation)
+    // fires BEFORE the binding's end-of-test `!timersPending` check. A bare
+    // `pump()` does not elapse fake_async time (it only flushes microtasks),
+    // so elapse `Duration.zero` to actually fire drift's zero-duration
+    // `Timer.run` close timer.
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(Duration.zero);
   });
 }

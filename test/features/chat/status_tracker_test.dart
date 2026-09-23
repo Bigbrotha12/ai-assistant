@@ -4,7 +4,9 @@ import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show StatusTracker, statusPhraseForError, ackPhrases, stillWorkingPhrases,
     domainPhrases, defaultDomainPhrases, authErrorPhrases, serverErrorPhrases,
-    networkErrorPhrases;
+    networkErrorPhrases, pendingErrorPhrases;
+import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -389,9 +391,122 @@ void main() {
       expect(phrase, anyOf(serverErrorPhrases));
     });
 
-    test('server error for ChatStreamError', () {
+    test('server error for ChatServerError', () {
       final phrase = statusPhraseForError(
-        ChatStreamError('stream broke'),
+        ChatServerError('stream broke', statusCode: 500),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(serverErrorPhrases));
+    });
+  });
+
+  group('statusPhraseForError (managed PluginClientException)', () {
+    test('auth phrase for unauthorized', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.unauthorized),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(authErrorPhrases));
+    });
+
+    test('auth phrase for credentials_expired', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.credentialsExpired),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(authErrorPhrases));
+    });
+
+    test('auth phrase for no_credentials', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.noCredentials),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(authErrorPhrases));
+    });
+
+    test('auth phrase for statusCode 401 with a non-auth envelope code '
+        '(unparseable 401 body)', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException('server_error', statusCode: 401),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(authErrorPhrases));
+    });
+
+    test('code match stays primary over status: an auth code with a '
+        'non-401 status still maps to the auth phrase', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.unauthorized,
+          statusCode: 500,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(authErrorPhrases));
+    });
+
+    test('server phrase for a non-auth code without a 401 status', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException('server_error', statusCode: 500),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(serverErrorPhrases));
+    });
+
+    test('network phrase for network_error', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.networkError),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(networkErrorPhrases));
+    });
+
+    test('network phrase for timeout', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.timeout),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(networkErrorPhrases));
+    });
+
+    test('network phrase for session_missing', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.sessionMissing),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(networkErrorPhrases));
+    });
+
+    test('pending phrase for pending_turn_exists', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.pendingTurnExists),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(pendingErrorPhrases));
+    });
+
+    test('neutral (empty) phrase for cancelled', () {
+      expect(
+        statusPhraseForError(
+          const PluginClientException(ManagedErrorCodes.cancelled),
+          random: Random(42),
+        ),
+        isEmpty,
+      );
+    });
+
+    test('server phrase for reconcile_required (fallback)', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.reconcileRequired),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(serverErrorPhrases));
+    });
+
+    test('server phrase for unknown wire code (fallback)', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException('foo'),
         random: Random(42),
       );
       expect(phrase, anyOf(serverErrorPhrases));

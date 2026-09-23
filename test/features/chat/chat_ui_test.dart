@@ -8,9 +8,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/features/auth/data/auth_client.dart';
 import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
+import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/attachments/data/file_cache.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
@@ -21,6 +21,7 @@ import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/ui/message_bubble.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
 import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
 import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
@@ -30,6 +31,8 @@ import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
 
 import '../../fakes.dart';
 import '../voice/voice_test_fakes.dart';
+import '../plugins/data/managed_conversation_service_test.dart'
+    show FakeAdapter, FakeScheduler, testPoller;
 
 Widget chatApp({
   required FakeSettingsStore store,
@@ -44,7 +47,9 @@ Widget chatApp({
       settingsStoreProvider.overrideWithValue(store),
       backendProbeProvider.overrideWithValue(probe),
       chatStoreProvider.overrideWithValue(chatStore),
-      chatApiClientProvider.overrideWithValue(client),
+      managedChatAdapterProvider.overrideWithValue(
+        FakeManagedChatAdapter(store: chatStore, script: client),
+      ),
       if (authCredentialsStore != null)
         authCredentialsStoreProvider.overrideWithValue(authCredentialsStore),
       if (authClient != null) authClientProvider.overrideWithValue(authClient),
@@ -75,6 +80,86 @@ void main() {
       find.ancestor(of: find.byIcon(Icons.send), matching: find.byType(IconButton)),
     );
     expect(sendButton.onPressed, isNull);
+  });
+
+  testWidgets('background submit button is gated: disabled while empty, '
+      'enabled once text is present', (tester) async {
+    final store = FakeSettingsStore(
+      stored: const BackendSettings(host: 'myhost'),
+    );
+    final chatStore = FakeChatStore();
+    await tester.pumpWidget(chatApp(
+      store: store,
+      probe: FakeProbe(),
+      chatStore: chatStore,
+      client: FakeChatClient(),
+    ));
+    await tester.pumpAndSettle();
+
+    IconButton button() => tester.widget<IconButton>(
+          find.ancestor(
+            of: find.byIcon(Icons.schedule_send),
+            matching: find.byType(IconButton),
+          ),
+        );
+
+    expect(find.byIcon(Icons.schedule_send), findsOneWidget);
+    expect(button().onPressed, isNull);
+
+    await tester.enterText(find.byType(TextField), 'later');
+    await tester.pump();
+    expect(button().onPressed, isNotNull);
+  });
+
+  testWidgets('background submit starts a pending job: the chip appears and '
+      'the input clears', (tester) async {
+    final store = FakeSettingsStore(
+      stored: const BackendSettings(host: 'myhost'),
+    );
+    final chatStore = FakeChatStore();
+    final scope = AuthAccountScope.fromIdentity(
+      backendOrigin: 'https://gw.test',
+      ownerId: 'owner-a',
+    )!;
+    // The job stays queued (poller never foregrounded) so the test only needs
+    // the submit to succeed; the poll-completion reconciliation is covered by
+    // the notifier-level P3 tests.
+    final poller = testPoller(
+      scope,
+      FakeAdapter((request) => throw StateError('unexpected poll')),
+      FakeScheduler(),
+    );
+    addTearDown(poller.dispose);
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        settingsStoreProvider.overrideWithValue(store),
+        backendProbeProvider.overrideWithValue(FakeProbe()),
+        chatStoreProvider.overrideWithValue(chatStore),
+        managedChatAdapterProvider.overrideWithValue(
+          FakeManagedChatAdapter(
+            store: chatStore,
+            script: FakeChatClient(),
+            poller: poller,
+          ),
+        ),
+      ],
+      child: const MaterialApp(home: ChatScreen()),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'later');
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.schedule_send));
+    await tester.pumpAndSettle();
+
+    // The pending-job chip + user bubble appear; the input cleared (the
+    // message was persisted by the submission's admission).
+    expect(find.text('Running background job…'), findsOneWidget);
+    expect(find.text('later'), findsOneWidget);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).controller!.text,
+      isEmpty,
+    );
   });
 
   testWidgets('typing and tapping Send appends a user bubble and assistant reply',
@@ -478,7 +563,6 @@ void main() {
         settingsStoreProvider.overrideWithValue(store),
         backendProbeProvider.overrideWithValue(FakeProbe()),
         chatStoreProvider.overrideWithValue(FakeChatStore()),
-        chatApiClientProvider.overrideWithValue(FakeChatClient()),
         filesStoreProvider.overrideWithValue(FakeFileStore()),
         // The voice screen needs the faked voice service graph.
         engineManagerProvider.overrideWithValue(FakeEngineManager()),

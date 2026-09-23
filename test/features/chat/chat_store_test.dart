@@ -105,6 +105,63 @@ void main() {
   });
 
   test(
+    'scoped load guard: a scoped store sees only its own rows; foreign and '
+    'null-scope rows are invisible to reads and fail closed on writes',
+    () async {
+      final acctA = DriftChatStore(db, scopeKey: 'acctA');
+      final acctB = DriftChatStore(db, scopeKey: 'acctB');
+      final unscoped = DriftChatStore(db);
+
+      await acctA.saveConversation(
+        conversation(id: 'c-a1', messages: [userMessage('m-a1', 'a1')]),
+      );
+      await acctA.saveConversation(
+        conversation(id: 'c-a2', messages: [userMessage('m-a2', 'a2')]),
+      );
+      await acctB.saveConversation(
+        conversation(id: 'c-b', messages: [userMessage('m-b', 'b')]),
+      );
+      // Legacy row from the old unscoped UI path (scope_key IS NULL).
+      await unscoped.saveConversation(
+        conversation(id: 'c-null', messages: [userMessage('m-n', 'n')]),
+      );
+
+      // The scoped watch lists exactly this scope's rows: the null-scope and
+      // foreign rows are invisible.
+      final visible = await acctA.watchConversations().first;
+      expect(visible.map((c) => c.id).toSet(), {'c-a1', 'c-a2'});
+
+      // Reading a foreign/null-scope row returns null instead of crashing
+      // (chat_store.dart:85-87).
+      expect(await acctA.loadConversation('c-b'), isNull);
+      expect(await acctA.loadConversation('c-null'), isNull);
+      expect(await acctA.loadConversation('c-a1'), isNotNull);
+
+      // A write against a foreign row fails closed with the scope-mismatch
+      // error rather than clobbering another tenant's data.
+      await expectLater(
+        acctA.saveConversation(conversation(id: 'c-b')),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('scope mismatch'),
+          ),
+        ),
+      );
+
+      // Fresh saves through the scoped store stamp its scope_key — no new
+      // null-scope rows are ever created.
+      final rows =
+          await (db.select(db.conversations)..where(
+                (t) => t.id.equals('c-a1'),
+              ))
+              .get();
+      expect(rows.single.scopeKey, 'acctA');
+    },
+  );
+
+  test(
     'appendMessage bumps updatedAt + messageCount and watch emits',
     () async {
       final c = conversation();
@@ -244,6 +301,27 @@ void main() {
       db.conversations,
     )..where((t) => t.id.equals('c1'))).getSingle();
     expect(row.messageCount, 1);
+  });
+
+  test(
+      'deleteMessage of a never-persisted message (zero-row delete) does NOT '
+      'decrement messageCount', () async {
+    await store.saveConversation(
+      conversation(messages: [userMessage('m1', 'a'), userMessage('m2', 'b')]),
+    );
+
+    // The managed path retries an in-memory-only assistant placeholder that
+    // was never persisted — deleting it must not drive messageCount negative.
+    await store.deleteMessage('c1', 'never-persisted');
+    await store.deleteMessage('c1', 'never-persisted');
+    await store.deleteMessage('c1', 'never-persisted');
+
+    final loaded = await store.loadConversation('c1');
+    expect(loaded!.messages, hasLength(2));
+    final row = await (db.select(
+      db.conversations,
+    )..where((t) => t.id.equals('c1'))).getSingle();
+    expect(row.messageCount, 2);
   });
 
   test('deleteAll clears everything', () async {

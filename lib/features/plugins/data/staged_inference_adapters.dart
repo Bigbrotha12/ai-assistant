@@ -8,6 +8,7 @@ import '../../../core/backend_probe.dart';
 import '../../auth/data/account_lifecycle.dart';
 import '../../auth/data/auth_credentials_store.dart';
 import '../../chat/data/chat_client.dart';
+import '../../chat/data/context_trimmer.dart';
 import '../../chat/data/message_model.dart';
 import '../../chat/data/sse.dart';
 import 'managed_conversation_dto.dart';
@@ -16,6 +17,7 @@ import 'langchain_client.dart';
 import 'langchain_request.dart';
 import 'managed_conversation_repository.dart';
 import 'managed_conversation_service.dart';
+import 'managed_resolution.dart';
 import 'plugin_credentials_store.dart';
 import 'plugin_dto.dart';
 import 'plugin_http.dart';
@@ -24,6 +26,7 @@ StagedInferenceAdapters createStagedInferenceAdapters({
   required LangChainClient client,
   required ManagedConversationRepository repository,
   required AuthAccountScope scope,
+  required ContextTrimmer trimmer,
   required AuthAccountScope? Function() currentScope,
   required AuthCredentialsStore authStore,
   required PluginCredentialsStore pluginStore,
@@ -37,6 +40,7 @@ StagedInferenceAdapters createStagedInferenceAdapters({
   client,
   repository,
   scope,
+  trimmer,
   currentScope,
   authStore,
   pluginStore,
@@ -59,6 +63,7 @@ class StagedInferenceAdapters implements VisionClient {
     this._client,
     this._repo,
     this._scope,
+    this._trimmer,
     this._currentScope,
     this._authStore,
     this._pluginStore,
@@ -89,6 +94,7 @@ class StagedInferenceAdapters implements VisionClient {
   final LangChainClient _client;
   final ManagedConversationRepository _repo;
   final AuthAccountScope _scope;
+  final ContextTrimmer _trimmer;
   final AuthAccountScope? Function() _currentScope;
   final AuthCredentialsStore _authStore;
   final PluginCredentialsStore _pluginStore;
@@ -114,107 +120,60 @@ class StagedInferenceAdapters implements VisionClient {
     }
   }
 
-  Future<_Selection> _resolve(
+  /// ONE resolver shared with the chat adapter (plan §3): delegates to
+  /// [resolveManagedSelection], threading this adapter's per-load epoch/cancel
+  /// guard and its scope-mismatch `cancel()` side effect.
+  Future<ManagedSelection> _resolve(
     int epoch,
     CancelToken? token, {
     required bool vision,
-  }) async {
-    _check(epoch, token);
-    final auth = await _authStore.load();
-    _check(epoch, token);
-    if (auth == null || auth.apiKey.trim().isEmpty) {
-      throw const StagedInferenceUnavailable(
-        ProbeStatus.noCredentials,
-        'no_credentials',
-      );
+  }) => resolveManagedSelection(
+    scope: _scope,
+    authStore: _authStore,
+    pluginStore: _pluginStore,
+    loadModels: _loadModels,
+    cancelToken: token,
+    vision: vision,
+    check: () => _check(epoch, token),
+    onScopeMismatch: cancel,
+  );
+
+  /// Non-vision [_resolve] with the chat adapter's error mapping: voice
+  /// callers get typed [PluginClientException]s (`no_selected_model` /
+  /// `no_credentials`) instead of raw [StagedInferenceUnavailable]. Vision
+  /// callers ([probeVision]) keep the raw form — probe translates the status.
+  Future<ManagedSelection> _mappedResolve(int epoch, CancelToken? token) async {
+    try {
+      return await _resolve(epoch, token, vision: false);
+    } on StagedInferenceUnavailable catch (error) {
+      throw PluginClientException(error.code);
     }
-    if (auth.accountScope != _scope) {
-      cancel();
-      throw const PluginClientException('cancelled');
-    }
-    final config = await _pluginStore.load(_scope);
-    _check(epoch, token);
-    final models = await _loadModels(
-      gatewayKey: auth.apiKey,
-      cancelToken: token,
-    );
-    _check(epoch, token);
-    final candidates = models
-        .where(
-          (model) =>
-              model.supportsStreaming &&
-              (!vision || model.visionCapable) &&
-              (model.id == config.selectedModel ||
-                  config.plugins[model.id]?.enabled == true),
-        )
-        .toList();
-    candidates.sort((a, b) {
-      if (a.id == config.selectedModel) return -1;
-      if (b.id == config.selectedModel) return 1;
-      return a.id.compareTo(b.id);
-    });
-    if (!vision) {
-      candidates.removeWhere((model) => model.id != config.selectedModel);
-    }
-    if (candidates.isEmpty) {
-      throw StagedInferenceUnavailable(
-        ProbeStatus.error,
-        vision ? 'no_capable_model' : 'no_selected_model',
-      );
-    }
-    for (final model in candidates) {
-      final fields = config.plugins[model.id]?.credentials;
-      if (fields == null || (fields['apiKey']?.trim().isEmpty ?? true)) {
-        continue;
-      }
-      final enabled =
-          vision
-                ? <String>[]
-                : config.plugins.entries
-                      .where(
-                        (entry) =>
-                            entry.value.enabled &&
-                            !models.any((m) => m.id == entry.key),
-                      )
-                      .map((entry) => entry.key)
-                      .toList()
-            ..sort();
-      return _Selection(
-        model.id,
-        enabled,
-        ManagedCredentials(
-          gatewayKey: auth.apiKey,
-          provider: {
-            model.id: fields,
-            for (final id in enabled) id: config.plugins[id]!.credentials,
-          },
-        ),
-      );
-    }
-    throw const StagedInferenceUnavailable(
-      ProbeStatus.noCredentials,
-      'no_credentials',
-    );
   }
 
+  /// Managed voice turn: one per-send construction (plan §3 — same
+  /// [buildManagedService] path as text) with a frozen selection that rejects
+  /// mid-turn drift (`configuration_changed`), history loaded from the scoped
+  /// store, and [onContent] forwarded to the service for sentence-buffered
+  /// TTS.
+  ///
+  /// Interrupt/barge-in is the CALLER's sequenced `abandonTurn` (plan P2):
+  /// this method never wires `cancelToken.whenCancel` to `cancel()` — a
+  /// scope-wide epoch bump there would make the abandon's guarded write fail
+  /// and strand the pending row (the wedge). A cancelled [cancelToken] only
+  /// fails this adapter's own epoch checks.
   Future<ManagedTurnOutcome> sendVoiceTurn(
     String conversationId, {
     required String userText,
     CancelToken? cancelToken,
+    void Function(String delta)? onContent,
     void Function(ManagedTurnOutcome outcome)? onCompleted,
   }) async {
     final epoch = _repo.epoch(_scope);
     _check(epoch, cancelToken);
     if (_voiceBusy) throw const PluginClientException('conversation_in_flight');
     _voiceBusy = true;
-    var active = true;
-    unawaited(
-      cancelToken?.whenCancel.then((_) {
-        if (active) cancel();
-      }),
-    );
     try {
-      final selection = await _resolve(epoch, cancelToken, vision: false);
+      final selection = await _mappedResolve(epoch, cancelToken);
       final history = await _repo.access(
         _scope,
         epoch,
@@ -224,34 +183,28 @@ class StagedInferenceAdapters implements VisionClient {
             <Message>[],
       );
       _check(epoch, cancelToken);
-      final service = ManagedConversationService(
+      final service = buildManagedService(
         client: _CurrentManagedClient(
           _client,
           () => _check(epoch, cancelToken),
         ),
         repo: _repo,
         scope: _scope,
-        modelPluginId: selection.model,
-        enabledPlugins: selection.enabled,
-        credentials: () async {
-          final fresh = await _resolve(epoch, cancelToken, vision: false);
-          if (fresh.model != selection.model ||
-              jsonEncode(fresh.enabled) != jsonEncode(selection.enabled)) {
-            throw const PluginClientException('configuration_changed');
-          }
-          return fresh.credentials;
-        },
+        trimmer: _trimmer,
+        selection: selection,
+        resolve: () => _mappedResolve(epoch, cancelToken),
+        stableSelection: true,
       );
       final outcome = await service.sendTurn(
         conversationId,
         history: history,
         userText: userText,
+        onContent: onContent,
       );
       _check(epoch, cancelToken);
       onCompleted?.call(outcome);
       return outcome;
     } finally {
-      active = false;
       _voiceBusy = false;
     }
   }
@@ -263,7 +216,7 @@ class StagedInferenceAdapters implements VisionClient {
       return CheckResult(
         check: BackendCheck.vision,
         status: ProbeStatus.ok,
-        detail: selection.model,
+        detail: selection.modelId,
       );
     } on StagedInferenceUnavailable catch (error) {
       return CheckResult(
@@ -401,23 +354,16 @@ class _CurrentManagedClient implements LangChainClient {
   );
 }
 
-class _Selection {
-  const _Selection(this.model, this.enabled, this.credentials);
-  final String model;
-  final List<String> enabled;
-  final ManagedCredentials credentials;
-}
-
 class _ImageRequest extends LangChainRequest {
   _ImageRequest(
-    _Selection selection,
+    ManagedSelection selection,
     Uint8List image,
     String mimeType,
     this.prompt,
   ) : imageUrl = 'data:$mimeType;base64,${base64Encode(image)}',
       super(
         gatewayKey: selection.credentials.gatewayKey,
-        modelPluginId: selection.model,
+        modelPluginId: selection.modelId,
         credentials: selection.credentials.provider,
         messages: [ApiMessage(role: 'user', content: prompt)],
       );

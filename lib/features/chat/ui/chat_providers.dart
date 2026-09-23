@@ -7,7 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/chat_client.dart';
-import '../data/chat_client_provider.dart';
+import '../data/status_tracker.dart';
 import '../../attachments/data/files_providers.dart';
 import '../../../core/network_banner.dart';
 import '../../vision/data/vision_client.dart';
@@ -19,6 +19,11 @@ import '../data/chat_store.dart';
 import '../data/context_trimmer.dart';
 import '../data/database_providers.dart';
 import '../data/message_model.dart';
+import '../../plugins/data/ledger_client.dart';
+import '../../plugins/data/managed_chat_providers.dart';
+import '../../plugins/data/managed_conversation_service.dart';
+import '../../plugins/data/managed_error_codes.dart';
+import '../../plugins/data/plugin_http.dart';
 
 
 export 'active_conversation_provider.dart';
@@ -49,6 +54,16 @@ class ConversationState {
   /// generic message.
   final bool authRequired;
 
+  /// True while this conversation owns a background job (plan P3): a pending
+  /// ledger-polled submission is running and its reply has not been appended
+  /// yet. Drives the pending-job chip + Retry/Cancel affordances. Cleared when
+  /// the poll observes a terminal status (or the job is cancelled).
+  final bool hasPendingJob;
+
+  /// Human-readable error for the last terminal background job when it failed
+  /// (`succeeded` clears it). Drives the chip's "Retry job" affordance.
+  final String? jobError;
+
   const ConversationState({
     required this.messages,
     this.isStreaming = false,
@@ -58,6 +73,8 @@ class ConversationState {
     this.isDbReady = false,
     this.attachmentUploads = const {},
     this.authRequired = false,
+    this.hasPendingJob = false,
+    this.jobError,
   });
 
   ConversationState copyWith({
@@ -69,6 +86,8 @@ class ConversationState {
     Object? attachmentUploads = _sentinel,
     bool? isDbReady,
     Object? authRequired = _sentinel,
+    bool? hasPendingJob,
+    Object? jobError = _sentinel,
   }) {
     return ConversationState(
       messages: messages ?? this.messages,
@@ -87,6 +106,8 @@ class ConversationState {
       authRequired: identical(authRequired, _sentinel)
           ? this.authRequired
           : authRequired as bool,
+      hasPendingJob: hasPendingJob ?? this.hasPendingJob,
+      jobError: identical(jobError, _sentinel) ? this.jobError : jobError as String?,
     );
   }
 }
@@ -106,9 +127,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   /// Cancel token for the in-flight request.
   CancelToken? _active;
 
-  /// Text of the most recent user message, kept for retry().
-  String? _lastUserText;
-
   /// Cancellation state of the in-flight turn is derived from the active
   /// [CancelToken] (see [stop] / [_onError]) rather than a bare bool, so a
   /// stale cancellation from a previous (stopped) turn can never be
@@ -120,7 +138,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   StringBuffer? _pendingContent;
 
   ChatStore? _store;
-  ChatClient? _client;
   ContextTrimmer? _trimmer;
   FileStore? _fileStore;
 
@@ -136,6 +153,14 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   /// Upload job ids whose `[file:<id>]` reference has already been appended.
   final Set<String> _appendedRefs = {};
 
+  /// Service-minted id of the user message admitted for the current/most
+  /// recent turn (`ManagedTurnOutcome.userMessageId`, or
+  /// `ManagedTurnError.userMessageId` on a post-admission failure). Null when
+  /// admission never ran. The STORE is only ever written with this id — the
+  /// optimistic in-memory UUID minted in [sendMessage] never matches the
+  /// service's row and would `insertOnConflictUpdate` a duplicate.
+  String? _serviceUserMessageId;
+
   /// Serializes [FileInfo] + message persistence across concurrently-completing
   /// uploads. Without it, two jobs finishing back-to-back each write the full
   /// user message and the later write can clobber the earlier ref.
@@ -144,11 +169,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   @override
   Future<ConversationState> build() async {
     _store = ref.watch(chatStoreProvider);
-    // Read (not watch) the shared providers: chatApiClientProvider resolves
-    // against the gateway URL and auth credentials (it watches settings for
-    // host changes). The client instance is snapshot at build time and stays
-    // pinned to this conversation's lifetime.
-    _client = ref.read(chatApiClientProvider);
     _trimmer = ref.watch(contextTrimmerProvider);
     _fileStore = ref.watch(filesStoreProvider);
     final queue = UploadQueue(filesService: ref.read(filesServiceProvider));
@@ -170,10 +190,80 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     final conversation = await _store!.loadConversation(conversationId);
     if (!ref.mounted) return const ConversationState(messages: []);
 
+    // Open-conversation store watch (plan P3): a background poller appends the
+    // job's reply (or another surface writes) without this notifier's
+    // involvement. Re-read on every store change so the appended reply renders
+    // without navigating away. Guards: skip while a live stream owns the
+    // in-memory state, and skip when the store row is byte-identical (a
+    // notifier-originated write emitting its own update would otherwise loop).
+    final storeSub = _store!.watchConversations().listen(_onStoreChanged);
+    ref.onDispose(storeSub.cancel);
+
+    // Restore the pending-job chip + re-arm a fresh watch when this notifier
+    // rebuilt after navigation while a background job is still pending (the
+    // poller + its handle survive in the account-scoped adapter). Best-effort:
+    // no scope / no background pending row yields null and the chip stays off.
+    var restoredJob = false;
+    try {
+      final handle = await ref
+          .read(managedChatAdapterProvider)
+          .rewatchPendingBackground(conversationId);
+      if (handle != null && ref.mounted) {
+        restoredJob = true;
+        _watchBackgroundHandle(handle);
+      }
+    } catch (_) {
+      // Scope not ready or the row is not a background envelope — no chip.
+    }
+
     return ConversationState(
       messages: conversation?.messages ?? const [],
       isDbReady: true,
+      hasPendingJob: restoredJob,
     );
+  }
+
+  /// Store-watch callback: mirrors the latest persisted conversation into
+  /// state whenever the store emits a change (a poller-appended reply, a
+  /// notifier-originated write, etc.). Skips while streaming (the live turn's
+  /// in-memory placeholder is ahead of the store) and when nothing changed.
+  void _onStoreChanged(List<Conversation> conversations) {
+    if (!ref.mounted) return;
+    final cur = state.value;
+    if (cur == null || cur.isStreaming) return;
+    final updated = conversations
+        .where((c) => c.id == conversationId)
+        .firstOrNull;
+    if (updated == null) return;
+    if (_sameMessages(updated.messages, cur.messages)) return;
+    _setState(cur.copyWith(messages: updated.messages, isDbReady: true));
+  }
+
+  /// Re-reads the conversation from the store and swaps its messages into
+  /// state (used after a background poll observes a terminal status, so the
+  /// appended reply / cleared marker renders). No-op when the store is
+  /// byte-identical to the current in-memory messages.
+  Future<void> _reloadFromStore() async {
+    if (!ref.mounted) return;
+    final conversation = await _store!.loadConversation(conversationId);
+    if (!ref.mounted) return;
+    final cur = state.value;
+    if (cur == null) return;
+    final messages = conversation?.messages ?? const <Message>[];
+    if (_sameMessages(messages, cur.messages)) return;
+    _setState(cur.copyWith(messages: messages, isDbReady: true));
+  }
+
+  static bool _sameMessages(List<Message> a, List<Message> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].id != b[i].id ||
+          a[i].role != b[i].role ||
+          a[i].content != b[i].content) {
+        return false;
+      }
+    }
+    return true;
   }
 
   Future<void> sendMessage(
@@ -185,8 +275,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
 
     final trimmed = text.trim();
     if (trimmed.isEmpty) return;
-
-    _lastUserText = trimmed;
 
     final userMsg = Message(
       id: _uuid.v4(),
@@ -204,34 +292,18 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       authRequired: false,
     ));
 
-    // Brand-new conversations need their row created first (the message row's
-    // FK references it), with a title derived from the first user message.
-    // ensureConversation (rather than saveConversation, a full-message-list
-    // overwrite) so a concurrent first-turn write from the voice surface on
-    // the same conversation id can never clobber this one.
-    final existing = await _store!.loadConversation(conversationId);
-    if (!ref.mounted) return;
-
-    if (existing == null) {
-      final title = trimmed.length <= 60
-          ? trimmed
-          : '${trimmed.substring(0, 60)}…';
-      await _store!.ensureConversation(
-        conversationId,
-        title: title,
-        firstMessage: userMsg,
-      );
-    } else {
-      await _store!.appendMessage(conversationId, userMsg);
-    }
-    if (!ref.mounted) return;
+    // No pre-persist: the managed service admits the user message (and the
+    // pending envelope) atomically inside sendTurn — exactly one writer.
 
     // Pre-send describe: attach image descriptions so the current turn
     // benefits from vision. Fail-open on failure — never blocks the send.
+    // The expanded text stays in-memory only; admission persists it as the
+    // userText passed to sendTurn (no post-send store round-trip).
     if (attachments.isNotEmpty) {
       final visionEnabled = ref.read(visionEnabledProvider) ?? true;
       if (visionEnabled) {
         final descriptions = await _describeDrafts(attachments);
+        if (!ref.mounted) return;
         if (descriptions.isNotEmpty) {
           final expanded = _injectImageDescriptions(userMsg.content, descriptions);
           final updatedUserMsg = userMsg.copyWith(content: expanded);
@@ -241,7 +313,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               if (m.id == updatedUserMsg.id) updatedUserMsg else m,
           ];
           _setState(cur.copyWith(messages: updatedMessages));
-          await _store!.updateMessage(conversationId, updatedUserMsg);
         }
       }
     }
@@ -270,9 +341,22 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       }
       rethrow;
     }
+    if (!ref.mounted) return;
     // §3.6: attachments upload asynchronously AFTER the turn succeeds, so the
-    // user's text is never blocked on slow uploads.
-    _enqueueAttachments(attachments, userMsg.id);
+    // user's text is never blocked on slow uploads. The uploads must be keyed
+    // to the SERVICE-minted user id (P1b): the store row was minted inside
+    // sendTurn's admission, and upload refs must land on that row or they
+    // write a duplicate.
+    //
+    // When admission never ran (a pre-admission rejection such as
+    // `pending_turn_exists` or a resolution failure), `_serviceUserMessageId`
+    // is null and the optimistic in-memory UUID must NOT be used as a fallback:
+    // `updateMessage` would `insertOnConflictUpdate` a phantom user row into
+    // the existing conversation. Drop the uploads instead — the UI retains the
+    // attachment selection, so a retry re-sends exactly once.
+    final persistedUserId = _serviceUserMessageId;
+    if (persistedUserId == null) return;
+    _enqueueAttachments(attachments, persistedUserId);
   }
 
   void _enqueueAttachments(List<AttachmentDraft> attachments, String userMsgId) {
@@ -416,6 +500,33 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     return null;
   }
 
+  /// Records the service-minted user-message id for the current turn and
+  /// re-keys the trailing in-memory user row to it (it was minted optimistically
+  /// in [sendMessage] and only matches the store after a post-outcome reload).
+  /// Re-keying here keeps in-memory ref bookkeeping (`_handleCompletedJobs`)
+  /// and the store write (`_persistCompletedUpload`) on the same id — the one
+  /// the service actually admitted. A null/empty id means nothing was
+  /// admitted; the optimistic id stays.
+  void _adoptServiceUserId(String? serviceId) {
+    if (serviceId == null || serviceId.isEmpty) return;
+    _serviceUserMessageId = serviceId;
+    final cur = state.value;
+    if (cur == null) return;
+    final index = cur.messages.lastIndexWhere((m) => m.role == MessageRole.user);
+    if (index < 0) return;
+    final existing = cur.messages[index];
+    if (existing.id == serviceId) return;
+    _setState(cur.copyWith(
+      messages: [
+        for (var i = 0; i < cur.messages.length; i++)
+          if (i == index) existing.copyWith(id: serviceId) else cur.messages[i],
+      ],
+      pendingUserMessageId: cur.pendingUserMessageId == existing.id
+          ? serviceId
+          : _sentinel,
+    ));
+  }
+
   /// Resolves a description for each local draft in parallel, with a 5s
   /// timeout per image. Fail-open: failures/timeouts skip that image.
   Future<Map<String, String>> _describeDrafts(
@@ -504,8 +615,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     final current = state.value;
     if (current == null || current.isStreaming) return;
     final failedId = current.failedMessageId;
-    final lastText = _lastUserText;
-    if (failedId == null || lastText == null) return;
+    if (failedId == null) return;
 
     // Drop the failed assistant placeholder from the store too, so the retried
     // turn doesn't leave a stale partial assistant message persisted next to
@@ -513,8 +623,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     await _store!.deleteMessage(conversationId, failedId);
     if (!ref.mounted) return;
 
-    // Drop the failed assistant placeholder from in-memory state and re-run
-    // the last send.
+    // Drop the failed assistant placeholder from in-memory state and replay
+    // the staged turn via retryTurn (same messageId/sessionId/envelope — plan
+    // §5.4 retry = replay, never a resend).
     _setState(current.copyWith(
       messages: [
         for (final m in current.messages)
@@ -526,7 +637,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       authRequired: false,
     ));
 
-    await _runTurn();
+    await _runTurn(replay: true);
   }
 
   Future<void> stop() async {
@@ -542,18 +653,28 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       isStreaming: false,
       pendingUserMessageId: null,
     ));
-    // Persist whatever partial content exists.
     final pendingId = _pendingAssistantId;
-    if (pendingId != null && ref.mounted) {
-      final messages = state.value?.messages ?? const <Message>[];
-      final partial = messages.where((m) => m.id == pendingId).toList();
-      if (partial.isNotEmpty) {
-        await _store!.updateMessage(conversationId, partial.first);
-      }
-    }
+    final partialText = pendingId != null
+        ? _assistantContent(pendingId)
+        : '';
     _pendingAssistantId = null;
     _pendingContent = null;
     _cancelThrottle();
+    // Abandon the staged turn so a stale pending row never blocks the next
+    // send (plan §3: cancel = abandon + partial retention). Best-effort: a
+    // failure here must not surface as an error on a user-initiated stop.
+    if (pendingId != null && ref.mounted) {
+      try {
+        final adapter = ref.read(managedChatAdapterProvider);
+        await adapter.abandonTurn(
+          conversationId,
+          partialText: partialText,
+        );
+      } catch (_) {
+        // Best-effort — the partial is already in memory; the next send will
+        // surface pending_turn_exists only if the clear genuinely failed.
+      }
+    }
   }
 
   Future<void> clear() async {
@@ -562,12 +683,253 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(current.copyWith(messages: const []));
   }
 
+  /// Submits [text] as a background job (plan §3/P3): the service POSTs a
+  /// self-contained snapshot and returns a [LedgerPollHandle] whose terminal
+  /// observation appends the reply. The conversation is marked with a
+  /// pending-job chip ([ConversationState.hasPendingJob]) that is cleared when
+  /// the poll observes a terminal status. The in-memory user row is written by
+  /// the service during admission (exactly one writer).
+  Future<void> submitBackgroundJob(String text) async {
+    final current = state.value;
+    if (current == null || current.isStreaming || current.hasPendingJob) {
+      return;
+    }
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return;
+
+    final userMsg = Message(
+      id: _uuid.v4(),
+      role: MessageRole.user,
+      content: trimmed,
+      createdAt: DateTime.now(),
+    );
+
+    _setState(current.copyWith(
+      messages: [...current.messages, userMsg],
+      pendingUserMessageId: userMsg.id,
+      isStreaming: true,
+      error: null,
+      failedMessageId: null,
+      authRequired: false,
+      hasPendingJob: true,
+      jobError: null,
+    ));
+
+    final all = state.value?.messages ?? const <Message>[];
+    final userIndex = all.lastIndexWhere((m) => m.role == MessageRole.user);
+    if (userIndex < 0) {
+      _setState(state.value!.copyWith(
+        isStreaming: false,
+        pendingUserMessageId: null,
+        hasPendingJob: false,
+      ));
+      return;
+    }
+    final priorMessages = [for (var i = 0; i < userIndex; i++) all[i]];
+    final expanded = await _expandMessages(priorMessages);
+    final trimmedHistory = _trimmer!.trim(expanded);
+    if (!ref.mounted) return;
+
+    try {
+      // Read inside the try: a `PluginReauthenticationRequired` from an
+      // unavailable scope routes through _onBackgroundError as the re-auth
+      // state instead of escaping as an unhandled error.
+      final adapter = ref.read(managedChatAdapterProvider);
+      final handle = await adapter.submitBackground(
+        conversationId,
+        history: trimmedHistory,
+        userText: trimmed,
+      );
+      if (!ref.mounted) return;
+      // The submission is accepted; nothing streams. Clear the streaming flags
+      // (the chip + handle.done drive the rest).
+      _setState(state.value!.copyWith(
+        isStreaming: false,
+        pendingUserMessageId: null,
+      ));
+      _watchBackgroundHandle(handle);
+    } catch (e) {
+      if (e is Error) {
+        // An unexpected throw leaves the streaming flag AND the optimistic chip
+        // set (nothing was submitted) — clear both so the UI is usable, then
+        // rethrow so the caller keeps its text for a fresh attempt.
+        final cur = state.value;
+        if (cur != null && ref.mounted) {
+          _setState(cur.copyWith(
+            isStreaming: false,
+            pendingUserMessageId: null,
+            hasPendingJob: false,
+            messages: [
+              for (final m in cur.messages)
+                if (m.id != userMsg.id) m,
+            ],
+          ));
+        }
+        rethrow;
+      }
+      await _onBackgroundError(e, optimisticUserId: userMsg.id);
+    }
+  }
+
+  /// Re-submits the conversation's pending background job (plan §3 chip
+  /// affordance): [ManagedChatAdapter.retryTurn] replays the identical envelope
+  /// (same `messageId`) and the re-submission returns a fresh watch. When the
+  /// pending row is already gone (`no_pending_turn`) the chip is cleared and
+  /// the conversation offers a fresh send.
+  Future<void> retryBackgroundJob() async {
+    final current = state.value;
+    if (current == null || !current.hasPendingJob) return;
+    try {
+      // Read inside the try: a `PluginReauthenticationRequired` from an
+      // unavailable scope routes through _onBackgroundError as the re-auth
+      // state instead of escaping as an unhandled error.
+      final adapter = ref.read(managedChatAdapterProvider);
+      final outcome = await adapter.retryTurn(conversationId);
+      if (!ref.mounted) return;
+      if (outcome is ManagedBackgroundResubmitted) {
+        _watchBackgroundHandle(outcome.handle);
+      }
+    } on PluginClientException catch (e) {
+      if (!ref.mounted) return;
+      if (e.code == ManagedErrorCodes.noPendingTurn) {
+        // The retry identity is gone — drop the chip and offer a fresh send.
+        _setState(state.value!.copyWith(
+          hasPendingJob: false,
+          jobError: null,
+        ));
+        return;
+      }
+      await _onBackgroundError(e);
+    } catch (e) {
+      if (e is Error) rethrow;
+      await _onBackgroundError(e);
+    }
+  }
+
+  /// Cancels the conversation's pending background job (plan §3 chip
+  /// affordance): [ManagedChatAdapter.abandonTurn] clears the pending row and
+  /// cancels the dispatch so the next submit is never blocked. Best-effort —
+  /// a failed clear surfaces `pending_turn_exists` on the next submit.
+  Future<void> cancelBackgroundJob() async {
+    final current = state.value;
+    if (current == null || !current.hasPendingJob) return;
+    try {
+      await ref
+          .read(managedChatAdapterProvider)
+          .abandonTurn(conversationId);
+    } catch (_) {
+      // Best-effort — the next submit surfaces pending_turn_exists if the
+      // clear genuinely failed (or the scope is unavailable).
+    }
+    if (!ref.mounted) return;
+    _setState(state.value!.copyWith(
+      hasPendingJob: false,
+      jobError: null,
+    ));
+  }
+
+  /// Watches a background-job [handle]: on an observed terminal status the
+  /// service has already reconciled (appended the reply / cleared the marker),
+  /// so the store is re-read and the chip is cleared; a `failed`/`cancelled`
+  /// terminal surfaces the retry affordance via [ConversationState.jobError].
+  void _watchBackgroundHandle(LedgerPollHandle handle) {
+    unawaited(handle.done.then((result) async {
+      if (!ref.mounted) return;
+      final terminal =
+          result.end == LedgerPollEnd.observed &&
+          (result.task?.status.isTerminal ?? false);
+      if (!terminal) {
+        // Exhausted/errored poll: the job is still pending (the marker is kept
+        // for an explicit retry) — keep the chip.
+        return;
+      }
+      await _reloadFromStore();
+      if (!ref.mounted) return;
+      final failed = result.task?.status == LedgerTaskStatus.failed ||
+          result.task?.status == LedgerTaskStatus.cancelled;
+      _setState(state.value!.copyWith(
+        hasPendingJob: false,
+        jobError: failed ? 'Background job failed' : null,
+        // A "wait for the job" banner is stale the moment the job is terminal.
+        error: null,
+      ));
+    }).catchError((Object _) {
+      // Never surface an unhandled async error from a background watch.
+    }));
+  }
+
+  /// Maps a background-submission failure into state (no assistant placeholder
+  /// exists on this path — the chip + error banner carry the failure). A
+  /// gateway 401 surfaces the re-auth card like every other managed error.
+  ///
+  /// A `pending_turn_exists` rejection (or any pre-admission rejection) never
+  /// admitted a user row: [optimisticUserId] — the in-memory row minted before
+  /// the submit — is a phantom and is dropped so it cannot pollute a later
+  /// send's history. The pending-job chip is KEPT when a genuine background
+  /// envelope is pending (a running job, or a post-admission failure that kept
+  /// its retry identity); otherwise it clears.
+  Future<void> _onBackgroundError(
+    Object error, {
+    String? optimisticUserId,
+  }) async {
+    if (!ref.mounted) return;
+    final authRequired = isAuthRequiredError(error);
+    final message = switch (error) {
+      // Managed codes map through the single statusPhraseForError surface
+      // (the same copy voice speaks) instead of leaking the raw code.
+      PluginClientException() => statusPhraseForError(error),
+      _ => 'Unexpected error',
+    };
+
+    var keepChip = false;
+    var dropOptimistic = false;
+    try {
+      keepChip = await ref
+          .read(managedChatAdapterProvider)
+          .hasPendingBackground(conversationId);
+      if (error is PluginClientException &&
+          error.code == ManagedErrorCodes.pendingTurnExists) {
+        // Rejected because another pending row exists: the optimistic row was
+        // never admitted — always a phantom.
+        dropOptimistic = true;
+      } else {
+        // A kept envelope means admission ran (the real user row is persisted
+        // and the optimistic row is its visible stand-in); a cleared envelope
+        // means rejection before admission — the optimistic row is phantom.
+        dropOptimistic = !keepChip;
+      }
+    } catch (_) {
+      keepChip = false;
+      dropOptimistic = true;
+    }
+    if (!ref.mounted) return;
+    final cur = state.value;
+    if (cur == null) return;
+    _setState(cur.copyWith(
+      isStreaming: false,
+      pendingUserMessageId: null,
+      hasPendingJob: keepChip,
+      // A neutral phrase (e.g. `cancelled`) is never shown as a banner.
+      error: authRequired || message.isEmpty ? null : message,
+      jobError: authRequired || message.isEmpty ? null : 'Background job failed',
+      authRequired: authRequired,
+      messages: dropOptimistic && optimisticUserId != null
+          ? [
+              for (final m in cur.messages)
+                if (m.id != optimisticUserId) m,
+            ]
+          : null,
+    ));
+  }
+
   /// Runs a single streaming turn (tools run server-side in the agent graph).
-  Future<void> _runTurn() async {
+  /// [replay] routes the dispatch through `retryTurn` (identical envelope)
+  /// instead of `sendTurn`.
+  Future<void> _runTurn({bool replay = false}) async {
     final token = CancelToken();
     _active = token;
     try {
-      await _streamOnce(token);
+      await _streamOnce(token, replay: replay);
     } finally {
       _active = null;
       _cancelThrottle();
@@ -575,19 +937,48 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     }
   }
 
-  /// Streams one turn from the gateway (tools run server-side in the agent
-  /// graph; no client-side tool loop or tool definitions are sent).
-  Future<void> _streamOnce(CancelToken token) async {
+  /// Streams one turn through the managed conversation service (tools run
+  /// server-side in the agent graph; no client-side tool loop or tool
+  /// definitions are sent). The service owns persistence: the user message is
+  /// admitted (with the pending envelope) inside [ManagedChatAdapter.sendTurn]
+  /// (or replayed by [ManagedChatAdapter.retryTurn] when [replay]) and the
+  /// assistant reply is written when the turn completes. This notifier only
+  /// mirrors live deltas into in-memory state and refreshes
+  /// ConversationState from the store once the outcome returns.
+  Future<void> _streamOnce(CancelToken token, {bool replay = false}) async {
     if (!ref.mounted) return;
+    // Fresh turn: drop any id adopted for a previous turn so a pre-admission
+    // failure can never re-key attachments onto a stale row.
+    _serviceUserMessageId = null;
     final current = state.value;
     if (current == null) return;
 
-    // Expand file refs, trim to token budget, convert to API messages.
-    final expandedMessages = await _expandMessages(current.messages);
-    final trimmed = _trimmer!.trim(expandedMessages);
-    final messagesForCall = toApiMessages(trimmed);
+    // The trailing user message is the optimistic row minted in sendMessage
+    // (or retained after a failed turn). The service persists it during
+    // admission — never pre-persist here. history excludes it (the service
+    // appends the user message itself from userText).
+    final all = current.messages;
+    final userIndex = all.lastIndexWhere((m) => m.role == MessageRole.user);
+    if (userIndex < 0) {
+      // clear() dropped the user message (or a rebuild raced): bail rather
+      // than wedge isStreaming with nothing to send.
+      _setState(current.copyWith(
+        isStreaming: false,
+        pendingUserMessageId: null,
+      ));
+      return;
+    }
+    final userMsg = all[userIndex];
+    final priorMessages = [for (var i = 0; i < userIndex; i++) all[i]];
 
-    // Fresh assistant placeholder to stream into.
+    // Expand [file:<id>] refs on the prior history; the trailing user text
+    // was already describe-expanded in sendMessage (in-memory only).
+    final expanded = await _expandMessages(priorMessages);
+    final trimmedHistory = _trimmer!.trim(expanded);
+    if (!ref.mounted) return;
+
+    // In-memory assistant placeholder to coalesce deltas into — never
+    // persisted by this notifier (the service writes the real reply).
     final assistant = Message(
       id: _uuid.v4(),
       role: MessageRole.assistant,
@@ -596,50 +987,147 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     );
     _pendingAssistantId = assistant.id;
     _pendingContent = StringBuffer();
-
-    _setState(current.copyWith(
-      messages: [...current.messages, assistant],
+    _setState(state.value!.copyWith(
+      messages: [...state.value!.messages, assistant],
     ));
 
-    ChatResult result;
+    final id = conversationId;
+
+    final ManagedTurnOutcome outcome;
     try {
-      result = await _client!.streamCompletions(
-        messages: messagesForCall,
-        // No tools parameter — the gateway runs tools server-side.
-        onContent: (text) => _onContent(assistant.id, text),
-        cancelToken: token,
-      );
+      // Read inside the try: a `PluginReauthenticationRequired` from an
+      // unavailable account scope (auth loading / settings errored) is routed
+      // through _onError as the re-auth state instead of escaping the turn.
+      final adapter = ref.read(managedChatAdapterProvider);
+      outcome = replay
+          ? await adapter.retryTurn(
+              id,
+              onContent: (text) => _onContent(assistant.id, text),
+            )
+          : await adapter.sendTurn(
+              id,
+              history: trimmedHistory,
+              userText: userMsg.content,
+              // sessionId omitted: the service resolves the mapped session itself
+              // (first turn seeds; later turns resume/delta/compact).
+              onContent: (text) => _onContent(assistant.id, text),
+            );
     } catch (e) {
+      // Fatal errors (StateError etc.) propagate so callers like the
+      // attachment enqueue guard keep their "turn did not succeed" contract;
+      // everything else is a chat-level failure surfaced via _onError.
+      if (e is Error) rethrow;
+      // Post-admission dispatch failures carry the admitted row's id: adopt it
+      // (and re-key the optimistic in-memory row) so attachments uploaded for
+      // a failed-but-persisted turn still land on the service's store row.
+      if (e is ManagedTurnError) _adoptServiceUserId(e.userMessageId);
       await _onError(e, assistant.id, token);
       return;
     }
     if (!ref.mounted) return;
-
-    // Push any coalesced content into state before finalizing.
+    _adoptServiceUserId(outcome.userMessageId);
     _flushThrottle();
 
-    var finalized = assistant.copyWith(content: result.content);
-    if (result.toolCalls.isNotEmpty) {
-      finalized = finalized.copyWith(toolCalls: result.toolCalls);
+    try {
+      switch (outcome) {
+        case ManagedAlreadyCompleted():
+          // No fresh inference happened. The service ALREADY reconciled local
+          // history with the server session inside _dispatch (§5) — swapping in
+          // the store's now-authoritative rows here avoids a SECOND
+          // loadSession + replaceHistory round-trip (which, if it failed,
+          // would strand a reconcileOnly marker).
+          final conversation = await _store!.loadConversation(id);
+          if (!ref.mounted) return;
+          _setState(state.value!.copyWith(
+            messages: conversation?.messages ?? state.value!.messages,
+            isStreaming: false,
+            pendingUserMessageId: null,
+            error: null,
+            failedMessageId: null,
+            authRequired: false,
+          ));
+        case ManagedStreamedTurn():
+          // The service persisted the assistant reply; reload the
+          // authoritative conversation (service-minted ids) and swap it in.
+          final conversation = await _store!.loadConversation(id);
+          if (!ref.mounted) return;
+          _setState(state.value!.copyWith(
+            messages: conversation?.messages ?? state.value!.messages,
+            isStreaming: false,
+            pendingUserMessageId: null,
+            error: null,
+            failedMessageId: null,
+            authRequired: false,
+          ));
+        case ManagedBackgroundResubmitted():
+          // sendTurn never produces a background outcome (P1c owns the
+          // text/background flag); clear streaming so the UI cannot wedge.
+          _setState(state.value!.copyWith(
+            isStreaming: false,
+            pendingUserMessageId: null,
+          ));
+      }
+    } on PluginClientException catch (e) {
+      if (e.code == ManagedErrorCodes.noPendingTurn) {
+        // The pending row is already gone (abandoned/cleared) — hide the
+        // retry affordance and offer a fresh send (plan §5 P1).
+        _finalizeWithoutError(assistant.id);
+        return;
+      }
+      if (e.code == ManagedErrorCodes.reconcileRequired) {
+        // retryTurn hit a turn that was already reconciled: swap in the
+        // server history, then the user can retry afresh (plan §5 edge case).
+        try {
+          // Re-read inside the nested try: a scope-unavailable rethrow routes
+          // through _onError as the re-auth state.
+          final serverHistory =
+              await ref.read(managedChatAdapterProvider).reconcileFromServer(id);
+          if (!ref.mounted) return;
+          _setState(state.value!.copyWith(
+            messages: serverHistory,
+            isStreaming: false,
+            pendingUserMessageId: null,
+            error: null,
+            failedMessageId: null,
+            authRequired: false,
+          ));
+          _clearPendingStream();
+          return;
+        } catch (reconcileError) {
+          if (reconcileError is Error) rethrow;
+          await _onError(reconcileError, assistant.id, token);
+          return;
+        }
+      }
+      if (e is Error) rethrow;
+      if (e is ManagedTurnError) _adoptServiceUserId(e.userMessageId);
+      await _onError(e, assistant.id, token);
+      return;
+    } catch (e) {
+      if (e is Error) rethrow;
+      await _onError(e, assistant.id, token);
+      return;
     }
-    await _store!.updateMessage(conversationId, finalized);
-    if (!ref.mounted) return;
+    _clearPendingStream();
+  }
 
-    final messages = [
-      for (final m in state.value!.messages)
-        if (m.id == assistant.id) finalized else m,
-    ];
-    _setState(state.value!.copyWith(
-      messages: messages,
+  /// Finalizes a turn without surfacing an error: drops the placeholder and
+  /// clears streaming flags so the UI offers a fresh send (no retry affordance).
+  void _finalizeWithoutError(String assistantId) {
+    final cur = state.value;
+    if (cur == null) return;
+    _setState(cur.copyWith(
+      messages: [
+        for (final m in cur.messages)
+          if (m.id != assistantId) m,
+      ],
       isStreaming: false,
       pendingUserMessageId: null,
       error: null,
       failedMessageId: null,
       authRequired: false,
     ));
-    _pendingAssistantId = null;
-    _pendingContent = null;
-    _cancelThrottle();
+    _clearPendingStream();
   }
 
   void _onContent(String assistantId, String text) {
@@ -680,14 +1168,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     return _pendingContent?.toString() ?? '';
   }
 
-  /// Re-resolves the [ChatClient] from [chatApiClientProvider]. Called after a
-  /// re-auth mints a fresh API key: the pinned client instance is swapped so
-  /// the next [retry] authorizes with the new key (the client is deliberately
-  /// read — not watched — at build time, see [build]).
-  void refreshClient() {
-    _client = ref.read(chatApiClientProvider);
-  }
-
   /// Clears the auth-required flag (e.g. the user dismissed the re-auth card).
   void dismissAuthRequired() {
     final current = state.value;
@@ -705,21 +1185,116 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // from a stale, already-stopped turn are also suppressed via the token's
     // own cancelled state, so they can't be mis-attributed to a newer turn.
     if (token.isCancelled) {
-      _pendingAssistantId = null;
-      _pendingContent = null;
-      _cancelThrottle();
+      _clearPendingStream();
+      return;
+    }
+
+    // A `cancelled` PluginClientException from the managed service with the
+    // local token still live (e.g. a mid-stream abandon that raced the
+    // stream, or a scope epoch bump) is a silent finalization, not an error:
+    // stop() already settled the streaming flags and kept the partial.
+    if (error is PluginClientException && error.code == ManagedErrorCodes.cancelled) {
+      _upsertPartial(assistantId, _assistantContent(assistantId));
+      _setState(state.value!.copyWith(
+        isStreaming: false,
+        pendingUserMessageId: null,
+        error: null,
+        failedMessageId: null,
+        authRequired: false,
+      ));
+      _clearPendingStream();
+      return;
+    }
+
+    // `no_pending_turn` from a replay against an already-cleared staged row:
+    // finalize silently — the retry affordance must not linger with no row
+    // behind it (plan §5 P1: hide retry, offer a fresh send).
+    if (error is PluginClientException && error.code == ManagedErrorCodes.noPendingTurn) {
+      _finalizeWithoutError(assistantId);
       return;
     }
 
     // A gateway 401 means the API key is missing/invalid: surface the distinct
     // auth-required state (the UI renders the re-auth card) instead of a
-    // generic error message.
+    // generic error message. Managed auth codes map through the same helper.
     final authRequired = isAuthRequiredError(error);
 
+    // A failed turn can leave a staged pending row (post-admission failures
+    // keep it). Surface once with an abandonTurn escape (plan §5 P1): the
+    // abandon clears the row so the next send/retry is not wedged, then the
+    // banner tells the user the in-progress reply was stopped. A BACKGROUND
+    // pending row is exempt: abandoning it would destroy a still-running job —
+    // its poller watch hits the `pending == null` guard and silently loses the
+    // reply. In that case the marker (chip) is kept, the optimistic user row +
+    // placeholder are dropped, and the error tells the user to wait.
+    if (error is PluginClientException && error.code == ManagedErrorCodes.pendingTurnExists) {
+      try {
+        final adapter = ref.read(managedChatAdapterProvider);
+        final cleared = await adapter.abandonTurnKeepingBackground(
+          conversationId,
+        );
+        if (!ref.mounted) return;
+        if (cleared) {
+          _upsertPartial(assistantId, _assistantContent(assistantId));
+          _setState(state.value!.copyWith(
+            isStreaming: false,
+            // Same copy surface as the mapper: the pending turn was
+            // abandoned, so this is the only special case the branch keeps —
+            // the abandonTurn action itself.
+            error: statusPhraseForError(error),
+            pendingUserMessageId: null,
+            failedMessageId: assistantId,
+            authRequired: false,
+          ));
+        } else {
+          // A background job is genuinely pending: keep the chip, drop the
+          // never-admitted optimistic user row + empty placeholder, and tell
+          // the user to wait for the job instead of claiming it was stopped.
+          final cur = state.value;
+          if (cur != null) {
+            final lastUserIndex =
+                cur.messages.lastIndexWhere((m) => m.role == MessageRole.user);
+            _setState(cur.copyWith(
+              messages: [
+                for (var i = 0; i < cur.messages.length; i++)
+                  if (i != lastUserIndex && cur.messages[i].id != assistantId)
+                    cur.messages[i],
+              ],
+              isStreaming: false,
+              error:
+                  'A background job is still running — wait for it to finish.',
+              pendingUserMessageId: null,
+              failedMessageId: null,
+              authRequired: false,
+              hasPendingJob: true,
+            ));
+          }
+        }
+      } catch (_) {
+        // Best-effort escape hatch; still surface the message.
+        _upsertPartial(assistantId, _assistantContent(assistantId));
+        _setState(state.value!.copyWith(
+          isStreaming: false,
+          error: statusPhraseForError(error),
+          pendingUserMessageId: null,
+          failedMessageId: assistantId,
+          authRequired: false,
+        ));
+      }
+      _clearPendingStream();
+      return;
+    }
+
     final message = switch (error) {
-      ChatNetworkError(:final message) => message,
-      ChatApiError(:final message) => message,
+      // The legacy Chat* surface routes through the single
+      // statusPhraseForError copy (the same copy voice speaks) instead of
+      // leaking raw message text as banner copy.
+      ChatApiError() => statusPhraseForError(error),
       DioException() => 'Network error',
+      // Managed-service failures map their code through the single
+      // statusPhraseForError surface (the same copy voice speaks) instead of
+      // leaking the raw code as banner text.
+      PluginClientException() => statusPhraseForError(error),
       _ => 'Unexpected error',
     };
 
@@ -727,8 +1302,28 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       ref.read(networkStatusProvider.notifier).set(NetworkStatus.disconnected);
     }
 
-    // Keep partial content; persist it.
-    final partialContent = _assistantContent(assistantId);
+    // Keep partial content in memory only: the service owns assistant-row
+    // persistence (the placeholder was never written), so there is no row to
+    // update here. stop() hands the partial to abandonTurn for persistence.
+    _upsertPartial(assistantId, _assistantContent(assistantId));
+
+    _setState(state.value!.copyWith(
+      isStreaming: false,
+      error: authRequired ? null : message,
+      pendingUserMessageId: null,
+      failedMessageId: assistantId,
+      authRequired: authRequired,
+    ));
+    _clearPendingStream();
+  }
+
+  /// Writes [partialContent] into the in-memory assistant placeholder for
+  /// [assistantId] (creating it if the row vanished) so the partial survives
+  /// finalization after an error/abandon. Never touches the store — the
+  /// service owns assistant-row persistence.
+  void _upsertPartial(String assistantId, String partialContent) {
+    final cur = state.value;
+    if (cur == null) return;
     final updated = <Message>[];
     var hasAssistant = false;
     for (final m in cur.messages) {
@@ -739,31 +1334,19 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         updated.add(m);
       }
     }
-    var messages = updated;
     if (!hasAssistant) {
-      messages = [
-        ...messages,
-        Message(
-          id: assistantId,
-          role: MessageRole.assistant,
-          content: partialContent,
-          createdAt: DateTime.now(),
-        ),
-      ];
+      updated.add(Message(
+        id: assistantId,
+        role: MessageRole.assistant,
+        content: partialContent,
+        createdAt: DateTime.now(),
+      ));
     }
+    _setState(cur.copyWith(messages: updated));
+  }
 
-    await _store!.updateMessage(conversationId,
-        messages.firstWhere((m) => m.id == assistantId));
-    if (!ref.mounted) return;
-
-    _setState(cur.copyWith(
-      messages: messages,
-      isStreaming: false,
-      error: authRequired ? null : message,
-      pendingUserMessageId: null,
-      failedMessageId: assistantId,
-      authRequired: authRequired,
-    ));
+  /// Clears the coalescing stream bookkeeping (buffer + throttle timer).
+  void _clearPendingStream() {
     _pendingAssistantId = null;
     _pendingContent = null;
     _cancelThrottle();

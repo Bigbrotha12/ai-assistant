@@ -33,139 +33,185 @@ void main() {
   const chunkAudioMs = 100;
 
   group('voice pipeline chunk timing', () {
-    test('inter-chunk pause equals next-chunk synthesis when the LLM is ahead',
-        () async {
-      final clock = Stopwatch()..start();
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['Alpha one. Beta two. ', 'Gamma three.'],
-        ],
-        results: [
-          ChatResult(
-            content: 'Alpha one. Beta two. Gamma three.',
+    test(
+      'inter-chunk pause equals next-chunk synthesis when the LLM is ahead',
+      () async {
+        final clock = Stopwatch()..start();
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['Alpha one. Beta two. ', 'Gamma three.'],
+          ],
+          results: [
+            ChatResult(
+              content: 'Alpha one. Beta two. Gamma three.',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = TimedPlayback(clock);
+        final tts = TimedTts(
+          clock: clock,
+          delayMs: synthDelayMs,
+          audioDurationMs: chunkAudioMs,
+        );
+
+        final controller = VoiceController(
+          sendTurn:
+              ({
+                required messages,
+                required userText,
+                systemPrompt,
+                cancelToken,
+                onReceived,
+                onContent,
+                onToolCallDelta,
+              }) {
+                return chat.sendTurn(
+                  '',
+                  history: const [],
+                  userText: userText,
+                  messages: messages,
+                  systemPrompt: systemPrompt,
+                  cancelToken: cancelToken,
+                  onReceived: onReceived,
+                  onContent: onContent,
+                  onToolCallDelta: onToolCallDelta,
+                );
+              },
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
+
+        final turnStart = clock.elapsedMilliseconds;
+        await controller.sendText('hello');
+
+        expect(tts.synthesized, hasLength(3));
+        expect(playback.playStartsMs, hasLength(3));
+        _printTimeline(clock, playback, tts, turnStart, 'LLM ahead');
+
+        // Gap between chunk N's playback end and chunk N+1's playback start.
+        final gapA = playback.playStartsMs[1] - playback.playEndsMs[0];
+        final gapB = playback.playStartsMs[2] - playback.playEndsMs[1];
+        // With one-ahead pipelining, chunk N+1's synthesis overlaps chunk N's
+        // playback: synthesis of the next chunk starts before the current one
+        // finishes, and the audible gap shrinks below the full synthesis time
+        // (120ms synth vs 100ms playback → ~20ms residual).
+        expect(
+          tts.synthStartMs[1],
+          lessThan(playback.playEndsMs[0]),
+          reason: 'chunk 2 synthesis started while chunk 1 was still playing',
+        );
+        expect(
+          tts.synthStartMs[2],
+          lessThan(playback.playEndsMs[1]),
+          reason: 'chunk 3 synthesis started while chunk 2 was still playing',
+        );
+        expect(gapA, lessThan(synthDelayMs), reason: 'gap 1-2 < full synth');
+        expect(gapB, lessThan(synthDelayMs), reason: 'gap 2-3 < full synth');
+        // Time to first audio ≈ first synthesis cost only (no LLM round-trip
+        // wait thrown in).
+        expect(
+          playback.playStartsMs[0] - turnStart,
+          _approx(synthDelayMs),
+          reason: 'time to first audio',
+        );
+
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
+
+    test(
+      'pause grows by the LLM catch-up wait when the queue empties mid-reply',
+      () async {
+        final clock = Stopwatch()..start();
+        const llmDelayMs = 400;
+        final chat = StagedChatClient(
+          clock: clock,
+          stageGapMs: llmDelayMs,
+          stageDeltas: [
+            // Newline-delimited so the splitter closes sentence 1 immediately
+            // (a '.'-terminal would wait for the lookahead of sentence 2).
+            ['First sentence.\n'],
+            ['Second sentence.'],
+          ],
+          result: ChatResult(
+            content: 'First sentence. Second sentence.',
             toolCalls: const [],
             finishReason: 'stop',
           ),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = TimedPlayback(clock);
-      final tts = TimedTts(
-        clock: clock,
-        delayMs: synthDelayMs,
-        audioDurationMs: chunkAudioMs,
-      );
+        );
+        final mic = FakeMicCaptureService();
+        final playback = TimedPlayback(clock);
+        final tts = TimedTts(
+          clock: clock,
+          delayMs: synthDelayMs,
+          audioDurationMs: chunkAudioMs,
+        );
 
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
+        final controller = VoiceController(
+          sendTurn:
+              ({
+                required messages,
+                required userText,
+                systemPrompt,
+                cancelToken,
+                onReceived,
+                onContent,
+                onToolCallDelta,
+              }) {
+                return chat.sendTurn(
+                  '',
+                  history: const [],
+                  userText: userText,
+                  messages: messages,
+                  systemPrompt: systemPrompt,
+                  cancelToken: cancelToken,
+                  onReceived: onReceived,
+                  onContent: onContent,
+                  onToolCallDelta: onToolCallDelta,
+                );
+              },
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
 
-      final turnStart = clock.elapsedMilliseconds;
-      await controller.sendText('hello');
+        final turnStart = clock.elapsedMilliseconds;
+        await controller.sendText('hello');
 
-      expect(tts.synthesized, hasLength(3));
-      expect(playback.playStartsMs, hasLength(3));
-      _printTimeline(clock, playback, tts, turnStart, 'LLM ahead');
+        expect(tts.synthesized, hasLength(2));
+        expect(playback.playStartsMs, hasLength(2));
+        _printTimeline(clock, playback, tts, turnStart, 'LLM lags');
 
-      // Gap between chunk N's playback end and chunk N+1's playback start.
-      final gapA = playback.playStartsMs[1] - playback.playEndsMs[0];
-      final gapB = playback.playStartsMs[2] - playback.playEndsMs[1];
-      // With one-ahead pipelining, chunk N+1's synthesis overlaps chunk N's
-      // playback: synthesis of the next chunk starts before the current one
-      // finishes, and the audible gap shrinks below the full synthesis time
-      // (120ms synth vs 100ms playback → ~20ms residual).
-      expect(
-        tts.synthStartMs[1],
-        lessThan(playback.playEndsMs[0]),
-        reason: 'chunk 2 synthesis started while chunk 1 was still playing',
-      );
-      expect(
-        tts.synthStartMs[2],
-        lessThan(playback.playEndsMs[1]),
-        reason: 'chunk 3 synthesis started while chunk 2 was still playing',
-      );
-      expect(gapA, lessThan(synthDelayMs), reason: 'gap 1-2 < full synth');
-      expect(gapB, lessThan(synthDelayMs), reason: 'gap 2-3 < full synth');
-      // Time to first audio ≈ first synthesis cost only (no LLM round-trip
-      // wait thrown in).
-      expect(
-        playback.playStartsMs[0] - turnStart,
-        _approx(synthDelayMs),
-        reason: 'time to first audio',
-      );
+        // Sentence 1 is delivered at t≈0; it synthesises for ~synthDelayMs then
+        // plays for ~chunkAudioMs. Sentence 2 arrives only at t≈llmDelayMs, so
+        // the queue is empty from play1's end (≈ synth+audio) until then. That
+        // empty-queue wait, plus sentence 2's synthesis, is the audible pause
+        // between the two chunks.
+        final gap = playback.playStartsMs[1] - playback.playEndsMs[0];
+        final emptyQueueWait = llmDelayMs - synthDelayMs - chunkAudioMs;
+        expect(
+          emptyQueueWait,
+          _approx(180),
+          reason: 'queue sat empty for the residual LLM delay',
+        );
+        final expectedGap = llmDelayMs - chunkAudioMs;
+        expect(gap, _approx(expectedGap), reason: 'gap 1-2 (LLM-bound)');
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
-
-    test('pause grows by the LLM catch-up wait when the queue empties mid-reply',
-        () async {
-      final clock = Stopwatch()..start();
-      const llmDelayMs = 400;
-      final chat = StagedChatClient(
-        clock: clock,
-        stageGapMs: llmDelayMs,
-        stageDeltas: [
-          // Newline-delimited so the splitter closes sentence 1 immediately
-          // (a '.'-terminal would wait for the lookahead of sentence 2).
-          ['First sentence.\n'],
-          ['Second sentence.'],
-        ],
-        result: ChatResult(
-          content: 'First sentence. Second sentence.',
-          toolCalls: const [],
-          finishReason: 'stop',
-        ),
-      );
-      final mic = FakeMicCaptureService();
-      final playback = TimedPlayback(clock);
-      final tts = TimedTts(
-        clock: clock,
-        delayMs: synthDelayMs,
-        audioDurationMs: chunkAudioMs,
-      );
-
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
-
-      final turnStart = clock.elapsedMilliseconds;
-      await controller.sendText('hello');
-
-      expect(tts.synthesized, hasLength(2));
-      expect(playback.playStartsMs, hasLength(2));
-      _printTimeline(clock, playback, tts, turnStart, 'LLM lags');
-
-      // Sentence 1 is delivered at t≈0; it synthesises for ~synthDelayMs then
-      // plays for ~chunkAudioMs. Sentence 2 arrives only at t≈llmDelayMs, so
-      // the queue is empty from play1's end (≈ synth+audio) until then. That
-      // empty-queue wait, plus sentence 2's synthesis, is the audible pause
-      // between the two chunks.
-      final gap = playback.playStartsMs[1] - playback.playEndsMs[0];
-      final emptyQueueWait = llmDelayMs - synthDelayMs - chunkAudioMs;
-      expect(
-        emptyQueueWait,
-        _approx(180),
-        reason: 'queue sat empty for the residual LLM delay',
-      );
-      final expectedGap = llmDelayMs - chunkAudioMs;
-      expect(gap, _approx(expectedGap), reason: 'gap 1-2 (LLM-bound)');
-
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
   });
 }
 
@@ -270,13 +316,13 @@ class TimedTts implements TtsEngine {
 
 /// Delivers staged sentence groups separated by [stageGapMs], simulating an
 /// LLM that streams the next sentence only after a delay.
-class StagedChatClient implements ChatClient {
+class StagedChatClient extends FakeChatClient {
   StagedChatClient({
     required this.clock,
     required this.stageGapMs,
     required this.stageDeltas,
     required this.result,
-  });
+  }) : super();
 
   final Stopwatch clock;
   final int stageGapMs;
@@ -284,17 +330,20 @@ class StagedChatClient implements ChatClient {
   final ChatResult result;
 
   @override
-  Future<ChatResult> streamCompletions({
-    required List<ApiMessage> messages,
+  Future<ChatResult> sendTurn(
+    String conversationId, {
+    required List<Message> history,
+    required String userText,
+    String? sessionId,
+    void Function(String delta)? onContent,
+    List<ApiMessage>? messages,
     String? systemPrompt,
     int maxTokens = 4096,
     int? temperature,
     List<Map<String, Object?>>? tools,
     bool enableThinking = false,
-    void Function(String text)? onContent,
-    void Function(int index, String name, String argsFragment)?
-        onToolCallDelta,
     CancelToken? cancelToken,
+    void Function(int index, String name, String argsFragment)? onToolCallDelta,
     void Function()? onReceived,
   }) async {
     if (cancelToken?.isCancelled ?? false) {
@@ -309,19 +358,5 @@ class StagedChatClient implements ChatClient {
       }
     }
     return result;
-  }
-
-  @override
-  Future<ChatResult> completions({
-    required List<ApiMessage> messages,
-    String? systemPrompt,
-    int maxTokens = 4096,
-    int? temperature,
-    List<Map<String, Object?>>? tools,
-    bool enableThinking = false,
-    CancelToken? cancelToken,
-    void Function()? onReceived,
-  }) {
-    throw UnimplementedError();
   }
 }

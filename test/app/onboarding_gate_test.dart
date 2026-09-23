@@ -7,7 +7,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/settings/data/prefs_providers.dart';
 import 'package:ai_assistant/features/settings/data/prefs_store.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
@@ -120,7 +119,6 @@ void main() {
         appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
         backendProbeProvider.overrideWithValue(FakeProbe()),
         chatStoreProvider.overrideWithValue(FakeChatStore()),
-        chatApiClientProvider.overrideWithValue(FakeChatClient()),
         engineManagerProvider.overrideWithValue(FakeEngineManager()),
         micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
         audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),

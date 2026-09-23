@@ -196,6 +196,16 @@ class DioBackendProbe implements BackendProbe {
               ),
             )
             .timeout(_timeouts.inference);
+        // 401: the stored gateway API key was rejected. validateStatus above
+        // accepts every status, so this arrives as a normal response rather
+        // than a badResponse DioException.
+        if (resp.statusCode == 401) {
+          return const CheckResult(
+            check: BackendCheck.inference,
+            status: ProbeStatus.unauthorized,
+            detail: 'gateway API key rejected (401)',
+          );
+        }
         // 2xx, 400, or 422: gateway endpoint is reachable and auth works;
         // the test model '_probe' won't resolve but the response confirms the
         // gateway is alive and the API key is valid.

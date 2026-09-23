@@ -1,10 +1,12 @@
 import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show domainPhrases;
+import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:ai_assistant/features/voice/data/engine_errors.dart';
 import 'package:ai_assistant/features/voice/ui/voice_conversation_state.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
@@ -12,73 +14,111 @@ import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
 import '../../fakes.dart';
 import 'voice_test_fakes.dart';
 
+/// Scripts the controller's [VoiceTurnSender] seam directly against the
+/// scripted client's managed sender seam ([FakeChatClient.sendTurn]): the
+/// controller-built wire messages are recorded verbatim in
+/// [FakeChatClient.calls]. The conversation id is irrelevant for a scripted
+/// client (no scoped persistence).
+VoiceTurnSender _scriptedTurnSender(FakeChatClient chat) {
+  return ({
+    required messages,
+    required userText,
+    systemPrompt,
+    cancelToken,
+    onReceived,
+    onContent,
+    onToolCallDelta,
+  }) {
+    return chat.sendTurn(
+      '',
+      history: const [],
+      userText: userText,
+      messages: messages,
+      systemPrompt: systemPrompt,
+      cancelToken: cancelToken,
+      onReceived: onReceived,
+      onContent: onContent,
+      onToolCallDelta: onToolCallDelta,
+    );
+  };
+}
+
 void main() {
-  test('startConversation activates the session and endConversation teardown',
-      () async {
-    final chat = FakeChatClient();
-    final mic = FakeMicCaptureService();
-    final playback = FakeAudioPlayback();
+  test(
+    'startConversation activates the session and endConversation teardown',
+    () async {
+      final chat = FakeChatClient();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
 
-    final controller = VoiceController(
-      chatClient: chat,
-      micCapture: mic,
-      playback: playback,
-    );
+      final controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: mic,
+        playback: playback,
+      );
 
-    await controller.startConversation();
-    expect(controller.state.isConnected, isTrue);
+      await controller.startConversation();
+      expect(controller.state.isConnected, isTrue);
 
-    await controller.startRecording();
-    expect(controller.state.isRecording, isTrue);
+      await controller.startRecording();
+      expect(controller.state.isRecording, isTrue);
 
-    await controller.endConversation();
-    expect(controller.state.isConnected, isFalse);
-    expect(controller.state.isRecording, isFalse);
+      await controller.endConversation();
+      expect(controller.state.isConnected, isFalse);
+      expect(controller.state.isRecording, isFalse);
 
-    await controller.dispose();
-    await mic.dispose();
-    await playback.dispose();
-  });
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    },
+  );
 
-  test('startConversation and endConversation clear stale turn fields', () async {
-    final chat = FakeChatClient(
-      results: [
-        ChatResult(content: 'hi', toolCalls: const [], finishReason: 'stop'),
-      ],
-    );
-    final mic = FakeMicCaptureService();
-    final playback = FakeAudioPlayback();
+  test(
+    'startConversation and endConversation clear stale turn fields',
+    () async {
+      final chat = FakeChatClient(
+        results: [
+          ChatResult(content: 'hi', toolCalls: const [], finishReason: 'stop'),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
 
-    final controller = VoiceController(
-      chatClient: chat,
-      micCapture: mic,
-      playback: playback,
-    );
+      final controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: mic,
+        playback: playback,
+      );
 
-    await controller.startConversation();
-    await controller.sendText('hello', speakReply: false);
-    // The completed turn leaves lastReply set.
-    expect(controller.state.lastReply, 'hi');
+      await controller.startConversation();
+      await controller.sendText('hello', speakReply: false);
+      // The completed turn leaves lastReply set.
+      expect(controller.state.lastReply, 'hi');
 
-    // endConversation clears per-turn fields.
-    await controller.endConversation();
-    expect(controller.state.lastReply, isNull);
-    expect(controller.state.onDeviceTranscript, isNull);
+      // endConversation clears per-turn fields.
+      await controller.endConversation();
+      expect(controller.state.lastReply, isNull);
+      expect(controller.state.onDeviceTranscript, isNull);
 
-    // A restarted session starts with clean per-turn fields.
-    await controller.startConversation();
-    expect(controller.state.lastReply, isNull);
-    expect(controller.state.onDeviceTranscript, isNull);
+      // A restarted session starts with clean per-turn fields.
+      await controller.startConversation();
+      expect(controller.state.lastReply, isNull);
+      expect(controller.state.onDeviceTranscript, isNull);
 
-    await controller.dispose();
-    await mic.dispose();
-    await playback.dispose();
-  });
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    },
+  );
 
   test('flushTranscriptionBuffer clears the buffer immediately', () async {
     final chat = FakeChatClient(
       results: [
-        ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
+        ChatResult(
+          content: 'hi there',
+          toolCalls: const [],
+          finishReason: 'stop',
+        ),
       ],
     );
     final mic = FakeMicCaptureService();
@@ -87,7 +127,7 @@ void main() {
     final tts = FakeTtsEngine();
 
     final controller = VoiceController(
-      chatClient: chat,
+      sendTurn: _scriptedTurnSender(chat),
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
@@ -116,51 +156,57 @@ void main() {
     await playback.dispose();
   });
 
-  test('flushTranscriptionBuffer sends the utterance and speaks the reply',
-      () async {
-    final chat = FakeChatClient(
-      streamDeltas: [
-        ['Hello', ' there'],
-      ],
-      results: [
-        ChatResult(content: 'Hello there', toolCalls: const [], finishReason: 'stop'),
-      ],
-    );
-    final mic = FakeMicCaptureService();
-    final playback = FakeAudioPlayback();
-    final stt = FakeSttEngine(transcript: 'hello world');
-    final tts = FakeTtsEngine();
+  test(
+    'flushTranscriptionBuffer sends the utterance and speaks the reply',
+    () async {
+      final chat = FakeChatClient(
+        streamDeltas: [
+          ['Hello', ' there'],
+        ],
+        results: [
+          ChatResult(
+            content: 'Hello there',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine(transcript: 'hello world');
+      final tts = FakeTtsEngine();
 
-    final controller = VoiceController(
-      chatClient: chat,
-      micCapture: mic,
-      playback: playback,
-      sttEngine: stt,
-      ttsEngine: tts,
-    );
-    await controller.startConversation();
+      final controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: tts,
+      );
+      await controller.startConversation();
 
-    final replies = <String>[];
-    controller.onTranscript = replies.add;
+      final replies = <String>[];
+      controller.onTranscript = replies.add;
 
-    mic.emitChunk([1, 2, 3]);
-    await pumpEventQueue();
-    await controller.flushTranscriptionBuffer();
-    await pumpEventQueue();
-    await pumpEventQueue();
-    await pumpEventQueue();
+      mic.emitChunk([1, 2, 3]);
+      await pumpEventQueue();
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      await pumpEventQueue();
+      await pumpEventQueue();
 
-    // The streamed reply is accumulated into state and finalised.
-    expect(controller.state.lastTranscript, 'Hello there');
-    expect(replies, ['Hello there']);
-    // The reply text is synthesised by the on-device TTS engine.
-    expect(tts.synthesized, ['Hello there']);
-    expect(playback.playedChunks, isNotEmpty);
+      // The streamed reply is accumulated into state and finalised.
+      expect(controller.state.lastTranscript, 'Hello there');
+      expect(replies, ['Hello there']);
+      // The reply text is synthesised by the on-device TTS engine.
+      expect(tts.synthesized, ['Hello there']);
+      expect(playback.playedChunks, isNotEmpty);
 
-    await controller.dispose();
-    await mic.dispose();
-    await playback.dispose();
-  });
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    },
+  );
 
   test('flushTranscriptionBuffer reports engine failures by type', () async {
     final chat = FakeChatClient();
@@ -169,7 +215,7 @@ void main() {
     final stt = FakeSttEngine()..error = const EngineInferenceError('boom');
 
     final controller = VoiceController(
-      chatClient: chat,
+      sendTurn: _scriptedTurnSender(chat),
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
@@ -198,7 +244,7 @@ void main() {
     final playback = FakeAudioPlayback();
 
     final controller = VoiceController(
-      chatClient: chat,
+      sendTurn: _scriptedTurnSender(chat),
       micCapture: mic,
       playback: playback,
     );
@@ -222,7 +268,7 @@ void main() {
     final playback = FakeAudioPlayback();
 
     final controller = VoiceController(
-      chatClient: chat,
+      sendTurn: _scriptedTurnSender(chat),
       micCapture: mic,
       playback: playback,
     );
@@ -232,10 +278,7 @@ void main() {
     await pumpEventQueue();
 
     expect(controller.state.error, isA<ChatServerError>());
-    expect(
-      (controller.state.error! as ChatServerError).statusCode,
-      401,
-    );
+    expect((controller.state.error! as ChatServerError).statusCode, 401);
     // The UI classifies this as "re-auth required", not a network error.
     expect(isAuthRequiredError(controller.state.error!), isTrue);
 
@@ -256,7 +299,7 @@ void main() {
     final stt = FakeSttEngine(transcript: '   ');
 
     final controller = VoiceController(
-      chatClient: chat,
+      sendTurn: _scriptedTurnSender(chat),
       micCapture: mic,
       playback: playback,
       sttEngine: stt,
@@ -283,7 +326,7 @@ void main() {
     final playback = FakeAudioPlayback();
 
     final controller = VoiceController(
-      chatClient: chat,
+      sendTurn: _scriptedTurnSender(chat),
       micCapture: mic,
       playback: playback,
     );
@@ -298,110 +341,126 @@ void main() {
   });
 
   group('echo gate', () {
-    test('mic chunks during and shortly after playback are not buffered',
-        () async {
-      final chat = FakeChatClient(
-        results: [
-          ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final stt = FakeSttEngine();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        sttEngine: stt,
-        ttsEngine: tts,
-      );
+    test(
+      'mic chunks during and shortly after playback are not buffered',
+      () async {
+        final chat = FakeChatClient(
+          results: [
+            ChatResult(
+              content: 'hi there',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final stt = FakeSttEngine();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+          ttsEngine: tts,
+        );
 
-      await controller.startConversation();
-      await controller.startRecording();
-      await controller.synthesizeOnDevice('reply');
-      // FakeAudioPlayback emitted isPlaying true → false (completion); the
-      // echo gate now covers the speaker tail. Chunks right after playback
-      // must not reach the STT buffer.
-      expect(controller.state.isAiSpeaking, isFalse);
-      mic.emitChunk(List.filled(160, 5));
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await Future<void>.delayed(Duration.zero);
-      expect(stt.transcribed, isEmpty);
+        await controller.startConversation();
+        await controller.startRecording();
+        await controller.synthesizeOnDevice('reply');
+        // FakeAudioPlayback emitted isPlaying true → false (completion); the
+        // echo gate now covers the speaker tail. Chunks right after playback
+        // must not reach the STT buffer.
+        expect(controller.state.isAiSpeaking, isFalse);
+        mic.emitChunk(List.filled(160, 5));
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await Future<void>.delayed(Duration.zero);
+        expect(stt.transcribed, isEmpty);
 
-      // After the refractory window, capture resumes.
-      await Future<void>.delayed(const Duration(milliseconds: 320));
-      mic.emitChunk(List.filled(160, 7));
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await Future<void>.delayed(Duration.zero);
-      expect(stt.transcribed, hasLength(1));
-      expect(stt.transcribed.single, everyElement(7));
+        // After the refractory window, capture resumes.
+        await Future<void>.delayed(const Duration(milliseconds: 320));
+        mic.emitChunk(List.filled(160, 7));
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await Future<void>.delayed(Duration.zero);
+        expect(stt.transcribed, hasLength(1));
+        expect(stt.transcribed.single, everyElement(7));
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
   });
 
   group('turn lifecycle', () {
-    test('endConversation cancels queued turns (no network or audio after)',
-        () async {
-      final chat = FakeChatClient(
-        results: [
-          ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final stt = FakeSttEngine();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        sttEngine: stt,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
+    test(
+      'endConversation cancels queued turns (no network or audio after)',
+      () async {
+        final chat = FakeChatClient(
+          results: [
+            ChatResult(
+              content: 'hi there',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final stt = FakeSttEngine();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
 
-      await controller.startConversation();
-      await controller.startRecording();
+        await controller.startConversation();
+        await controller.startRecording();
 
-      // Turn 1 in flight (STT held open), turn 2 queued behind it.
-      stt.gate = Completer<void>();
-      mic.emitChunk(List.filled(40, 1));
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await Future<void>.delayed(Duration.zero);
-      mic.emitChunk(List.filled(40, 2));
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      expect(stt.transcribed, hasLength(1));
+        // Turn 1 in flight (STT held open), turn 2 queued behind it.
+        stt.gate = Completer<void>();
+        mic.emitChunk(List.filled(40, 1));
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await Future<void>.delayed(Duration.zero);
+        mic.emitChunk(List.filled(40, 2));
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        expect(stt.transcribed, hasLength(1));
 
-      // Teardown while turn 1 is mid-flight.
-      await controller.endConversation();
+        // Teardown while turn 1 is mid-flight.
+        await controller.endConversation();
 
-      // Release the gate: turn 1 must abort after STT, turn 2 never start —
-      // no network call and no audio after the session is gone.
-      stt.gate!.complete();
-      await Future<void>.delayed(Duration.zero);
-      await Future<void>.delayed(Duration.zero);
+        // Release the gate: turn 1 must abort after STT, turn 2 never start —
+        // no network call and no audio after the session is gone.
+        stt.gate!.complete();
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
 
-      expect(chat.calls, isEmpty);
-      expect(playback.playedChunks, isEmpty);
-      expect(controller.state.isConnected, isFalse);
+        expect(chat.calls, isEmpty);
+        expect(playback.playedChunks, isEmpty);
+        expect(controller.state.isConnected, isFalse);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('concurrent flushes serialize into ordered turns', () async {
       final chat = FakeChatClient(
         results: [
-          ChatResult(content: 'hi there', toolCalls: const [], finishReason: 'stop'),
+          ChatResult(
+            content: 'hi there',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
         ],
       );
       final mic = FakeMicCaptureService();
@@ -409,7 +468,7 @@ void main() {
       final stt = FakeSttEngine();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         sttEngine: stt,
@@ -451,83 +510,86 @@ void main() {
       await playback.dispose();
     });
 
-    test('onDeviceTranscript is set per utterance and cleared at turn start',
-        () async {
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['Hello', ' there', '!'],
-        ],
-        results: [
-          ChatResult(
+    test(
+      'onDeviceTranscript is set per utterance and cleared at turn start',
+      () async {
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['Hello', ' there', '!'],
+          ],
+          results: [
+            ChatResult(
               content: 'Hello there!',
               toolCalls: const [],
-              finishReason: 'stop'),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final stt = FakeSttEngine(transcript: 'hello world');
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        sttEngine: stt,
-        ttsEngine: tts,
-        // Back-to-back turns at test speed would otherwise be swallowed by
-        // the echo refractory window.
-        echoGateDuration: Duration.zero,
-      );
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final stt = FakeSttEngine(transcript: 'hello world');
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+          ttsEngine: tts,
+          // Back-to-back turns at test speed would otherwise be swallowed by
+          // the echo refractory window.
+          echoGateDuration: Duration.zero,
+        );
 
-      final emissions = <VoiceConversationState>[];
-      controller.stateStream.listen(emissions.add);
-      int transcriptEmits(String text) => emissions.fold(
-            0,
-            (n, s) => n + (s.onDeviceTranscript == text ? 1 : 0),
-          );
+        final emissions = <VoiceConversationState>[];
+        controller.stateStream.listen(emissions.add);
+        int transcriptEmits(String text) => emissions.fold(
+          0,
+          (n, s) => n + (s.onDeviceTranscript == text ? 1 : 0),
+        );
 
-      await controller.startConversation();
+        await controller.startConversation();
 
-      // Turn 1: a full STT → LLM (streamed deltas) → TTS turn.
-      mic.emitChunk([1, 2, 3]);
-      await pumpEventQueue();
-      await controller.flushTranscriptionBuffer();
-      await pumpEventQueue();
-      await pumpEventQueue();
-      await pumpEventQueue();
+        // Turn 1: a full STT → LLM (streamed deltas) → TTS turn.
+        mic.emitChunk([1, 2, 3]);
+        await pumpEventQueue();
+        await controller.flushTranscriptionBuffer();
+        await pumpEventQueue();
+        await pumpEventQueue();
+        await pumpEventQueue();
 
-      // (a) The slot is cleared once the turn begins, so it is null after
-      // the turn completes (streaming deltas and playback flips must not
-      // keep re-carrying the stale utterance).
-      expect(controller.state.onDeviceTranscript, isNull);
-      // (b) The recognised transcript appeared exactly twice per utterance:
-      // once from flushTranscriptionBuffer and once from sendText (the UI
-      // dedupes the consecutive identical values).
-      expect(transcriptEmits('hello world'), 2);
+        // (a) The slot is cleared once the turn begins, so it is null after
+        // the turn completes (streaming deltas and playback flips must not
+        // keep re-carrying the stale utterance).
+        expect(controller.state.onDeviceTranscript, isNull);
+        // (b) The recognised transcript appeared exactly twice per utterance:
+        // once from flushTranscriptionBuffer and once from sendText (the UI
+        // dedupes the consecutive identical values).
+        expect(transcriptEmits('hello world'), 2);
 
-      // Turn 2: the SAME text in a new turn must still produce fresh
-      // non-null emissions, since the slot was null between turns.
-      mic.emitChunk([4, 5, 6]);
-      await pumpEventQueue();
-      await controller.flushTranscriptionBuffer();
-      await pumpEventQueue();
-      await pumpEventQueue();
-      await pumpEventQueue();
+        // Turn 2: the SAME text in a new turn must still produce fresh
+        // non-null emissions, since the slot was null between turns.
+        mic.emitChunk([4, 5, 6]);
+        await pumpEventQueue();
+        await controller.flushTranscriptionBuffer();
+        await pumpEventQueue();
+        await pumpEventQueue();
+        await pumpEventQueue();
 
-      expect(controller.state.onDeviceTranscript, isNull);
-      expect(transcriptEmits('hello world'), 4);
+        expect(controller.state.onDeviceTranscript, isNull);
+        expect(transcriptEmits('hello world'), 4);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('mic stream errors are tolerated, not unhandled', () async {
       final chat = FakeChatClient();
       final mic = FakeMicCaptureService();
       final playback = FakeAudioPlayback();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         sttEngine: FakeSttEngine(),
@@ -546,6 +608,32 @@ void main() {
       await playback.dispose();
     });
 
+    test('a conversation_in_flight from a fast re-hold is dropped, never an '
+        'error banner (plan P2 barge-in)', () async {
+      final chat = FakeChatClient()
+        ..error = const PluginClientException('conversation_in_flight');
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: mic,
+        playback: playback,
+      );
+      await controller.startConversation();
+
+      // The client-local dedup flag is a transient race — the previous turn's
+      // sendVoiceTurn finally has not unwound yet — not a genuine failure.
+      await controller.sendText('hello');
+      await pumpEventQueue();
+
+      expect(controller.state.error, isNull);
+      expect(controller.state.isConnected, isTrue);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
     test('endConversation cancels an in-flight LLM stream (no transcript or '
         'audio after the session is gone)', () async {
       final chat = FakeChatClient(
@@ -553,14 +641,18 @@ void main() {
           ['partial'],
         ],
         results: [
-          ChatResult(content: 'partial', toolCalls: const [], finishReason: 'stop'),
+          ChatResult(
+            content: 'partial',
+            toolCalls: const [],
+            finishReason: 'stop',
+          ),
         ],
       )..hang = Completer<ChatResult>();
       final mic = FakeMicCaptureService();
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -582,7 +674,11 @@ void main() {
       // The stream returns a result despite the cancelled token: nothing may
       // fire onTranscript or keep mutating state after the session is gone.
       chat.hang!.complete(
-        const ChatResult(content: 'partial', toolCalls: [], finishReason: 'stop'),
+        const ChatResult(
+          content: 'partial',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
       );
       await send;
 
@@ -599,70 +695,79 @@ void main() {
   });
 
   group('background suspension', () {
-    test('background keeps an in-flight LLM stream alive and defers its reply',
-        () async {
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['partial'],
-        ],
-        results: [
-          ChatResult(content: 'partial', toolCalls: const [], finishReason: 'stop'),
-        ],
-      )..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-      );
-      await controller.startConversation();
+    test(
+      'background keeps an in-flight LLM stream alive and defers its reply',
+      () async {
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['partial'],
+          ],
+          results: [
+            ChatResult(
+              content: 'partial',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        )..hang = Completer<ChatResult>();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+        );
+        await controller.startConversation();
 
-      final transcripts = <String>[];
-      controller.onTranscript = transcripts.add;
+        final transcripts = <String>[];
+        controller.onTranscript = transcripts.add;
 
-      // The stream accumulates a delta, then hangs in flight.
-      final send = controller.sendText('hello');
-      await Future<void>.delayed(Duration.zero);
-      expect(chat.callCount, 1);
-      expect(controller.state.lastTranscript, 'partial');
+        // The stream accumulates a delta, then hangs in flight.
+        final send = controller.sendText('hello');
+        await Future<void>.delayed(Duration.zero);
+        expect(chat.callCount, 1);
+        expect(controller.state.lastTranscript, 'partial');
 
-      // The app backgrounds while the stream is in flight: audio is suspended
-      // but the turn is NOT cancelled.
-      await controller.enterBackground();
+        // The app backgrounds while the stream is in flight: audio is suspended
+        // but the turn is NOT cancelled.
+        await controller.enterBackground();
 
-      // The stream completes in the background: the reply is produced and
-      // persisted, but nothing is synthesised or played yet.
-      chat.hang!.complete(
-        const ChatResult(content: 'partial', toolCalls: [], finishReason: 'stop'),
-      );
-      await send;
+        // The stream completes in the background: the reply is produced and
+        // persisted, but nothing is synthesised or played yet.
+        chat.hang!.complete(
+          const ChatResult(
+            content: 'partial',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        );
+        await send;
 
-      expect(chat.callCount, 1);
-      expect(controller.state.isConnected, isTrue);
-      expect(controller.state.lastReply, 'partial');
-      expect(transcripts, ['partial']);
-      expect(tts.synthesized, isEmpty);
-      expect(playback.playedChunks, isEmpty);
+        expect(chat.callCount, 1);
+        expect(controller.state.isConnected, isTrue);
+        expect(controller.state.lastReply, 'partial');
+        expect(transcripts, ['partial']);
+        expect(tts.synthesized, isEmpty);
+        expect(playback.playedChunks, isEmpty);
 
-      // Returning to the foreground plays the deferred reply and closes the
-      // turn.
-      await controller.exitBackground();
-      await pumpEventQueue();
-      await pumpEventQueue();
-      expect(playback.playedChunks, hasLength(1));
-      expect(tts.synthesized, ['partial']);
-      expect(controller.state.isAiSpeaking, isFalse);
+        // Returning to the foreground plays the deferred reply and closes the
+        // turn.
+        await controller.exitBackground();
+        await pumpEventQueue();
+        await pumpEventQueue();
+        expect(playback.playedChunks, hasLength(1));
+        expect(tts.synthesized, ['partial']);
+        expect(controller.state.isAiSpeaking, isFalse);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
-    test('background stops playback mid-reply and plays the rest on resume',
-        () async {
+    test('background stops playback mid-reply and plays the rest on resume', () async {
       final chat = FakeChatClient(
         streamDeltas: [
           ['First sentence.', ' Second sentence.'],
@@ -679,7 +784,7 @@ void main() {
       final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -737,7 +842,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine()..gate = Completer<void>();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -778,112 +883,119 @@ void main() {
       await playback.dispose();
     });
 
-    test('synthesizeOnDevice resolves immediately while backgrounded',
-        () async {
-      final chat = FakeChatClient();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-      );
-      await controller.startConversation();
-      await controller.enterBackground();
+    test(
+      'synthesizeOnDevice resolves immediately while backgrounded',
+      () async {
+        final chat = FakeChatClient();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+        );
+        await controller.startConversation();
+        await controller.enterBackground();
 
-      // The queue drain is suspended while hidden: a backgrounded speak must
-      // not hang on the item's completer nor synthesise anything.
-      final result = await controller.synthesizeOnDevice('Say this');
-      expect(result, isEmpty);
-      expect(tts.synthesized, isEmpty);
-      expect(playback.playedChunks, isEmpty);
+        // The queue drain is suspended while hidden: a backgrounded speak must
+        // not hang on the item's completer nor synthesise anything.
+        final result = await controller.synthesizeOnDevice('Say this');
+        expect(result, isEmpty);
+        expect(tts.synthesized, isEmpty);
+        expect(playback.playedChunks, isEmpty);
 
-      await controller.exitBackground();
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.exitBackground();
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
   });
 
   group('speak normalization', () {
-    test('symbols are normalised for speech but not for the transcript',
-        () async {
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['The price is \u20AC5.'],
-        ],
-        results: [
-          ChatResult(
-            content: 'The price is \u20AC5.',
-            toolCalls: const [],
-            finishReason: 'stop',
-          ),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-      );
-      await controller.startConversation();
+    test(
+      'symbols are normalised for speech but not for the transcript',
+      () async {
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['The price is \u20AC5.'],
+          ],
+          results: [
+            ChatResult(
+              content: 'The price is \u20AC5.',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+        );
+        await controller.startConversation();
 
-      await controller.sendText('What does it cost?');
-      await pumpEventQueue();
-      await pumpEventQueue();
-      await pumpEventQueue();
+        await controller.sendText('What does it cost?');
+        await pumpEventQueue();
+        await pumpEventQueue();
+        await pumpEventQueue();
 
-      // The transcript keeps the raw reply text…
-      expect(controller.state.lastReply, 'The price is \u20AC5.');
-      // …but the spoken audio reads the expanded currency.
-      expect(tts.synthesized, ['The price is 5 euros.']);
+        // The transcript keeps the raw reply text…
+        expect(controller.state.lastReply, 'The price is \u20AC5.');
+        // …but the spoken audio reads the expanded currency.
+        expect(tts.synthesized, ['The price is 5 euros.']);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
   });
 
   group('interrupt', () {
-    test('interrupt during playback stops playback and clears isAiSpeaking',
-        () async {
-      final chat = FakeChatClient();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-      );
-      await controller.startConversation();
+    test(
+      'interrupt during playback stops playback and clears isAiSpeaking',
+      () async {
+        final chat = FakeChatClient();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback()
+          ..holdCompletion = Completer<void>();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+        );
+        await controller.startConversation();
 
-      // Synthesis completes but playAudio holds the playing state open, as a
-      // real long reply would.
-      unawaited(controller.synthesizeOnDevice('hello'));
-      await pumpEventQueue();
-      expect(controller.state.isAiSpeaking, isTrue);
-      expect(playback.playedChunks, hasLength(1));
+        // Synthesis completes but playAudio holds the playing state open, as a
+        // real long reply would.
+        unawaited(controller.synthesizeOnDevice('hello'));
+        await pumpEventQueue();
+        expect(controller.state.isAiSpeaking, isTrue);
+        expect(playback.playedChunks, hasLength(1));
 
-      await controller.interrupt();
+        await controller.interrupt();
 
-      expect(controller.state.isAiSpeaking, isFalse);
+        expect(controller.state.isAiSpeaking, isFalse);
 
-      // Releasing the held playback must not restart anything.
-      playback.holdCompletion!.complete();
-      await pumpEventQueue();
-      expect(controller.state.isAiSpeaking, isFalse);
+        // Releasing the held playback must not restart anything.
+        playback.holdCompletion!.complete();
+        await pumpEventQueue();
+        expect(controller.state.isAiSpeaking, isFalse);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('interrupt re-opens the mic gates synchronously even while the '
         'playback stop is held open', () async {
@@ -894,7 +1006,7 @@ void main() {
         ..stopGate = Completer<void>();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -936,7 +1048,7 @@ void main() {
       // the ChatNetworkError('cancelled').
       final builderGate = Completer<void>();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -994,7 +1106,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1043,7 +1155,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1070,40 +1182,46 @@ void main() {
       await playback.dispose();
     });
 
-    test('a new turn after interrupt still streams (token not pre-cancelled)',
-        () async {
-      final chat = FakeChatClient(
-        results: [
-          ChatResult(content: 'hi', toolCalls: const [], finishReason: 'stop'),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-      );
-      await controller.startConversation();
+    test(
+      'a new turn after interrupt still streams (token not pre-cancelled)',
+      () async {
+        final chat = FakeChatClient(
+          results: [
+            ChatResult(
+              content: 'hi',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+        );
+        await controller.startConversation();
 
-      // Interrupt with nothing playing: idempotent and side-effect free, and
-      // the next turn must stream against a fresh, uncancelled token.
-      await controller.interrupt();
-      expect(controller.state.error, isNull);
+        // Interrupt with nothing playing: idempotent and side-effect free, and
+        // the next turn must stream against a fresh, uncancelled token.
+        await controller.interrupt();
+        expect(controller.state.error, isNull);
 
-      await controller.sendText('hello');
+        await controller.sendText('hello');
 
-      expect(chat.callCount, 1);
-      expect(controller.state.lastReply, 'hi');
-      expect(tts.synthesized, ['hi']);
-      expect(playback.playedChunks, hasLength(1));
+        expect(chat.callCount, 1);
+        expect(controller.state.lastReply, 'hi');
+        expect(tts.synthesized, ['hi']);
+        expect(playback.playedChunks, hasLength(1));
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('barge-in mid-reply then a follow-up utterance still completes its '
         'turn (user-observed pipeline stall)', () async {
@@ -1124,7 +1242,7 @@ void main() {
       final tts = FakeTtsEngine();
       final stt = FakeSttEngine(transcript: 'follow up');
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         sttEngine: stt,
@@ -1180,7 +1298,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine()..gate = Completer<void>();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1225,7 +1343,7 @@ void main() {
       final stt = FakeSttEngine(transcript: 'hello world');
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         sttEngine: stt,
@@ -1276,59 +1394,61 @@ void main() {
   });
 
   group('isGenerating lifecycle', () {
-    test('true while the LLM stream is held, false once the turn completes',
-        () async {
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['Hello', ' there.'],
-        ],
-        results: [
-          ChatResult(
+    test(
+      'true while the LLM stream is held, false once the turn completes',
+      () async {
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['Hello', ' there.'],
+          ],
+          results: [
+            ChatResult(
+              content: 'Hello there.',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        )..hang = Completer<ChatResult>();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
+
+        expect(controller.state.isGenerating, isFalse);
+
+        // The stream hangs mid-generation, as a real LLM stream would.
+        final send = controller.sendText('hello');
+        await pumpEventQueue();
+        expect(chat.hang!.isCompleted, isFalse);
+        expect(controller.state.isGenerating, isTrue);
+
+        // Release the stream and let the whole turn finish (speak-queue drain
+        // + playback included).
+        chat.hang!.complete(
+          const ChatResult(
             content: 'Hello there.',
-            toolCalls: const [],
+            toolCalls: [],
             finishReason: 'stop',
           ),
-        ],
-      )..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
+        );
+        await send;
 
-      expect(controller.state.isGenerating, isFalse);
+        expect(controller.state.isGenerating, isFalse);
+        expect(controller.state.isAiSpeaking, isFalse);
+        expect(controller.state.lastReply, 'Hello there.');
 
-      // The stream hangs mid-generation, as a real LLM stream would.
-      final send = controller.sendText('hello');
-      await pumpEventQueue();
-      expect(chat.hang!.isCompleted, isFalse);
-      expect(controller.state.isGenerating, isTrue);
-
-      // Release the stream and let the whole turn finish (speak-queue drain
-      // + playback included).
-      chat.hang!.complete(
-        const ChatResult(
-          content: 'Hello there.',
-          toolCalls: [],
-          finishReason: 'stop',
-        ),
-      );
-      await send;
-
-      expect(controller.state.isGenerating, isFalse);
-      expect(controller.state.isAiSpeaking, isFalse);
-      expect(controller.state.lastReply, 'Hello there.');
-
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('isGenerating is false on an errored stream', () async {
       final failure = ChatServerError('boom');
@@ -1337,7 +1457,7 @@ void main() {
       final playback = FakeAudioPlayback();
 
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
       );
@@ -1372,7 +1492,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1424,7 +1544,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1481,13 +1601,15 @@ void main() {
       final playback = FakeAudioPlayback();
       // Distinct PCM per synthesis call ties each played chunk to its
       // utterance, so the played order is observable.
-      final tts = FakeTtsEngine(sampleVariants: const [
-        [1],
-        [2, 2],
-        [3, 3, 3],
-      ]);
+      final tts = FakeTtsEngine(
+        sampleVariants: const [
+          [1],
+          [2, 2],
+          [3, 3, 3],
+        ],
+      );
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1510,44 +1632,46 @@ void main() {
       await playback.dispose();
     });
 
-    test('the trailing partial sentence is dispatched on LLM completion',
-        () async {
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['Done sentence.', ' Trailing bit'],
-        ],
-        results: [
-          ChatResult(
-            content: 'Done sentence. Trailing bit',
-            toolCalls: const [],
-            finishReason: 'stop',
-          ),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
+    test(
+      'the trailing partial sentence is dispatched on LLM completion',
+      () async {
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['Done sentence.', ' Trailing bit'],
+          ],
+          results: [
+            ChatResult(
+              content: 'Done sentence. Trailing bit',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
 
-      await controller.sendText('hello');
+        await controller.sendText('hello');
 
-      // The boundary closes 'Done sentence.' mid-stream; 'Trailing bit'
-      // has no terminator and must be flushed as the remainder on
-      // completion.
-      expect(tts.synthesized, ['Done sentence.', 'Trailing bit']);
-      expect(playback.playedChunks, hasLength(2));
+        // The boundary closes 'Done sentence.' mid-stream; 'Trailing bit'
+        // has no terminator and must be flushed as the remainder on
+        // completion.
+        expect(tts.synthesized, ['Done sentence.', 'Trailing bit']);
+        expect(playback.playedChunks, hasLength(2));
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('isAiSpeaking stays true across the inter-sentence gap', () async {
       final chat = FakeChatClient(
@@ -1572,7 +1696,7 @@ void main() {
         ..gate = Completer<void>()
         ..gateStartIndex = 1;
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1631,7 +1755,7 @@ void main() {
         ..gate = Completer<void>()
         ..gateStartIndex = 1;
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1686,7 +1810,7 @@ void main() {
       ];
       final tts = FakeTtsEngine(samples: padded);
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1725,7 +1849,7 @@ void main() {
       final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1757,63 +1881,66 @@ void main() {
       await playback.dispose();
     });
 
-    test('pause mid-queue suspends the reply and resume continues it',
-        () async {
-      final chat = FakeChatClient(
-        streamDeltas: [
-          ['Alpha.', ' Beta.'],
-        ],
-        results: [
-          ChatResult(
-            content: 'Alpha. Beta.',
-            toolCalls: const [],
-            finishReason: 'stop',
-          ),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
-      final tts = FakeTtsEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
+    test(
+      'pause mid-queue suspends the reply and resume continues it',
+      () async {
+        final chat = FakeChatClient(
+          streamDeltas: [
+            ['Alpha.', ' Beta.'],
+          ],
+          results: [
+            ChatResult(
+              content: 'Alpha. Beta.',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback()
+          ..holdCompletion = Completer<void>();
+        final tts = FakeTtsEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
 
-      final send = controller.sendText('hello');
-      await pumpEventQueue();
-      expect(controller.state.isAiSpeaking, isTrue);
-      expect(playback.playedChunks, hasLength(1));
+        final send = controller.sendText('hello');
+        await pumpEventQueue();
+        expect(controller.state.isAiSpeaking, isTrue);
+        expect(playback.playedChunks, hasLength(1));
 
-      // OS interruption: playback stops, but the queue must not advance
-      // while paused.
-      await controller.pauseForInterruption();
-      await pumpEventQueue();
-      expect(controller.state.isPaused, isTrue);
-      expect(playback.playedChunks, hasLength(1));
-      // Alpha played; Beta may already be prefetch-synthesised but its
-      // playback is suspended by the pause.
-      expect(tts.synthesized, contains('Alpha.'));
+        // OS interruption: playback stops, but the queue must not advance
+        // while paused.
+        await controller.pauseForInterruption();
+        await pumpEventQueue();
+        expect(controller.state.isPaused, isTrue);
+        expect(playback.playedChunks, hasLength(1));
+        // Alpha played; Beta may already be prefetch-synthesised but its
+        // playback is suspended by the pause.
+        expect(tts.synthesized, contains('Alpha.'));
 
-      // The interruption ended the held track; release the fake's hold so
-      // the resumed sentence can finish.
-      playback.holdCompletion!.complete();
+        // The interruption ended the held track; release the fake's hold so
+        // the resumed sentence can finish.
+        playback.holdCompletion!.complete();
 
-      await controller.resumeAfterInterruption();
-      await send;
+        await controller.resumeAfterInterruption();
+        await send;
 
-      // Nothing was lost: Beta plays after the resume.
-      expect(tts.synthesized, ['Alpha.', 'Beta.']);
-      expect(playback.playedChunks, hasLength(2));
-      expect(controller.state.isAiSpeaking, isFalse);
+        // Nothing was lost: Beta plays after the resume.
+        expect(tts.synthesized, ['Alpha.', 'Beta.']);
+        expect(playback.playedChunks, hasLength(2));
+        expect(controller.state.isAiSpeaking, isFalse);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
     test('a sentence that filters to empty is skipped', () async {
       final chat = FakeChatClient(
@@ -1832,7 +1959,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -1863,122 +1990,130 @@ void main() {
       }
     }
 
-    test('an utterance flushed mid-generation queues as the NEXT turn',
-        () async {
-      final chat = FakeChatClient(
-        results: [
-          const ChatResult(content: 'First reply.', toolCalls: [], finishReason: 'stop'),
-        ],
-      )..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final stt = FakeSttEngine(transcript: 'second hello');
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        sttEngine: stt,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
+    test(
+      'an utterance flushed mid-generation queues as the NEXT turn',
+      () async {
+        final chat = FakeChatClient(
+          results: [
+            const ChatResult(
+              content: 'First reply.',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
+          ],
+        )..hang = Completer<ChatResult>();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final stt = FakeSttEngine(transcript: 'second hello');
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
 
-      // Turn 1 runs and hangs mid-stream.
-      mic.emitChunk([1, 1, 1]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await settle();
-      expect(chat.callCount, 1);
-      expect(controller.state.isGenerating, isTrue);
+        // Turn 1 runs and hangs mid-stream.
+        mic.emitChunk([1, 1, 1]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await settle();
+        expect(chat.callCount, 1);
+        expect(controller.state.isGenerating, isTrue);
 
-      // A second utterance flushed mid-generation is accepted as the queued
-      // next turn: no concurrent chat call, and its STT waits behind turn 1.
-      mic.emitChunk([2, 2, 2]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await settle();
-      expect(chat.callCount, 1);
-      expect(stt.transcribed, hasLength(1));
-      expect(controller.state.notice, isNull);
+        // A second utterance flushed mid-generation is accepted as the queued
+        // next turn: no concurrent chat call, and its STT waits behind turn 1.
+        mic.emitChunk([2, 2, 2]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await settle();
+        expect(chat.callCount, 1);
+        expect(stt.transcribed, hasLength(1));
+        expect(controller.state.notice, isNull);
 
-      // A third utterance while one is already pending is dropped with a
-      // notice.
-      mic.emitChunk([3, 3, 3]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await settle();
-      expect(stt.transcribed, hasLength(1));
-      expect(controller.state.notice, isNotNull);
+        // A third utterance while one is already pending is dropped with a
+        // notice.
+        mic.emitChunk([3, 3, 3]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await settle();
+        expect(stt.transcribed, hasLength(1));
+        expect(controller.state.notice, isNotNull);
 
-      // Releasing the stream finishes turn 1, then the queued turn runs.
-      chat.hang!.complete(
-        const ChatResult(
-          content: 'First reply.',
-          toolCalls: [],
-          finishReason: 'stop',
-        ),
-      );
-      await settle();
+        // Releasing the stream finishes turn 1, then the queued turn runs.
+        chat.hang!.complete(
+          const ChatResult(
+            content: 'First reply.',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        );
+        await settle();
 
-      expect(chat.callCount, 2);
-      expect(stt.transcribed, hasLength(2));
-      // The queued turn's sendText consumed the drop notice.
-      expect(controller.state.notice, isNull);
+        expect(chat.callCount, 2);
+        expect(stt.transcribed, hasLength(2));
+        // The queued turn's sendText consumed the drop notice.
+        expect(controller.state.notice, isNull);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
 
-    test('a dropped flush leaves the mic buffer clear (nothing accumulates)',
-        () async {
-      final chat = FakeChatClient()..hang = Completer<ChatResult>();
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final stt = FakeSttEngine();
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        sttEngine: stt,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-      );
-      await controller.startConversation();
+    test(
+      'a dropped flush leaves the mic buffer clear (nothing accumulates)',
+      () async {
+        final chat = FakeChatClient()..hang = Completer<ChatResult>();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final stt = FakeSttEngine();
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+        );
+        await controller.startConversation();
 
-      mic.emitChunk([1, 1, 1]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await settle();
+        mic.emitChunk([1, 1, 1]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await settle();
 
-      // Flush 2 is accepted (one pending slot), flush 3 is dropped: neither
-      // drop may resurrect audio later.
-      mic.emitChunk([2, 2, 2]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      mic.emitChunk([3, 3, 3]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await settle();
+        // Flush 2 is accepted (one pending slot), flush 3 is dropped: neither
+        // drop may resurrect audio later.
+        mic.emitChunk([2, 2, 2]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        mic.emitChunk([3, 3, 3]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await settle();
 
-      chat.hang!.complete(
-        const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
-      );
-      await settle();
+        chat.hang!.complete(
+          const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
+        );
+        await settle();
 
-      // Exactly two turns reached STT — [3,3,3] never did. The queued turn
-      // (accepted mid-generation) ran after turn 1, never concurrently.
-      expect(stt.transcribed, hasLength(2));
-      expect(stt.transcribed[0], [1, 1, 1]);
-      expect(stt.transcribed[1], [2, 2, 2]);
-      expect(chat.callCount, 2);
+        // Exactly two turns reached STT — [3,3,3] never did. The queued turn
+        // (accepted mid-generation) ran after turn 1, never concurrently.
+        expect(stt.transcribed, hasLength(2));
+        expect(stt.transcribed[0], [1, 1, 1]);
+        expect(stt.transcribed[1], [2, 2, 2]);
+        expect(chat.callCount, 2);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
   });
 
   group('review fixes (post-commit 0995545)', () {
@@ -2000,7 +2135,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine()..gate = Completer<void>();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2029,7 +2164,10 @@ void main() {
       // Sentence 2 survived and played. (The fake records the synthesis
       // request before its gate, so both calls appear in the record; only
       // sentence 2 produced audio.)
-      expect(tts.synthesized, containsAll(['First sentence.', 'Second sentence.']));
+      expect(
+        tts.synthesized,
+        containsAll(['First sentence.', 'Second sentence.']),
+      );
       expect(playback.playedChunks, hasLength(1));
       expect(controller.state.isAiSpeaking, isFalse);
 
@@ -2056,7 +2194,7 @@ void main() {
       final playback = FakeAudioPlayback();
       final tts = FakeTtsEngine()..gate = Completer<void>();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2106,7 +2244,7 @@ void main() {
       final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
       final tts = FakeTtsEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2137,7 +2275,7 @@ void main() {
       final tts = FakeTtsEngine();
       final stt = FakeSttEngine();
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         sttEngine: stt,
@@ -2171,40 +2309,46 @@ void main() {
       await playback.dispose();
     });
 
-    test('onDeviceTranscript callback fires exactly once per utterance (m5)',
-        () async {
-      final chat = FakeChatClient(
-        results: [
-          const ChatResult(content: 'hi', toolCalls: [], finishReason: 'stop'),
-        ],
-      );
-      final mic = FakeMicCaptureService();
-      final playback = FakeAudioPlayback();
-      final tts = FakeTtsEngine();
-      final stt = FakeSttEngine();
-      final transcripts = <String>[];
-      final controller = VoiceController(
-        chatClient: chat,
-        micCapture: mic,
-        playback: playback,
-        sttEngine: stt,
-        ttsEngine: tts,
-        echoGateDuration: Duration.zero,
-        onDeviceTranscript: transcripts.add,
-      );
-      await controller.startConversation();
+    test(
+      'onDeviceTranscript callback fires exactly once per utterance (m5)',
+      () async {
+        final chat = FakeChatClient(
+          results: [
+            const ChatResult(
+              content: 'hi',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        final tts = FakeTtsEngine();
+        final stt = FakeSttEngine();
+        final transcripts = <String>[];
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+          ttsEngine: tts,
+          echoGateDuration: Duration.zero,
+          onDeviceTranscript: transcripts.add,
+        );
+        await controller.startConversation();
 
-      mic.emitChunk([1, 1, 1]);
-      await Future<void>.delayed(Duration.zero);
-      await controller.flushTranscriptionBuffer();
-      await pumpEventQueue();
+        mic.emitChunk([1, 1, 1]);
+        await Future<void>.delayed(Duration.zero);
+        await controller.flushTranscriptionBuffer();
+        await pumpEventQueue();
 
-      expect(transcripts, ['hello']);
+        expect(transcripts, ['hello']);
 
-      await controller.dispose();
-      await mic.dispose();
-      await playback.dispose();
-    });
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
   });
 
   group('status interjections', () {
@@ -2220,7 +2364,7 @@ void main() {
       final tts = FakeTtsEngine();
 
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2243,8 +2387,7 @@ void main() {
       await playback.dispose();
     });
 
-    test('onToolCallDelta sets status with Working prefix and enqueues TTS',
-        () async {
+    test('onToolCallDelta sets status with Working prefix and enqueues TTS', () async {
       final chat = FakeChatClient(
         fireOnReceived: true,
         toolCallDeltas: [
@@ -2254,7 +2397,11 @@ void main() {
           ['done'],
         ],
         results: [
-          const ChatResult(content: 'done', toolCalls: [], finishReason: 'stop'),
+          const ChatResult(
+            content: 'done',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
         ],
       );
       final mic = FakeMicCaptureService();
@@ -2262,7 +2409,7 @@ void main() {
       final tts = FakeTtsEngine();
 
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2302,7 +2449,7 @@ void main() {
       final tts = FakeTtsEngine();
 
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2318,7 +2465,8 @@ void main() {
       // The error phrase must be one of the known server error phrases
       // (the fake picks from the list deterministically or randomly).
       final hasErrorPhrase = tts.synthesized.any(
-        (s) => s.contains('snag') ||
+        (s) =>
+            s.contains('snag') ||
             s.contains('issue') ||
             s.contains('try again') ||
             s.contains('server'),
@@ -2342,7 +2490,7 @@ void main() {
       final tts = FakeTtsEngine();
 
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,
@@ -2384,7 +2532,7 @@ void main() {
       final tts = FakeTtsEngine();
 
       final controller = VoiceController(
-        chatClient: chat,
+        sendTurn: _scriptedTurnSender(chat),
         micCapture: mic,
         playback: playback,
         ttsEngine: tts,

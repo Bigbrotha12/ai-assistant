@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:math';
 
+import '../../plugins/data/managed_error_codes.dart';
+import '../../plugins/data/plugin_http.dart';
+
 import './chat_client.dart';
 
 /// Phrase lists used by [StatusTracker] and [statusPhraseForError]. Exported
@@ -59,6 +62,11 @@ const serverErrorPhrases = [
 const networkErrorPhrases = [
   'I can\'t reach my server right now — please try again.',
   'It looks like I lost my server connection — please try again.',
+];
+
+const pendingErrorPhrases = [
+  'A reply is already in progress…',
+  'A reply is still being prepared…',
 ];
 
 const domainKeywords = [
@@ -196,6 +204,29 @@ String statusPhraseForError(Object error, {Random? random}) {
   }
   if (error is ChatNetworkError) {
     return _pick(networkErrorPhrases, rng);
+  }
+  if (error is PluginClientException) {
+    // Defense-in-depth for a gateway 401 whose error envelope carries no
+    // parseable auth code (`server_error` with statusCode 401): the code
+    // match below stays primary, but a 401 status is itself a key rejection.
+    if (error.statusCode == 401) {
+      return _pick(authErrorPhrases, rng);
+    }
+    return switch (error.code) {
+      ManagedErrorCodes.unauthorized ||
+      ManagedErrorCodes.credentialsExpired ||
+      ManagedErrorCodes.noCredentials =>
+        _pick(authErrorPhrases, rng),
+      ManagedErrorCodes.networkError ||
+      ManagedErrorCodes.timeout ||
+      ManagedErrorCodes.sessionMissing =>
+        _pick(networkErrorPhrases, rng),
+      ManagedErrorCodes.pendingTurnExists => _pick(pendingErrorPhrases, rng),
+      // A cancelled managed turn is a silent finalization, never an error.
+      ManagedErrorCodes.cancelled => '',
+      // All other managed codes (and unknown wire codes) are server-ish.
+      _ => _pick(serverErrorPhrases, rng),
+    };
   }
   return _pick(serverErrorPhrases, rng);
 }

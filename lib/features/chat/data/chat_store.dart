@@ -34,8 +34,11 @@ abstract interface class ChatStore {
   Future<void> updateMessage(String conversationId, Message m);
 
   /// Deletes a single message within a conversation and decrements its
-  /// messageCount when positive (e.g. removing a failed assistant placeholder
-  /// before a retry).
+  /// messageCount when a row was actually deleted and the count is positive
+  /// (e.g. removing a failed assistant placeholder before a retry). A
+  /// zero-row delete (the message was never persisted) leaves the count
+  /// untouched — the store must never drift negative on a retry of a
+  /// placeholder that only ever lived in memory.
   Future<void> deleteMessage(String conversationId, String messageId);
 
   /// Deletes a conversation; messages are removed via FK cascade.
@@ -154,12 +157,16 @@ class DriftChatStore implements ChatStore {
   Future<void> deleteMessage(String conversationId, String messageId) {
     return _db.transaction(() async {
       await _checkOwnership(conversationId);
-      await (_db.delete(_db.messages)..where(
+      final deleted = await (_db.delete(_db.messages)..where(
             (t) =>
                 t.id.equals(messageId) &
                 t.conversationId.equals(conversationId),
           ))
           .go();
+      // A zero-row delete (the message was never persisted — e.g. the managed
+      // path's in-memory-only assistant placeholder) must not decrement the
+      // count: retry() would otherwise drive messageCount negative.
+      if (deleted == 0) return;
       final current = await (_db.select(
         _db.conversations,
       )..where((t) => t.id.equals(conversationId))).getSingleOrNull();

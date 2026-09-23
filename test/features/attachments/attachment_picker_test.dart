@@ -8,7 +8,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'package:ai_assistant/core/backend_settings.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
@@ -339,7 +338,6 @@ void main() {
           )),
           backendProbeProvider.overrideWithValue(FakeProbe()),
           chatStoreProvider.overrideWithValue(FakeChatStore()),
-          chatApiClientProvider.overrideWithValue(FakeChatClient()),
           filesServiceProvider.overrideWithValue(filesClient),
         ],
         child: const MaterialApp(home: ChatScreen()),

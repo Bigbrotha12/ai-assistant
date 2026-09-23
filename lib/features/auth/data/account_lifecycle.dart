@@ -53,8 +53,11 @@ final accountLifecycleProvider = Provider<AccountLifecycle>((ref) {
   // adapter instance, which may not be alive at logout), so a sign-out can
   // always drop the scope's conversations and pending turns. Writers are
   // cancelled before deletion so a concurrent send can never land a late
-  // write; the remote thread is never touched and unscoped legacy history
-  // (scopeKey null) is retained.
+  // write; the remote thread is never touched. Legacy unscoped rows
+  // (scopeKey null) are NOT retained: chatStoreProvider's one-shot cleanup
+  // (`nullScopeCleanupProvider`) deletes them the first time the account
+  // scope becomes ready — plan decision: delete, don't backfill null-scope
+  // legacy rows. This hook itself only ever deletes this scope's rows.
   lifecycle.register(
     AccountCleanupRegistration(
       cancelPending: () async {},

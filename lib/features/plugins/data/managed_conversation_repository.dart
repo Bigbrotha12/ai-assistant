@@ -21,7 +21,16 @@ class ManagedConversationRepository {
   final AppDatabase db;
   final _epochs = <String, int>{};
   final _tokens = <String, Set<CancelToken>>{};
+
+  /// Per-conversation in-flight dispatch token, keyed by
+  /// `scope.storageId|conversationId`. Lets [abandonTurn] cancel exactly one
+  /// turn's stream WITHOUT an epoch bump (a scope-wide cancel would make the
+  /// abandon's own guarded write throw and leave the pending row wedged).
+  final _dispatchTokens = <String, CancelToken>{};
   Future<void> _queue = Future.value();
+
+  static String _dispatchKey(AuthAccountScope scope, String conversationId) =>
+      '${scope.storageId}|$conversationId';
 
   /// Monotonic per-scope epoch: bumped by [cancelScope] / [clearScope]. Any
   /// access captured before the bump throws 'cancelled', which is how a late
@@ -38,6 +47,47 @@ class ManagedConversationRepository {
     _tokens[scope.storageId]?.remove(token);
   }
 
+  /// Registers the in-flight dispatch token for [conversationId] so
+  /// [takeDispatch] can cancel exactly this turn's stream on abandon. The
+  /// token is ALSO in the scope-wide set, so [cancelScope] still cancels it
+  /// on logout. Any previous dispatch for the same conversation is cancelled
+  /// (one pending turn per conversation).
+  CancelToken registerDispatch(AuthAccountScope scope, String conversationId) {
+    final token = register(scope);
+    final key = _dispatchKey(scope, conversationId);
+    final previous = _dispatchTokens.remove(key);
+    if (previous != null) {
+      _tokens[scope.storageId]?.remove(previous);
+      previous.cancel();
+    }
+    _dispatchTokens[key] = token;
+    return token;
+  }
+
+  /// Cancels and removes the conversation's in-flight dispatch token (if
+  /// any), returning it. Does NOT bump the epoch — abandon must stay able to
+  /// write under the current one.
+  CancelToken? takeDispatch(AuthAccountScope scope, String conversationId) {
+    final token = _dispatchTokens.remove(_dispatchKey(scope, conversationId));
+    if (token == null) return null;
+    _tokens[scope.storageId]?.remove(token);
+    token.cancel();
+    return token;
+  }
+
+  /// Identity-guarded remove: only drops the map entry when it still points
+  /// at [token] (a nested re-establish may have registered a newer one).
+  void clearDispatch(
+    AuthAccountScope scope,
+    String conversationId,
+    CancelToken token,
+  ) {
+    final key = _dispatchKey(scope, conversationId);
+    if (identical(_dispatchTokens[key], token)) {
+      _dispatchTokens.remove(key);
+    }
+  }
+
   /// Cancels in-flight sends for [scope] and invalidates all queued local
   /// writes (they will throw). Does not delete data by itself.
   void cancelScope(AuthAccountScope scope) {
@@ -45,6 +95,8 @@ class ManagedConversationRepository {
     for (final token in _tokens.remove(scope.storageId) ?? <CancelToken>{}) {
       token.cancel();
     }
+    final prefix = '${scope.storageId}|';
+    _dispatchTokens.removeWhere((key, _) => key.startsWith(prefix));
   }
 
   /// Serializes one scope-checked store operation on the shared DB.
@@ -81,6 +133,8 @@ class ManagedConversationRepository {
   Future<void> clearScope(AuthAccountScope scope) {
     final next = epoch(scope) + 1;
     _epochs[scope.storageId] = next;
+    final prefix = '${scope.storageId}|';
+    _dispatchTokens.removeWhere((key, _) => key.startsWith(prefix));
     return access(scope, next, () {}, (store) async {
       await (db.delete(
         db.managedPendingTurns,
@@ -96,6 +150,14 @@ class ManagedConversationRepository {
                 t.scopeKey.equals(scope.storageId),
           ))
           .getSingleOrNull();
+
+  /// Every pending-turn row for [scope] across all conversations. Used by the
+  /// foreground re-watch (plan P3) to enumerate still-pending background jobs.
+  Future<List<ManagedPendingTurnRow>> pendingRows(AuthAccountScope scope) =>
+      (db.select(db.managedPendingTurns)..where(
+            (t) => t.scopeKey.equals(scope.storageId),
+          ))
+          .get();
 
   Future<void> savePending(
     String id,

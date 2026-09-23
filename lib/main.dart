@@ -5,6 +5,7 @@ import './app/onboarding_gate.dart';
 import './app/theme.dart';
 import './app/theme_providers.dart';
 import './app/widgets/gold_band.dart';
+import './features/plugins/data/managed_chat_providers.dart';
 
 void main() => runApp(const ProviderScope(child: AiAssistantApp()));
 
@@ -15,6 +16,11 @@ class AiAssistantApp extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final tier = ref.watch(appTierProvider).value ?? AppTier.standard;
     final premium = tier == AppTier.premium;
+    // Keep the background-poll lifecycle observer alive app-wide (plan P3):
+    // reading it here (never in an autoDispose UI family) means a conversation
+    // notifier rebuild can never orphan the foreground/background wiring while
+    // a background job is pending.
+    ref.watch(chatPollerLifecycleObserverProvider);
 
     return MaterialApp(
       title: 'Voice Assist',

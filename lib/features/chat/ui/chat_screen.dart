@@ -74,12 +74,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   /// Re-authentication succeeded: the [AuthFlow] already minted + persisted a
-  /// fresh API key. Swap the conversation's pinned client for one carrying the
-  /// new key, then re-send the failed message.
+  /// fresh API key. Credentials re-resolve per dispatch on the managed path,
+  /// so a re-auth just re-reads them — re-send the failed message.
   Future<void> _onReauthSuccess(AuthSession session) async {
     if (!mounted) return;
     final notifier = ref.read(conversationProvider(_conversationId).notifier);
-    notifier.refreshClient();
     await notifier.retry();
   }
 
@@ -141,6 +140,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         m.role == MessageRole.user && m.content.startsWith(text));
   }
 
+  /// Submits the current input as a BACKGROUND job (plan P3): the service
+  /// POSTs a self-contained snapshot and a poller appends the reply later.
+  /// The input is cleared only once the user message was actually admitted
+  /// (persisted); a rejected submission keeps the text for a fresh attempt.
+  Future<void> _sendBackground() async {
+    final text = _input.text.trim();
+    if (text.isEmpty) return;
+    final state = ref.read(conversationProvider(_conversationId)).value;
+    if (state == null || state.isStreaming || state.hasPendingJob) return;
+    try {
+      await ref
+          .read(conversationProvider(_conversationId).notifier)
+          .submitBackgroundJob(text);
+    } catch (_) {
+      // Fall through: the persistence check decides whether the submission
+      // landed (clearing the input) or was rejected (keeping it).
+    }
+    if (!mounted) return;
+    final persisted = await _isUserMessagePersisted(text);
+    if (!persisted) return;
+    _input.clear();
+    setState(() {});
+  }
+
   /// Hands off to the voice screen via the shared Voice/Text pill. Replaces
   /// this screen so toggling modes never stacks surfaces (Voice→Text→Voice
   /// would otherwise grow the back stack unboundedly).
@@ -168,6 +191,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final isDbReady = state?.isDbReady ?? false;
     final error = state?.error;
     final authRequired = state?.authRequired ?? false;
+    final hasPendingJob = state?.hasPendingJob ?? false;
 
     // Mirror the conversation's live upload progress into the picker's
     // notifier so AttachmentRow overlays update as jobs progress / complete /
@@ -197,6 +221,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final showAttachmentRow = filesConfigured || _attachments.isNotEmpty;
 
     final canSend = !isStreaming && isDbReady && _input.text.trim().isNotEmpty;
+    // The background action is a text-only submit: unavailable while a job is
+    // already pending (the chip owns that conversation), while streaming, or
+    // when files are selected (the background path carries no attachments).
+    final canSendBackground =
+        canSend && !hasPendingJob && _attachments.isEmpty;
 
     return Scaffold(
       appBar: AppBar(
@@ -227,6 +256,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   .read(conversationProvider(_conversationId).notifier)
                   .dismissAuthRequired(),
             ),
+          if (hasPendingJob)
+            _PendingJobBar(
+              jobError: state?.jobError,
+              onRetry: () => ref
+                  .read(conversationProvider(_conversationId).notifier)
+                  .retryBackgroundJob(),
+              onCancel: () => ref
+                  .read(conversationProvider(_conversationId).notifier)
+                  .cancelBackgroundJob(),
+            ),
           Expanded(
             child: MessageList(
               messages: state?.messages ?? const [],
@@ -245,6 +284,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             isDbReady: isDbReady,
             canSend: canSend,
             onSend: _send,
+            onSendBackground: _sendBackground,
+            canSendBackground: canSendBackground,
             onStop: () => ref
                 .read(conversationProvider(_conversationId).notifier)
                 .stop(),
@@ -335,8 +376,56 @@ class _ConfigureBanner extends ConsumerWidget {
   }
 }
 
-/// Bottom input bar: multiline text field with a Send / Stop button, plus an
-/// optional attachment picker row above it.
+/// Inline pending-job bar (plan P3): shown while this conversation owns a
+/// background job. [jobError] switches the label to the failed state with the
+/// Retry affordance; Cancel clears the pending row via the notifier.
+class _PendingJobBar extends StatelessWidget {
+  const _PendingJobBar({
+    required this.jobError,
+    required this.onRetry,
+    required this.onCancel,
+  });
+
+  final String? jobError;
+  final VoidCallback onRetry;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final failed = jobError != null;
+    return Material(
+      color: failed ? scheme.errorContainer : scheme.surfaceContainerHigh,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        child: Row(
+          children: [
+            Icon(
+              failed ? Icons.error_outline : Icons.hourglass_top,
+              size: 18,
+              color: failed ? scheme.onErrorContainer : scheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                failed ? 'Background job failed' : 'Running background job…',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+            if (failed)
+              TextButton(onPressed: onRetry, child: const Text('Retry job'))
+            else
+              TextButton(onPressed: onCancel, child: const Text('Cancel')),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom input bar: multiline text field with a Send / Stop button, a
+/// background-submit action (plan P3), plus an optional attachment picker row
+/// above it.
 class _InputBar extends StatelessWidget {
   const _InputBar({
     required this.controller,
@@ -344,6 +433,8 @@ class _InputBar extends StatelessWidget {
     required this.isDbReady,
     required this.canSend,
     required this.onSend,
+    required this.onSendBackground,
+    required this.canSendBackground,
     required this.onStop,
     required this.onChanged,
     this.attachmentRow,
@@ -354,6 +445,8 @@ class _InputBar extends StatelessWidget {
   final bool isDbReady;
   final bool canSend;
   final VoidCallback onSend;
+  final VoidCallback onSendBackground;
+  final bool canSendBackground;
   final VoidCallback onStop;
   final VoidCallback onChanged;
 
@@ -408,12 +501,22 @@ class _InputBar extends StatelessWidget {
                       tooltip: 'Stop',
                       onPressed: onStop,
                     )
-                  else
+                  else ...[
+                    IconButton(
+                      key: const Key('send-background'),
+                      icon: Icon(
+                        Icons.schedule_send,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                      tooltip: 'Send in background',
+                      onPressed: canSendBackground ? onSendBackground : null,
+                    ),
                     IconButton(
                       icon: Icon(Icons.send, color: scheme.primary),
                       tooltip: 'Send',
                       onPressed: canSend ? onSend : null,
                     ),
+                  ],
                 ],
               ),
             ],

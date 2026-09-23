@@ -1,12 +1,14 @@
 import 'dart:async';
-
 import 'package:dio/dio.dart';
+
 import 'package:flutter/foundation.dart';
 
 import '../../chat/data/chat_client.dart';
 import '../../chat/data/message_model.dart';
 import '../../chat/data/sse.dart' show stripStructuredTokens;
 import '../../chat/data/status_tracker.dart';
+import '../../plugins/data/managed_error_codes.dart';
+import '../../plugins/data/plugin_http.dart';
 import './voice_conversation_state.dart';
 import '../data/audio_playback_service.dart';
 import '../data/mic_capture_service.dart';
@@ -71,24 +73,40 @@ class _SentenceSynthesis {
 
 /// Orchestrates a turn-based text voice conversation.
 ///
-/// Wires the mic capture (on-device STT), the textual [ChatClient] (LLM) and
+/// Wires the mic capture (on-device STT), the textual LLM leg and
 /// the audio playback / TTS layer together into a single session object,
 /// exposes its state via [state] / [stateStream], and reports utterances and
 /// replies back through [onDeviceTranscript] / [onTranscript] / [onError]
 /// (settable at any time).
 ///
+/// The controller-facing LLM send seam (plan P2): a managed
+/// `sendVoiceTurn`-backed sender in production, a scripted sender in
+/// tests. [messages]/[systemPrompt] are built by the controller's
+/// contextBuilder but only the legacy adapter consumes them — the managed
+/// sender loads history through the service (single-writer persistence).
+typedef VoiceTurnSender = Future<ChatResult> Function({
+  required List<ApiMessage> messages,
+  required String userText,
+  String? systemPrompt,
+  CancelToken? cancelToken,
+  void Function()? onReceived,
+  void Function(String text)? onContent,
+  void Function(int index, String name, String argsFragment)? onToolCallDelta,
+});
+
 /// Turn flow: the pipeline flushes buffered mic audio to the on-device STT
 /// engine via [flushTranscriptionBuffer]; the recognised utterance is then
-/// sent through [sendText] to the [ChatClient]. The streamed reply is split
+/// sent through [sendText] to the LLM leg. The streamed reply is split
 /// into sentences while it streams ([SentenceAccumulator]); each completed
 /// sentence is enqueued onto a speak queue and synthesised + played
 /// sequentially, so the first sentence is audible while the LLM is still
 /// generating.
 final class VoiceController {
   VoiceController({
-    required this.chatClient,
+    required this.sendTurn,
     required this.micCapture,
     required this.playback,
+    this.abandonActiveTurn,
     this.sttEngine,
     this.ttsEngine,
     this.screenWakeLock,
@@ -123,14 +141,23 @@ final class VoiceController {
     _playbackErrorSubscription = playback.errors.listen(_reportError);
   }
 
-  /// The textual LLM client used to produce assistant replies.
-  final ChatClient chatClient;
+  /// The managed LLM send seam used to produce assistant replies (plan P2):
+  /// production routes through `StagedInferenceAdapters.sendVoiceTurn`.
+  final VoiceTurnSender sendTurn;
 
   /// Microphone capture used for the client side of the conversation.
   final MicCaptureService micCapture;
 
   /// Playback of the on-device TTS audio.
   final AudioPlayback playback;
+
+  /// Barge-in/end-of-session cleanup (plan P2): abandons the in-flight
+  /// managed turn (clears its pending row and cancels the conversation's
+  /// dispatch token WITHOUT an epoch bump). Invoked only while this
+  /// controller has an LLM turn in flight; null in tests that don't exercise
+  /// managed persistence. Best-effort — failures are swallowed like chat's
+  /// `stop()`.
+  final Future<void> Function()? abandonActiveTurn;
 
   /// Keeps the screen awake for the duration of a connected conversation.
   /// Null (or a no-op) leaves the OS idle timer untouched.
@@ -200,13 +227,26 @@ final class VoiceController {
   /// bail when it moved on.
   int _turnEpoch = 0;
 
-  /// Active per-turn [CancelToken] forwarded to [ChatClient.streamCompletions].
+  /// Active per-turn [CancelToken] forwarded to [VoiceTurnSender].
   ///
   /// [interrupt] cancels it to abort an in-flight turn and immediately
   /// replaces it, so the NEXT turn's stream is never pre-cancelled. [dispose]
   /// cancels it too, so a stale stream can never complete into a disposed
-  /// notifier's persistence callbacks.
+  /// notifier's persistence callbacks. Cancelling it NEVER bumps the managed
+  /// repository's epoch — the sequenced [abandonActiveTurn] clears the turn
+  /// under the still-current one (plan P2).
   CancelToken _activeTurnToken = CancelToken();
+
+  /// True from just before the send seam is invoked until its future settles:
+  /// gates [abandonActiveTurn] so an interrupt/idle session can never abandon
+  /// a turn this controller doesn't own (e.g. a text turn on the same
+  /// conversation).
+  bool _turnInFlight = false;
+
+  /// Tail of in-flight abandon cleanups started by [interrupt]/
+  /// [endConversation]. [sendText] awaits it before dispatching, so a next
+  /// turn can never race the pending-row clear into `pending_turn_exists`.
+  Future<void>? _turnCleanup;
 
   /// Chunks are ignored this long after playback ends — the speaker's tail
   /// and room echo would otherwise land in the STT buffer as a phantom
@@ -280,7 +320,7 @@ final class VoiceController {
 
   /// Starts (or resumes) the text conversation session. Marks the session as
   /// active so [startRecording] is allowed. There is no room, JWT or signaling
-  /// handshake — conversation happens over the [ChatClient]'s text path.
+  /// handshake — conversation happens over the LLM leg's text path.
   Future<void> startConversation() async {
     // A stale paused flag from an interruption that hit while idle must not
     // mute a fresh session (synthesize gates on isPaused). Per-turn fields
@@ -306,6 +346,12 @@ final class VoiceController {
     // mid-synthesis will wake to the epoch change and leave the queue (now
     // possibly holding a fresh session's items) alone.
     _dropPendingSpeakItems();
+    // P2: abandon an in-flight managed turn FIRST (its synchronous prefix
+    // cancels the conversation's dispatch token under the current repo
+    // epoch), then abort the per-turn stream token. Never cancelScope — an
+    // epoch bump here would strand the pending row. Not awaited: the next
+    // sendText awaits the chained cleanup tail.
+    _startAbandonCleanup();
     // Abort the active LLM stream and mint a fresh token (mirroring
     // interrupt): a stream still in flight when the session ends must not
     // keep mutating lastTranscript or fire onTranscript on completion.
@@ -584,7 +630,7 @@ final class VoiceController {
     return result;
   }
 
-  /// Sends [text] (a recognised user utterance) to the [ChatClient], streams
+  /// Sends [text] (a recognised user utterance) to the LLM leg, streams
   /// the assistant reply into [VoiceConversationState.lastTranscript], and
   /// speaks it with sentence-buffered streaming TTS: streamed deltas feed a
   /// [SentenceAccumulator]; each completed sentence is enqueued onto the
@@ -612,8 +658,10 @@ final class VoiceController {
     // The user's utterance surfaces in the UI transcript for this turn. Voice
     // turns already set it in flushTranscriptionBuffer (the UI dedupes the
     // consecutive identical value); text-mode turns rely on this so the user's
-    // text appears in the transcript. Persistence of the user message goes
-    // through onUserMessage ONLY (otherwise voice turns would persist twice).
+    // text appears in the transcript. Persistence of the user message is
+    // SERVICE-OWNED on the managed path (plan P2 single-writer): this seam
+    // only captures the turn's conversation id for the sender/abandon
+    // closures — otherwise a voice turn could persist twice.
     //
     // The previous turn's [lastReply] MUST be cleared in the SAME emission:
     // the transcript listener appends onDeviceTranscript (user) and lastReply
@@ -627,6 +675,10 @@ final class VoiceController {
     ));
     onDeviceTranscript?.call(trimmed);
     onUserMessage?.call(trimmed);
+    // Wait out any abandon cleanup from a previous barge-in/end so this
+    // turn's admission can never race the pending-row clear into
+    // `pending_turn_exists` (plan P2). No-op (null/settled tail) normally.
+    await _awaitTurnCleanup();
     // Snapshot the active token: interrupt() cancels and replaces it, so a
     // turn that started before an interrupt must still abort, while turns
     // started after it pick up the fresh token. The epoch snapshot scopes
@@ -676,10 +728,12 @@ final class VoiceController {
       // abandon return, and both error paths via the catch below — so a
       // stream that dies mid-flight can never leave it stuck true.
       _update(_state.copyWith(isGenerating: true));
+      _turnInFlight = true;
       final ChatResult result;
       try {
-        result = await chatClient.streamCompletions(
+        result = await sendTurn(
           messages: messages,
+          userText: trimmed,
           systemPrompt: systemPrompt,
           cancelToken: cancelToken,
           onReceived: () => tracker.onBackendAck(),
@@ -724,6 +778,7 @@ final class VoiceController {
         );
       } finally {
         tracker.cancel();
+        _turnInFlight = false;
         _update(_state.copyWith(isGenerating: false));
       }
       // The client surfaced a result despite an interrupt that cancelled the
@@ -771,11 +826,23 @@ final class VoiceController {
         }
       }
     } catch (e) {
-      // A deliberate interrupt cancels the active token; the resulting
-      // ChatNetworkError('cancelled') is not a failure and must not surface
-      // an error banner. ANY other error — even one arriving in the same
-      // instant as the interrupt — is genuine and must surface.
-      if (e is ChatNetworkError && e.message == 'cancelled') {
+      // A deliberate interrupt cancels the active token / abandons the
+      // managed turn; the resulting ChatNetworkError('cancelled') or
+      // PluginClientException('cancelled') is not a failure and must not
+      // surface an error banner (plan P2: barge-in never raises one).
+      // `conversation_in_flight` is the staged adapter's client-local busy
+      // flag: on a fast re-hold the previous turn's sendVoiceTurn may not have
+      // unwound its `finally` yet, so the new turn is dropped rather than
+      // raced — never an error banner. ANY other error — even one arriving in
+      // the same instant as the interrupt — is genuine and must surface.
+      // (The ChatNetworkError('cancelled') arm is a test-driven compatibility
+      // branch: production senders throw PluginClientException('cancelled')
+      // here — the fakes still script the legacy wire shape.)
+      if (e is ChatNetworkError && e.message == 'cancelled' ||
+          e is PluginClientException &&
+              e.code == ManagedErrorCodes.cancelled ||
+          e is PluginClientException &&
+              e.code == ManagedErrorCodes.conversationInFlight) {
         // Drop any partial reply accumulated before the cancellation landed.
         _update(_state.copyWith(lastTranscript: null, status: null));
         return;
@@ -1204,10 +1271,60 @@ final class VoiceController {
     }
   }
 
+  // ---- barge-in abandon (plan P2) ---------------------------------------
+
+  /// Starts [abandonActiveTurn] for the in-flight managed turn (if this
+  /// controller owns one) and chains it onto the cleanup tail. The closure's
+  /// synchronous prefix — `abandonTurn`'s `repo.takeDispatch` — runs before
+  /// this returns, so the caller can cancel the per-turn stream token
+  /// afterwards with the repo epoch untouched (never `cancelScope`).
+  /// Best-effort: failures are swallowed, mirroring chat's `stop()`.
+  void _startAbandonCleanup() {
+    if (!_turnInFlight) return;
+    final abandon = abandonActiveTurn;
+    if (abandon == null) return;
+    late final Future<void> work;
+    try {
+      work = abandon();
+    } catch (_) {
+      return;
+    }
+    final previous = _turnCleanup;
+    _turnCleanup = () async {
+      if (previous != null) {
+        try {
+          await previous;
+        } catch (_) {
+          // One failed cleanup must never wedge the next.
+        }
+      }
+      try {
+        await work;
+      } catch (_) {
+        // Best-effort — the next send surfaces pending_turn_exists only if
+        // the clear genuinely failed.
+      }
+    }();
+  }
+
+  /// Awaits the cleanup tail (no-op when none). Called by [sendText] before
+  /// dispatching and at the end of [interrupt], so a follow-up turn never
+  /// races an in-progress pending-row clear.
+  Future<void> _awaitTurnCleanup() async {
+    final tail = _turnCleanup;
+    if (tail == null) return;
+    try {
+      await tail;
+    } catch (_) {
+      // Chained cleanups swallow their own errors; this is belt-and-braces.
+    }
+  }
+
   /// Halts the current turn immediately (barge-in): invalidates queued and
-  /// in-flight turns, cancels the active LLM stream, stops playback and
-  /// re-opens the mic gates ([VoiceConversationState.isAiSpeaking] was holding
-  /// them closed) so the user's next utterance is captured.
+  /// in-flight turns, abandons the managed turn FIRST, cancels the active LLM
+  /// stream, stops playback and re-opens the mic gates
+  /// ([VoiceConversationState.isAiSpeaking] was holding them closed) so the
+  /// user's next utterance is captured.
   ///
   /// Idempotent: safe to call when nothing is playing or streaming.
   Future<void> interrupt() async {
@@ -1219,6 +1336,15 @@ final class VoiceController {
     // synthesis returns, and sentences enqueued afterwards belong to the
     // NEXT turn — a later drain wake must not swallow them.
     _dropPendingSpeakItems();
+    // P2 sequence: abandon FIRST (clears the pending row and cancels the
+    // conversation's dispatch token under the CURRENT repo epoch — never
+    // cancelScope, whose epoch bump would strand the row), THEN cancel this
+    // turn's per-turn stream token. The abandon future is chained so a
+    // racing next send waits for the clear; it is awaited at the END, after
+    // the synchronous mic-gate reopening, so a slow server terminal check
+    // cannot hold the barge-in gates shut (the screen's interrupt bound
+    // opens the mic regardless; sendText re-checks the tail).
+    _startAbandonCleanup();
     // Abort the active LLM stream and mint a fresh token so the NEXT turn is
     // never pre-cancelled.
     _activeTurnToken.cancel();
@@ -1244,6 +1370,9 @@ final class VoiceController {
     // stop was slow, the gate armed above may have expired while the tail was
     // still decaying — re-arm it from the actual stop so the tail is covered.
     _echoGateUntil = DateTime.now().add(_echoGateDuration);
+    // Finish the sequenced abandon before reporting the interrupt done, so
+    // `await interrupt()` means "the conversation is sendable again".
+    await _awaitTurnCleanup();
   }
 
   /// Synthesises [text] locally using the on-device TTS engine via the speak

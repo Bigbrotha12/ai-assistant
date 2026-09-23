@@ -30,6 +30,7 @@ class FakeLangChainClient implements LangChainClient {
         taskId: 'task-1',
       );
   final requests = <LangChainRequest>[];
+  final cancelTokens = <CancelToken?>[];
   final sessionLoads = <String>[];
   final deletedSessions = <({String sessionId, String gatewayKey})>[];
   Object? loadSessionError;
@@ -38,6 +39,16 @@ class FakeLangChainClient implements LangChainClient {
   /// the default fixed history.
   ManagedSessionHistory Function(String sessionId)? historyBuilder;
 
+  /// Deltas delivered via [onContent] before [respond] runs (when
+  /// [respondWithEmit] is null).
+  List<String> emitDeltas = const [];
+
+  /// When set, called with an emit closure before [respond] so tests can
+  /// drive mid-stream effects (e.g. [ManagedConversationRepository.cancelScope]
+  /// between deltas). Exceptions from the closure propagate out of
+  /// [managedTurn] exactly as a real SSE stream would.
+  void Function(void Function(String text) emit)? respondWithEmit;
+
   @override
   Future<ManagedTurnResult> managedTurn(
     LangChainRequest request, {
@@ -45,6 +56,17 @@ class FakeLangChainClient implements LangChainClient {
     void Function(String text)? onContent,
   }) async {
     requests.add(request);
+    cancelTokens.add(cancelToken);
+    final emit = respondWithEmit;
+    if (onContent != null) {
+      if (emit != null) {
+        emit(onContent);
+      } else {
+        for (final delta in emitDeltas) {
+          onContent(delta);
+        }
+      }
+    }
     return respond(request);
   }
 
@@ -54,6 +76,7 @@ class FakeLangChainClient implements LangChainClient {
     CancelToken? cancelToken,
   }) async {
     requests.add(request);
+    cancelTokens.add(cancelToken);
     return respondBackground(request);
   }
 
@@ -218,6 +241,11 @@ class FakeNotifClient implements NotifClient {
   Future<void> unsubscribe(String topic) async => unsubscribed.add(topic);
 }
 
+/// Session id of the first recorded managed request (handy inside gate
+/// completions where the request variable is not in scope).
+String request0Session(FakeLangChainClient client) =>
+    client.requests.first.conversationPublicId ?? '';
+
 void main() {
   late AppDatabase db;
   late ManagedConversationRepository repo;
@@ -277,6 +305,42 @@ void main() {
     expect(pending, isNull);
     final mapped = await repo.mappedSession('c1');
     expect(mapped, outcome.sessionId);
+  });
+
+  test('sendTurn threads onContent deltas through the dispatch wrapper',
+      () async {
+    client.emitDeltas = const ['Hel', 'lo'];
+    final seen = <String>[];
+    final outcome = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+      onContent: seen.add,
+    );
+    expect(seen, ['Hel', 'lo']);
+    expect(outcome, isA<ManagedStreamedTurn>());
+  });
+
+  test('onContent deltas are epoch-checked: cancelScope mid-stream drops the '
+      'late delta and surfaces ManagedTurnError(cancelled)', () async {
+    final seen = <String>[];
+    client.respondWithEmit = (emit) {
+      emit('first');
+      repo.cancelScope(scope);
+      emit('second'); // _checkEpoch throws before the collector sees it
+    };
+    await expectLater(
+      service.sendTurn(
+        'c1',
+        history: const [],
+        userText: 'hi',
+        onContent: seen.add,
+      ),
+      throwsA(
+        isA<ManagedTurnError>().having((e) => e.code, 'code', 'cancelled'),
+      ),
+    );
+    expect(seen, ['first']);
   });
 
   test('establish sends the FULL local history and the server seeds', () async {
@@ -1906,5 +1970,451 @@ void main() {
 
     await subscription.cancel();
     await controller.close();
+  });
+
+  test('foreground resume re-watches a still-pending background job after the '
+      'original handle\'s deadline expired (exhausted handle misses nothing)',
+      () async {
+    final clock = FakeScheduler();
+    var messageId = '';
+    final adapter = FakeAdapter((request) {
+      if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+        final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
+        return jsonResponse(backgroundTaskJson(
+          status: 'succeeded',
+          messageId: byKey,
+          taskId: 'task-1',
+        ));
+      }
+      if (request.uri.path == '/ledger/tasks/task-1') {
+        return jsonResponse({
+          ...backgroundTaskJson(
+            status: 'succeeded',
+            messageId: messageId,
+            taskId: 'task-1',
+          ),
+          'steps': [
+            {
+              'stage': 'reply',
+              'action': 'assistant_message',
+              'result': 'bg reply',
+            },
+          ],
+        });
+      }
+      throw StateError('unexpected ledger path ${request.uri.path}');
+    });
+    final poller = testPoller(scope, adapter, clock);
+    final backgroundService = ManagedConversationService(
+      client: client,
+      repo: repo,
+      scope: scope,
+      credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+      poller: poller,
+    );
+    await backgroundService.submitBackground(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
+    messageId = (await repo.pending(scope, 'c1'))!.messageId;
+
+    // Backgrounded past the handle's fixed deadline (maxElapsed = 30s): a
+    // suspended app runs no timers, so the deadline elapses unseen.
+    poller.setForeground(false);
+    await clock.advance(const Duration(seconds: 31));
+    expect(adapter.requests, isEmpty,
+        reason: 'no polls may run while the app is backgrounded');
+
+    // Resume: re-arm the poller, then re-watch with a FRESH handle (the old
+    // one would finish `exhausted` with zero polls).
+    poller.setForeground(true);
+    final fresh = await backgroundService.rewatchPendingBackground('c1');
+    expect(fresh, isNotNull);
+    await clock.advance(const Duration(seconds: 1));
+    final result = await fresh!.done;
+    expect(result.end, LedgerPollEnd.observed,
+        reason: 'the fresh watch must observe the terminal task, not expire');
+    expect(result.task?.status, LedgerTaskStatus.succeeded);
+    await waitFor(() async => (await repo.pending(scope, 'c1')) == null);
+    final loaded = await repo.access(
+      scope,
+      repo.epoch(scope),
+      () {},
+      (store) => store.loadConversation('c1'),
+    );
+    expect(loaded!.messages.last.role, MessageRole.assistant);
+    expect(loaded.messages.last.content, 'bg reply');
+  });
+
+  test('foreground-gated polling: a submitted job does not poll until the '
+      'lifecycle path arms it, then completes on setForeground(true)',
+      () async {
+    final clock = FakeScheduler();
+    var messageId = '';
+    final adapter = FakeAdapter((request) {
+      if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+        final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
+        return jsonResponse(backgroundTaskJson(
+          status: 'succeeded',
+          messageId: byKey,
+          taskId: 'task-1',
+        ));
+      }
+      if (request.uri.path == '/ledger/tasks/task-1') {
+        return jsonResponse({
+          ...backgroundTaskJson(
+            status: 'succeeded',
+            messageId: messageId,
+            taskId: 'task-1',
+          ),
+          'steps': [
+            {
+              'stage': 'reply',
+              'action': 'assistant_message',
+              'result': 'bg reply',
+            },
+          ],
+        });
+      }
+      throw StateError('unexpected ledger path ${request.uri.path}');
+    });
+    final poller = testPoller(scope, adapter, clock);
+    final backgroundService = ManagedConversationService(
+      client: client,
+      repo: repo,
+      scope: scope,
+      credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+      poller: poller,
+    );
+    final handle = await backgroundService.submitBackground(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
+    messageId = (await repo.pending(scope, 'c1'))!.messageId;
+
+    // Backgrounded: advance well past initialDelay — no timer runs, no poll.
+    await clock.advance(const Duration(seconds: 5));
+    expect(adapter.requests, isEmpty,
+        reason: 'the poller must refuse to poll while suspended');
+
+    // The lifecycle observer arms the poller on resume; the handle polls.
+    poller.setForeground(true);
+    await clock.advance(const Duration(seconds: 1));
+    expect(adapter.requests, isNotEmpty,
+        reason: 'setForeground(true) from the lifecycle path arms the handle');
+    expect((await handle.done).task?.status, LedgerTaskStatus.succeeded);
+    await waitFor(() async => (await repo.pending(scope, 'c1')) == null);
+  });
+
+  group('P1c: abandonTurn', () {
+    Future<void> admitHangingTurn({
+      required Completer<ManagedTurnResult> gate,
+      String conversationId = 'c1',
+      String userText = 'hi',
+    }) async {
+      respondWith = (request) => gate.future;
+      final sent = service.sendTurn(
+        conversationId,
+        history: const [],
+        userText: userText,
+      );
+      while ((await repo.pending(scope, conversationId)) == null) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      // Keep the unawaited send from tripping the test's unhandled-error
+      // zone when the gate later completes with a cancellation.
+      sent.ignore();
+    }
+
+    test('abandonTurn mid-dispatch cancels the token, clears pending, and '
+        'persists the partial so the next send is immediately sendable',
+        () async {
+      final gate = Completer<ManagedTurnResult>();
+      await admitHangingTurn(gate: gate);
+      // Mid-flight first turn: the server has the user message but no reply
+      // yet — abandon must take the partial-retention path, not reconcile.
+      client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+        'sessionId': sessionId,
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+        ],
+      });
+      final dispatched = client.cancelTokens.single;
+      expect(dispatched!.isCancelled, isFalse);
+
+      await service.abandonTurn('c1', partialText: 'partial ');
+
+      expect(dispatched.isCancelled, isTrue,
+          reason: 'abandon cancels exactly this turn\'s dispatch token');
+      expect(await repo.pending(scope, 'c1'), isNull);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages, hasLength(2));
+      expect(loaded.messages.last.role, MessageRole.assistant);
+      expect(loaded.messages.last.content, 'partial ');
+
+      // (b) a delta right after abandon is sendable — no pending_turn_exists.
+      respondWith = (request) async => ManagedTurnResult(
+        sessionId: request.conversationPublicId!,
+        state: 'resumed',
+        result: const ChatResult(
+          content: 'next',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
+      );
+      final next = await service.sendTurn(
+        'c1',
+        history: loaded.messages,
+        userText: 'second',
+      );
+      expect(next.state, 'resumed');
+      expect(await repo.pending(scope, 'c1'), isNull);
+    });
+
+    test('abandonTurn with no pending row is a no-op', () async {
+      await service.abandonTurn('c1', partialText: 'ignored');
+      expect(client.cancelTokens, isEmpty);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded, isNull);
+    });
+
+    test('abandonTurn with empty partial clears pending without writing an '
+        'assistant row', () async {
+      final gate = Completer<ManagedTurnResult>();
+      await admitHangingTurn(gate: gate);
+      // No server reply yet → partial path (with empty partial: clear only).
+      client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+        'sessionId': sessionId,
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+        ],
+      });
+      await service.abandonTurn('c1');
+      expect(await repo.pending(scope, 'c1'), isNull);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages, hasLength(1));
+      expect(loaded.messages.single.role, MessageRole.user);
+    });
+
+    test('abandonTurn when the server holds a terminal assistant turn '
+        'reconciles instead of persisting the partial', () async {
+      final gate = Completer<ManagedTurnResult>();
+      await admitHangingTurn(gate: gate);
+      final session = await repo.mappedSession('c1');
+      client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+        'sessionId': sessionId,
+        'messages': [
+          {'role': 'user', 'content': 'hi'},
+          {'role': 'assistant', 'content': 'full server reply'},
+        ],
+      });
+
+      await service.abandonTurn('c1', partialText: 'partial ');
+
+      expect(client.sessionLoads, [session]);
+      expect(await repo.pending(scope, 'c1'), isNull);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages, hasLength(2));
+      expect(loaded.messages.last.content, 'full server reply');
+      expect(
+        loaded.messages.any((m) => m.content == 'partial '),
+        isFalse,
+        reason: 'the server\'s terminal reply replaces the local partial');
+    });
+
+    test('abandonTurn when the server fetch fails falls back to the '
+        'partial-clear path (pending cleared, partial persisted)', () async {
+      final gate = Completer<ManagedTurnResult>();
+      await admitHangingTurn(gate: gate);
+      // Default server history is terminal ([user, assistant]); make the
+      // loadSession fail so the fallback runs.
+      client.loadSessionError = const PluginClientException('network_error');
+
+      await service.abandonTurn('c1', partialText: 'partial ');
+
+      expect(await repo.pending(scope, 'c1'), isNull);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages, hasLength(2));
+      expect(loaded.messages.last.content, 'partial ');
+    });
+
+    test('a late completion after abandon surfaces cancelled and never '
+        'persists the assistant reply', () async {
+      final gate = Completer<ManagedTurnResult>();
+      // Route dispatch through the gate BEFORE the send starts — otherwise
+      // the default responder can finish the turn and clear pending before
+      // the wait loop ever observes it (spinning forever).
+      respondWith = (request) => gate.future;
+      final sent = service.sendTurn('c1', history: const [], userText: 'hi');
+      while ((await repo.pending(scope, 'c1')) == null) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      // Abandon while the dispatch is still awaiting the gate.
+      await service.abandonTurn('c1');
+      gate.complete(
+        ManagedTurnResult(
+          sessionId: request0Session(client),
+          state: 'seeded',
+          result: const ChatResult(
+            content: 'late reply',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        ),
+      );
+      await expectLater(
+        sent,
+        throwsA(
+          isA<ManagedTurnError>().having((e) => e.code, 'code', 'cancelled'),
+        ),
+      );
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(
+        loaded!.messages.any((m) => m.content == 'late reply'),
+        isFalse,
+        reason: 'a completion after abandon must not persist');
+      expect(await repo.pending(scope, 'c1'), isNull);
+    });
+  });
+
+  group('P1b: service-minted user-message id', () {
+    test('sendTurn outcome.userMessageId matches the persisted trailing user '
+        'row', () async {
+      final outcome = await service.sendTurn(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      final users = loaded!.messages.where(
+        (m) => m.role == MessageRole.user,
+      );
+      expect(users, hasLength(1));
+      expect(outcome.userMessageId, users.single.id);
+      expect(outcome.userMessageId, isNotEmpty);
+    });
+
+    test('the persisted envelope carries userMessageId; the failure '
+        'ManagedTurnError and a later retryTurn both reuse it', () async {
+      respondWith = (_) => throw const PluginClientException('network_error');
+      Object? thrown;
+      try {
+        await service.sendTurn('c1', history: const [], userText: 'hi');
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown, isA<ManagedTurnError>());
+      final failure = thrown! as ManagedTurnError;
+      final pending = (await repo.pending(scope, 'c1'))!;
+      final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
+      expect(envelope['userMessageId'], isA<String>());
+      final admittedId = envelope['userMessageId'] as String;
+      expect(admittedId, isNotEmpty);
+      // The post-admission failure surfaces the SAME id the envelope stored.
+      expect(failure.userMessageId, admittedId);
+
+      respondWith = (request) async => ManagedTurnResult(
+        sessionId: request.conversationPublicId!,
+        state: 'resumed',
+        result: const ChatResult(
+          content: 'ok',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
+      );
+      final outcome = await service.retryTurn('c1');
+      expect(outcome.userMessageId, admittedId,
+          reason: 'retry replays the envelope id, never re-mints');
+    });
+
+    test('a pre-P1b envelope without userMessageId derives the trailing user '
+        'row id on retryTurn', () async {
+      respondWith = (_) => throw const PluginClientException('network_error');
+      await expectLater(
+        service.sendTurn('c1', history: const [], userText: 'hi'),
+        throwsA(isA<ManagedTurnError>()),
+      );
+      final pending = (await repo.pending(scope, 'c1'))!;
+      final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
+      final admittedId = envelope.remove('userMessageId');
+      expect(admittedId, isA<String>(),
+          reason: 'this test starts from a real envelope, then strips the '
+              'key to simulate a pre-P1b mint');
+      await repo.savePending('c1', scope, pending.messageId, envelope);
+      final rewritten =
+          jsonDecode((await repo.pending(scope, 'c1'))!.envelope)
+              as Map<String, dynamic>;
+      expect(rewritten.containsKey('userMessageId'), isFalse);
+
+      respondWith = (request) async => ManagedTurnResult(
+        sessionId: request.conversationPublicId!,
+        state: 'resumed',
+        result: const ChatResult(
+          content: 'ok',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
+      );
+      final outcome = await service.retryTurn('c1');
+      expect(outcome.userMessageId, admittedId,
+          reason: 'derived from the conversation trailing user row');
+    });
+
+    test('submitBackground persists userMessageId and a background '
+        'retryTurn surfaces it on ManagedBackgroundResubmitted', () async {
+      client.respondBackground =
+          (_) => throw const PluginClientException('network_error');
+      await expectLater(
+        service.submitBackground('c1', history: const [], userText: 'hi'),
+        throwsA(isA<PluginClientException>()),
+      );
+      final pending = (await repo.pending(scope, 'c1'))!;
+      final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
+      final admittedId = envelope['userMessageId'] as String;
+      expect(admittedId, isNotEmpty);
+
+      client.respondBackground = (_) async =>
+          const BackgroundTurnResult(status: 'accepted', taskId: 'task-1');
+      final outcome = await service.retryTurn('c1');
+      expect(outcome, isA<ManagedBackgroundResubmitted>());
+      expect(outcome.userMessageId, admittedId);
+    });
   });
 }

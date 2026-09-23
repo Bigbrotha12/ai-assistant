@@ -11,7 +11,8 @@ import '../../settings/data/settings_providers.dart';
 ///
 /// The backend gateway (Hono + better-auth) is now used for account services
 /// ONLY: the auth base is `host:17600` under the `/api/auth` path. Inference
-/// never routes through the gateway (see [chatApiClientProvider]).
+/// never routes through the gateway; it goes through the managed chat
+/// adapter surface instead.
 final authBackendOriginProvider = Provider<String>((ref) {
   final settings = ref.watch(settingsProvider).value;
   final baseUrl = BackendConfig.gatewayBase(

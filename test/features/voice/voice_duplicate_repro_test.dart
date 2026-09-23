@@ -6,8 +6,6 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart'
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
-import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
@@ -51,9 +49,32 @@ void main() {
         ),
         micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
         audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
-        audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
+        audioSessionManagerProvider.overrideWithValue(
+          FakeAudioSessionManager(),
+        ),
         screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
-        chatApiClientProvider.overrideWithValue(chat),
+        voiceTurnSenderProvider.overrideWithValue(({
+          required conversationId,
+          required messages,
+          required userText,
+          systemPrompt,
+          cancelToken,
+          onReceived,
+          onContent,
+          onToolCallDelta,
+        }) {
+          return chat.sendTurn(
+            conversationId,
+            history: const [],
+            userText: userText,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            cancelToken: cancelToken,
+            onReceived: onReceived,
+            onContent: onContent,
+            onToolCallDelta: onToolCallDelta,
+          );
+        }),
         chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
         if (activeConversationId != null)
           activeConversationIdProvider.overrideWith(
@@ -65,8 +86,7 @@ void main() {
     return container;
   }
 
-  testWidgets(
-      'a second voice turn never re-emits the previous assistant reply '
+  testWidgets('a second voice turn never re-emits the previous assistant reply '
       'alongside the new user utterance', (tester) async {
     final chat = FakeChatClient(
       streamDeltas: const [
@@ -75,7 +95,11 @@ void main() {
       ],
       results: const [
         ChatResult(content: 'First reply', toolCalls: [], finishReason: 'stop'),
-        ChatResult(content: 'Second reply', toolCalls: [], finishReason: 'stop'),
+        ChatResult(
+          content: 'Second reply',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
       ],
     );
     final store = FakeChatStore();
@@ -120,15 +144,11 @@ void main() {
       }
     }
 
-    // The persisted conversation holds exactly one user + one assistant per
-    // turn — never a duplicate assistant reply.
-    final conv = await store.loadConversation('conv-dup');
-    expect(conv, isNotNull);
-    expect(
-      conv!.messages.map((m) => m.role).toList(),
-      [MessageRole.user, MessageRole.assistant, MessageRole.user, MessageRole.assistant],
-    );
-    expect(conv.messages.map((m) => m.content).toList(),
-        ['hello', 'First reply', 'who are you?', 'Second reply']);
+    // Single-writer (plan P2): the controller no longer persists — the
+    // service owns turn writes, so the legacy sender (no scoped store) must
+    // leave the store untouched. The transcript dedup asserted above is the
+    // controller's concern; exactly-once rows are covered by the managed path
+    // in voice_turn_persistence_test.dart.
+    expect(await store.loadConversation('conv-dup'), isNull);
   });
 }

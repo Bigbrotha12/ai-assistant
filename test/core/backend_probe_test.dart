@@ -204,6 +204,36 @@ void main() {
       expect(result.detail, contains('gateway API key'));
     });
 
+    test('returns unauthorized when the gateway replies 401 (validateStatus bypass)',
+        () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        _inferenceUrl,
+        (r) => r.reply(401, {'error': 'invalid_api_key'}),
+      );
+
+      final status = await probe(dio).probe(_settings);
+
+      final result = status.resultFor(BackendCheck.inference)!;
+      expect(result.status, ProbeStatus.unauthorized);
+      expect(result.detail, contains('gateway API key'));
+    });
+
+    test('returns error on a 500 response', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        _inferenceUrl,
+        (r) => r.reply(500, {'error': 'internal'}),
+      );
+
+      final status = await probe(dio).probe(_settings);
+
+      expect(
+        status.resultFor(BackendCheck.inference)!.status,
+        ProbeStatus.error,
+      );
+    });
+
     test('returns error with 503 in the detail', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(

@@ -11,7 +11,6 @@ import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/features/settings/data/prefs_providers.dart';
 import 'package:ai_assistant/app/theme_providers.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/app/widgets/speak_button.dart';
 import 'package:ai_assistant/features/auth/ui/auth_flow.dart';
@@ -74,14 +73,18 @@ void main() {
     FakeSttEngine? stt,
     String? activeConversationId,
   }) {
+    // One scripted client drives the managed voice send seam override — the
+    // controller's sendTurn goes through voiceTurnSenderProvider, which must
+    // script the same instance.
+    final resolvedChat = chatClient ?? FakeChatClient();
     final container = ProviderContainer(
       overrides: [
         engineManagerProvider.overrideWithValue(
           tts != null
               ? _TtsAwareEngineManager(tts)
               : stt != null
-                  ? _SttAwareEngineManager(stt)
-                  : FakeEngineManager(),
+              ? _SttAwareEngineManager(stt)
+              : FakeEngineManager(),
         ),
         voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
         settingsStoreProvider.overrideWithValue(
@@ -97,11 +100,32 @@ void main() {
         audioPlaybackServiceProvider.overrideWithValue(
           playback ?? FakeAudioPlayback(),
         ),
-        audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
-        screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
-        chatApiClientProvider.overrideWithValue(
-          chatClient ?? FakeChatClient(),
+        audioSessionManagerProvider.overrideWithValue(
+          FakeAudioSessionManager(),
         ),
+        screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+        voiceTurnSenderProvider.overrideWithValue(({
+          required conversationId,
+          required messages,
+          required userText,
+          systemPrompt,
+          cancelToken,
+          onReceived,
+          onContent,
+          onToolCallDelta,
+        }) {
+          return resolvedChat.sendTurn(
+            conversationId,
+            history: const [],
+            userText: userText,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            cancelToken: cancelToken,
+            onReceived: onReceived,
+            onContent: onContent,
+            onToolCallDelta: onToolCallDelta,
+          );
+        }),
         chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
         filesStoreProvider.overrideWithValue(FakeFileStore()),
         if (activeConversationId != null)
@@ -134,14 +158,13 @@ void main() {
     required String id,
     required String title,
     required List<Message> messages,
-  }) =>
-      Conversation(
-        id: id,
-        title: title,
-        messages: messages,
-        createdAt: DateTime(2026, 1, 1),
-        updatedAt: DateTime(2026, 1, 1, 0, 0, 1),
-      );
+  }) => Conversation(
+    id: id,
+    title: title,
+    messages: messages,
+    createdAt: DateTime(2026, 1, 1),
+    updatedAt: DateTime(2026, 1, 1, 0, 0, 1),
+  );
 
   Message message({
     required String id,
@@ -150,8 +173,9 @@ void main() {
   }) =>
       Message(id: id, role: role, content: content, createdAt: DateTime(2026));
 
-  testWidgets('a 401 conversation error surfaces the ReauthCard',
-      (tester) async {
+  testWidgets('a 401 conversation error surfaces the ReauthCard', (
+    tester,
+  ) async {
     final chatClient = FakeChatClient()
       ..error = const ChatServerError('HTTP 401', statusCode: 401);
     final container = buildContainer(chatClient: chatClient);
@@ -174,33 +198,36 @@ void main() {
     expect(find.text('Session expired'), findsOneWidget);
   });
 
-  testWidgets('missing credentials surface the ReauthCard on the voice surface',
-      (tester) async {
-    // No stored session/API key: the resolver throws ChatAuthRequiredError
-    // before any network call; the voice surface must treat it like a gateway
-    // 401 and surface the login flow.
-    final chatClient = FakeChatClient()
-      ..error = const ChatAuthRequiredError('Not authenticated');
-    final container = buildContainer(chatClient: chatClient);
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: VoiceScreen()),
-      ),
-    );
-    await settle(tester);
+  testWidgets(
+    'missing credentials surface the ReauthCard on the voice surface',
+    (tester) async {
+      // No stored session/API key: the resolver throws ChatAuthRequiredError
+      // before any network call; the voice surface must treat it like a gateway
+      // 401 and surface the login flow.
+      final chatClient = FakeChatClient()
+        ..error = const ChatAuthRequiredError('Not authenticated');
+      final container = buildContainer(chatClient: chatClient);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(home: VoiceScreen()),
+        ),
+      );
+      await settle(tester);
 
-    final controller = container.read(voiceControllerProvider);
-    await controller.startConversation();
-    await controller.sendText('hello');
-    await settle(tester);
+      final controller = container.read(voiceControllerProvider);
+      await controller.startConversation();
+      await controller.sendText('hello');
+      await settle(tester);
 
-    expect(find.byType(ReauthCard), findsOneWidget);
-    expect(find.text('Session expired'), findsOneWidget);
-  });
+      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.text('Session expired'), findsOneWidget);
+    },
+  );
 
-  testWidgets('dismissing the ReauthCard clears the voice error',
-      (tester) async {
+  testWidgets('dismissing the ReauthCard clears the voice error', (
+    tester,
+  ) async {
     final chatClient = FakeChatClient()
       ..error = const ChatServerError('HTTP 401', statusCode: 401);
     final container = buildContainer(chatClient: chatClient);
@@ -228,8 +255,9 @@ void main() {
     expect(controller.state.isConnected, isTrue);
   });
 
-  testWidgets('non-401 errors still render the generic error banner',
-      (tester) async {
+  testWidgets('non-401 errors still render the generic error banner', (
+    tester,
+  ) async {
     final chatClient = FakeChatClient()
       ..error = const ChatServerError('HTTP 503', statusCode: 503);
     final container = buildContainer(chatClient: chatClient);
@@ -251,8 +279,9 @@ void main() {
     expect(find.textContaining('HTTP 503'), findsOneWidget);
   });
 
-  testWidgets('the Text segment of the pill opens the chat screen',
-      (tester) async {
+  testWidgets('the Text segment of the pill opens the chat screen', (
+    tester,
+  ) async {
     final container = buildContainer(activeConversationId: 'conv-1');
     await tester.pumpWidget(
       UncontrolledProviderScope(
@@ -276,27 +305,28 @@ void main() {
 
   testWidgets('history action opens the session list and switching selects '
       'the conversation', (tester) async {
-    final store = FakeChatStore(initial: [
-      conversation(
-        id: 'conv-a',
-        title: 'Conversation A',
-        messages: [
-          message(
-            id: 'a1',
-            role: MessageRole.user,
-            content: 'Hello A',
-          ),
-        ],
-      ),
-      conversation(
-        id: 'conv-b',
-        title: 'Conversation B',
-        messages: [
-          message(id: 'b1', role: MessageRole.user, content: 'Hello B'),
-        ],
-      ),
-    ]);
-    final container = buildContainer(store: store, activeConversationId: 'conv-a');
+    final store = FakeChatStore(
+      initial: [
+        conversation(
+          id: 'conv-a',
+          title: 'Conversation A',
+          messages: [
+            message(id: 'a1', role: MessageRole.user, content: 'Hello A'),
+          ],
+        ),
+        conversation(
+          id: 'conv-b',
+          title: 'Conversation B',
+          messages: [
+            message(id: 'b1', role: MessageRole.user, content: 'Hello B'),
+          ],
+        ),
+      ],
+    );
+    final container = buildContainer(
+      store: store,
+      activeConversationId: 'conv-a',
+    );
     await tester.pumpWidget(
       UncontrolledProviderScope(
         container: container,
@@ -320,8 +350,9 @@ void main() {
     expect(find.byType(ConversationListScreen), findsNothing);
   });
 
-  testWidgets('the SpeakButton shows a stop affordance while the AI speaks',
-      (tester) async {
+  testWidgets('the SpeakButton shows a stop affordance while the AI speaks', (
+    tester,
+  ) async {
     final tts = FakeTtsEngine();
     final playback = FakeAudioPlayback()..holdCompletion = Completer<void>();
     final container = buildContainer(tts: tts, playback: playback);
@@ -354,8 +385,9 @@ void main() {
     expect(find.byIcon(Icons.stop), findsNothing);
   });
 
-  testWidgets('the SpeakButton sits at the exact vertical middle of the hero',
-      (tester) async {
+  testWidgets('the SpeakButton sits at the exact vertical middle of the hero', (
+    tester,
+  ) async {
     final container = buildContainer();
     await tester.pumpWidget(
       UncontrolledProviderScope(
@@ -370,10 +402,7 @@ void main() {
     // middle.
     final buttonCenter = tester.getCenter(find.byType(SpeakButton));
     final heroRect = tester.getRect(find.byType(SingleChildScrollView));
-    expect(
-      buttonCenter.dy,
-      moreOrLessEquals(heroRect.center.dy, epsilon: 0.5),
-    );
+    expect(buttonCenter.dy, moreOrLessEquals(heroRect.center.dy, epsilon: 0.5));
   });
 
   testWidgets('holding the talk button while the AI speaks stops the AI and '
@@ -419,8 +448,9 @@ void main() {
   });
 
   testWidgets('holding the talk button while the AI is still generating '
-      '(no audio yet) interrupts the turn and starts recording',
-      (tester) async {
+      '(no audio yet) interrupts the turn and starts recording', (
+    tester,
+  ) async {
     // The reply streams but the turn hangs mid-generation, so isGenerating is
     // true while isAiSpeaking is still false ("Working…" status).
     final chat = FakeChatClient()..hang = Completer<ChatResult>();
@@ -521,8 +551,9 @@ void main() {
     expect(controller.state.isRecording, isFalse);
   });
 
-  testWidgets('shows the Working status while the LLM stream is in flight',
-      (tester) async {
+  testWidgets('shows the Working status while the LLM stream is in flight', (
+    tester,
+  ) async {
     final chat = FakeChatClient()..hang = Completer<ChatResult>();
     final container = buildContainer(chatClient: chat);
     await tester.pumpWidget(
@@ -551,8 +582,9 @@ void main() {
     expect(find.textContaining('Working'), findsNothing);
   });
 
-  testWidgets('renders the transient notice when a busy flush is dropped',
-      (tester) async {
+  testWidgets('renders the transient notice when a busy flush is dropped', (
+    tester,
+  ) async {
     final chat = FakeChatClient()..hang = Completer<ChatResult>();
     final container = buildContainer(chatClient: chat, stt: FakeSttEngine());
     await tester.pumpWidget(
@@ -564,7 +596,8 @@ void main() {
     await settle(tester);
 
     final controller = container.read(voiceControllerProvider);
-    final mic = container.read(micCaptureServiceProvider) as FakeMicCaptureService;
+    final mic =
+        container.read(micCaptureServiceProvider) as FakeMicCaptureService;
     await controller.startConversation();
     // Turn 1 is a flushed utterance whose stream hangs mid-generation.
     mic.emitChunk([1, 1, 1]);
@@ -582,10 +615,7 @@ void main() {
     await settle(tester);
 
     expect(controller.state.notice, isNotNull);
-    expect(
-      find.text('Dropped — one utterance at a time.'),
-      findsOneWidget,
-    );
+    expect(find.text('Dropped — one utterance at a time.'), findsOneWidget);
 
     chat.hang!.complete(
       const ChatResult(content: '', toolCalls: [], finishReason: 'stop'),
@@ -603,7 +633,8 @@ void main() {
     required FakeChatClient client,
   }) {
     final settingsStore =
-        store ?? FakeSettingsStore(stored: const BackendSettings(host: 'myhost'));
+        store ??
+        FakeSettingsStore(stored: const BackendSettings(host: 'myhost'));
     return ProviderScope(
       overrides: [
         settingsStoreProvider.overrideWithValue(settingsStore),
@@ -617,7 +648,28 @@ void main() {
         appPrefsStoreProvider.overrideWithValue(FakePrefsStore()),
         backendProbeProvider.overrideWithValue(probe),
         chatStoreProvider.overrideWithValue(chatStore),
-        chatApiClientProvider.overrideWithValue(client),
+        voiceTurnSenderProvider.overrideWithValue(({
+          required conversationId,
+          required messages,
+          required userText,
+          systemPrompt,
+          cancelToken,
+          onReceived,
+          onContent,
+          onToolCallDelta,
+        }) {
+          return client.sendTurn(
+            conversationId,
+            history: const [],
+            userText: userText,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            cancelToken: cancelToken,
+            onReceived: onReceived,
+            onContent: onContent,
+            onToolCallDelta: onToolCallDelta,
+          );
+        }),
         filesStoreProvider.overrideWithValue(FakeFileStore()),
         // The voice home boots the real audio stack (record, just_audio,
         // secure storage, path_provider); none of that exists in widget
@@ -625,12 +677,12 @@ void main() {
         engineManagerProvider.overrideWithValue(FakeEngineManager()),
         micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
         audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
-        audioSessionManagerProvider
-            .overrideWithValue(FakeAudioSessionManager()),
+        audioSessionManagerProvider.overrideWithValue(
+          FakeAudioSessionManager(),
+        ),
         screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
         vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
-        voiceSettingsStoreProvider
-            .overrideWithValue(FakeVoiceSettingsStore()),
+        voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
         appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
       ],
       child: const AiAssistantApp(),
@@ -647,41 +699,42 @@ void main() {
   }
 
   group('full-app boot', () {
-    testWidgets('app boots to VoiceScreen with valid settings',
-        (tester) async {
+    testWidgets('app boots to VoiceScreen with valid settings', (tester) async {
       final store = FakeSettingsStore(
         stored: const BackendSettings(host: 'myhost'),
       );
-      await tester.pumpWidget(app(
-        store: store,
-        probe: FakeProbe(),
-        chatStore: FakeChatStore(),
-        client: FakeChatClient(),
-      ));
+      await tester.pumpWidget(
+        app(
+          store: store,
+          probe: FakeProbe(),
+          chatStore: FakeChatStore(),
+          client: FakeChatClient(),
+        ),
+      );
       await pumpBounded(tester);
 
       expect(find.text('Voice Assist'), findsOneWidget);
       expect(find.byType(SpeakButton), findsOneWidget);
       expect(find.text('PRESS AND HOLD TO TALK'), findsOneWidget);
       // The shared voice/text pill renders in voice home too.
-      expect(
-        find.byKey(const Key('voice-input-mode-toggle')),
-        findsOneWidget,
-      );
+      expect(find.byKey(const Key('voice-input-mode-toggle')), findsOneWidget);
       expect(find.text('Backend not configured'), findsNothing);
     });
 
-    testWidgets('Settings screen opens from the bottom bar gear',
-        (tester) async {
+    testWidgets('Settings screen opens from the bottom bar gear', (
+      tester,
+    ) async {
       final store = FakeSettingsStore(
         stored: const BackendSettings(host: 'myhost'),
       );
-      await tester.pumpWidget(app(
-        store: store,
-        probe: FakeProbe(),
-        chatStore: FakeChatStore(),
-        client: FakeChatClient(),
-      ));
+      await tester.pumpWidget(
+        app(
+          store: store,
+          probe: FakeProbe(),
+          chatStore: FakeChatStore(),
+          client: FakeChatClient(),
+        ),
+      );
       await pumpBounded(tester);
 
       // The settings gear in the bottom bar opens the settings screen.

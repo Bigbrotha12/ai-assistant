@@ -1,7 +1,7 @@
 /// Snapshot of a voice conversation's state, used to drive the UI.
 ///
 /// The conversation is turn-based and TEXT-only: on-device STT turns the
-/// recognised utterance into text, the [ChatClient] produces a text reply,
+/// recognised utterance into text, the managed LLM leg produces a text reply,
 /// and on-device TTS turns that reply into audible speech. No raw audio ever
 /// crosses the network, so there is no room / JWT / data-channel concept.
 class VoiceConversationState {
@@ -50,7 +50,7 @@ class VoiceConversationState {
   final bool isPaused;
 
   /// Whether the assistant's LLM reply for the current turn is being
-  /// streamed. Set just before [ChatClient.streamCompletions] dispatches and
+  /// streamed. Set just before the managed sender dispatches and
   /// cleared when the stream exits — on completion, on the cancelled-token
   /// abandon, or on either error path — so it can never leak true.
   final bool isGenerating;

@@ -15,6 +15,7 @@ import 'langchain_request.dart';
 import 'ledger_client.dart';
 import 'managed_conversation_dto.dart';
 import 'managed_conversation_repository.dart';
+import 'managed_error_codes.dart';
 import 'plugin_http.dart';
 
 /// Gateway + provider credentials for one dispatch. Resolved fresh on every
@@ -33,17 +34,32 @@ typedef CredentialResolver = Future<ManagedCredentials?> Function();
 
 /// Outcome of one staged managed turn.
 sealed class ManagedTurnOutcome {
-  const ManagedTurnOutcome(this.sessionId, this.state);
+  const ManagedTurnOutcome(this.sessionId, this.state, this.userMessageId);
 
   /// Raw public session id the server named (equals the client-minted id).
   final String sessionId;
 
   /// 'seeded' | 'resumed'.
   final String state;
+
+  /// Id of the user-message row admitted for this turn: minted inside
+  /// [ManagedConversationService.sendTurn]'s admission transaction and stored
+  /// in the pending envelope so [retryTurn] reports the same id. Post-send
+  /// store writes keyed to the user message (attachment `[file:]` refs,
+  /// FileInfo persistence, vision follow-ups) MUST use this id — a caller's
+  /// optimistic in-memory UUID never matches the store row and would
+  /// `insertOnConflictUpdate` a duplicate. Empty only when no user row was
+  /// admitted and none could be derived (nothing to key).
+  final String userMessageId;
 }
 
 class ManagedStreamedTurn extends ManagedTurnOutcome {
-  const ManagedStreamedTurn(super.sessionId, super.state, this.result);
+  const ManagedStreamedTurn(
+    super.sessionId,
+    super.state,
+    super.userMessageId,
+    this.result,
+  );
 
   final ChatResult result;
 }
@@ -54,14 +70,26 @@ class ManagedStreamedTurn extends ManagedTurnOutcome {
 /// duplicate; it carries no task metadata (the sync path admits no ledger
 /// tasks).
 class ManagedAlreadyCompleted extends ManagedTurnOutcome {
-  const ManagedAlreadyCompleted(super.sessionId, super.state);
+  const ManagedAlreadyCompleted(super.sessionId, super.state, super.userMessageId);
 }
 
 /// Failure that keeps the server session id reachable for the caller.
 class ManagedTurnError extends PluginClientException {
-  const ManagedTurnError(super.code, {super.statusCode, this.sessionId});
+  const ManagedTurnError(
+    super.code, {
+    super.statusCode,
+    this.sessionId,
+    this.userMessageId,
+  });
 
   final String? sessionId;
+
+  /// The admitted user-message id when the failure happened AFTER admission
+  /// (any dispatch-path failure — the user row and pending envelope survive
+  /// for an explicit retry); null for pre-admission failures where no user
+  /// row was written. Callers re-key follow-up writes to it exactly as they
+  /// would on a successful [ManagedTurnOutcome].
+  final String? userMessageId;
 }
 
 /// Injectable staged managed-chat service. Owns the per-send idempotency
@@ -118,6 +146,12 @@ class ManagedConversationService {
     return created;
   }
 
+  /// The background-job poller backing this service (built lazily when none
+  /// was injected — see [_ledgerPoller]). Public so app-lifecycle wiring can
+  /// arm / suspend live background watches ([LedgerPoller.setForeground]) and
+  /// tests can assert the same instance the service watches through.
+  LedgerPoller get poller => _ledgerPoller;
+
   Future<AuthCredentials?> _pollCredentials() async {
     final managed = await credentials();
     if (managed == null) return null;
@@ -142,11 +176,17 @@ class ManagedConversationService {
   /// creation/append, the session mapping, and the pending-row persistence all
   /// run inside one scope-checked repository transaction, so a logout racing
   /// the send can never leave a pending row behind after its clear.
+  ///
+  /// [onContent] receives streamed content deltas while the turn is
+  /// dispatching. Each delta is epoch-checked first: once the scope is
+  /// cancelled the wrapper throws `cancelled` before the caller sees the
+  /// delta, and that throw surfaces as [ManagedTurnError] (`cancelled`).
   Future<ManagedTurnOutcome> sendTurn(
     String conversationId, {
     required List<Message> history,
     required String userText,
     String? sessionId,
+    void Function(String delta)? onContent,
   }) async {
     final epoch = repo.epoch(scope);
     final userMessage = Message(
@@ -159,7 +199,7 @@ class ManagedConversationService {
       // One unresolved turn per scoped conversation: a second send would
       // replace the previous pending row and destroy its retry identity.
       if (await repo.pending(scope, conversationId) != null) {
-        throw const PluginClientException('pending_turn_exists');
+        throw const PluginClientException(ManagedErrorCodes.pendingTurnExists);
       }
       final now = DateTime.now();
       final current = await store.loadConversation(conversationId);
@@ -194,6 +234,7 @@ class ManagedConversationService {
           sessionId: effectiveSession,
           messages: shape.messages,
           delta: shape.delta,
+          userMessageId: userMessage.id,
         ),
       );
       return (
@@ -208,11 +249,13 @@ class ManagedConversationService {
       epoch,
       sessionId: prepared.sessionId,
       messageId: prepared.messageId,
+      userMessageId: userMessage.id,
       messages: prepared.messages,
       history: localHistory,
       modelPluginId: modelPluginId,
       enabledPlugins: enabledPlugins,
       delta: prepared.delta,
+      onContent: onContent,
     );
   }
 
@@ -224,16 +267,29 @@ class ManagedConversationService {
   /// surfaces `reconcile_required` (retry is not a send). A BACKGROUND pending
   /// re-submits the identical background job (same messageId, same snapshot)
   /// and returns a [ManagedBackgroundResubmitted] carrying the new watch.
-  Future<ManagedTurnOutcome> retryTurn(String conversationId) async {
+  ///
+  /// [onContent] threads streamed content deltas exactly as in [sendTurn];
+  /// background envelopes never stream, so it is ignored on that path.
+  Future<ManagedTurnOutcome> retryTurn(
+    String conversationId, {
+    void Function(String delta)? onContent,
+  }) async {
     final epoch = repo.epoch(scope);
     final pending = await repo.pending(scope, conversationId);
     if (pending == null) {
-      throw const PluginClientException('no_pending_turn');
+      throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
     }
     if (pending.reconcileOnly) {
-      throw const PluginClientException('reconcile_required');
+      throw const PluginClientException(ManagedErrorCodes.reconcileRequired);
     }
     final resumed = _decodeEnvelope(pending.envelope);
+    // Backward-compatible read: envelopes minted before P1b carry no
+    // `userMessageId` — derive it from the admitted row (the conversation's
+    // trailing user message; the turn is still unresolved, so no later user
+    // row can exist). '' when nothing is found (nothing to key).
+    final userMessageId =
+        resumed.userMessageId ??
+        await _trailingUserMessageId(conversationId, epoch);
     if (resumed.background) {
       final handle = await _dispatchBackground(
         conversationId,
@@ -244,19 +300,35 @@ class ManagedConversationService {
         modelPluginId: resumed.modelPluginId,
         enabledPlugins: resumed.enabledPlugins,
       );
-      return ManagedBackgroundResubmitted(handle);
+      return ManagedBackgroundResubmitted(handle, userMessageId);
     }
     return _dispatch(
       conversationId,
       epoch,
       sessionId: resumed.sessionId,
       messageId: pending.messageId,
+      userMessageId: userMessageId,
       messages: resumed.messages,
       history: _historyFromApi(resumed.messages),
       modelPluginId: resumed.modelPluginId,
       enabledPlugins: resumed.enabledPlugins,
       delta: resumed.delta,
+      onContent: onContent,
     );
+  }
+
+  /// Backward-compatible fallback for pre-P1b pending envelopes: resolves the
+  /// admitted user row's id as the conversation's trailing user message.
+  /// Returns '' when the conversation (or a user row) is gone.
+  Future<String> _trailingUserMessageId(String conversationId, int epoch) {
+    return repo.access(scope, epoch, () {}, (store) async {
+      final conversation = await store.loadConversation(conversationId);
+      if (conversation == null) return '';
+      for (final message in conversation.messages.reversed) {
+        if (message.role == MessageRole.user) return message.id;
+      }
+      return '';
+    });
   }
 
   /// Submits a background job (plan §5 async submission) for the conversation.
@@ -274,6 +346,12 @@ class ManagedConversationService {
   /// on `failed`/`cancelled`. Multiple different conversations run independent
   /// watches concurrently; the one-pending-turn rule still rejects a second
   /// concurrent submit on the SAME conversation.
+  ///
+  /// The admitted user-message id is stored in the background pending envelope
+  /// (surfaced by a later [retryTurn] as [ManagedBackgroundResubmitted
+  /// .userMessageId]) but NOT returned here — the [LedgerPollHandle] contract
+  /// is unchanged for its consumers; exposing it on submit is deferred with the
+  /// background-chip UI (plan P3).
   Future<LedgerPollHandle> submitBackground(
     String conversationId, {
     required List<Message> history,
@@ -290,7 +368,7 @@ class ManagedConversationService {
       // One unresolved turn per scoped conversation: a second submit would
       // replace the previous pending row and destroy its retry identity.
       if (await repo.pending(scope, conversationId) != null) {
-        throw const PluginClientException('pending_turn_exists');
+        throw const PluginClientException(ManagedErrorCodes.pendingTurnExists);
       }
       final now = DateTime.now();
       final current = await store.loadConversation(conversationId);
@@ -315,7 +393,11 @@ class ManagedConversationService {
         conversationId,
         scope,
         messageId,
-        _backgroundEnvelope(messageId: messageId, messages: messages),
+        _backgroundEnvelope(
+          messageId: messageId,
+          messages: messages,
+          userMessageId: userMessage.id,
+        ),
       );
       return (messageId: messageId, messages: messages);
     });
@@ -370,6 +452,7 @@ class ManagedConversationService {
     int epoch, {
     required String sessionId,
     required String messageId,
+    required String userMessageId,
     required List<ApiMessage> messages,
     required List<Message> history,
     required String modelPluginId,
@@ -377,11 +460,18 @@ class ManagedConversationService {
     bool reestablishAttempted = false,
     bool delta = false,
     bool tooLargeRetried = false,
+    void Function(String delta)? onContent,
   }) async {
     _checkEpoch(epoch);
     final resolved = await credentials();
     if (resolved == null) {
-      throw const PluginClientException('missing_gateway_key');
+      // Post-admission: the user row already exists, so the error carries its
+      // id for the caller's follow-up writes.
+      throw ManagedTurnError(
+        'missing_gateway_key',
+        sessionId: sessionId,
+        userMessageId: userMessageId,
+      );
     }
     _checkEpoch(epoch);
     final request = LangChainRequest(
@@ -394,9 +484,26 @@ class ManagedConversationService {
       managed: true,
       enabledPlugins: enabledPlugins,
     );
-    final token = repo.register(scope);
+    final token = repo.registerDispatch(scope, conversationId);
     try {
-      final streamed = await client.managedTurn(request, cancelToken: token);
+      final streamed = await client.managedTurn(
+        request,
+        cancelToken: token,
+        // Epoch-check every delta before it reaches the caller: a scope
+        // cancelled mid-stream must never deliver a late delta, and the
+        // throw surfaces as ManagedTurnError('cancelled').
+        onContent: onContent == null
+            ? null
+            : (text) {
+                _checkEpoch(epoch);
+                onContent(text);
+              },
+      );
+      // abandonTurn may have cancelled this turn's dispatch after the stream
+      // resolved but before we got here — a late completion must not persist.
+      if (token.isCancelled) {
+        throw const PluginClientException(ManagedErrorCodes.cancelled);
+      }
       _checkEpoch(epoch);
       if (streamed.result != null) {
         // N2: a single-message DELTA that the server answered `seeded` means the
@@ -413,13 +520,16 @@ class ManagedConversationService {
             conversationId,
             epoch,
             sessionId: sessionId,
+            userMessageId: userMessageId,
             modelPluginId: modelPluginId,
             enabledPlugins: enabledPlugins,
+            onContent: onContent,
           );
         }
         final outcome = ManagedStreamedTurn(
           streamed.sessionId,
           streamed.state,
+          userMessageId,
           streamed.result!,
         );
         await _completeTurn(
@@ -434,6 +544,7 @@ class ManagedConversationService {
       final outcome = ManagedAlreadyCompleted(
         streamed.sessionId,
         streamed.state,
+        userMessageId,
       );
       await _reconcileAlreadyCompleted(
         conversationId,
@@ -444,7 +555,7 @@ class ManagedConversationService {
       );
       return outcome;
     } on PluginClientException catch (error) {
-      if (error.code == 'session_missing' && !reestablishAttempted) {
+      if (error.code == ManagedErrorCodes.sessionMissing && !reestablishAttempted) {
         // Plan §5/R4: the server evicted/restarted its session cache. Do NOT
         // drop-and-mint a new id — re-establish under the SAME session_id from
         // the client-owned store (which already includes the user's message)
@@ -453,11 +564,13 @@ class ManagedConversationService {
           conversationId,
           epoch,
           sessionId: sessionId,
+          userMessageId: userMessageId,
           modelPluginId: modelPluginId,
           enabledPlugins: enabledPlugins,
+          onContent: onContent,
         );
       }
-      if (error.code == 'request_too_large' && !tooLargeRetried) {
+      if (error.code == ManagedErrorCodes.requestTooLarge && !tooLargeRetried) {
         // Plan §5/R6: an establish (full history + base64 images) can exceed the
         // body cap. Retry ONCE with a harder prune — drop image blocks from all
         // but the newest image-bearing message. Deltas stay small by design; a
@@ -470,6 +583,7 @@ class ManagedConversationService {
             epoch,
             sessionId: sessionId,
             messageId: messageId,
+            userMessageId: userMessageId,
             messages: pruned,
             history: history,
             modelPluginId: modelPluginId,
@@ -477,10 +591,11 @@ class ManagedConversationService {
             reestablishAttempted: reestablishAttempted,
             delta: delta,
             tooLargeRetried: true,
+            onContent: onContent,
           );
         }
       }
-      if (error.code == 'reseed_required') {
+      if (error.code == ManagedErrorCodes.reseedRequired) {
         await _dropStaleThread(
           conversationId,
           threadId: sessionId,
@@ -491,9 +606,11 @@ class ManagedConversationService {
         error.code,
         statusCode: error.statusCode,
         sessionId: sessionId,
+        userMessageId: userMessageId,
       );
     } finally {
       repo.unregister(scope, token);
+      repo.clearDispatch(scope, conversationId, token);
     }
   }
 
@@ -554,7 +671,7 @@ class ManagedConversationService {
     _checkEpoch(epoch);
     final resolved = await credentials();
     if (resolved == null) {
-      throw const PluginClientException('missing_gateway_key');
+      throw const PluginClientException(ManagedErrorCodes.missingGatewayKey);
     }
     _checkEpoch(epoch);
     final request = LangChainRequest(
@@ -614,6 +731,31 @@ class ManagedConversationService {
       }
     }));
     return handle;
+  }
+
+  /// Re-arms the ledger watch for a still-pending BACKGROUND job (plan P3
+  /// foreground liveness): a suspended app runs no timers, so the original
+  /// handle's fixed deadline may have expired (an expired handle finishes
+  /// `exhausted` with zero polls). Each still-pending background envelope gets
+  /// a FRESH watch keyed by the same `messageId` — the job is already on the
+  /// server, nothing is re-submitted. Returns the new handle, or null when the
+  /// conversation has no pending background envelope (a non-background or
+  /// reconcile-only pending row). The fresh watch replaces the old one for the
+  /// lookup ([LedgerPoller.watch] invalidates the previous handle).
+  Future<LedgerPollHandle?> rewatchPendingBackground(
+    String conversationId,
+  ) async {
+    final epoch = repo.epoch(scope);
+    final pending = await repo.pending(scope, conversationId);
+    if (pending == null || pending.reconcileOnly) return null;
+    final resumed = _decodeEnvelope(pending.envelope);
+    if (!resumed.background) return null;
+    return _watchBackground(
+      conversationId,
+      epoch,
+      lookup: LedgerLookup.byMessageId(pending.messageId),
+      history: _historyFromApi(resumed.messages),
+    );
   }
 
   Future<void> _handleBackgroundTerminal(
@@ -757,8 +899,10 @@ class ManagedConversationService {
     String conversationId,
     int epoch, {
     required String sessionId,
+    required String userMessageId,
     required String modelPluginId,
     required List<String> enabledPlugins,
+    void Function(String delta)? onContent,
   }) async {
     _checkEpoch(epoch);
     final stored = await repo.access(
@@ -768,7 +912,7 @@ class ManagedConversationService {
       (store) => store.loadConversation(conversationId),
     );
     _checkEpoch(epoch);
-    if (stored == null) throw const PluginClientException('no_pending_turn');
+    if (stored == null) throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
     // The local conversation may itself be over budget — run the same trimmer
     // over the full history before re-seeding (plan §6).
     final trimmed = trimmer.trim(stored.messages);
@@ -786,6 +930,7 @@ class ManagedConversationService {
           messageId: messageId,
           sessionId: sessionId,
           messages: messages,
+          userMessageId: userMessageId,
         ),
       );
     });
@@ -795,11 +940,13 @@ class ManagedConversationService {
       epoch,
       sessionId: sessionId,
       messageId: messageId,
+      userMessageId: userMessageId,
       messages: messages,
       history: trimmed,
       modelPluginId: modelPluginId,
       enabledPlugins: enabledPlugins,
       reestablishAttempted: true,
+      onContent: onContent,
     );
   }
 
@@ -891,6 +1038,187 @@ class ManagedConversationService {
     });
   }
 
+  /// Abandons an in-flight or failed turn for [conversationId] (plan §3:
+  /// cancel = abandon, so the next send is never blocked by a stale pending
+  /// row). Cancels the conversation's dispatch token (no epoch bump), then:
+  ///
+  ///  - no pending row → no-op;
+  ///  - `reconcileOnly` pending, or the server session holds a terminal
+  ///    assistant turn the local history lacks → [reconcileFromServer]
+  ///    (replace local with the server's full reply); a non-`cancelled`
+  ///    failure during that fetch falls through to the partial-clear path;
+  ///  - otherwise → clear the pending row and persist the partial as the
+  ///    assistant message in one transaction. Empty [partialText] still
+  ///    clears the pending row (the next send must not throw
+  ///    `pending_turn_exists`) but writes no assistant row.
+  ///
+  /// Never `replaceHistory`s when the server has no terminal turn — that
+  /// would silently drop the just-sent user message. [generation] lets a
+  /// caller pin the epoch it observed at admission (a logout racing the
+  /// abandon still throws `cancelled`). Only an epoch `cancelled` escapes;
+  /// every other failure surfaces as a [PluginClientException].
+  Future<void> abandonTurn(
+    String conversationId, {
+    String? sessionId,
+    int? generation,
+    String? partialText,
+  }) async {
+    final epoch = generation ?? repo.epoch(scope);
+    repo.takeDispatch(scope, conversationId);
+    final pending = await repo.pending(scope, conversationId);
+    if (pending == null) return;
+    final session = sessionId ?? await repo.mappedSession(conversationId);
+
+    if (pending.reconcileOnly) {
+      try {
+        await reconcileFromServer(conversationId);
+        return;
+      } on PluginClientException catch (error) {
+        if (error.code == ManagedErrorCodes.cancelled) rethrow;
+        // Fetch failed (network, reseed, …): fall through and clear the
+        // partial so the conversation stays sendable; the partial is the
+        // only content we still own.
+      }
+    } else {
+      // One fetch serves both decisions: the terminal check's history is
+      // handed to reconcile so the session is loaded exactly once.
+      final terminal = await _serverTerminalMessages(
+        conversationId,
+        session,
+        epoch,
+      );
+      if (terminal != null) {
+        try {
+          await reconcileFromServer(
+            conversationId,
+            preloadedHistory: terminal,
+          );
+          return;
+        } on PluginClientException catch (error) {
+          if (error.code == ManagedErrorCodes.cancelled) rethrow;
+        }
+      }
+    }
+    await _clearAndPersistPartial(
+      conversationId,
+      epoch,
+      messageId: pending.messageId,
+      partialText: partialText ?? '',
+    );
+  }
+
+  /// True when the conversation's pending row (if any) is a BACKGROUND job
+  /// envelope (plan P3). The chat notifier uses this to keep the pending-job
+  /// chip when a `pending_turn_exists` rejection surfaces against a genuinely
+  /// running job (or to confirm a post-admission background failure kept its
+  /// retry identity). Reconcile-only markers and malformed envelopes answer
+  /// false.
+  Future<bool> hasPendingBackground(String conversationId) async {
+    final pending = await repo.pending(scope, conversationId);
+    if (pending == null || pending.reconcileOnly) return false;
+    try {
+      return _decodeEnvelope(pending.envelope).background;
+    } on PluginClientException {
+      return false;
+    }
+  }
+
+  /// Abandons the conversation's staged turn UNLESS it is a background job's
+  /// pending envelope (plan P3): the escape-hatch abandon in the chat
+  /// notifier must never destroy a still-running background job — its poller
+  /// watch would hit the `pending == null` guard and silently lose the reply
+  /// append. Returns true when the pending row was cleared (or none existed);
+  /// false when a background envelope was retained for the running job.
+  Future<bool> abandonTurnKeepingBackground(
+    String conversationId, {
+    String? sessionId,
+    int? generation,
+    String? partialText,
+  }) async {
+    final pending = await repo.pending(scope, conversationId);
+    if (pending == null) return true;
+    if (!pending.reconcileOnly) {
+      try {
+        if (_decodeEnvelope(pending.envelope).background) return false;
+      } on PluginClientException {
+        // Malformed envelope — fall through to the escape-hatch abandon.
+      }
+    }
+    await abandonTurn(
+      conversationId,
+      sessionId: sessionId,
+      generation: generation,
+      partialText: partialText,
+    );
+    return true;
+  }
+
+  /// The mapped server session's history when it proves the server finished
+  /// the turn the client abandoned mid-stream — MORE messages than the local
+  /// history, last one an assistant reply; `null` otherwise. Network/session
+  /// failures (anything but `cancelled`) answer `null`: we cannot prove a
+  /// terminal turn, so the partial-retention path runs instead of risking a
+  /// `replaceHistory` that drops the just-sent user message. The fetched
+  /// history is returned so [abandonTurn] can hand it to [reconcileFromServer]
+  /// without a second load.
+  Future<List<Message>?> _serverTerminalMessages(
+    String conversationId,
+    String? sessionId,
+    int epoch,
+  ) async {
+    if (sessionId == null || sessionId.isEmpty) return null;
+    final local = await repo.access(
+      scope,
+      epoch,
+      () {},
+      (store) async =>
+          (await store.loadConversation(conversationId))?.messages ??
+          const <Message>[],
+    );
+    final managed = await credentials();
+    if (managed == null) return null;
+    final List<Message> server;
+    try {
+      final history = await client.loadSession(
+        sessionId,
+        gatewayKey: managed.gatewayKey,
+      );
+      _checkEpoch(epoch);
+      server = history.messages;
+    } on PluginClientException catch (error) {
+      if (error.code == ManagedErrorCodes.cancelled) rethrow;
+      return null;
+    }
+    final terminal = server.length > local.length &&
+        server.last.role == MessageRole.assistant;
+    return terminal ? server : null;
+  }
+
+  /// Clears this turn's pending row and persists the partial assistant
+  /// message in ONE transaction under [epoch]. An empty [partialText] clears
+  /// the pending row only (no assistant row). Epoch failures rethrow
+  /// `cancelled`; other store failures surface as-is (the caller treats a
+  /// non-`cancelled` failure as best-effort and still returns).
+  Future<void> _clearAndPersistPartial(
+    String conversationId,
+    int epoch, {
+    required String messageId,
+    required String partialText,
+  }) => repo.access(scope, epoch, () {}, (store) async {
+    final current = await store.loadConversation(conversationId);
+    if (current != null && partialText.isNotEmpty) {
+      await store.appendMessage(
+        conversationId,
+        Message(
+          id: const Uuid().v4(),
+          role: MessageRole.assistant,
+          content: partialText,
+        ),
+      );
+    }
+    await repo.clearPending(scope, conversationId, messageId: messageId);
+  });
+
   /// Replaces local history with the server session for the conversation's
   /// mapped session id. No inference happens here. A reconciliation marker is
   /// persisted before the fetch so a failure leaves an explicit, retryable
@@ -901,11 +1229,18 @@ class ManagedConversationService {
   /// server to reconcile — the client store is authoritative — so the local
   /// messages are returned and the reconcile marker cleared WITHOUT dropping
   /// the session mapping.
-  Future<List<Message>> reconcileFromServer(String conversationId) async {
+  ///
+  /// [preloadedHistory] hands in an already-fetched session history (the
+  /// terminal check in [abandonTurn] loaded it) so that path fetches the
+  /// session exactly once.
+  Future<List<Message>> reconcileFromServer(
+    String conversationId, {
+    List<Message>? preloadedHistory,
+  }) async {
     final epoch = repo.epoch(scope);
     final sessionId = await repo.mappedSession(conversationId);
     if (sessionId == null) {
-      throw const PluginClientException('no_pending_turn');
+      throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
     }
     final messageId = (await repo.pending(scope, conversationId))?.messageId ??
         const Uuid().v4();
@@ -920,52 +1255,59 @@ class ManagedConversationService {
         );
       }
     });
-    final ManagedSessionHistory history;
-    try {
-      history = await client.loadSession(
-        sessionId,
-        gatewayKey: (await credentials())!.gatewayKey,
-      );
+    final List<Message> serverMessages;
+    if (preloadedHistory != null) {
       _checkEpoch(epoch);
-    } on PluginClientException catch (error) {
-      if (error.code == 'reseed_required') {
-        await _dropStaleThread(
-          conversationId,
-          threadId: sessionId,
-          messageId: messageId,
+      serverMessages = preloadedHistory;
+    } else {
+      final ManagedSessionHistory history;
+      try {
+        history = await client.loadSession(
+          sessionId,
+          gatewayKey: (await credentials())!.gatewayKey,
         );
+        _checkEpoch(epoch);
+      } on PluginClientException catch (error) {
+        if (error.code == ManagedErrorCodes.reseedRequired) {
+          await _dropStaleThread(
+            conversationId,
+            threadId: sessionId,
+            messageId: messageId,
+          );
+          rethrow;
+        }
+        if (error.code == ManagedErrorCodes.sessionMissing) {
+          await repo.clearPending(scope, conversationId, messageId: messageId);
+          _checkEpoch(epoch);
+          final local = await repo.access(
+            scope,
+            epoch,
+            () {},
+            (store) async =>
+                (await store.loadConversation(conversationId))?.messages ??
+                const <Message>[],
+          );
+          return local;
+        }
         rethrow;
       }
-      if (error.code == 'session_missing') {
-        await repo.clearPending(scope, conversationId, messageId: messageId);
-        _checkEpoch(epoch);
-        final local = await repo.access(
-          scope,
-          epoch,
-          () {},
-          (store) async =>
-              (await store.loadConversation(conversationId))?.messages ??
-              const <Message>[],
-        );
-        return local;
-      }
-      rethrow;
+      serverMessages = history.messages;
     }
     await repo.access(scope, epoch, () {}, (store) async {
       final previous = await store.loadConversation(conversationId);
       if (previous == null) {
-        throw const PluginClientException('no_pending_turn');
+        throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
       }
       await repo.replaceHistory(
         scope,
         store,
         previous,
         sessionId,
-        history.messages,
+        serverMessages,
         expectedMessageId: messageId,
       );
     });
-    return history.messages;
+    return serverMessages;
   }
 
   Future<void> deleteSession(String sessionId) async {
@@ -975,8 +1317,10 @@ class ManagedConversationService {
 
   /// Logout hook: cancels in-flight sends and epochs out pending work, then
   /// drops this scope's conversations, messages, and pending rows. Also stops
-  /// any live background-job watches. Never touches the remote session;
-  /// unscoped legacy history is retained.
+  /// any live background-job watches. Never touches the remote session or
+  /// other scopes; legacy unscoped rows (scopeKey null) are not handled here —
+  /// they are deleted once by the UI store's one-shot null-scope cleanup
+  /// (`nullScopeCleanupProvider`) when the account scope first becomes ready.
   Future<void> clearAccountData() async {
     _poller?.invalidateScope();
     repo.cancelScope(scope);
@@ -999,7 +1343,7 @@ class ManagedConversationService {
 
   void _checkEpoch(int epoch) {
     if (repo.epoch(scope) != epoch) {
-      throw const PluginClientException('cancelled');
+      throw const PluginClientException(ManagedErrorCodes.cancelled);
     }
   }
 
@@ -1012,6 +1356,7 @@ class ManagedConversationService {
     required String sessionId,
     required List<ApiMessage> messages,
     bool delta = false,
+    String userMessageId = '',
   }) => {
     'messageId': messageId,
     'session_id': sessionId,
@@ -1019,6 +1364,9 @@ class ManagedConversationService {
     'enabledPlugins': enabledPlugins,
     'messages': _encodeMessages(messages),
     'delta': delta,
+    // Omitted when unknown so pre-P1b envelopes stay byte-identical;
+    // `_decodeEnvelope` reads it as null and `retryTurn` derives it.
+    if (userMessageId.isNotEmpty) 'userMessageId': userMessageId,
   };
 
   /// Persisted retry envelope for a BACKGROUND job: no session (the job runs
@@ -1027,12 +1375,14 @@ class ManagedConversationService {
   Map<String, dynamic> _backgroundEnvelope({
     required String messageId,
     required List<ApiMessage> messages,
+    String userMessageId = '',
   }) => {
     'messageId': messageId,
     'model': modelPluginId,
     'enabledPlugins': enabledPlugins,
     'messages': _encodeMessages(messages),
     'background': true,
+    if (userMessageId.isNotEmpty) 'userMessageId': userMessageId,
   };
 
   Map<String, dynamic> _reconcileEnvelope({required String sessionId}) => {
@@ -1074,10 +1424,10 @@ class ManagedConversationService {
     try {
       decoded = jsonDecode(envelope);
     } catch (_) {
-      throw const PluginClientException('invalid_config');
+      throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     }
     if (decoded is! Map<String, dynamic>) {
-      throw const PluginClientException('invalid_config');
+      throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     }
     final background = decoded['background'] == true;
     final sessionId = decoded['session_id'];
@@ -1085,20 +1435,25 @@ class ManagedConversationService {
     final plugins = decoded['enabledPlugins'];
     final rawMessages = decoded['messages'];
     final delta = decoded['delta'] == true;
+    final rawUserMessageId = decoded['userMessageId'];
+    final userMessageId =
+        rawUserMessageId is String && rawUserMessageId.isNotEmpty
+        ? rawUserMessageId
+        : null; // pre-P1b envelope — retryTurn derives it.
     if (!background && (sessionId is! String || sessionId.trim().isEmpty)) {
-      throw const PluginClientException('invalid_config');
+      throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     }
     if (model is! String ||
         model.trim().isEmpty ||
         plugins is! List ||
         plugins.any((p) => p is! String || p.trim().isEmpty) ||
         rawMessages is! List) {
-      throw const PluginClientException('invalid_config');
+      throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     }
     final messages = <ApiMessage>[];
     for (final value in rawMessages) {
       if (value is! Map<String, dynamic>) {
-        throw const PluginClientException('invalid_config');
+        throw const PluginClientException(ManagedErrorCodes.invalidConfig);
       }
       final role = value['role'];
       final content = value['content'];
@@ -1110,7 +1465,7 @@ class ManagedConversationService {
               (calls is! List ||
                   calls.any((c) => c is! Map<String, dynamic>))) ||
           (linkage != null && linkage is! String)) {
-        throw const PluginClientException('invalid_config');
+        throw const PluginClientException(ManagedErrorCodes.invalidConfig);
       }
       messages.add(
         ApiMessage(
@@ -1130,6 +1485,7 @@ class ManagedConversationService {
       modelPluginId: model,
       enabledPlugins: plugins.cast<String>(),
       messages: messages,
+      userMessageId: userMessageId,
     );
   }
 }
@@ -1142,6 +1498,7 @@ class _ResumedTurn {
     required this.modelPluginId,
     required this.enabledPlugins,
     required this.messages,
+    this.userMessageId,
   });
 
   final String sessionId;
@@ -1150,6 +1507,10 @@ class _ResumedTurn {
   final String modelPluginId;
   final List<String> enabledPlugins;
   final List<ApiMessage> messages;
+
+  /// The admitted user-message id stored in the envelope (null for pre-P1b
+  /// envelopes — the caller derives it from the store).
+  final String? userMessageId;
 }
 
 /// A re-submitted BACKGROUND turn ([retryTurn] on a background pending): the
@@ -1157,7 +1518,8 @@ class _ResumedTurn {
 /// observes its terminal status and reply. The base sessionId/state are empty
 /// because a background job has no session.
 class ManagedBackgroundResubmitted extends ManagedTurnOutcome {
-  const ManagedBackgroundResubmitted(this.handle) : super('', 'background');
+  const ManagedBackgroundResubmitted(this.handle, String userMessageId)
+    : super('', 'background', userMessageId);
 
   final LedgerPollHandle handle;
 }

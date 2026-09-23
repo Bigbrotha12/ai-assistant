@@ -4,13 +4,17 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
 import 'package:ai_assistant/features/attachments/data/file_model.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/chat/data/status_tracker.dart'
+    show networkErrorPhrases, pendingErrorPhrases;
+import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 
 import '../../fakes.dart';
 
@@ -19,13 +23,18 @@ ProviderContainer _container({
   FakeChatClient? client,
   FakeFilesClient? filesService,
   FakeFileStore? fileStore,
+  FakeManagedChatAdapter? adapter,
 }) {
+  final s = store ?? FakeChatStore();
+  final c = client ?? FakeChatClient();
   final container = ProviderContainer(
     overrides: [
-      chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
-      chatApiClientProvider.overrideWithValue(client ?? FakeChatClient()),
+      chatStoreProvider.overrideWithValue(s),
       filesServiceProvider.overrideWithValue(filesService ?? FakeFilesClient()),
       filesStoreProvider.overrideWithValue(fileStore ?? FakeFileStore()),
+      managedChatAdapterProvider.overrideWithValue(
+        adapter ?? FakeManagedChatAdapter(store: s, script: c),
+      ),
     ],
   );
   addTearDown(container.dispose);
@@ -39,6 +48,28 @@ void _keepAlive(ProviderContainer container, String id) {
     conversationProvider(id),
     (_, _) {},
   );
+}
+
+/// Container + shared adapter, so tests can assert on sends/retries/abandons.
+({ProviderContainer container, FakeManagedChatAdapter adapter})
+_containerWithAdapter({
+  FakeChatStore? store,
+  FakeChatClient? client,
+  FakeManagedChatAdapter? adapter,
+  FakeFilesClient? filesService,
+  FakeFileStore? fileStore,
+}) {
+  final s = store ?? FakeChatStore();
+  final c = client ?? FakeChatClient();
+  final a = adapter ?? FakeManagedChatAdapter(store: s, script: c);
+  final container = _container(
+    store: s,
+    client: c,
+    adapter: a,
+    filesService: filesService,
+    fileStore: fileStore,
+  );
+  return (container: container, adapter: a);
 }
 
 /// Drains the upload microtask pipeline. The fake client resolves without
@@ -141,14 +172,17 @@ void main() {
 
       final state = container.read(conversationProvider('c1')).value!;
       expect(state.isStreaming, isFalse);
-      expect(state.error, 'boom');
+      expect(state.error, anyOf(networkErrorPhrases));
       expect(state.failedMessageId, isNotNull);
       expect(state.pendingUserMessageId, isNull);
-      // Partial content retained.
+      // Partial content retained in memory only — the service owns assistant
+      // persistence, so the store keeps just the admitted user row.
       expect(state.messages.last.content, 'partial ');
 
       final persisted = await store.loadConversation('c1');
-      expect(persisted!.messages.last.content, 'partial ');
+      expect(persisted!.messages, hasLength(1));
+      expect(persisted.messages.single.role, MessageRole.user);
+      expect(persisted.messages.single.content, 'Hi');
     });
 
     test('retry removes failed placeholder and re-sends', () async {
@@ -158,7 +192,9 @@ void main() {
           ChatResult(content: 'Recovered', toolCalls: [], finishReason: 'stop'),
         ],
       );
-      final container = _container(store: store, client: client);
+      final wired = _containerWithAdapter(store: store, client: client);
+      final container = wired.container;
+      final adapter = wired.adapter;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
@@ -186,6 +222,12 @@ void main() {
       expect(state.messages.last.content, 'Recovered');
       expect(state.messages.first.content, 'Hi');
 
+      // (d) retry routed through retryTurn — the staged pending row was
+      // replayed, never a second sendTurn admission.
+      expect(adapter.sends, hasLength(1));
+      expect(adapter.retries, ['c1']);
+      expect(adapter.retryMessageIds, hasLength(1));
+
       // The failed placeholder must also be gone from the store: after retry
       // drift contains [user, successfulAssistant], not
       // [user, failedAssistant(partial), successfulAssistant].
@@ -195,14 +237,232 @@ void main() {
       expect(persisted.messages, hasLength(2));
     });
 
-    test('stop cancels and clears streaming', () async {
+    test('retryTurn with no staged pending row finalizes without an error '
+        'banner (no_pending_turn → fresh send)', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(streamDeltas: const [
-        ['partial '],
-      ]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'Recovered', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      // Break the fake's pending model so retryTurn throws no_pending_turn.
+      final adapter = FakeManagedChatAdapter(store: store, script: client);
+      final container = _container(
+        store: store,
+        client: client,
+        adapter: adapter,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      client.error = const ChatNetworkError('boom');
+      await notifier.sendMessage('Hi');
+      final failedId =
+          container.read(conversationProvider('c1')).value!.failedMessageId;
+      expect(failedId, isNotNull);
+
+      // Simulate the staged row already having been cleared externally.
+      // (The fake only exposes this via abandonTurn, which also bumps the
+      // generation — retryTurn then hits no_pending_turn.)
+      await adapter.abandonTurn('c1');
+
+      await notifier.retry();
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNull);
+      // The failed placeholder was dropped; no fresh assistant reply was
+      // fabricated — the user can send again.
+      expect(state.messages.where((m) => m.id == failedId), isEmpty);
+      expect(adapter.retries, ['c1']);
+    });
+
+    test('stop mid-stream abandons the staged turn, persists the partial, '
+        'and leaves the conversation sendable', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        // FakeChatClient gates streamDeltas on the results-derived index —
+        // without a results entry the deltas never fire and stop() would
+        // hand abandonTurn an empty partial.
+        results: const [
+          ChatResult(content: 'partial ', toolCalls: [], finishReason: 'stop'),
+        ],
+        streamDeltas: const [
+          ['partial '],
+        ],
+      );
       final hang = Completer<ChatResult>();
       client.hang = hang;
+      final wired = _containerWithAdapter(store: store, client: client);
+      final container = wired.container;
+      final adapter = wired.adapter;
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      final send = notifier.sendMessage('Hi');
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      // Still streaming while hung.
+      expect(
+        container.read(conversationProvider('c1')).value!.isStreaming,
+        isTrue,
+      );
+
+      await notifier.stop();
+
+      // stop() abandoned the staged turn and handed over the partial.
+      expect(adapter.abandons, hasLength(1));
+      expect(adapter.abandons.single.conversationId, 'c1');
+      expect(adapter.abandons.single.partialText, 'partial ');
+
+      // (g) the partial is persisted as the assistant message.
+      final persisted = await store.loadConversation('c1');
+      expect(persisted!.messages, hasLength(2));
+      expect(persisted.messages.last.role, MessageRole.assistant);
+      expect(persisted.messages.last.content, 'partial ');
+
+      // The late hang completion must not overwrite / re-persist.
+      hang.complete(
+        const ChatResult(content: 'late ', toolCalls: [], finishReason: 'stop'),
+      );
+      await send;
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNull);
+      expect(state.messages.last.content, 'partial ');
+
+      // (b) the conversation is immediately sendable — no pending wedge.
+      client.hang = null;
+      client.streamDeltas = const [];
+      client.results = const [
+        ChatResult(content: 'next', toolCalls: [], finishReason: 'stop'),
+      ];
+      await notifier.sendMessage('second');
+      final after = container.read(conversationProvider('c1')).value!;
+      expect(after.error, isNull);
+      expect(after.messages.last.content, 'next');
+    });
+
+    test('a managed cancelled error with a live token finalizes silently '
+        'without an error banner', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        error: const PluginClientException('cancelled'),
+        results: const [
+          ChatResult(content: 'partial ', toolCalls: [], finishReason: 'stop'),
+        ],
+        streamDeltas: const [
+          ['partial '],
+        ],
+      );
       final container = _container(store: store, client: client);
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Hi');
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNull);
+      expect(state.pendingUserMessageId, isNull);
+      expect(state.messages.last.content, 'partial ');
+    });
+
+    test('a managed auth-code error surfaces authRequired without a generic '
+        'error banner', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        error: const PluginClientException('no_credentials'),
+      );
+      final container = _container(store: store, client: client);
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Hi');
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.authRequired, isTrue);
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNotNull);
+    });
+
+    test('a PluginReauthenticationRequired from an unavailable scope surfaces '
+        'the re-auth card (authRequired), never an unexpected-error banner',
+        () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient();
+      final adapter = FakeManagedChatAdapter(store: store, script: client)
+        ..admissionError = const PluginReauthenticationRequired();
+      final wired = _containerWithAdapter(
+        store: store,
+        client: client,
+        adapter: adapter,
+      );
+      final container = wired.container;
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Hi');
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.authRequired, isTrue);
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNotNull);
+    });
+
+    test('a pending_turn_exists failure abandons the escape hatch and '
+        'surfaces the stopped-reply message', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient();
+      final adapter = FakeManagedChatAdapter(store: store, script: client)
+        ..admissionError = const PluginClientException('pending_turn_exists');
+      final wired = _containerWithAdapter(
+        store: store,
+        client: client,
+        adapter: adapter,
+      );
+      final container = wired.container;
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Hi');
+
+      expect(adapter.abandons, hasLength(1));
+      expect(adapter.abandons.single.conversationId, 'c1');
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.error, anyOf(pendingErrorPhrases));
+      expect(state.failedMessageId, isNotNull);
+      expect(state.authRequired, isFalse);
+    });
+
+    test('stop cancels and clears streaming', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        // See above: streamDeltas only fire when results is non-empty.
+        results: const [
+          ChatResult(content: 'partial ', toolCalls: [], finishReason: 'stop'),
+        ],
+        streamDeltas: const [
+          ['partial '],
+        ],
+      );
+      final hang = Completer<ChatResult>();
+      client.hang = hang;
+      final wired = _containerWithAdapter(store: store, client: client);
+      final container = wired.container;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
@@ -228,6 +488,9 @@ void main() {
       expect(state.failedMessageId, isNull);
       // Partial content retained.
       expect(state.messages.last.content, 'partial ');
+      // stop() handed the partial to abandonTurn.
+      expect(wired.adapter.abandons, hasLength(1));
+      expect(wired.adapter.abandons.single.partialText, 'partial ');
     });
 
     test('stop suppresses a cancellation error and keeps flushed partial',
@@ -274,7 +537,8 @@ void main() {
       );
       final hangA = Completer<ChatResult>();
       client.hang = hangA;
-      final container = _container(store: store, client: client);
+      final wired = _containerWithAdapter(store: store, client: client);
+      final container = wired.container;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
@@ -335,9 +599,11 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           chatStoreProvider.overrideWithValue(store),
-          chatApiClientProvider.overrideWithValue(client),
           filesServiceProvider.overrideWithValue(FakeFilesClient()),
           filesStoreProvider.overrideWithValue(FakeFileStore()),
+          managedChatAdapterProvider.overrideWithValue(
+            FakeManagedChatAdapter(store: store, script: client),
+          ),
         ],
       );
       final notifier = container.read(conversationProvider('c1').notifier);
@@ -354,7 +620,8 @@ void main() {
       expect(send, completes);
     });
 
-    test('new conversation is titled from the first user message', () async {
+    test('error path keeps partial content and sets failedMessageId',
+        () async {
       final store = FakeChatStore();
       final client = FakeChatClient(
         results: const [
@@ -577,12 +844,13 @@ void main() {
       );
       final files = FakeFilesClient();
       final fileStore = FakeFileStore();
-      final container = _container(
+      final wired = _containerWithAdapter(
         store: store,
         client: client,
         filesService: files,
         fileStore: fileStore,
       );
+      final container = wired.container;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
@@ -606,7 +874,9 @@ void main() {
       expect(files.uploadCalls, isEmpty);
 
       // The user presses Send again after the failure; uploads start exactly
-      // once — no duplicate server uploads or duplicated refs.
+      // once — no duplicate server uploads or duplicated refs. (A double-press
+      // is a fresh sendTurn — the previous StateError left no pending row in
+      // the fake, and the user text differs from nothing staged.)
       store.failUpdateMessage = false;
       await notifier.sendMessage('Send file', attachments: attachments);
       await _settle();

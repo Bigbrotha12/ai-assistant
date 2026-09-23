@@ -1,13 +1,19 @@
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:uuid/uuid.dart';
 
-import '../../chat/data/chat_client_provider.dart';
 import '../../../core/network_banner.dart';
+import '../../chat/data/chat_client.dart';
 import '../../chat/ui/chat_providers.dart';
 import '../../chat/data/database_providers.dart';
 import '../../chat/data/message_model.dart';
+import '../../plugins/data/managed_chat_providers.dart';
+import '../../plugins/data/managed_conversation_service.dart';
+import '../../plugins/data/managed_error_codes.dart';
+import '../../plugins/data/plugin_credentials_store.dart';
+import '../../plugins/data/plugin_http.dart';
+import '../../plugins/data/staged_inference_adapters.dart';
 import '../data/audio_playback_service.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/mic_capture_service.dart';
@@ -15,6 +21,65 @@ import '../data/screen_wake_lock.dart';
 import '../data/voice_capture_providers.dart';
 import './voice_conversation_state.dart';
 import './voice_controller.dart';
+
+/// Provider-facing send seam (plan P2): same as [VoiceTurnSender] but
+/// conversation-id aware — the notifier resolves the id captured at turn
+/// start and passes it in, so a mid-turn conversation switch can never reroute
+/// the managed send. Tests override this with a scripted sender; the
+/// production implementation routes through
+/// `StagedInferenceAdapters.sendVoiceTurn`.
+typedef VoiceManagedTurnSender = Future<ChatResult> Function({
+  required String conversationId,
+  required List<ApiMessage> messages,
+  required String userText,
+  String? systemPrompt,
+  CancelToken? cancelToken,
+  void Function()? onReceived,
+  void Function(String text)? onContent,
+  void Function(int index, String name, String argsFragment)? onToolCallDelta,
+});
+
+/// Production managed voice sender (plan P2): `sendVoiceTurn` over the
+/// staged adapters — same per-send construction, single-writer persistence,
+/// and `configuration_changed` freeze as text. Reads the adapters LAZILY per
+/// turn: the controller must build while [pluginAccountScopeProvider] is
+/// still loading (cold boot) and every turn picks up the current account's
+/// instance. [messages]/[systemPrompt]/[onReceived]/[onToolCallDelta] are
+/// accepted for seam parity but unused — the managed path loads history
+/// through the service, the backend owns the system prompt, and
+/// `managedTurn` streams content deltas only (no ack/tool-fragment hooks;
+/// StatusTracker falls back to first-content).
+final voiceTurnSenderProvider = Provider<VoiceManagedTurnSender>((ref) {
+  return ({
+    required conversationId,
+    required messages,
+    required userText,
+    systemPrompt,
+    cancelToken,
+    onReceived,
+    onContent,
+    onToolCallDelta,
+  }) async {
+    final StagedInferenceAdapters adapters;
+    try {
+      adapters = ref.read(stagedInferenceAdaptersProvider);
+    } on PluginReauthenticationRequired {
+      // Map to the P1 auth-mapper code so the voice screen's re-auth card
+      // fires (isAuthRequiredError matches PluginClientException codes).
+      throw const PluginClientException(ManagedErrorCodes.unauthorized);
+    }
+    final outcome = await adapters.sendVoiceTurn(
+      conversationId,
+      userText: userText,
+      cancelToken: cancelToken,
+      onContent: onContent,
+    );
+    if (outcome is ManagedStreamedTurn) return outcome.result;
+    // ManagedAlreadyCompleted: the turn already ran and the service
+    // reconciled history as part of the outcome — no fresh content to speak.
+    return const ChatResult(content: '', toolCalls: [], finishReason: 'stop');
+  };
+});
 
 /// Microphone capture streaming raw PCM16 chunks.
 final micCaptureServiceProvider = Provider<MicCaptureService>((ref) {
@@ -37,10 +102,11 @@ final audioPlaybackServiceProvider = Provider<AudioPlayback>((ref) {
 
 /// Owns the [VoiceController] for the current (or next) conversation.
 ///
-/// Rebuilds when backend auth credentials change: watching
-/// [chatApiClientProvider] keeps a fresh controller wired to the shared chat
-/// client (the inference target is fixed at build time via the `LLM_*`
-/// dart-defines — see AGENTS.md).
+/// The controller's LLM leg is wired to [voiceTurnSenderProvider] — the
+/// managed `sendVoiceTurn` path (plan P2) — resolved lazily per turn, so a
+/// scope/auth change is picked up on the next send without rebuilding (and
+/// without the build-time scope-provider throw that watching it would cause
+/// on cold boot).
 final voiceControllerProvider =
     NotifierProvider<VoiceControllerNotifier, VoiceController>(
       VoiceControllerNotifier.new,
@@ -56,89 +122,25 @@ final screenWakeLockProvider = Provider<ScreenWakeLock>((ref) {
 class VoiceControllerNotifier extends Notifier<VoiceController> {
   void Function()? _enginesListener;
 
-  final _uuid = const Uuid();
-
-  /// Conversation id captured at turn start ([onUserMessage]). The user
-  /// message and — seconds later — the assistant reply both persist into this
-  /// id, so switching the active conversation mid-stream can never split a
-  /// turn across two conversations (the reply always follows its user message;
-  /// a missing row in a switched-to conversation can never swallow it either).
-  /// Fall back to [ensure] when null (a text turn started before any capture).
+  /// Conversation id captured at turn start ([onUserMessage]). The managed
+  /// sender and the barge-in abandon closure both key off this id, so
+  /// switching the active conversation mid-stream can never reroute a turn's
+  /// send or cleanup across two conversations. Fall back to [ensure] when
+  /// null (a text turn started before any capture).
   String? _turnConversationId;
 
-  /// Serialises persistence writes so a first-turn row creation and the user /
-  /// reply appends can never interleave (two concurrent first turns could
-  /// clobber via a full-message-list overwrite). Each link swallows errors so
-  /// one failure never wedges the chain.
-  Future<void> _persistTail = Future.value();
-
-  /// Appends [action] onto [_persistTail], fire-and-forget. The caller must
-  /// not await it: persistence runs serially in the background.
-  void _enqueuePersist(Future<void> Function() action) {
-    _persistTail = _persistTail.then((_) => action()).catchError((_) {});
-  }
+  /// Serialises handoff-bound persistence flushes. The managed service owns
+  /// all turn writes now (plan P2 single-writer), so no per-turn enqueues
+  /// remain — the tail stays because [flushPersistence] is the chat-handoff
+  /// and account-lifecycle contract (callers await it before re-reading the
+  /// scoped store).
+  final Future<void> _persistTail = Future.value();
 
   /// Awaits the queued persistence writes to drain. Called before handing off
   /// to the chat screen so the conversation loaded there includes every
   /// message persisted by voice turns (the chat notifier reads the store once
   /// on build; a racing un-flushed write would be missing from that load).
   Future<void> flushPersistence() => _persistTail;
-
-  /// Persists the user message into [conversationId], creating the
-  /// conversation row (with a title from the first user text) when absent.
-  /// The id is captured at call time: the caller enqueues persistence with the
-  /// conversation that was active when the turn STARTED, so a later
-  /// conversation switch can never reroute this turn's writes.
-  Future<void> _persistUserMessage(
-    String conversationId,
-    String userText,
-  ) async {
-    if (!ref.mounted) return;
-    final store = ref.read(chatStoreProvider);
-    final existing = await store.loadConversation(conversationId);
-    if (existing == null) {
-      final now = DateTime.now();
-      final title = userText.length <= 60
-          ? userText
-          : '${userText.substring(0, 60)}…';
-      // ensureConversation (not saveConversation, a full-message-list
-      // overwrite) so a concurrent first-turn write from the chat surface on
-      // the same conversation id can never clobber this one.
-      await store.ensureConversation(
-        conversationId,
-        title: title,
-        firstMessage: Message(
-          id: _uuid.v4(),
-          role: MessageRole.user,
-          content: userText,
-          createdAt: now,
-        ),
-      );
-    } else {
-      await store.appendMessage(conversationId, Message(
-        id: _uuid.v4(),
-        role: MessageRole.user,
-        content: userText,
-        createdAt: DateTime.now(),
-      ));
-    }
-  }
-
-  /// Persists the assistant reply into [conversationId]. Runs after the user
-  /// message on [_persistTail], so the conversation row always exists.
-  Future<void> _persistAssistantReply(
-    String conversationId,
-    String reply,
-  ) async {
-    if (!ref.mounted) return;
-    final store = ref.read(chatStoreProvider);
-    await store.appendMessage(conversationId, Message(
-      id: _uuid.v4(),
-      role: MessageRole.assistant,
-      content: reply,
-      createdAt: DateTime.now(),
-    ));
-  }
 
   /// Builds the full request message list for a turn: trimmed conversation
   /// history (from the turn's conversation) plus the new user message.
@@ -173,10 +175,56 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     // Watch the trimmer so it is part of this notifier's dependency graph; the
     // context builder itself reads it at call time (never captured).
     ref.watch(contextTrimmerProvider);
+    // Managed send seam (plan P2): stable identity (the provider watches
+    // nothing scope-reactive), with the staged adapters read per turn inside.
+    final managedSend = ref.watch(voiceTurnSenderProvider);
     // The controller owns its per-turn cancel token (interrupt() cancels and
     // replaces it) and cancels it in dispose(); nothing to abort here.
     final controller = VoiceController(
-      chatClient: ref.watch(chatApiClientProvider),
+      sendTurn: ({
+        required messages,
+        required userText,
+        systemPrompt,
+        cancelToken,
+        onReceived,
+        onContent,
+        onToolCallDelta,
+      }) {
+        if (!ref.mounted) {
+          throw const PluginClientException(ManagedErrorCodes.cancelled);
+        }
+        // Captured at onUserMessage (fired before the seam runs): a mid-turn
+        // conversation switch can never reroute this turn's managed send.
+        final conversationId =
+            _turnConversationId ??
+            ref.read(activeConversationIdProvider.notifier).ensure();
+        return managedSend(
+          conversationId: conversationId,
+          messages: messages,
+          userText: userText,
+          systemPrompt: systemPrompt,
+          cancelToken: cancelToken,
+          onReceived: onReceived,
+          onContent: onContent,
+          onToolCallDelta: onToolCallDelta,
+        );
+      },
+      abandonActiveTurn: () async {
+        if (!ref.mounted) return;
+        final conversationId = _turnConversationId;
+        if (conversationId == null) return;
+        try {
+          // Shared with the text stop() path: clears the pending row under
+          // the current epoch and cancels the conversation's dispatch token
+          // (no epoch bump). partialText null → clear-only; voice drops its
+          // partial on barge-in (legacy UX).
+          await ref
+              .read(managedChatAdapterProvider)
+              .abandonTurn(conversationId, partialText: null);
+        } catch (_) {
+          // Best-effort — mirrors chat stop(); never surfaces as a banner.
+        }
+      },
       micCapture: ref.read(micCaptureServiceProvider),
       playback: ref.read(audioPlaybackServiceProvider),
       screenWakeLock: ref.watch(screenWakeLockProvider),
@@ -188,22 +236,11 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
       },
       onUserMessage: (userText) {
         if (!ref.mounted) return;
+        // Capture the turn's conversation id — the only per-turn hook the
+        // provider keeps: the managed service owns the row writes (plan P2
+        // single-writer), so no persistence is enqueued here.
         _turnConversationId =
             ref.read(activeConversationIdProvider.notifier).ensure();
-        // Capture the id now: the queued write may not run until after a later
-        // conversation switch, and it must target the conversation this turn
-        // started in.
-        final turnId = _turnConversationId!;
-        _enqueuePersist(() => _persistUserMessage(turnId, userText));
-      },
-      onTranscript: (reply) {
-        if (!ref.mounted) return;
-        // The user message enqueue ran before this reply's enqueue, so
-        // [_turnConversationId] is set and still points at this turn's
-        // conversation. Capture it now so a later conversation switch cannot
-        // reroute this reply's write.
-        final turnId = _turnConversationId!;
-        _enqueuePersist(() => _persistAssistantReply(turnId, reply));
       },
       contextBuilder: (userText) => _buildRequestMessages(userText),
     );

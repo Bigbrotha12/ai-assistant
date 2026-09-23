@@ -5,7 +5,6 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ai_assistant/features/chat/data/chat_client_provider.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
 import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
@@ -96,16 +95,38 @@ void main() {
     playback = FakeAudioPlayback();
     tts = FakeTtsEngine();
     wakeLock = _GatedDisableScreenWakeLock();
+    final script = FakeChatClient();
     final container = ProviderContainer(
       overrides: [
-        engineManagerProvider.overrideWithValue(
-          _EngineAwareManager(tts: tts),
-        ),
+        engineManagerProvider.overrideWithValue(_EngineAwareManager(tts: tts)),
         micCaptureServiceProvider.overrideWithValue(mic),
         audioPlaybackServiceProvider.overrideWithValue(playback),
-        audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
+        audioSessionManagerProvider.overrideWithValue(
+          FakeAudioSessionManager(),
+        ),
         screenWakeLockProvider.overrideWithValue(wakeLock),
-        chatApiClientProvider.overrideWithValue(FakeChatClient()),
+        voiceTurnSenderProvider.overrideWithValue(({
+          required conversationId,
+          required messages,
+          required userText,
+          systemPrompt,
+          cancelToken,
+          onReceived,
+          onContent,
+          onToolCallDelta,
+        }) {
+          return script.sendTurn(
+            conversationId,
+            history: const [],
+            userText: userText,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            cancelToken: cancelToken,
+            onReceived: onReceived,
+            onContent: onContent,
+            onToolCallDelta: onToolCallDelta,
+          );
+        }),
         chatStoreProvider.overrideWithValue(FakeChatStore()),
         voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
       ],
@@ -115,8 +136,7 @@ void main() {
   }
 
   group('pipeline lifecycle', () {
-    test(
-        'a foreground landing mid-background-teardown wins: the session is '
+    test('a foreground landing mid-background-teardown wins: the session is '
         'not stranded backgrounded and the wake lock is restored', () async {
       final container = buildContainer();
       final controller = container.read(voiceControllerProvider);
@@ -130,13 +150,15 @@ void main() {
 
       // App backgrounds: the handler suspends inside the gated mic stop.
       mic.stopGate = Completer<void>();
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      WidgetsBinding.instance.handleAppLifecycleStateChanged(
+        AppLifecycleState.paused,
+      );
       await pumpEventQueue();
 
       // App returns while the background teardown is still in flight.
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      WidgetsBinding.instance.handleAppLifecycleStateChanged(
+        AppLifecycleState.resumed,
+      );
       await pumpEventQueue();
 
       // Release the halt: the queued foreground transition must now run last.
@@ -153,37 +175,41 @@ void main() {
       expect(controller.state.isConnected, isTrue);
     });
 
-    test('a background after an earlier foreground still suspends the session',
-        () async {
-      final container = buildContainer();
-      final controller = container.read(voiceControllerProvider);
-      container.read(voiceCapturePipelineProvider);
-      await controller.startConversation();
+    test(
+      'a background after an earlier foreground still suspends the session',
+      () async {
+        final container = buildContainer();
+        final controller = container.read(voiceControllerProvider);
+        container.read(voiceCapturePipelineProvider);
+        await controller.startConversation();
 
-      // Clean pause → resume cycle, then another pause: the last event wins.
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.paused);
-      await pumpEventQueue();
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-      for (var i = 0; i < 10; i++) {
+        // Clean pause → resume cycle, then another pause: the last event wins.
+        WidgetsBinding.instance.handleAppLifecycleStateChanged(
+          AppLifecycleState.paused,
+        );
         await pumpEventQueue();
-      }
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.paused);
-      for (var i = 0; i < 10; i++) {
-        await pumpEventQueue();
-      }
+        WidgetsBinding.instance.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        for (var i = 0; i < 10; i++) {
+          await pumpEventQueue();
+        }
+        WidgetsBinding.instance.handleAppLifecycleStateChanged(
+          AppLifecycleState.paused,
+        );
+        for (var i = 0; i < 10; i++) {
+          await pumpEventQueue();
+        }
 
-      // Backgrounded at the end: a backgrounded speak resolves without audio.
-      final spoken = await controller.synthesizeOnDevice('quiet');
-      expect(spoken, isEmpty);
-      expect(playback.playedChunks, isEmpty);
-      expect(wakeLock.enabled, isFalse);
-    });
+        // Backgrounded at the end: a backgrounded speak resolves without audio.
+        final spoken = await controller.synthesizeOnDevice('quiet');
+        expect(spoken, isEmpty);
+        expect(playback.playedChunks, isEmpty);
+        expect(wakeLock.enabled, isFalse);
+      },
+    );
 
-    testWidgets(
-        'a background transition overrunning the 2s bound (straggler) still '
+    testWidgets('a background transition overrunning the 2s bound (straggler) still '
         'tears down the pipeline mic after the foreground won', (tester) async {
       final container = buildContainer();
       final controller = container.read(voiceControllerProvider);
@@ -195,12 +221,14 @@ void main() {
       // The background parks the controller teardown inside its own gated mic
       // stop; it then overruns the 2s lifecycle bound.
       mic.stopGate = Completer<void>();
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      WidgetsBinding.instance.handleAppLifecycleStateChanged(
+        AppLifecycleState.paused,
+      );
       await tester.pump();
       expect(controller.isBackgrounded, isTrue);
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      WidgetsBinding.instance.handleAppLifecycleStateChanged(
+        AppLifecycleState.resumed,
+      );
       await tester.pump();
       expect(controller.isBackgrounded, isTrue);
 
@@ -219,8 +247,9 @@ void main() {
       expect(wakeLock.enabled, isTrue);
     });
 
-    testWidgets('a hung wake-lock disable cannot wedge the resume enable',
-        (tester) async {
+    testWidgets('a hung wake-lock disable cannot wedge the resume enable', (
+      tester,
+    ) async {
       final container = buildContainer();
       final controller = container.read(voiceControllerProvider);
       container.read(voiceCapturePipelineProvider);
@@ -232,13 +261,15 @@ void main() {
       // behind it forever and exitBackground would never complete; the 2s
       // bound is what lets the enable apply and resolves the resume.
       wakeLock.disableGate = Completer<void>();
-      WidgetsBinding.instance
-          .handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      WidgetsBinding.instance.handleAppLifecycleStateChanged(
+        AppLifecycleState.paused,
+      );
       await tester.pump();
       expect(controller.isBackgrounded, isTrue);
 
-      final resumed =
-          controller.exitBackground().timeout(const Duration(seconds: 3));
+      final resumed = controller.exitBackground().timeout(
+        const Duration(seconds: 3),
+      );
       await tester.pump(const Duration(seconds: 3));
       await resumed;
       expect(controller.isBackgrounded, isFalse);
