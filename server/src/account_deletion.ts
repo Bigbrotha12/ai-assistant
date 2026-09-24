@@ -2,10 +2,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { AsyncMutex } from "./jobs/mutex.ts";
 
 /**
- * Process-local deletion coordination. Tombstones and owner barriers live for
- * the lifetime of one gateway process, so this contract assumes a single
- * replica. Lock order is owner barrier -> NotifyStore mutex; code must never
- * acquire an owner barrier while holding the store mutex.
+ * Process-local deletion coordination. Tombstones, owner barriers, and pending
+ * deletion state live for the lifetime of one gateway process. This deliberate
+ * SINGLE-REPLICA assumption requires **exactly one gateway replica; no
+ * overlapping rolling deployments**. A second process can miss a tombstone or
+ * owner barrier and admit work that raced deletion; there is no in-process
+ * replica-count guard, so ops must enforce the Deployment and rollout. Lock
+ * order is owner barrier -> NotifyStore mutex; code must never acquire an owner
+ * barrier while holding the store mutex. Multi-replica deletion coordination is
+ * a separate distributed-coordination project.
  */
 const deletingOwners = new Set<string>();
 const pendingDeletionOwners = new Set<string>();

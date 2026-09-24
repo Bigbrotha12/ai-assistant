@@ -381,6 +381,8 @@ class FakeFilesClient implements FilesClient {
   FakeFilesClient({
     this.uploadCompleter,
     this.uploadError,
+    this.honorCancellation = true,
+    this.onUploadSettled,
     this.fetchError,
     this.fetchCompleter,
     this.fetchBytes = const [1, 2, 3],
@@ -394,6 +396,9 @@ class FakeFilesClient implements FilesClient {
 
   /// When set, every [uploadFile] throws [uploadError].
   Object? uploadError;
+
+  bool honorCancellation;
+  void Function()? onUploadSettled;
 
   /// When set, [fetchFile] throws [fetchError].
   Object? fetchError;
@@ -445,19 +450,42 @@ class FakeFilesClient implements FilesClient {
       sizeBytes: sizeBytes,
       mimeType: mimeType,
     ));
-    final completer = uploadCompleter;
-    if (completer != null) {
-      return completer.future;
+    try {
+      if (cancelToken?.isCancelled ?? false) {
+        throw const FilesCancelledError('cancelled');
+      }
+      final completer = uploadCompleter;
+      if (completer != null) {
+        if (cancelToken == null) {
+          return await completer.future;
+        }
+        if (honorCancellation) {
+          final result = await Future.any<Object?>([
+            completer.future,
+            cancelToken.whenCancel,
+          ]);
+          if (cancelToken.isCancelled) {
+            throw const FilesCancelledError('cancelled');
+          }
+          return result as FileInfo;
+        }
+        return await completer.future;
+      }
+      if (cancelToken?.isCancelled ?? false) {
+        throw const FilesCancelledError('cancelled');
+      }
+      final error = uploadError;
+      if (error != null) throw error;
+      return FileInfo(
+        id: 'server-${uploadCalls.length}',
+        filename: filename,
+        sizeBytes: sizeBytes,
+        mimeType: mimeType,
+        uploadedAt: DateTime.now(),
+      );
+    } finally {
+      onUploadSettled?.call();
     }
-    final error = uploadError;
-    if (error != null) throw error;
-    return FileInfo(
-      id: 'server-${uploadCalls.length}',
-      filename: filename,
-      sizeBytes: sizeBytes,
-      mimeType: mimeType,
-      uploadedAt: DateTime.now(),
-    );
   }
 
   @override
@@ -1147,6 +1175,11 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     final handle = _poller!.watch(LedgerLookup.byMessageId(messageId));
     handle.done
         .then((result) async {
+          if (result.end == LedgerPollEnd.error &&
+              isAccountDeletedError(result.error)) {
+            _pending.remove(conversationId);
+            return;
+          }
           if (result.end != LedgerPollEnd.observed || result.task == null) {
             return;
           }

@@ -1,4 +1,5 @@
 import type { Ledger, StepRow, TaskRow } from "../ledger.ts";
+import { redactForOutbound } from "../redact.ts";
 
 /**
  * Idempotency — Phase 2, Wave B (rebuild, correct).
@@ -103,7 +104,8 @@ export function recordToolResult(
       {
         stage: "tool",
         action: `tool:${input.toolName}`,
-        result: input.result,
+        // Persisted tool results are state: redact here because custom handlers may bypass ToolExecutor.
+        result: redactForOutbound(input.result),
         toolCallId: input.toolCallId,
       },
       input.fenceToken,

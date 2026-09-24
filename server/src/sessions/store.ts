@@ -95,6 +95,7 @@
  */
 import { AsyncMutex } from "../jobs/mutex.ts";
 import { isRecord } from "../util.ts";
+import { redactBaseMessage, redactMessages } from "../redact.ts";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 
 export type SessionKey = { owner: string; sessionId: string };
@@ -309,6 +310,28 @@ function isMessageList(
   return Array.isArray(value);
 }
 
+function redactOutcomes(
+  outcomes: ReadonlyMap<string, SessionOutcomeState>,
+): Map<string, SessionOutcomeState> {
+  const redacted = new Map<string, SessionOutcomeState>();
+  for (const [messageId, outcome] of outcomes) {
+    if (outcome.status === "in_progress") {
+      redacted.set(messageId, {
+        status: "in_progress",
+        message: redactBaseMessage(outcome.message),
+      });
+    } else if (outcome.status === "completed" && outcome.reply) {
+      redacted.set(messageId, {
+        status: "completed",
+        reply: redactBaseMessage(outcome.reply),
+      });
+    } else {
+      redacted.set(messageId, outcome);
+    }
+  }
+  return redacted;
+}
+
 /**
  * Byte estimate for one message: text content chars (≈ bytes) plus raw
  * `image_url.url` length (base64 data URI), with JSON fallbacks for other
@@ -510,8 +533,8 @@ export function createSessionStore(
         const existing = sessions.get(k);
         const t = now();
         const record: SessionRecord = {
-          messages: [...messages],
-          outcomes: existing ? existing.record.outcomes : new Map(),
+          messages: redactMessages(messages),
+          outcomes: existing ? redactOutcomes(existing.record.outcomes) : new Map(),
           createdAt: existing ? existing.record.createdAt : t,
           lastTouchedAt: t,
           // Every establish — seed AND re-seed (§6 compaction re-base) — mints
@@ -584,11 +607,13 @@ export function createSessionStore(
         // exactly-once anchor — mirrors the missing-session establish flow so a
         // failed re-base rolls back cleanly (no duplicate on retry).
         const history = messages.length > 0 ? messages.slice(0, -1) : [];
-        const lastUser = messages[messages.length - 1];
+        const lastUser = messages[messages.length - 1]
+          ? redactBaseMessage(messages[messages.length - 1]!)
+          : undefined;
         const t = now();
         const next: SessionRecord = {
-          messages: [...history],
-          outcomes: record.outcomes,
+          messages: redactMessages(history),
+          outcomes: redactOutcomes(record.outcomes),
           createdAt: record.createdAt,
           lastTouchedAt: t,
           generation: record.generation + 1,
@@ -649,8 +674,9 @@ export function createSessionStore(
           // through to re-append the user message and reset the outcome to
           // in_progress (markFailed already rolled the previous append back).
         }
-        record.messages.push(message);
-        record.outcomes.set(messageId, { status: "in_progress", message });
+        const storedMessage = redactBaseMessage(message);
+        record.messages.push(storedMessage);
+        record.outcomes.set(messageId, { status: "in_progress", message: storedMessage });
         record.lastTouchedAt = now();
         pruneOutcomes(record);
         if (estimateSessionBytes(record.messages) > maxSessionBytes) {
@@ -684,7 +710,10 @@ export function createSessionStore(
           // finalization must not stamp the new incarnation (F4).
           return { evicted: false };
         }
-        stored.record.outcomes.set(messageId, { status: "completed", reply });
+        stored.record.outcomes.set(messageId, {
+          status: "completed",
+          reply: redactBaseMessage(reply),
+        });
         return { evicted: false };
       } finally {
         release();

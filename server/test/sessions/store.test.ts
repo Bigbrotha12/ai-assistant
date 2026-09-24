@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import {
   createSessionStore,
   estimateSessionBytes,
@@ -505,6 +505,87 @@ describe("createSessionStore", () => {
     const completed = await store.markCompleted("alice", "s1", "m1", new AIMessage("r".repeat(60)));
     assert.deepEqual(completed, { evicted: false });
     assert.equal(store.get("alice", "s1")?.outcomes.get("m1")?.status, "completed");
+  });
+
+  test("persistence redacts deep message state in history, deltas, and completed outcomes", async (t) => {
+    const { store } = makeStore();
+    t.after(() => store.dispose());
+
+    const historyAssistant = new AIMessage({
+      content: [
+        { type: "thinking", thinking: `private sk-ant-api03-${"a".repeat(32)}` },
+        { type: "text", text: `history sk-or-v1-${"b".repeat(32)}` },
+      ] as unknown as AIMessage["content"],
+      id: "history-assistant",
+      name: "assistant",
+      tool_calls: [{
+        id: "call-1",
+        name: "lookup",
+        type: "tool_call",
+        args: { nested: { token: `tok-${"c".repeat(32)}` }, note: "unchanged" },
+      }],
+      additional_kwargs: { detail: `sk-proj-${"d".repeat(32)}` },
+      response_metadata: { model_name: "scripted", created: 123 },
+      usage_metadata: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+    });
+    const historyTool = new ToolMessage({
+      content: "ordinary tool output",
+      tool_call_id: "call-1",
+      metadata: { value: `tok-${"e".repeat(32)}` },
+    });
+    const user = new HumanMessage(`user tok-${"f".repeat(32)}`);
+
+    await store.establish("alice", "s1", [historyAssistant, historyTool]);
+    await store.appendDelta("alice", "s1", "turn-1", user);
+    await store.markCompleted("alice", "s1", "turn-1", new AIMessage({
+      content: `reply sk-proj-${"g".repeat(32)}`,
+      id: "reply-1",
+      tool_calls: [{
+        id: "call-2",
+        name: "lookup",
+        type: "tool_call",
+        args: { token: `sk-or-v1-${"h".repeat(32)}` },
+      }],
+      usage_metadata: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+    }));
+
+    const messages = store.getMessages("alice", "s1");
+    assert.ok(messages);
+    const storedAssistant = messages[0] as AIMessage;
+    const storedTool = messages[1] as ToolMessage;
+    const storedUser = messages[2] as HumanMessage;
+    assert.equal(storedAssistant.id, "history-assistant");
+    assert.equal(storedAssistant.name, "assistant");
+    assert.equal(storedAssistant.usage_metadata?.total_tokens, 3);
+    assert.equal(storedAssistant.response_metadata?.model_name, "scripted");
+    assert.deepEqual(storedAssistant.content, [
+      { type: "thinking", thinking: "private sk-ant-api03-***" },
+      { type: "text", text: "history sk-or-v1-***" },
+    ]);
+    assert.deepEqual(storedAssistant.tool_calls?.[0]?.args, {
+      nested: { token: "tok-***" },
+      note: "unchanged",
+    });
+    assert.equal(storedAssistant.tool_calls?.[0]?.id, "call-1");
+    assert.equal(storedAssistant.tool_calls?.[0]?.name, "lookup");
+    assert.deepEqual(storedAssistant.additional_kwargs, { detail: "sk-proj-***" });
+    assert.equal(storedTool.tool_call_id, "call-1");
+    assert.deepEqual(storedTool.metadata, { value: "tok-***" });
+    assert.equal(storedTool.content, "ordinary tool output");
+    assert.equal(storedUser.content, "user tok-***");
+
+    const outcome = store.get("alice", "s1")?.outcomes.get("turn-1");
+    assert.equal(outcome?.status, "completed");
+    if (outcome?.status === "completed") {
+      const reply = outcome.reply as AIMessage;
+      assert.equal(reply.id, "reply-1");
+      assert.equal(reply.content, "reply sk-proj-***");
+      assert.equal(reply.tool_calls?.[0]?.id, "call-2");
+      assert.equal(reply.tool_calls?.[0]?.name, "lookup");
+      assert.deepEqual(reply.tool_calls?.[0]?.args, { token: "sk-or-v1-***" });
+      assert.equal(reply.usage_metadata?.total_tokens, 7);
+    }
+    assert.equal(historyAssistant.tool_calls?.[0]?.args.nested.token, `tok-${"c".repeat(32)}`);
   });
 
   test("deleteSession removes a session; deleteSessionsForOwner removes all of an owner's", async (t) => {

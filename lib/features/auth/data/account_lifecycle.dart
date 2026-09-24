@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../attachments/data/file_cache.dart';
 import '../../attachments/data/file_store.dart';
+import '../../attachments/data/upload_queue.dart';
 import '../../chat/ui/chat_providers.dart';
 import '../../memory/data/memory_store.dart';
 import '../../plugins/data/managed_chat_providers.dart';
@@ -12,6 +13,8 @@ import '../../plugins/data/managed_conversation_repository.dart';
 import '../../plugins/data/plugin_credentials_providers.dart';
 import '../../voice/ui/voice_controller_provider.dart';
 import 'auth_credentials_store.dart';
+
+const defaultAttachmentDrainTimeout = Duration(seconds: 125);
 
 class AccountLifecycleCancelled implements Exception {
   const AccountLifecycleCancelled();
@@ -25,6 +28,17 @@ class AttachmentDownloadCancelled implements Exception {
 
   @override
   String toString() => 'Attachment download is no longer current.';
+}
+
+class AttachmentDownloadDrainTimeout implements Exception {
+  const AttachmentDownloadDrainTimeout(this.scopeKey, this.entryCount);
+
+  final String scopeKey;
+  final int entryCount;
+
+  @override
+  String toString() =>
+      'AttachmentDownloadDrainTimeout: $entryCount entries did not settle';
 }
 
 class _AttachmentDownloadScope {
@@ -49,6 +63,11 @@ class _AttachmentDownloadEntry {
 }
 
 class AttachmentDownloadCoordinator {
+  AttachmentDownloadCoordinator({
+    this.drainTimeout = defaultAttachmentDrainTimeout,
+  });
+
+  final Duration drainTimeout;
   final Map<String, _AttachmentDownloadScope> _scopes = {};
   int _nextEpoch = 0;
 
@@ -83,14 +102,28 @@ class AttachmentDownloadCoordinator {
     for (final entry in scope.active) {
       entry.cancelToken.cancel();
     }
-    return _drainScope(scope);
+    return _drainScope(scope, scopeKey);
   }
 
   Future<void> drainAll() async {
+    final stopwatch = Stopwatch()..start();
     while (true) {
       final entries = [for (final scope in _scopes.values) ...scope.active];
       if (entries.isEmpty) return;
-      await Future.wait([for (final entry in entries) entry.completed.future]);
+      final remaining = drainTimeout - stopwatch.elapsed;
+      if (remaining <= Duration.zero) {
+        final timedOut = entries.where((entry) => !entry.isComplete).toList();
+        _settleEntries(timedOut);
+        throw AttachmentDownloadDrainTimeout('all', timedOut.length);
+      }
+      try {
+        await Future.wait([for (final entry in entries) entry.completed.future])
+            .timeout(remaining);
+      } on TimeoutException {
+        final timedOut = entries.where((entry) => !entry.isComplete).toList();
+        _settleEntries(timedOut);
+        throw AttachmentDownloadDrainTimeout('all', timedOut.length);
+      }
     }
   }
 
@@ -131,10 +164,35 @@ class AttachmentDownloadCoordinator {
     return _scopes.putIfAbsent(scopeKey, _AttachmentDownloadScope.new);
   }
 
-  Future<void> _drainScope(_AttachmentDownloadScope scope) async {
+  Future<void> _drainScope(
+    _AttachmentDownloadScope scope,
+    String scopeKey,
+  ) async {
+    final stopwatch = Stopwatch()..start();
     while (scope.active.isNotEmpty) {
+      final remaining = drainTimeout - stopwatch.elapsed;
       final entries = scope.active.toList();
-      await Future.wait([for (final entry in entries) entry.completed.future]);
+      if (remaining <= Duration.zero) {
+        final timedOut = entries.where((entry) => !entry.isComplete).toList();
+        _settleEntries(timedOut);
+        throw AttachmentDownloadDrainTimeout(scopeKey, timedOut.length);
+      }
+      try {
+        await Future.wait([for (final entry in entries) entry.completed.future])
+            .timeout(remaining);
+      } on TimeoutException {
+        final timedOut = entries.where((entry) => !entry.isComplete).toList();
+        _settleEntries(timedOut);
+        throw AttachmentDownloadDrainTimeout(scopeKey, timedOut.length);
+      }
+    }
+  }
+
+  void _settleEntries(Iterable<_AttachmentDownloadEntry> entries) {
+    for (final entry in entries) {
+      if (entry.isComplete) continue;
+      entry.cancelToken.cancel();
+      _complete(entry);
     }
   }
 }
@@ -183,8 +241,9 @@ class PartialAccountWipe implements Exception {
 /// M12 account-deletion local wipe — the one cleanup path after the server
 /// confirmed `POST /api/auth/delete-user`.
 ///
-/// Order: drain and tombstone attachment downloads, then account data (file
-/// rows, memories, file cache), then [clearCredentials] — normally
+/// Order: cancel and drain attachment upload queues, then drain and tombstone
+/// attachment downloads, then account data (file rows, memories, file cache),
+/// then [clearCredentials] — normally
 /// `authCredentialsProvider.notifier.clear()`, which runs the shared sign-out
 /// ceremony (AccountLifecycle `cancelPending` + `clearLocal`: scoped plugin
 /// credentials, conversations + pending turns, the credential store). A
@@ -202,35 +261,45 @@ Future<void> wipeLocalAccountData({
   required MemoryStore memoryStore,
   required FileCache fileCache,
 }) async {
-  Object? dataError;
+  final deletionEpoch = lifecycle.beginDeletion();
   try {
-    await lifecycle.cancelAndDrain(scope.storageId);
-  } catch (e) {
-    dataError = e;
-  }
-  if (dataError == null) {
+    Object? dataError;
     try {
-      await fileStore.deleteAllForScope(scope.storageId);
+      await lifecycle.cancelAndDrainUploads();
     } catch (e) {
       dataError = e;
     }
     try {
-      await memoryStore.deleteAllMemoriesForScope(scope.storageId);
+      await lifecycle.cancelAndDrain(scope.storageId);
     } catch (e) {
       dataError ??= e;
+    }
+    if (dataError == null) {
+      try {
+        await fileStore.deleteAllForScope(scope.storageId);
+      } catch (e) {
+        dataError = e;
+      }
+      try {
+        await memoryStore.deleteAllMemoriesForScope(scope.storageId);
+      } catch (e) {
+        dataError ??= e;
+      }
+      try {
+        await fileCache.evictAllForScope(scope.storageId);
+      } catch (e) {
+        dataError ??= e;
+      }
     }
     try {
-      await fileCache.evictAllForScope(scope.storageId);
+      await clearCredentials();
     } catch (e) {
-      dataError ??= e;
+      throw PartialAccountWipe(e);
     }
+    if (dataError != null) throw PartialAccountWipe(dataError);
+  } finally {
+    lifecycle.endDeletion(deletionEpoch);
   }
-  try {
-    await clearCredentials();
-  } catch (e) {
-    throw PartialAccountWipe(e);
-  }
-  if (dataError != null) throw PartialAccountWipe(dataError);
 }
 
 class AccountCleanupRegistration {
@@ -304,22 +373,67 @@ final accountLifecycleProvider = Provider<AccountLifecycle>((ref) {
 });
 
 class AccountLifecycle {
-  AccountLifecycle({this.resetActiveConversation});
+  AccountLifecycle({
+    this.resetActiveConversation,
+    AttachmentDownloadCoordinator? downloadCoordinator,
+  }) : _downloads = downloadCoordinator ?? AttachmentDownloadCoordinator();
 
   final void Function()? resetActiveConversation;
   final Set<AccountCleanupRegistration> _registrations = {};
-  final AttachmentDownloadCoordinator _downloads =
-      AttachmentDownloadCoordinator();
+  final Set<UploadQueue> _uploadQueues = {};
+  final AttachmentDownloadCoordinator _downloads;
   int _epoch = 0;
   bool _blocked = false;
+  int _deletionEpoch = 0;
+  bool _deletionInProgress = false;
 
   int get epoch => _epoch;
   bool get blocked => _blocked;
+  int get deletionEpoch => _deletionEpoch;
+  bool get deletionInProgress => _deletionInProgress;
   AttachmentDownloadCoordinator get downloadCoordinator => _downloads;
 
   void Function() register(AccountCleanupRegistration registration) {
     _registrations.add(registration);
     return () => _registrations.remove(registration);
+  }
+
+  int beginDeletion() {
+    _deletionInProgress = true;
+    return ++_deletionEpoch;
+  }
+
+  void endDeletion(int epoch) {
+    if (epoch == _deletionEpoch) _deletionInProgress = false;
+  }
+
+  void checkUploadAllowed() {
+    if (_deletionInProgress) throw const AccountLifecycleCancelled();
+  }
+
+  bool get uploadsAllowed => !_deletionInProgress;
+
+  void Function() registerUploadQueue(UploadQueue queue) {
+    checkUploadAllowed();
+    _uploadQueues.add(queue);
+    void check() => checkUploadAllowed();
+    final detach = queue.attachUploadAdmissionCheck(check);
+    return () {
+      _uploadQueues.remove(queue);
+      detach();
+    };
+  }
+
+  Future<void> cancelAndDrainUploads() async {
+    final drained = <UploadQueue>{};
+    while (true) {
+      final queues = _uploadQueues
+          .where((queue) => !drained.contains(queue))
+          .toList();
+      if (queues.isEmpty) return;
+      await Future.wait([for (final queue in queues) queue.cancelAndDrain()]);
+      drained.addAll(queues);
+    }
   }
 
   void checkCurrent(int epoch) {
@@ -384,6 +498,12 @@ class AccountLifecycle {
       cancellationStack = stack;
     }
     try {
+      await cancelAndDrainUploads();
+    } catch (error, stack) {
+      cancellationError ??= error;
+      cancellationStack ??= stack;
+    }
+    try {
       await _downloads.drainAll();
     } catch (error, stack) {
       cancellationError ??= error;
@@ -406,5 +526,6 @@ class AccountLifecycle {
   void dispose() {
     begin();
     _registrations.clear();
+    unawaited(cancelAndDrainUploads());
   }
 }

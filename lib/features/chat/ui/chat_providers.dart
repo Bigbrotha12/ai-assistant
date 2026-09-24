@@ -8,6 +8,8 @@ import 'package:uuid/uuid.dart';
 
 import '../data/chat_client.dart';
 import '../data/status_tracker.dart';
+import '../../auth/data/account_deleted_handler.dart';
+import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/account_lifecycle.dart';
 import '../../attachments/data/files_providers.dart';
 import '../../../app/global_messenger.dart';
@@ -191,22 +193,28 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _trimmer = ref.watch(contextTrimmerProvider);
     _fileStore = ref.watch(filesStoreProvider);
     _fileScopeKey = ref.read(fileCacheProvider).scopeKey;
+    final lifecycle = ref.read(accountLifecycleProvider);
     final queue = UploadQueue(filesService: ref.read(filesServiceProvider));
+    final unregisterUploadQueue = lifecycle.registerUploadQueue(queue);
     _queue = queue;
-
-    // Wait for the database to be ready before loading messages.
-    await ref.watch(databaseReadyProvider);
-    if (!ref.mounted) return const ConversationState(messages: []);
-
     queue.jobs.addListener(_onQueueChanged);
 
     ref.onDispose(() {
       queue.jobs.removeListener(_onQueueChanged);
-      queue.dispose();
+      unawaited(
+        queue.cancelAndDrain().then<void>(
+          (_) => unregisterUploadQueue(),
+          onError: (Object _, StackTrace _) => unregisterUploadQueue(),
+        ),
+      );
       _retryInFlight = false;
       _active?.cancel();
       _throttle?.cancel();
     });
+
+    // Wait for the database to be ready before loading messages.
+    await ref.watch(databaseReadyProvider);
+    if (!ref.mounted) return const ConversationState(messages: []);
 
     final conversation = await _store!.loadConversation(conversationId);
     if (!ref.mounted) return const ConversationState(messages: []);
@@ -373,6 +381,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       rethrow;
     }
     if (!ref.mounted) return;
+    if (ref.read(accountDeletedProvider)) return;
     // §3.6: attachments upload asynchronously AFTER the turn succeeds, so the
     // user's text is never blocked on slow uploads. The uploads must be keyed
     // to the SERVICE-minted user id (P1b): the store row was minted inside
@@ -503,17 +512,6 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     String userMsgId,
   ) async {
     if (!ref.mounted) return;
-    try {
-      // Re-read the freshest in-memory content (every ref appended so far) so
-      // the write is consistent even if another upload completed meanwhile.
-      final message = _latestUserMessage(userMsgId);
-      if (message != null) {
-        await _store!.updateMessage(conversationId, message);
-      }
-    } catch (_) {
-      // Best-effort: the reference is already reflected in in-memory state.
-    }
-    if (!ref.mounted) return;
     final scopeKey = _fileScopeKey;
     if (scopeKey == null) return;
     try {
@@ -521,21 +519,30 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         registration,
       ) async {
         registration.checkCurrent();
-        await _fileStore!.saveFile(
-          FileInfo(
-            id: serverFileId,
-            filename: job.filename,
-            sizeBytes: job.sizeBytes,
-            mimeType: job.mimeType,
-            uploadedAt: DateTime.now(),
-          ),
-          conversationId: conversationId,
-        );
+        try {
+          final message = _latestUserMessage(userMsgId);
+          if (message != null) {
+            await _store!.updateMessage(conversationId, message);
+          }
+        } catch (_) {}
+        registration.checkCurrent();
+        if (ref.mounted) {
+          try {
+            await _fileStore!.saveFile(
+              FileInfo(
+                id: serverFileId,
+                filename: job.filename,
+                sizeBytes: job.sizeBytes,
+                mimeType: job.mimeType,
+                uploadedAt: DateTime.now(),
+              ),
+              conversationId: conversationId,
+            );
+          } catch (_) {}
+        }
         registration.checkCurrent();
       });
-    } catch (_) {
-      // Best-effort: a persistence failure must not crash the turn.
-    }
+    } catch (_) {}
   }
 
   /// Returns the current in-memory user message for [userMsgId], or null.
@@ -900,6 +907,27 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(state.value!.copyWith(hasPendingJob: false, jobError: null));
   }
 
+  Future<void> _handleAccountDeleted(Object error) async {
+    if (!isAccountDeletedError(error)) return;
+    final current = state.value;
+    if (current != null && ref.mounted) {
+      _setState(
+        current.copyWith(
+          isStreaming: false,
+          pendingUserMessageId: null,
+          hasPendingJob: false,
+          jobError: null,
+          error: accountDeletedNotice,
+          failedMessageId: null,
+          authRequired: false,
+        ),
+      );
+    }
+    try {
+      await ref.read(accountDeletedHandlerProvider).handle(error);
+    } catch (_) {}
+  }
+
   /// Watches a background-job [handle]: on an observed terminal status the
   /// service has already reconciled (appended the reply / cleared the marker),
   /// so the store is re-read and the chip is cleared; a `failed`/`cancelled`
@@ -909,6 +937,12 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       handle.done
           .then((result) async {
             if (!ref.mounted) return;
+            if (result.end == LedgerPollEnd.error &&
+                result.error != null &&
+                isAccountDeletedError(result.error)) {
+              await _handleAccountDeleted(result.error!);
+              return;
+            }
             final terminal =
                 result.end == LedgerPollEnd.observed &&
                 (result.task?.status.isTerminal ?? false);
@@ -952,6 +986,10 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     String? optimisticUserId,
   }) async {
     if (!ref.mounted) return;
+    if (isAccountDeletedError(error)) {
+      await _handleAccountDeleted(error);
+      return;
+    }
     final authRequired = isAuthRequiredError(error);
     final message = switch (error) {
       // Managed codes map through the single statusPhraseForError surface
@@ -1314,6 +1352,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     if (error is PluginClientException &&
         error.code == ManagedErrorCodes.noPendingTurn) {
       _finalizeWithoutError(assistantId);
+      return;
+    }
+
+    if (isAccountDeletedError(error)) {
+      await _handleAccountDeleted(error);
       return;
     }
 

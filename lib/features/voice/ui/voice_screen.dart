@@ -11,6 +11,8 @@ import '../../../app/app_startup.dart';
 import '../../../app/widgets/app_logo.dart';
 import '../../../app/widgets/speak_button.dart';
 import '../../../app/widgets/voice_text_mode_pill.dart';
+import '../../auth/data/account_deleted_handler.dart';
+import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/ui/auth_flow.dart';
 import '../../chat/data/chat_client.dart';
@@ -233,30 +235,36 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     try {
       final controller = ref.read(voiceControllerProvider);
       await controller.endConversation();
-      await ref
-          .read(voiceControllerProvider.notifier)
-          .flushPersistence();
+      await ref.read(voiceControllerProvider.notifier).flushPersistence();
     } catch (_) {
       // Best-effort teardown: a failed stop/flush must never block the mode
       // switch (the chat surface still works; the session is abandoned).
     }
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const ChatScreen()),
-    );
+    Navigator.of(context)
+        .pushReplacement(MaterialPageRoute(builder: (_) => const ChatScreen()));
   }
 
   @override
   Widget build(BuildContext context) {
+    ref.listen(voiceConversationStateProvider, (_, next) {
+      final error = next.error;
+      if (error != null && isAccountDeletedError(error)) {
+        unawaited(ref.read(accountDeletedHandlerProvider).handle(error));
+      }
+    });
     final state = ref.watch(voiceConversationStateProvider);
 
+    final accountDeleted =
+        state.error != null && isAccountDeletedError(state.error);
     final scheme = Theme.of(context).colorScheme;
-    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
+    final tier =
+        Theme.of(context).extension<TierTheme>() ??
+        const TierTheme(premium: false);
     final recording = state.isRecording || _localRecording;
     final error = state.error ?? _localError;
-    // A gateway 401 (missing/invalid API key) surfaces the shared re-auth card
-    // instead of the generic error banner.
-    final authRequired = error != null && isAuthRequiredError(error);
+    final authRequired =
+        error != null && !accountDeleted && isAuthRequiredError(error);
     // Mirrors the onboarding gate's configured rule (API key + explicitly
     // stored, valid host), so the banner never disagrees with the gate.
     final configured = isConfigured(
@@ -300,10 +308,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            if (!configured)
-              const _ConfigureBanner()
-            else
-              _FallbackBanner(),
+            if (!configured) const _ConfigureBanner() else _FallbackBanner(),
             if (error != null)
               authRequired
                   ? Flexible(
@@ -319,7 +324,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                       ),
                     )
                   : _ErrorBanner(
-                      error: error,
+                      error: accountDeleted ? accountDeletedNotice : error,
                       onOpenSettings: _openAppSettings,
                       onConfigureBackend: _openBackendSettings,
                       onRetry: _retryConnection,
@@ -371,10 +376,11 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                                   // the same reserved, non-blocking slot —
                                   // shown while recording, cleared by the
                                   // controller when the buffer flushes.
-                                  notice: state.notice ??
+                                  notice:
+                                      state.notice ??
                                       (state.micBufferTruncated
                                           ? 'Utterance truncated — kept the '
-                                              'last 3 minutes.'
+                                                'last 3 minutes.'
                                           : null),
                                 ),
                                 const SizedBox(height: 10),
@@ -382,41 +388,35 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                                   phase: recording
                                       ? 'Listening'
                                       : state.isGenerating
-                                          ? 'Working'
-                                          : state.isAiSpeaking
-                                              ? 'Speaking'
-                                              : 'Speak',
+                                      ? 'Working'
+                                      : state.isAiSpeaking
+                                      ? 'Speaking'
+                                      : 'Speak',
                                   style: Theme.of(context)
                                       .textTheme
                                       .displaySmall
-                                      ?.copyWith(
-                                        color: scheme.onSurface,
-                                      ),
+                                      ?.copyWith(color: scheme.onSurface),
                                 ),
                                 SizedBox(
                                   height: 36,
                                   child: AnimatedSwitcher(
-                                    duration: const Duration(
-                                        milliseconds: 200),
-                                    child: recording ||
-                                            state.isSpeaking
+                                    duration: const Duration(milliseconds: 200),
+                                    child: recording || state.isSpeaking
                                         ? Padding(
-                                            key: const ValueKey(
-                                                'waveform'),
-                                            padding:
-                                                const EdgeInsets.only(
-                                                    top: 16),
+                                            key: const ValueKey('waveform'),
+                                            padding: const EdgeInsets.only(
+                                              top: 16,
+                                            ),
                                             child: _Waveform(
-                                              active: recording ||
-                                                  state.isSpeaking,
+                                              active:
+                                                  recording || state.isSpeaking,
                                               color: tier.premium
                                                   ? AppColors.goldBase
                                                   : scheme.primary,
                                             ),
                                           )
                                         : const SizedBox(
-                                            key: ValueKey(
-                                                'waveform-idle'),
+                                            key: ValueKey('waveform-idle'),
                                             height: 1,
                                           ),
                                   ),
@@ -443,24 +443,20 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                               height: 20,
                               child: Center(
                                 child: Text(
-                                  state.status ??
-                                      'PRESS AND HOLD TO TALK',
+                                  state.status ?? 'PRESS AND HOLD TO TALK',
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   textAlign: TextAlign.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .labelSmall
+                                  style: Theme.of(context).textTheme.labelSmall
                                       ?.copyWith(
-                                        letterSpacing:
-                                            state.status == null
-                                                ? 1.4
-                                                : null,
+                                        letterSpacing: state.status == null
+                                            ? 1.4
+                                            : null,
                                         fontStyle: state.status == null
                                             ? null
                                             : FontStyle.italic,
-                                        color: state.status == null &&
-                                                tier.premium
+                                        color:
+                                            state.status == null && tier.premium
                                             ? AppColors.goldDark
                                             : scheme.onSurfaceVariant,
                                       ),
@@ -483,8 +479,10 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
               child: SafeArea(
                 top: false,
                 child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 6,
+                  ),
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
@@ -495,7 +493,8 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                         // so the conversation state is consistent and the mic
                         // is never left live when this screen unmounts —
                         // mirrors the chat screen's own `enabled: !isStreaming`.
-                        enabled: !recording &&
+                        enabled:
+                            !recording &&
                             !state.isGenerating &&
                             !state.isAiSpeaking &&
                             !_micBusy,
@@ -592,10 +591,7 @@ class _PhaseLabelState extends State<_PhaseLabel>
             Stack(
               alignment: Alignment.centerLeft,
               children: [
-                Opacity(
-                  opacity: 0,
-                  child: Text('...', style: widget.style),
-                ),
+                Opacity(opacity: 0, child: Text('...', style: widget.style)),
                 Text('.' * dots, style: widget.style),
               ],
             ),
@@ -623,9 +619,8 @@ class _TurnStatusLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final noticeStyle = Theme.of(context).textTheme.labelSmall?.copyWith(
-          color: scheme.onSurfaceVariant,
-        );
+    final noticeStyle = Theme.of(context).textTheme.labelSmall
+        ?.copyWith(color: scheme.onSurfaceVariant);
     return SizedBox(
       height: _slotHeight,
       child: Visibility(
@@ -673,8 +668,7 @@ class _ErrorBanner extends StatelessWidget {
   bool get _needsConfiguration =>
       _detail.toLowerCase().contains('not configured');
 
-  bool get _connectionFailed =>
-      _detail.toLowerCase().contains('connect');
+  bool get _connectionFailed => _detail.toLowerCase().contains('connect');
 
   String get _message {
     if (error is EngineModelNotFoundError) {
@@ -766,9 +760,9 @@ class _ConfigureBanner extends ConsumerWidget {
               style: TextButton.styleFrom(
                 foregroundColor: scheme.onErrorContainer,
               ),
-              onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const SettingsScreen()),
-              ),
+              onPressed: () => Navigator.of(
+                context,
+              ).push(MaterialPageRoute(builder: (_) => const SettingsScreen())),
               child: const Text('Configure Backend'),
             ),
           ],

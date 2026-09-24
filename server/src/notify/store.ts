@@ -34,6 +34,13 @@ import { AsyncMutex } from "../jobs/mutex.ts";
  *    has the same warned default the env schema guarantees). The AES-256-GCM
  *    key is derived deterministically (`sha256(key)`) so previously-written
  *    files stay decryptable across restarts.
+ *  - **SINGLE-REPLICA assumption (deliberate contract).** This store's cached
+ *    `file` snapshot and `mutationMutex` require **exactly one gateway replica;
+ *    no overlapping rolling deployments**. A second or overlapping process can
+ *    retain stale accounts and overwrite a newer notify snapshot. There is no
+ *    in-process replica-count guard; ops must enforce the Deployment and
+ *    rollout. Multi-replica deletion coordination is a separate
+ *    distributed-coordination project.
  *  - **0600 permissions + atomic write.** Persist writes the JSON to a temp
  *    file in the same directory, chmods it `0600`, then renames over the
  *    target (same as `plugins/store.ts`). A crash never leaves a partial file.

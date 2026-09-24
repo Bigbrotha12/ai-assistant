@@ -3,9 +3,11 @@ import 'package:flutter/widgets.dart' show WidgetsBinding;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/http/dio_provider.dart';
+import '../../auth/data/account_deleted_handler.dart';
 import '../../auth/data/account_lifecycle.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/data/auth_credentials_store.dart';
+import '../../chat/data/chat_client.dart';
 import '../../chat/data/context_trimmer.dart';
 import '../../chat/data/message_model.dart';
 import '../../chat/ui/chat_lifecycle_observer.dart';
@@ -71,6 +73,8 @@ final managedChatAdapterProvider = Provider<ManagedChatAdapter>((ref) {
     repo: ref.watch(managedConversationRepositoryProvider),
     trimmer: ref.watch(contextTrimmerProvider),
     pollerFactory: ref.watch(managedChatPollerFactoryProvider),
+    onAccountDeleted: (error) =>
+        ref.read(accountDeletedHandlerProvider).handle(error),
     resolveSelection: () => resolveManagedSelection(
       scope: scope,
       authStore: authStore,
@@ -116,6 +120,8 @@ final stagedInferenceAdaptersProvider = Provider<StagedInferenceAdapters>((
     loadModels: registry.listModels,
     loadAgents: registry.listAgents,
     lifecycle: ref.watch(accountLifecycleProvider),
+    onAccountDeleted: (error) =>
+        ref.read(accountDeletedHandlerProvider).handle(error),
   );
   ref.onDispose(adapters.dispose);
   return adapters;
@@ -136,6 +142,7 @@ class ManagedChatAdapter {
     LedgerPoller? poller,
     bool ownsPoller = false,
     ManagedChatPollerFactory? pollerFactory,
+    Future<void> Function(Object error)? onAccountDeleted,
   }) => ManagedChatAdapter._(
     scope,
     client,
@@ -145,6 +152,7 @@ class ManagedChatAdapter {
     poller,
     ownsPoller,
     pollerFactory,
+    onAccountDeleted,
   );
 
   ManagedChatAdapter._(
@@ -156,6 +164,7 @@ class ManagedChatAdapter {
     this._poller,
     this._ownsPoller,
     this._pollerFactory,
+    this._onAccountDeleted,
   );
 
   final AuthAccountScope scope;
@@ -165,10 +174,19 @@ class ManagedChatAdapter {
   final ContextTrimmer trimmer;
   final Future<ManagedSelection> Function() resolveSelection;
   final ManagedChatPollerFactory? _pollerFactory;
+  final Future<void> Function(Object error)? _onAccountDeleted;
   LedgerPoller? _poller;
   bool _ownsPoller;
   Dio? _ownedDio;
   bool _disposed = false;
+
+  Future<void> _notifyAccountDeleted(Object error) async {
+    final callback = _onAccountDeleted;
+    if (callback == null || !isAccountDeletedError(error)) return;
+    try {
+      await callback(error);
+    } catch (_) {}
+  }
 
   /// Per-send construction: resolves model + enabled plugins + credentials
   /// now, then builds the turn's [ManagedConversationService] with those
@@ -185,6 +203,7 @@ class ManagedChatAdapter {
       selection: selection,
       resolve: _resolve,
       poller: poller,
+      onAccountDeleted: _notifyAccountDeleted,
     );
   }
 
@@ -226,6 +245,9 @@ class ManagedChatAdapter {
         ownerId: scope.ownerId,
         backendOrigin: scope.backendOrigin,
       );
+    } on PluginClientException catch (error) {
+      if (isAccountDeletedError(error)) rethrow;
+      return null;
     } catch (_) {
       return null;
     }
@@ -291,9 +313,16 @@ class ManagedChatAdapter {
     scope: scope,
     trimmer: trimmer,
     poller: poller,
+    onAccountDeleted: _notifyAccountDeleted,
     credentials: () async {
       try {
         return (await _resolve()).credentials;
+      } on PluginClientException catch (error) {
+        if (isAccountDeletedError(error)) {
+          await _notifyAccountDeleted(error);
+          rethrow;
+        }
+        return null;
       } catch (_) {
         return null;
       }
@@ -303,6 +332,11 @@ class ManagedChatAdapter {
   Future<ManagedSelection> _resolve() async {
     try {
       return await resolveSelection();
+    } on PluginClientException catch (error) {
+      if (isAccountDeletedError(error)) {
+        await _notifyAccountDeleted(error);
+      }
+      rethrow;
     } on StagedInferenceUnavailable catch (error) {
       // Mirror the staged adapters' handling: callers get a typed
       // PluginClientException (no_selected_model / no_credentials / ...) and
@@ -455,7 +489,8 @@ final chatPollerLifecycleObserverProvider = Provider<ChatLifecycleObserver>((
       return;
     }
     try {
-      await ref.read(managedChatAdapterProvider)
+      await ref
+          .read(managedChatAdapterProvider)
           .rewatchPendingBackgroundOnForeground();
     } catch (_) {
       // Best-effort: a failed re-watch leaves the pending marker for the next

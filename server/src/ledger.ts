@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Database as DatabaseType } from "better-sqlite3";
+import { redactForOutbound } from "./redact.ts";
 
 export const TASK_STATUSES = [
   "queued",
@@ -403,6 +404,18 @@ export interface AppendStepInput {
   toolCallId?: string;
 }
 
+function redactStepResult(input: AppendStepInput): string | null {
+  if (input.result === null) return null;
+  const assistantOrTool =
+    input.stage === "reply" ||
+    input.stage === "assistant" ||
+    input.stage === "tool" ||
+    input.action === "assistant_message" ||
+    input.action.startsWith("assistant:") ||
+    input.action.startsWith("tool:");
+  return assistantOrTool ? redactForOutbound(input.result) : input.result;
+}
+
 export class Ledger {
   private readonly db: DatabaseType;
   private readonly stuckTimeoutMs: number;
@@ -694,6 +707,7 @@ export class Ledger {
     this.requireStatus(task, ["running"]);
     this.requireFence(task, fenceToken);
 
+    const result = redactStepResult(input);
     let step: StepRow | null = null;
     let digest = "";
     this.appendTx(() => {
@@ -713,7 +727,7 @@ export class Ledger {
           seq,
           stage: input.stage,
           action: input.action,
-          result: input.result,
+          result,
           ts,
           toolCallId: input.toolCallId ?? null,
         });
@@ -723,7 +737,7 @@ export class Ledger {
         seq,
         stage: input.stage,
         action: input.action,
-        result: input.result,
+        result,
       });
       digest = sha256Hex(`${prevDigest}\n${content}\n${ts}`);
       this.db
@@ -743,7 +757,7 @@ export class Ledger {
         seq,
         stage: input.stage,
         action: input.action,
-        result: input.result,
+        result,
         ts,
         tool_call_id: input.toolCallId ?? null,
       };

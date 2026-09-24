@@ -147,47 +147,59 @@ void main() {
       );
     });
 
-    test('maps a 422 duplicate-email sign-up to AuthEmailTaken with its code',
-        () async {
-      // better-auth (1.7.x) rejects a duplicate sign-up with 422 and an
-      // explicit USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL code.
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/sign-up/email',
-        (r) => r.reply(422, {
-          'message': 'User already exists. Use another email.',
-          'code': 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL',
-        }),
-      );
+    test(
+      'maps a 422 duplicate-email sign-up to AuthEmailTaken with its code',
+      () async {
+        // better-auth (1.7.x) rejects a duplicate sign-up with 422 and an
+        // explicit USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL code.
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/sign-up/email',
+          (r) => r.reply(422, {
+            'message': 'User already exists. Use another email.',
+            'code': 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL',
+          }),
+        );
 
-      await expectLater(
-        _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
-        throwsA(
-          isA<AuthEmailTaken>()
-              .having((e) => e.statusCode, 'statusCode', 422)
-              .having((e) => e.code, 'code', 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL'),
-        ),
-      );
-    });
+        await expectLater(
+          _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
+          throwsA(
+            isA<AuthEmailTaken>()
+                .having((e) => e.statusCode, 'statusCode', 422)
+                .having(
+                  (e) => e.code,
+                  'code',
+                  'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL',
+                ),
+          ),
+        );
+      },
+    );
 
-    test('maps a 400 password-policy violation to AuthInvalidCredentials', () async {
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/sign-up/email',
-        (r) => r.reply(400, {
-          'message': 'Password too short',
-          'code': 'PASSWORD_TOO_SHORT',
-        }),
-      );
+    test(
+      'maps a 400 password-policy violation to AuthInvalidCredentials',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/sign-up/email',
+          (r) => r.reply(400, {
+            'message': 'Password too short',
+            'code': 'PASSWORD_TOO_SHORT',
+          }),
+        );
 
-      await expectLater(
-        _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
-        throwsA(
-          isA<AuthInvalidCredentials>()
-              .having((e) => e.code, 'code', 'PASSWORD_TOO_SHORT'),
-        ),
-      );
-    });
+        await expectLater(
+          _client(dio).signUp(name: 'Ada', email: 'a@b.c', password: 'p'),
+          throwsA(
+            isA<AuthInvalidCredentials>().having(
+              (e) => e.code,
+              'code',
+              'PASSWORD_TOO_SHORT',
+            ),
+          ),
+        );
+      },
+    );
 
     test('throws AuthServerError on a 500 response', () async {
       final (dio, adapter) = makeDio();
@@ -268,70 +280,96 @@ void main() {
       );
     });
 
-    test('maps a 403 EMAIL_NOT_VERIFIED sign-in to AuthEmailNotVerified',
-        () async {
-      // C2: signing in before the email is verified is a 403 with the
-      // better-auth EMAIL_NOT_VERIFIED code — distinct from a credential or
-      // session failure so the UI can offer check-inbox/resend.
+    test(
+      'maps a 403 EMAIL_NOT_VERIFIED sign-in to AuthEmailNotVerified',
+      () async {
+        // C2: signing in before the email is verified is a 403 with the
+        // better-auth EMAIL_NOT_VERIFIED code — distinct from a credential or
+        // session failure so the UI can offer check-inbox/resend.
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/sign-in/email',
+          (r) => r.reply(403, {
+            'message': 'Email not verified',
+            'code': 'EMAIL_NOT_VERIFIED',
+          }),
+        );
+
+        await expectLater(
+          _client(dio).signIn(email: 'a@b.c', password: 'secret123'),
+          throwsA(
+            isA<AuthEmailNotVerified>()
+                .having((e) => e.statusCode, 'statusCode', 403)
+                .having((e) => e.code, 'code', 'EMAIL_NOT_VERIFIED'),
+          ),
+        );
+      },
+    );
+
+    test('maps a 403 account_deleted response to AuthAccountDeleted', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
         '$_base/api/auth/sign-in/email',
-        (r) => r.reply(403, {
-          'message': 'Email not verified',
-          'code': 'EMAIL_NOT_VERIFIED',
-        }),
+        (r) => r.reply(403, {'error': 'account_deleted'}),
       );
 
       await expectLater(
         _client(dio).signIn(email: 'a@b.c', password: 'secret123'),
         throwsA(
-          isA<AuthEmailNotVerified>()
+          isA<AuthAccountDeleted>()
               .having((e) => e.statusCode, 'statusCode', 403)
-              .having((e) => e.code, 'code', 'EMAIL_NOT_VERIFIED'),
+              .having((e) => e.code, 'code', 'account_deleted'),
         ),
       );
     });
 
-    test('a 403 without the verification signal stays a server error',
-        () async {
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/sign-in/email',
-        (r) => r.reply(403, {'message': 'Forbidden'}),
-      );
+    test(
+      'a 403 without the verification signal stays a server error',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/sign-in/email',
+          (r) => r.reply(403, {'message': 'Forbidden'}),
+        );
 
-      await expectLater(
-        _client(dio).signIn(email: 'a@b.c', password: 'secret123'),
-        throwsA(
-          isA<AuthServerError>()
-              .having((e) => e.statusCode, 'statusCode', 403),
-        ),
-      );
-    });
+        await expectLater(
+          _client(dio).signIn(email: 'a@b.c', password: 'secret123'),
+          throwsA(
+            isA<AuthServerError>().having(
+              (e) => e.statusCode,
+              'statusCode',
+              403,
+            ),
+          ),
+        );
+      },
+    );
 
-    test('maps a 401 INVALID_EMAIL_OR_PASSWORD sign-in to AuthInvalidCredentials',
-        () async {
-      // Wrong credentials surface as 401 with an explicit code; this is a
-      // credential error ("Incorrect email or password"), not a session
-      // rejection.
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/sign-in/email',
-        (r) => r.reply(401, {
-          'message': 'Invalid email or password',
-          'code': 'INVALID_EMAIL_OR_PASSWORD',
-        }),
-      );
+    test(
+      'maps a 401 INVALID_EMAIL_OR_PASSWORD sign-in to AuthInvalidCredentials',
+      () async {
+        // Wrong credentials surface as 401 with an explicit code; this is a
+        // credential error ("Incorrect email or password"), not a session
+        // rejection.
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/sign-in/email',
+          (r) => r.reply(401, {
+            'message': 'Invalid email or password',
+            'code': 'INVALID_EMAIL_OR_PASSWORD',
+          }),
+        );
 
-      await expectLater(
-        _client(dio).signIn(email: 'a@b.c', password: 'wrong'),
-        throwsA(
-          isA<AuthInvalidCredentials>()
-              .having((e) => e.statusCode, 'statusCode', 401)
-              .having((e) => e.code, 'code', 'INVALID_EMAIL_OR_PASSWORD'),
-        ),
-      );
-    });
+        await expectLater(
+          _client(dio).signIn(email: 'a@b.c', password: 'wrong'),
+          throwsA(
+            isA<AuthInvalidCredentials>()
+                .having((e) => e.statusCode, 'statusCode', 401)
+                .having((e) => e.code, 'code', 'INVALID_EMAIL_OR_PASSWORD'),
+          ),
+        );
+      },
+    );
   });
 
   group('signOut', () {
@@ -444,36 +482,40 @@ void main() {
       expect(body['email'], 'a@b.c');
     });
 
-    test('always succeeds for a 200 status true (even an unknown account)',
-        () async {
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/request-password-reset',
-        (r) => r.reply(200, {
-          'status': true,
-          'message': 'If this email exists in our system, check your email for the reset link',
-        }),
-      );
+    test(
+      'always succeeds for a 200 status true (even an unknown account)',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/request-password-reset',
+          (r) => r.reply(200, {
+            'status': true,
+            'message': 'If this email exists in our system, check your email for the reset link',
+          }),
+        );
 
-      await expectLater(
-        _client(dio).requestPasswordReset(email: 'ghost@example.com'),
-        completes,
-      );
-    });
+        await expectLater(
+          _client(dio).requestPasswordReset(email: 'ghost@example.com'),
+          completes,
+        );
+      },
+    );
 
-    test('throws AuthServerError when the response status is not true',
-        () async {
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/request-password-reset',
-        (r) => r.reply(200, {'status': false}),
-      );
+    test(
+      'throws AuthServerError when the response status is not true',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/request-password-reset',
+          (r) => r.reply(200, {'status': false}),
+        );
 
-      await expectLater(
-        _client(dio).requestPasswordReset(email: 'a@b.c'),
-        throwsA(isA<AuthServerError>()),
-      );
-    });
+        await expectLater(
+          _client(dio).requestPasswordReset(email: 'a@b.c'),
+          throwsA(isA<AuthServerError>()),
+        );
+      },
+    );
 
     test('maps a 422 validation error to AuthInvalidCredentials', () async {
       final (dio, adapter) = makeDio();
@@ -505,30 +547,32 @@ void main() {
       expect(body['email'], 'a@b.c');
     });
 
-    test('maps a 429 RATE_LIMIT_EXCEEDED to AuthRateLimited with the wait',
-        () async {
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/send-verification-email',
-        (r) => r.reply(429, {
-          'message':
-              'Too many verification emails requested for this address. '
-                  'Try again in a minute.',
-          'code': 'RATE_LIMIT_EXCEEDED',
-          'retryAfterSeconds': 60,
-        }),
-      );
+    test(
+      'maps a 429 RATE_LIMIT_EXCEEDED to AuthRateLimited with the wait',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/send-verification-email',
+          (r) => r.reply(429, {
+            'message':
+                'Too many verification emails requested for this address. '
+                'Try again in a minute.',
+            'code': 'RATE_LIMIT_EXCEEDED',
+            'retryAfterSeconds': 60,
+          }),
+        );
 
-      await expectLater(
-        _client(dio).sendVerificationEmail(email: 'a@b.c'),
-        throwsA(
-          isA<AuthRateLimited>()
-              .having((e) => e.statusCode, 'statusCode', 429)
-              .having((e) => e.code, 'code', 'RATE_LIMIT_EXCEEDED')
-              .having((e) => e.retryAfterSeconds, 'retryAfterSeconds', 60),
-        ),
-      );
-    });
+        await expectLater(
+          _client(dio).sendVerificationEmail(email: 'a@b.c'),
+          throwsA(
+            isA<AuthRateLimited>()
+                .having((e) => e.statusCode, 'statusCode', 429)
+                .having((e) => e.code, 'code', 'RATE_LIMIT_EXCEEDED')
+                .having((e) => e.retryAfterSeconds, 'retryAfterSeconds', 60),
+          ),
+        );
+      },
+    );
   });
 
   group('getSession', () {
@@ -721,23 +765,25 @@ void main() {
   });
 
   group('deleteAccount', () {
-    test('posts password with bearer session + Origin and reads success',
-        () async {
-      final adapter = _CaptureAdapter(body: {'success': true});
-      final dio = Dio()..httpClientAdapter = adapter;
+    test(
+      'posts password with bearer session + Origin and reads success',
+      () async {
+        final adapter = _CaptureAdapter(body: {'success': true});
+        final dio = Dio()..httpClientAdapter = adapter;
 
-      await _client(dio)
-          .deleteAccount(sessionToken: 'tok-9', password: 'secret123');
+        await _client(dio)
+            .deleteAccount(sessionToken: 'tok-9', password: 'secret123');
 
-      final req = adapter.requests.single;
-      expect(req.path, '$_base/api/auth/delete-user');
-      expect(req.headers['Authorization'], 'Bearer tok-9');
-      // better-auth 403s a state-changing auth request without an Origin
-      // matching the server origin (MISSING_OR_NULL_ORIGIN).
-      expect(req.headers['Origin'], 'http://192.168.1.5:17600');
-      final body = req.data as Map<String, dynamic>;
-      expect(body['password'], 'secret123');
-    });
+        final req = adapter.requests.single;
+        expect(req.path, '$_base/api/auth/delete-user');
+        expect(req.headers['Authorization'], 'Bearer tok-9');
+        // better-auth 403s a state-changing auth request without an Origin
+        // matching the server origin (MISSING_OR_NULL_ORIGIN).
+        expect(req.headers['Origin'], 'http://192.168.1.5:17600');
+        final body = req.data as Map<String, dynamic>;
+        expect(body['password'], 'secret123');
+      },
+    );
 
     test('maps a 400 INVALID_PASSWORD to AuthInvalidCredentials', () async {
       final (dio, adapter) = makeDio();
@@ -794,26 +840,28 @@ void main() {
       );
     });
 
-    test('maps a 403 MISSING_OR_NULL_ORIGIN to AuthServerError with its code',
-        () async {
-      final (dio, adapter) = makeDio();
-      adapter.onPost(
-        '$_base/api/auth/delete-user',
-        (r) => r.reply(403, {
-          'message': 'Missing or null origin',
-          'code': 'MISSING_OR_NULL_ORIGIN',
-        }),
-      );
+    test(
+      'maps a 403 MISSING_OR_NULL_ORIGIN to AuthServerError with its code',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          '$_base/api/auth/delete-user',
+          (r) => r.reply(403, {
+            'message': 'Missing or null origin',
+            'code': 'MISSING_OR_NULL_ORIGIN',
+          }),
+        );
 
-      await expectLater(
-        _client(dio).deleteAccount(sessionToken: 'tok', password: 'p'),
-        throwsA(
-          isA<AuthServerError>()
-              .having((e) => e.statusCode, 'statusCode', 403)
-              .having((e) => e.code, 'code', 'MISSING_OR_NULL_ORIGIN'),
-        ),
-      );
-    });
+        await expectLater(
+          _client(dio).deleteAccount(sessionToken: 'tok', password: 'p'),
+          throwsA(
+            isA<AuthServerError>()
+                .having((e) => e.statusCode, 'statusCode', 403)
+                .having((e) => e.code, 'code', 'MISSING_OR_NULL_ORIGIN'),
+          ),
+        );
+      },
+    );
 
     test('maps a connection failure to AuthNetworkError', () async {
       final dio = Dio()

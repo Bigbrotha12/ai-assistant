@@ -7,6 +7,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/features/auth/data/account_deleted_handler.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_state.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
@@ -24,7 +26,24 @@ import 'package:ai_assistant/features/vision/data/vision_provider.dart';
 
 import '../../fakes.dart';
 import '../plugins/data/managed_conversation_service_test.dart'
-    show FakeAdapter, FakeScheduler, backgroundTaskJson, jsonResponse, testPoller, waitFor;
+    show
+        FakeAdapter,
+        FakeScheduler,
+        backgroundTaskJson,
+        jsonResponse,
+        testPoller,
+        waitFor;
+
+class _RecordingAccountDeletedHandler extends AccountDeletedHandler {
+  _RecordingAccountDeletedHandler(super.ref);
+
+  int calls = 0;
+
+  @override
+  Future<void> handle(Object? error) async {
+    calls++;
+  }
+}
 
 Conversation _existingConversation({List<Message> messages = const []}) =>
     Conversation(
@@ -91,8 +110,7 @@ class _FakeVisionClient implements VisionClient {
     required String mimeType,
     String prompt = 'Describe this image in detail.',
     CancelToken? cancelToken,
-  }) async =>
-      description;
+  }) async => description;
 }
 
 /// Notifier override that skips the real build (VRAM gate / gateway probe /
@@ -108,25 +126,28 @@ class _FakeVisionNotifier extends VisionClientNotifier {
 
 void main() {
   group('ConversationNotifier managed cutover (P1a)', () {
-    test(
-        'a send admits exactly one user row and sendTurn history excludes the '
+    test('a send admits exactly one user row and sendTurn history excludes the '
         'trailing user message', () async {
-      final store = FakeChatStore(initial: [
-        _existingConversation(messages: const [
-          Message(
-            id: 'u0',
-            role: MessageRole.user,
-            content: 'earlier',
-            createdAt: null,
+      final store = FakeChatStore(
+        initial: [
+          _existingConversation(
+            messages: const [
+              Message(
+                id: 'u0',
+                role: MessageRole.user,
+                content: 'earlier',
+                createdAt: null,
+              ),
+              Message(
+                id: 'a0',
+                role: MessageRole.assistant,
+                content: 'earlier reply',
+                createdAt: null,
+              ),
+            ],
           ),
-          Message(
-            id: 'a0',
-            role: MessageRole.assistant,
-            content: 'earlier reply',
-            createdAt: null,
-          ),
-        ]),
-      ]);
+        ],
+      );
       final client = FakeChatClient(
         results: const [
           ChatResult(content: 'Reply', toolCalls: [], finishReason: 'stop'),
@@ -167,8 +188,7 @@ void main() {
       expect(conv.messages.last.content, 'Reply');
     });
 
-    test(
-        'onContent coalesces into the in-memory placeholder while the turn is '
+    test('onContent coalesces into the in-memory placeholder while the turn is '
         'still streaming', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
@@ -232,8 +252,7 @@ void main() {
       expect(adapter.sends, hasLength(1));
     });
 
-    test(
-        'alreadyCompleted reconciles server history without duplicating the '
+    test('alreadyCompleted reconciles server history without duplicating the '
         'admitted user row', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient();
@@ -253,11 +272,7 @@ void main() {
             createdAt: null,
           ),
         ];
-      final wired = _container(
-        store: store,
-        client: client,
-        adapter: scripted,
-      );
+      final wired = _container(store: store, client: client, adapter: scripted);
       final container = wired.container;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
@@ -287,18 +302,13 @@ void main() {
       expect(conv.messages.last.content, 'Server reply');
     });
 
-    test(
-        'an admission failure surfaces as state.error without throwing and '
+    test('an admission failure surfaces as state.error without throwing and '
         'without admitting a user row', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient();
       final scripted = FakeManagedChatAdapter(store: store, script: client)
         ..admissionError = const ManagedTurnError('network_error');
-      final wired = _container(
-        store: store,
-        client: client,
-        adapter: scripted,
-      );
+      final wired = _container(store: store, client: client, adapter: scripted);
       final container = wired.container;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
@@ -317,8 +327,7 @@ void main() {
       expect(conv!.messages, isEmpty);
     });
 
-    test(
-        'a hanging turn leaves only the user row in the store mid-stream and '
+    test('a hanging turn leaves only the user row in the store mid-stream and '
         'the full pair after completion', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
@@ -378,122 +387,144 @@ void main() {
     );
 
     test(
-        'a completed upload appends [file:] to the SERVICE-minted user row — '
-        'exactly one store row, every user-role update uses the service id',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
-          ChatResult(content: 'Here you go', toolCalls: [], finishReason: 'stop'),
-        ],
-      );
-      final files = FakeFilesClient();
-      final fileStore = FakeFileStore();
-      final wired = _container(
-        store: store,
-        client: client,
-        adapter: FakeManagedChatAdapter(store: store, script: client),
-        filesService: files,
-        fileStore: fileStore,
-      );
-      final container = wired.container;
-      final adapter = wired.adapter;
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+      'a completed upload appends [file:] to the SERVICE-minted user row — '
+      'exactly one store row, every user-role update uses the service id',
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
+            ChatResult(
+              content: 'Here you go',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final files = FakeFilesClient();
+        final fileStore = FakeFileStore();
+        final wired = _container(
+          store: store,
+          client: client,
+          adapter: FakeManagedChatAdapter(store: store, script: client),
+          filesService: files,
+          fileStore: fileStore,
+        );
+        final container = wired.container;
+        final adapter = wired.adapter;
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Check this', attachments: const [
-        attachmentDraft,
-      ]);
-      await _settle();
+        await notifier.sendMessage(
+          'Check this',
+          attachments: const [attachmentDraft],
+        );
+        await _settle();
 
-      final admitted = adapter.lastAdmittedUserMessageId;
-      expect(admitted, isNotNull);
-      final conv = await wired.store.loadConversation('c1');
-      final userRows = conv!.messages
-          .where((m) => m.role == MessageRole.user)
-          .where((m) => m.content.startsWith('Check this'))
-          .toList();
-      expect(userRows, hasLength(1),
-          reason: 'the optimistic in-memory UUID must never insert a second '
-              'user row — the ref lands on the service-admitted row');
-      final row = userRows.single;
-      expect(row.id, admitted);
-      expect(row.content, 'Check this [file:server-1]');
+        final admitted = adapter.lastAdmittedUserMessageId;
+        expect(admitted, isNotNull);
+        final conv = await wired.store.loadConversation('c1');
+        final userRows = conv!.messages
+            .where((m) => m.role == MessageRole.user)
+            .where((m) => m.content.startsWith('Check this'))
+            .toList();
+        expect(
+          userRows,
+          hasLength(1),
+          reason:
+              'the optimistic in-memory UUID must never insert a second '
+              'user row — the ref lands on the service-admitted row',
+        );
+        final row = userRows.single;
+        expect(row.id, admitted);
+        expect(row.content, 'Check this [file:server-1]');
 
-      // Every user-role store write went through the service id (the
-      // optimistic id is never persisted).
-      final userUpdates = wired.store.updatedMessages
-          .where((m) => m.role == MessageRole.user)
-          .toList();
-      expect(userUpdates, isNotEmpty,
-          reason: 'the completed upload persists the [file:] ref');
-      for (final m in userUpdates) {
-        expect(m.id, admitted);
-      }
-      expect(fileStore.saved, hasLength(1));
-      expect(fileStore.saved.single.id, 'server-1');
-    });
-
-    test(
-        'a post-admission dispatch failure still uploads onto the admitted '
-        'row — no optimistic-id duplicate, error surfaces without throwing',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient()
-        ..error = const PluginClientException('network_error');
-      final files = FakeFilesClient();
-      final fileStore = FakeFileStore();
-      final wired = _container(
-        store: store,
-        client: client,
-        adapter: FakeManagedChatAdapter(store: store, script: client),
-        filesService: files,
-        fileStore: fileStore,
-      );
-      final container = wired.container;
-      final adapter = wired.adapter;
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
-
-      // A *chat* error does not throw out of sendMessage: the message was
-      // persisted, so attachments still enqueue (retained-selection retry
-      // contract is about unexpected throws only).
-      await notifier.sendMessage('Hi there', attachments: const [
-        attachmentDraft,
-      ]);
-      await _settle();
-
-      final state = container.read(conversationProvider('c1')).value!;
-      expect(state.isStreaming, isFalse);
-      expect(state.error, anyOf(networkErrorPhrases));
-
-      final admitted = adapter.lastAdmittedUserMessageId;
-      expect(admitted, isNotNull,
-          reason: 'the failed dispatch was post-admission');
-      final conv = await wired.store.loadConversation('c1');
-      final userRows = conv!.messages
-          .where((m) => m.role == MessageRole.user)
-          .where((m) => m.content.startsWith('Hi there'))
-          .toList();
-      expect(userRows, hasLength(1),
-          reason: 'updateMessage(optimisticId) would insert a duplicate — '
-              'the catch-path adoption must re-key first');
-      expect(userRows.single.id, admitted);
-      expect(userRows.single.content, 'Hi there [file:server-1]');
-      expect(
-        state.messages.where((m) => m.role == MessageRole.user),
-        hasLength(1),
-      );
-      for (final m in wired.store.updatedMessages
-          .where((m) => m.role == MessageRole.user)) {
-        expect(m.id, admitted);
-      }
-    });
+        // Every user-role store write went through the service id (the
+        // optimistic id is never persisted).
+        final userUpdates = wired.store.updatedMessages
+            .where((m) => m.role == MessageRole.user)
+            .toList();
+        expect(
+          userUpdates,
+          isNotEmpty,
+          reason: 'the completed upload persists the [file:] ref',
+        );
+        for (final m in userUpdates) {
+          expect(m.id, admitted);
+        }
+        expect(fileStore.saved, hasLength(1));
+        expect(fileStore.saved.single.id, 'server-1');
+      },
+    );
 
     test(
-        'a PRE-admission rejection (pending_turn_exists) does not enqueue '
+      'a post-admission dispatch failure still uploads onto the admitted '
+      'row — no optimistic-id duplicate, error surfaces without throwing',
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient()
+          ..error = const PluginClientException('network_error');
+        final files = FakeFilesClient();
+        final fileStore = FakeFileStore();
+        final wired = _container(
+          store: store,
+          client: client,
+          adapter: FakeManagedChatAdapter(store: store, script: client),
+          filesService: files,
+          fileStore: fileStore,
+        );
+        final container = wired.container;
+        final adapter = wired.adapter;
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
+
+        // A *chat* error does not throw out of sendMessage: the message was
+        // persisted, so attachments still enqueue (retained-selection retry
+        // contract is about unexpected throws only).
+        await notifier.sendMessage(
+          'Hi there',
+          attachments: const [attachmentDraft],
+        );
+        await _settle();
+
+        final state = container.read(conversationProvider('c1')).value!;
+        expect(state.isStreaming, isFalse);
+        expect(state.error, anyOf(networkErrorPhrases));
+
+        final admitted = adapter.lastAdmittedUserMessageId;
+        expect(
+          admitted,
+          isNotNull,
+          reason: 'the failed dispatch was post-admission',
+        );
+        final conv = await wired.store.loadConversation('c1');
+        final userRows = conv!.messages
+            .where((m) => m.role == MessageRole.user)
+            .where((m) => m.content.startsWith('Hi there'))
+            .toList();
+        expect(
+          userRows,
+          hasLength(1),
+          reason:
+              'updateMessage(optimisticId) would insert a duplicate — '
+              'the catch-path adoption must re-key first',
+        );
+        expect(userRows.single.id, admitted);
+        expect(userRows.single.content, 'Hi there [file:server-1]');
+        expect(
+          state.messages.where((m) => m.role == MessageRole.user),
+          hasLength(1),
+        );
+        for (final m in wired.store.updatedMessages.where(
+          (m) => m.role == MessageRole.user,
+        )) {
+          expect(m.id, admitted);
+        }
+      },
+    );
+
+    test('a PRE-admission rejection (pending_turn_exists) does not enqueue '
         'attachments — the optimistic-id fallback would insert a phantom '
         'duplicate user row', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
@@ -513,27 +544,32 @@ void main() {
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Hi there', attachments: const [
-        attachmentDraft,
-      ]);
+      await notifier.sendMessage(
+        'Hi there',
+        attachments: const [attachmentDraft],
+      );
       await _settle();
 
-      expect(files.uploadCalls, isEmpty,
-          reason: 'admission never ran — an upload keyed to the optimistic id '
-              'would insertOnConflictUpdate a phantom user row');
+      expect(
+        files.uploadCalls,
+        isEmpty,
+        reason:
+            'admission never ran — an upload keyed to the optimistic id '
+            'would insertOnConflictUpdate a phantom user row',
+      );
       final conv = await wired.store.loadConversation('c1');
       expect(
         conv!.messages.where(
           (m) => m.role == MessageRole.user && m.content.startsWith('Hi there'),
         ),
         isEmpty,
-        reason: 'no phantom user row may land in the store');
+        reason: 'no phantom user row may land in the store',
+      );
       final state = container.read(conversationProvider('c1')).value!;
       expect(state.error, isNotNull);
     });
 
-    test(
-        'vision descriptions are injected into the admitted text BEFORE '
+    test('vision descriptions are injected into the admitted text BEFORE '
         'dispatch (describe-before-send) and no post-send user-role '
         'updateMessage is written', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
@@ -575,14 +611,17 @@ void main() {
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Look at this', attachments: [
-        AttachmentDraft(
-          path: image.path,
-          filename: 'photo.png',
-          sizeBytes: 3,
-          mimeType: 'image/png',
-        ),
-      ]);
+      await notifier.sendMessage(
+        'Look at this',
+        attachments: [
+          AttachmentDraft(
+            path: image.path,
+            filename: 'photo.png',
+            sizeBytes: 3,
+            mimeType: 'image/png',
+          ),
+        ],
+      );
 
       // Describe ran BEFORE sendTurn: the admitted userText is expanded.
       expect(adapter.sends, hasLength(1));
@@ -603,10 +642,15 @@ void main() {
       expect(
         wired.store.updatedMessages.where((m) => m.role == MessageRole.user),
         isEmpty,
-        reason: 'descriptions live in the in-memory text that admission '
-            'persists as userText — no post-send user updateMessage');
-      expect(files.uploadCalls, hasLength(1),
-          reason: 'attachments still enqueue after the turn');
+        reason:
+            'descriptions live in the in-memory text that admission '
+            'persists as userText — no post-send user updateMessage',
+      );
+      expect(
+        files.uploadCalls,
+        hasLength(1),
+        reason: 'attachments still enqueue after the turn',
+      );
     });
   });
 
@@ -616,8 +660,7 @@ void main() {
       ownerId: 'owner-a',
     )!;
 
-    test(
-        'submitBackgroundJob marks a pending chip; the poll-completed reply '
+    test('submitBackgroundJob marks a pending chip; the poll-completed reply '
         'auto-renders via the store watch without a manual reload', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient();
@@ -683,8 +726,57 @@ void main() {
       expect(state.messages, hasLength(2));
     });
 
-    test(
-        'retryBackgroundJob replays the pending job; cancelBackgroundJob '
+    test('a terminal account_deleted poll error clears the chip and triggers '
+        'the terminal handler', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient();
+      final clock = FakeScheduler();
+      final ledgerAdapter = FakeAdapter((request) {
+        if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+          return jsonResponse({'error': 'account_deleted'}, status: 403);
+        }
+        throw StateError('unexpected ledger path ${request.uri.path}');
+      });
+      final poller = testPoller(scope, ledgerAdapter, clock);
+      addTearDown(poller.dispose);
+      late _RecordingAccountDeletedHandler terminalHandler;
+      final fake = FakeManagedChatAdapter(
+        store: store,
+        script: client,
+        poller: poller,
+      );
+      final wired = _container(
+        store: store,
+        client: client,
+        adapter: fake,
+        extraOverrides: [
+          accountDeletedHandlerProvider.overrideWith((ref) {
+            terminalHandler = _RecordingAccountDeletedHandler(ref);
+            return terminalHandler;
+          }),
+        ],
+      );
+      final container = wired.container;
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.submitBackgroundJob('Hi');
+      poller.setForeground(true);
+      await clock.advance(Duration.zero);
+      await waitFor(() async {
+        final state = container.read(conversationProvider('c1')).value;
+        return state != null && !state.hasPendingJob;
+      });
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.error, accountDeletedNotice);
+      expect(state.authRequired, isFalse);
+      expect(state.jobError, isNull);
+      expect(terminalHandler.calls, 1);
+    });
+
+    test('retryBackgroundJob replays the pending job; cancelBackgroundJob '
         'clears the chip and the pending row', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient();
@@ -692,11 +784,13 @@ void main() {
       final ledgerAdapter = FakeAdapter((request) {
         if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
           final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-          return jsonResponse(backgroundTaskJson(
-            status: 'queued',
-            messageId: byKey,
-            taskId: 'task-1',
-          ));
+          return jsonResponse(
+            backgroundTaskJson(
+              status: 'queued',
+              messageId: byKey,
+              taskId: 'task-1',
+            ),
+          );
         }
         throw StateError('unexpected ledger path ${request.uri.path}');
       });
@@ -738,8 +832,7 @@ void main() {
       expect(state.jobError, isNull);
     });
 
-    test(
-        'a text send while a background job is pending does NOT abandon the '
+    test('a text send while a background job is pending does NOT abandon the '
         'job — the chip stays, the reply still appends on completion', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient();
@@ -789,8 +882,11 @@ void main() {
       // recorded), the chip stays, and the error tells the user to wait rather
       // than claiming the reply was stopped.
       await notifier.sendMessage('interrupt text');
-      expect(fake.abandons, isEmpty,
-          reason: 'abandoning would clear the running job and lose its reply');
+      expect(
+        fake.abandons,
+        isEmpty,
+        reason: 'abandoning would clear the running job and lose its reply',
+      );
       var state = container.read(conversationProvider('c1')).value!;
       expect(state.hasPendingJob, isTrue);
       expect(
@@ -818,8 +914,7 @@ void main() {
       expect(state.messages.last.content, 'bg reply');
     });
 
-    test(
-        'a background submit rejected with pending_turn_exists keeps the chip '
+    test('a background submit rejected with pending_turn_exists keeps the chip '
         '(a job is genuinely pending) and drops the never-admitted optimistic '
         'row', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
@@ -829,11 +924,15 @@ void main() {
         script: client,
         poller: testPoller(
           scope,
-          FakeAdapter((request) => jsonResponse(backgroundTaskJson(
+          FakeAdapter(
+            (request) => jsonResponse(
+              backgroundTaskJson(
                 status: 'queued',
                 messageId: 'job-1',
                 taskId: 'task-1',
-              ))),
+              ),
+            ),
+          ),
           FakeScheduler(),
         ),
       );

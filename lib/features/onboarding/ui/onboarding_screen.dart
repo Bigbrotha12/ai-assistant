@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/auth_client.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../../core/backend_settings.dart';
@@ -36,7 +37,9 @@ import '../../voice/ui/voice_settings_providers.dart';
 /// The gate mounts `const OnboardingScreen()` with no arguments; this widget
 /// keeps that exact contract.
 class OnboardingScreen extends ConsumerStatefulWidget {
-  const OnboardingScreen({super.key});
+  const OnboardingScreen({super.key, this.accountDeleted = false});
+
+  final bool accountDeleted;
 
   @override
   ConsumerState<OnboardingScreen> createState() => _OnboardingScreenState();
@@ -156,9 +159,9 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
 
   /// True when the "Next" button for [index] may advance.
   bool _canContinue(int index) => switch (index) {
-        0 => _accountReady,
-        _ => true,
-      };
+    0 => _accountReady,
+    _ => true,
+  };
 
   // -------------------------------------------------------------------------
   // Account (via the shared AuthFlow)
@@ -171,16 +174,72 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     });
   }
 
+  Widget _buildDeletedAccountStep() {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Card(
+      key: const Key('account-deleted-notice'),
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(Icons.person_off_outlined, color: scheme.onErrorContainer),
+            const SizedBox(height: 12),
+            Text(
+              accountDeletedNotice,
+              style: theme.textTheme.titleMedium?.copyWith(
+                color: scheme.onErrorContainer,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'This account can no longer be used. Start a new account to '
+              'continue.',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: scheme.onErrorContainer,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _startNewAccount() async {
+    final terminalState = ref.read(accountDeletedProvider.notifier);
+    await terminalState.resetForNewAccount();
+    if (!mounted) return;
+    try {
+      await ref
+          .read(authCredentialsProvider.notifier)
+          .clear(preserveAccountDeleted: true);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not clear the deleted account. Try again.'),
+          ),
+        );
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _currentStep = 0);
+  }
+
   Widget _buildAccountStep() {
+    if (widget.accountDeleted) return _buildDeletedAccountStep();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
           'The app talks to your gateway with a per-user API key. '
           'Sign in to an existing account or create one.',
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+          style: Theme.of(context).textTheme.bodyMedium
+              ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
         ),
         const SizedBox(height: 16),
         AuthFlow(onSuccess: _onAuthSuccess),
@@ -367,8 +426,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // -------------------------------------------------------------------------
 
   String get _modelsSummary {
-    final stt = ref
-            .read(voiceEngineStatusProvider)[EngineConfig.whisperTinyId] ??
+    final stt =
+        ref.read(voiceEngineStatusProvider)[EngineConfig.whisperTinyId] ??
         VoiceEngineStatus.notStarted;
     final sttLabel = switch (stt) {
       VoiceEngineStatus.ready => 'ready',
@@ -397,19 +456,22 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
           .read(voiceSettingsProvider.notifier)
           .save(current.copyWith(preferredLanguage: _language));
       // 2) Prefs: date format + onboarding complete.
-      await ref.read(appPrefsProvider.notifier).save(AppPrefs(
-            dateFormat: _dateFormat,
-            onboardingComplete: true,
-          ));
+      await ref
+          .read(appPrefsProvider.notifier)
+          .save(AppPrefs(dateFormat: _dateFormat, onboardingComplete: true));
       // 3) Backend settings LAST — only this flips the gate to "configured".
       //    The host and environment are derived from compile-time defaults
       //    (--dart-define HOST_FQDN / PUBLIC_BACKEND_URL); the onboarding
       //    flow no longer collects them interactively, so only the build-time
       //    defaults are persisted (mcpSecret/filesSecret/storageUrl are not).
-      await ref.read(settingsProvider.notifier).save(BackendSettings(
-            host: BackendConfig.defaultHost,
-            environment: BackendConfig.defaultEnvironment,
-          ));
+      await ref
+          .read(settingsProvider.notifier)
+          .save(
+            BackendSettings(
+              host: BackendConfig.defaultHost,
+              environment: BackendConfig.defaultEnvironment,
+            ),
+          );
       if (mounted) setState(() => _saving = false);
     } catch (e) {
       // Never wipe credentials, never leave onboarding: surface the failure
@@ -471,17 +533,25 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // Stepper assembly
   // -------------------------------------------------------------------------
 
-  StepState _stepState(int index) =>
-      index < _currentStep ? StepState.complete : StepState.indexed;
+  StepState _stepState(int index, int currentStep) =>
+      index < currentStep ? StepState.complete : StepState.indexed;
 
   Widget _controlsBuilder(
     BuildContext context,
     ControlsDetails details,
     int stepCount,
   ) {
+    if (widget.accountDeleted) {
+      if (details.stepIndex != 0) return const SizedBox.shrink();
+      return FilledButton.icon(
+        key: const Key('account-deleted-new-account'),
+        onPressed: _startNewAccount,
+        icon: const Icon(Icons.person_add_alt_1),
+        label: const Text('Create a new account'),
+      );
+    }
     final isLast = details.stepIndex == stepCount - 1;
-    final canContinue =
-        isLast ? !_saving : _canContinue(details.stepIndex);
+    final canContinue = isLast ? !_saving : _canContinue(details.stepIndex);
     return Row(
       children: [
         FilledButton(
@@ -504,33 +574,38 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     ref.listen(appPrefsProvider, _onPrefsChanged);
     ref.listen(voiceSettingsProvider, _onVoiceSettingsChanged);
 
+    final currentStep = widget.accountDeleted ? 0 : _currentStep;
     final steps = <Step>[
       Step(
-        title: const Text('Account'),
-        subtitle: const Text('Sign in or create your account'),
+        title: Text(widget.accountDeleted ? 'Account deleted' : 'Account'),
+        subtitle: Text(
+          widget.accountDeleted
+              ? 'This account is no longer available'
+              : 'Sign in or create your account',
+        ),
         isActive: _currentStep >= 0,
-        state: _stepState(0),
+        state: _stepState(0, currentStep),
         content: _buildAccountStep(),
       ),
       Step(
         title: const Text('Language & region'),
         subtitle: const Text('Preferred language and date format'),
         isActive: _currentStep >= 1,
-        state: _stepState(1),
+        state: _stepState(1, currentStep),
         content: _buildRegionStep(),
       ),
       Step(
         title: const Text('Voice & models'),
         subtitle: const Text('On-device model download'),
         isActive: _currentStep >= 2,
-        state: _stepState(2),
+        state: _stepState(2, currentStep),
         content: _buildVoiceStep(),
       ),
       Step(
         title: const Text('Finish'),
         subtitle: const Text('Review and get started'),
         isActive: _currentStep >= 3,
-        state: _stepState(3),
+        state: _stepState(3, currentStep),
         content: _buildFinishStep(),
       ),
     ];
@@ -540,7 +615,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       body: SafeArea(
         child: Stepper(
           type: StepperType.vertical,
-          currentStep: _currentStep,
+          currentStep: currentStep,
           onStepContinue: _onStepContinue,
           onStepCancel: _onStepCancel,
           controlsBuilder: (context, details) =>
@@ -576,38 +651,39 @@ class _ModelRow extends StatelessWidget {
     final needsAction =
         status == VoiceEngineStatus.failed ||
         status == VoiceEngineStatus.notStarted;
-    final actionLabel =
-        status == VoiceEngineStatus.failed ? 'Retry' : 'Download';
+    final actionLabel = status == VoiceEngineStatus.failed
+        ? 'Retry'
+        : 'Download';
     final percent = progress?.percent;
 
     final (icon, color, subtitle) = switch (status) {
       VoiceEngineStatus.ready => (
-          Icons.check_circle,
-          Colors.green.shade600,
-          'ready',
-        ),
+        Icons.check_circle,
+        Colors.green.shade600,
+        'ready',
+      ),
       VoiceEngineStatus.downloading => (
-          Icons.downloading,
-          scheme.primary,
-          percent == null
-              ? 'downloading…'
-              : 'downloading ${(percent * 100).round()}%',
-        ),
+        Icons.downloading,
+        scheme.primary,
+        percent == null
+            ? 'downloading…'
+            : 'downloading ${(percent * 100).round()}%',
+      ),
       VoiceEngineStatus.failed => (
-          Icons.error_outline,
-          scheme.error,
-          'download failed',
-        ),
+        Icons.error_outline,
+        scheme.error,
+        'download failed',
+      ),
       VoiceEngineStatus.notStarted => (
-          Icons.download_outlined,
-          scheme.onSurfaceVariant,
-          size == null ? 'not downloaded' : 'not downloaded · $size',
-        ),
+        Icons.download_outlined,
+        scheme.onSurfaceVariant,
+        size == null ? 'not downloaded' : 'not downloaded · $size',
+      ),
       VoiceEngineStatus.unavailable => (
-          Icons.block,
-          scheme.onSurfaceVariant,
-          'unavailable',
-        ),
+        Icons.block,
+        scheme.onSurfaceVariant,
+        'unavailable',
+      ),
     };
 
     return Container(
@@ -645,10 +721,7 @@ class _ModelRow extends StatelessWidget {
               ),
             ),
           ] else if (needsAction) ...[
-            TextButton(
-              onPressed: onAction,
-              child: Text(actionLabel),
-            ),
+            TextButton(onPressed: onAction, child: Text(actionLabel)),
           ],
         ],
       ),
@@ -680,9 +753,7 @@ class _SummaryRow extends StatelessWidget {
               ),
             ),
           ),
-          Expanded(
-            child: Text(value, style: theme.textTheme.bodyMedium),
-          ),
+          Expanded(child: Text(value, style: theme.textTheme.bodyMedium)),
         ],
       ),
     );

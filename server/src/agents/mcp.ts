@@ -16,6 +16,7 @@ import {
   validateStaticUrl,
 } from "../plugins/ssrf.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
+import { redactForOutbound } from "../redact.ts";
 import type { JsonSchema } from "../plugins/types.ts";
 
 export type McpServerConfig = {
@@ -413,7 +414,7 @@ export async function bindMcpServers(
               const client = await getClient();
               const result = await client.callTool({ name: tool.name, arguments: args });
               const content = result.content ?? [];
-              return content.map((c) => c.text ?? "").join("\n");
+              return redactForOutbound(content.map((c) => c.text ?? "").join("\n"));
             },
           }),
         );

@@ -1,12 +1,16 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../auth/data/account_deleted_handler.dart';
+import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/auth_client_provider.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/data/auth_credentials_store.dart';
 import '../../settings/data/settings_providers.dart';
+import '../../chat/data/chat_client.dart';
 import 'agent_config.dart';
 import 'plugin_catalog_providers.dart';
 import 'plugin_credentials_store.dart';
+import 'plugin_http.dart';
 
 final pluginCredentialsStoreProvider = Provider<PluginCredentialsStore>(
   (ref) => PluginCredentialsStore(),
@@ -50,26 +54,31 @@ class PluginCredentialsEpoch extends Notifier<int> {
 
 final pluginCredentialsProvider =
     FutureProvider.autoDispose<PluginAccountConfiguration>((ref) async {
-  ref.watch(pluginCredentialsEpochProvider);
-  final scope = ref.watch(pluginAccountScopeProvider);
-  final store = ref.watch(pluginCredentialsStoreProvider);
-  var config = await store.load(scope);
-  if (config.plugins.isEmpty ||
-      store.hasFallbackAgent(config) ||
-      store.needsDefaultAgent(config)) {
-    await store.ensureDefaultAgent(
-      scope,
-      templateId: await _firstAgentTemplateId(ref),
-    );
-    config = await store.load(scope);
-  }
-  return config;
-});
+      ref.watch(pluginCredentialsEpochProvider);
+      final scope = ref.watch(pluginAccountScopeProvider);
+      final store = ref.watch(pluginCredentialsStoreProvider);
+      var config = await store.load(scope);
+      if (config.plugins.isEmpty ||
+          store.hasFallbackAgent(config) ||
+          store.needsDefaultAgent(config)) {
+        await store.ensureDefaultAgent(
+          scope,
+          templateId: await _firstAgentTemplateId(ref),
+        );
+        config = await store.load(scope);
+      }
+      return config;
+    });
 
 Future<String?> _firstAgentTemplateId(Ref ref) async {
+  AuthCredentials? auth;
+  AuthAccountScope? scope;
+  int? epoch;
   try {
-    final auth = ref.read(authCredentialsProvider).value;
+    auth = ref.read(authCredentialsProvider).value;
     if (auth == null) return null;
+    scope = auth.accountScope;
+    epoch = ref.read(pluginCredentialsEpochProvider);
     final client = ref.read(pluginRegistryClientProvider);
     final templates = await client
         .fetchAgentTemplates(gatewayKey: auth.apiKey)
@@ -77,6 +86,26 @@ Future<String?> _firstAgentTemplateId(Ref ref) async {
     if (templates.isEmpty) return null;
     final id = templates.first['id'];
     return id is String && id.trim().isNotEmpty ? id : null;
+  } on PluginClientException catch (error) {
+    if (isAccountDeletedError(error)) {
+      try {
+        await ref.read(accountDeletedHandlerProvider).handle(error);
+      } catch (_) {
+        if (ref.read(accountDeletedProvider)) {
+          throw const PluginReauthenticationRequired();
+        }
+        rethrow;
+      }
+      final current = ref.read(authCredentialsProvider).value;
+      if (ref.read(accountDeletedProvider) ||
+          !ref.mounted ||
+          current != auth ||
+          current?.accountScope != scope ||
+          ref.read(pluginCredentialsEpochProvider) != epoch) {
+        throw const PluginReauthenticationRequired();
+      }
+    }
+    return null;
   } catch (_) {
     return null;
   }

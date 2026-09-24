@@ -140,6 +140,45 @@ describe("task lifecycle: create -> append -> transitions", () => {
   });
 });
 
+describe("ledger step redaction", () => {
+  test("redacts assistant/tool result text while preserving structured step metadata", () => {
+    const { ledger } = makeLedger();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "step-redaction", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    const tool = ledger.appendStep(
+      task.id,
+      "user-1",
+      {
+        stage: "tool",
+        action: "tool:lookup",
+        result: `{"token":"sk-or-v1-${"a".repeat(32)}"}`,
+        toolCallId: "call-1",
+      },
+      claimed.fence_token,
+    ).step;
+    const reply = ledger.appendStep(
+      task.id,
+      "user-1",
+      {
+        stage: "reply",
+        action: "assistant_message",
+        result: `sk-ant-api03-${"b".repeat(32)}`,
+      },
+      claimed.fence_token,
+    ).step;
+
+    assert.equal(tool.stage, "tool");
+    assert.equal(tool.action, "tool:lookup");
+    assert.equal(tool.tool_call_id, "call-1");
+    assert.equal(tool.result, `{"token": "***"}`);
+    assert.equal(reply.stage, "reply");
+    assert.equal(reply.action, "assistant_message");
+    assert.equal(reply.result, "sk-ant-api03-***");
+    assert.equal(ledger.getTask(task.id)?.status, "running");
+    assert.equal(ledger.verifyChain(task.id), true);
+  });
+});
+
 describe("heartbeat + lease + stuck ordering", () => {
   test("stuck-timeout fires before lease-expiry for a dead worker", () => {
     let now = 1_000_000;

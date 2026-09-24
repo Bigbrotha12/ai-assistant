@@ -8,6 +8,11 @@ import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/app/global_messenger.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_handler.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_state.dart';
+import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
+import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
+import 'package:ai_assistant/features/attachments/data/file_cache.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
@@ -18,6 +23,7 @@ import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show networkErrorPhrases, pendingErrorPhrases;
 import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
+import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:ai_assistant/features/vision/data/vision_client.dart';
@@ -87,6 +93,17 @@ _containerWithAdapter({
 Future<void> _settle() async {
   await Future<void>.delayed(Duration.zero);
   await Future<void>.delayed(Duration.zero);
+}
+
+class _RecordingAccountDeletedHandler extends AccountDeletedHandler {
+  _RecordingAccountDeletedHandler(super.ref);
+
+  int calls = 0;
+
+  @override
+  Future<void> handle(Object? error) async {
+    calls++;
+  }
 }
 
 Conversation _existingConversation({List<Message> messages = const []}) =>
@@ -170,18 +187,18 @@ void main() {
         initial: [
           _existingConversation(
             messages: [
-          const Message(
-            id: 'u1',
-            role: MessageRole.user,
-            content: 'hello',
-            createdAt: null,
-          ),
-          const Message(
-            id: 'a1',
-            role: MessageRole.assistant,
-            content: 'hi there',
-            createdAt: null,
-          ),
+              const Message(
+                id: 'u1',
+                role: MessageRole.user,
+                content: 'hello',
+                createdAt: null,
+              ),
+              const Message(
+                id: 'a1',
+                role: MessageRole.assistant,
+                content: 'hi there',
+                createdAt: null,
+              ),
             ],
           ),
         ],
@@ -200,39 +217,39 @@ void main() {
 
     test(
       'sendMessage streams content, persists, and toggles isStreaming',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
             ChatResult(
               content: 'Hello there',
               toolCalls: [],
               finishReason: 'stop',
             ),
-        ],
-        streamDeltas: const [
-          ['Hello', ' there'],
-        ],
-      );
-      final container = _container(store: store, client: client);
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+          ],
+          streamDeltas: const [
+            ['Hello', ' there'],
+          ],
+        );
+        final container = _container(store: store, client: client);
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Hi');
+        await notifier.sendMessage('Hi');
 
-      final state = container.read(conversationProvider('c1')).value!;
-      expect(state.isStreaming, isFalse);
-      expect(state.error, isNull);
-      expect(state.pendingUserMessageId, isNull);
-      expect(state.messages, hasLength(2));
-      expect(state.messages[0].content, 'Hi');
-      expect(state.messages.last.content, 'Hello there');
+        final state = container.read(conversationProvider('c1')).value!;
+        expect(state.isStreaming, isFalse);
+        expect(state.error, isNull);
+        expect(state.pendingUserMessageId, isNull);
+        expect(state.messages, hasLength(2));
+        expect(state.messages[0].content, 'Hi');
+        expect(state.messages.last.content, 'Hello there');
 
-      final persisted = await store.loadConversation('c1');
-      expect(persisted!.messages, hasLength(2));
-      expect(persisted.messages.last.content, 'Hello there');
-      expect(client.lastSystemPrompt, isNull);
+        final persisted = await store.loadConversation('c1');
+        expect(persisted!.messages, hasLength(2));
+        expect(persisted.messages.last.content, 'Hello there');
+        expect(client.lastSystemPrompt, isNull);
       },
     );
 
@@ -661,20 +678,25 @@ void main() {
       expect(state.failedMessageId, isNotNull);
     });
 
-    test(
-      'a PluginReauthenticationRequired from an unavailable scope surfaces '
-        'the re-auth card (authRequired), never an unexpected-error banner',
-        () async {
+    test('account_deleted enters the terminal path and never shows re-auth or a generic error', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient();
-      final adapter = FakeManagedChatAdapter(store: store, script: client)
-        ..admissionError = const PluginReauthenticationRequired();
-      final wired = _containerWithAdapter(
+      final client = FakeChatClient(
+        error: const PluginClientException(
+          ManagedErrorCodes.accountDeleted,
+          statusCode: 403,
+        ),
+      );
+      late _RecordingAccountDeletedHandler terminalHandler;
+      final container = _container(
         store: store,
         client: client,
-        adapter: adapter,
+        extraOverrides: [
+          accountDeletedHandlerProvider.overrideWith((ref) {
+            terminalHandler = _RecordingAccountDeletedHandler(ref);
+            return terminalHandler;
+          }),
+        ],
       );
-      final container = wired.container;
       _keepAlive(container, 'c1');
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
@@ -683,9 +705,37 @@ void main() {
 
       final state = container.read(conversationProvider('c1')).value!;
       expect(state.isStreaming, isFalse);
-      expect(state.authRequired, isTrue);
-      expect(state.error, isNull);
-      expect(state.failedMessageId, isNotNull);
+      expect(state.authRequired, isFalse);
+      expect(state.error, accountDeletedNotice);
+      expect(state.failedMessageId, isNull);
+      expect(terminalHandler.calls, 1);
+    });
+
+    test(
+      'a PluginReauthenticationRequired from an unavailable scope surfaces '
+      'the re-auth card (authRequired), never an unexpected-error banner',
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient();
+        final adapter = FakeManagedChatAdapter(store: store, script: client)
+          ..admissionError = const PluginReauthenticationRequired();
+        final wired = _containerWithAdapter(
+          store: store,
+          client: client,
+          adapter: adapter,
+        );
+        final container = wired.container;
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
+
+        await notifier.sendMessage('Hi');
+
+        final state = container.read(conversationProvider('c1')).value!;
+        expect(state.isStreaming, isFalse);
+        expect(state.authRequired, isTrue);
+        expect(state.error, isNull);
+        expect(state.failedMessageId, isNotNull);
       },
     );
 
@@ -767,41 +817,41 @@ void main() {
 
     test(
       'stop suppresses a cancellation error and keeps flushed partial',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
             ChatResult(
               content: 'partial ',
               toolCalls: [],
               finishReason: 'stop',
             ),
-        ],
-        streamDeltas: const [
-          ['partial '],
-        ],
-      );
-      final hang = Completer<ChatResult>();
-      client.hang = hang;
-      final container = _container(store: store, client: client);
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+          ],
+          streamDeltas: const [
+            ['partial '],
+          ],
+        );
+        final hang = Completer<ChatResult>();
+        client.hang = hang;
+        final container = _container(store: store, client: client);
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
-      final send = notifier.sendMessage('Hi');
-      // Let the coalescing throttle flush the streamed partial into state.
-      await Future<void>.delayed(const Duration(milliseconds: 120));
+        final send = notifier.sendMessage('Hi');
+        // Let the coalescing throttle flush the streamed partial into state.
+        await Future<void>.delayed(const Duration(milliseconds: 120));
 
-      await notifier.stop();
-      // The cancellation surfaces as a ChatNetworkError afterwards.
-      hang.completeError(const ChatNetworkError('cancelled'));
-      await send;
+        await notifier.stop();
+        // The cancellation surfaces as a ChatNetworkError afterwards.
+        hang.completeError(const ChatNetworkError('cancelled'));
+        await send;
 
-      final state = container.read(conversationProvider('c1')).value!;
-      expect(state.isStreaming, isFalse);
-      expect(state.error, isNull);
-      expect(state.failedMessageId, isNull);
-      expect(state.messages.last.content, 'partial ');
+        final state = container.read(conversationProvider('c1')).value!;
+        expect(state.isStreaming, isFalse);
+        expect(state.error, isNull);
+        expect(state.failedMessageId, isNull);
+        expect(state.messages.last.content, 'partial ');
       },
     );
 
@@ -919,124 +969,219 @@ void main() {
 
     test(
       'sendMessage enqueues attachments after the turn and tracks progress',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
             ChatResult(
               content: 'Here you go',
               toolCalls: [],
               finishReason: 'stop',
             ),
-        ],
-      );
-      final upload = Completer<FileInfo>();
-      final files = FakeFilesClient(uploadCompleter: upload);
-      final fileStore = FakeFileStore();
-      final container = _container(
-        store: store,
-        client: client,
-        filesService: files,
-        fileStore: fileStore,
-      );
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+          ],
+        );
+        final upload = Completer<FileInfo>();
+        final files = FakeFilesClient(uploadCompleter: upload);
+        final fileStore = FakeFileStore();
+        final container = _container(
+          store: store,
+          client: client,
+          filesService: files,
+          fileStore: fileStore,
+        );
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
         await notifier.sendMessage(
           'Check this',
           attachments: const [
-        AttachmentDraft(
-          path: '/tmp/a.jpg',
-          filename: 'a.jpg',
-          sizeBytes: 100,
-          mimeType: 'image/jpeg',
-        ),
+            AttachmentDraft(
+              path: '/tmp/a.jpg',
+              filename: 'a.jpg',
+              sizeBytes: 100,
+              mimeType: 'image/jpeg',
+            ),
           ],
         );
 
-      // The turn completed before the upload resolved.
-      var state = container.read(conversationProvider('c1')).value!;
-      expect(state.isStreaming, isFalse);
-      expect(state.messages.last.content, 'Here you go');
-      expect(files.uploadCalls, hasLength(1));
-      expect(files.uploadCalls.single.path, '/tmp/a.jpg');
+        // The turn completed before the upload resolved.
+        var state = container.read(conversationProvider('c1')).value!;
+        expect(state.isStreaming, isFalse);
+        expect(state.messages.last.content, 'Here you go');
+        expect(files.uploadCalls, hasLength(1));
+        expect(files.uploadCalls.single.path, '/tmp/a.jpg');
 
-      // The upload is in-flight: status shows uploading, no ref appended yet.
-      final jobId = state.attachmentUploads.keys.single;
-      expect(state.attachmentUploads[jobId]!.status, UploadStatus.uploading);
-      expect(state.messages.first.content, 'Check this');
+        // The upload is in-flight: status shows uploading, no ref appended yet.
+        final jobId = state.attachmentUploads.keys.single;
+        expect(state.attachmentUploads[jobId]!.status, UploadStatus.uploading);
+        expect(state.messages.first.content, 'Check this');
 
-      // Completing the upload appends the file ref and persists FileInfo.
+        // Completing the upload appends the file ref and persists FileInfo.
         upload.complete(
           FileInfo(
-        id: 'fid-123',
-        filename: 'a.jpg',
-        sizeBytes: 100,
-        mimeType: 'image/jpeg',
-        uploadedAt: DateTime(2024, 1, 1),
+            id: 'fid-123',
+            filename: 'a.jpg',
+            sizeBytes: 100,
+            mimeType: 'image/jpeg',
+            uploadedAt: DateTime(2024, 1, 1),
           ),
         );
-      await _settle();
+        await _settle();
 
-      state = container.read(conversationProvider('c1')).value!;
-      final done = state.attachmentUploads[jobId]!;
-      expect(done.status, UploadStatus.done);
-      expect(done.serverFileId, 'fid-123');
-      expect(state.messages.first.content, 'Check this [file:fid-123]');
+        state = container.read(conversationProvider('c1')).value!;
+        final done = state.attachmentUploads[jobId]!;
+        expect(done.status, UploadStatus.done);
+        expect(done.serverFileId, 'fid-123');
+        expect(state.messages.first.content, 'Check this [file:fid-123]');
 
-      final persisted = await store.loadConversation('c1');
-      expect(persisted!.messages.first.content, 'Check this [file:fid-123]');
+        final persisted = await store.loadConversation('c1');
+        expect(persisted!.messages.first.content, 'Check this [file:fid-123]');
 
-      expect(fileStore.saved, hasLength(1));
-      expect(fileStore.saved.single.id, 'fid-123');
-      expect(fileStore.saved.single.uploadedAt, isNotNull);
+        expect(fileStore.saved, hasLength(1));
+        expect(fileStore.saved.single.id, 'fid-123');
+        expect(fileStore.saved.single.uploadedAt, isNotNull);
+      },
+    );
+
+    test(
+      'account deletion drains a gated upload before metadata wipe',
+      () async {
+        final scope = AuthAccountScope.fromIdentity(
+          backendOrigin: 'http://example.com:17600',
+          ownerId: 'chat-owner',
+        )!;
+        final root = await Directory.systemTemp.createTemp('chat_upload_wipe');
+        addTearDown(() => root.delete(recursive: true));
+        final fileCache = FileCache(cacheDir: root, scopeKey: scope.storageId);
+        final fileStore = FakeFileStore(scopeKey: scope.storageId);
+        final uploadGate = Completer<FileInfo>();
+        final files = FakeFilesClient(
+          uploadCompleter: uploadGate,
+          honorCancellation: false,
+        );
+        final lifecycle = AccountLifecycle();
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
+            ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+          ],
+        );
+        final container = _container(
+          store: store,
+          client: client,
+          filesService: files,
+          fileStore: fileStore,
+          extraOverrides: [
+            accountLifecycleProvider.overrideWithValue(lifecycle),
+            fileCacheProvider.overrideWithValue(fileCache),
+          ],
+        );
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
+        await notifier.sendMessage(
+          'Send file',
+          attachments: const [
+            AttachmentDraft(
+              path: '/tmp/a.jpg',
+              filename: 'a.jpg',
+              sizeBytes: 1,
+              mimeType: 'image/jpeg',
+            ),
+          ],
+        );
+        expect(
+          container
+              .read(conversationProvider('c1'))
+              .value!
+              .attachmentUploads
+              .values
+              .single
+              .status,
+          UploadStatus.uploading,
+        );
+
+        var wipeCompleted = false;
+        final wipe = wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async {},
+          fileStore: fileStore,
+          memoryStore: FakeMemoryStore(scopeKey: scope.storageId),
+          fileCache: fileCache,
+        ).whenComplete(() => wipeCompleted = true);
+        await Future<void>.delayed(Duration.zero);
+        expect(wipeCompleted, isFalse);
+        expect(fileStore.deleteAllCalls, 0);
+
+        uploadGate.complete(
+          const FileInfo(
+            id: 'late-file',
+            filename: 'a.jpg',
+            sizeBytes: 1,
+            mimeType: 'image/jpeg',
+          ),
+        );
+        await expectLater(wipe, completes);
+        expect(wipeCompleted, isTrue);
+        expect(fileStore.saved, isEmpty);
+        expect(
+          container
+              .read(conversationProvider('c1'))
+              .value!
+              .attachmentUploads
+              .values
+              .single
+              .status,
+          UploadStatus.failed,
+        );
       },
     );
 
     test(
       'multiple completed uploads append file refs and persist FileInfo',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
-          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
-        ],
-      );
-      final files = FakeFilesClient();
-      final fileStore = FakeFileStore();
-      final container = _container(
-        store: store,
-        client: client,
-        filesService: files,
-        fileStore: fileStore,
-      );
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
+            ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+          ],
+        );
+        final files = FakeFilesClient();
+        final fileStore = FakeFileStore();
+        final container = _container(
+          store: store,
+          client: client,
+          filesService: files,
+          fileStore: fileStore,
+        );
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
         await notifier.sendMessage(
           'Two files',
           attachments: const [
-        AttachmentDraft(
-          path: '/a.jpg',
-          filename: 'a.jpg',
-          sizeBytes: 1,
-          mimeType: 'image/jpeg',
-        ),
-        AttachmentDraft(
-          path: '/b.png',
-          filename: 'b.png',
-          sizeBytes: 2,
-          mimeType: 'image/png',
-        ),
+            AttachmentDraft(
+              path: '/a.jpg',
+              filename: 'a.jpg',
+              sizeBytes: 1,
+              mimeType: 'image/jpeg',
+            ),
+            AttachmentDraft(
+              path: '/b.png',
+              filename: 'b.png',
+              sizeBytes: 2,
+              mimeType: 'image/png',
+            ),
           ],
         );
-      await _settle();
+        await _settle();
 
-      final state = container.read(conversationProvider('c1')).value!;
-      final uploads = state.attachmentUploads;
-      expect(uploads, hasLength(2));
+        final state = container.read(conversationProvider('c1')).value!;
+        final uploads = state.attachmentUploads;
+        expect(uploads, hasLength(2));
         expect(uploads.values.map((u) => u.status).toSet(), {
           UploadStatus.done,
         });
@@ -1045,88 +1190,88 @@ void main() {
           'server-2',
         });
 
-      final userContent = state.messages.first.content;
-      expect(userContent.startsWith('Two files'), isTrue);
-      expect(userContent, contains('[file:server-1]'));
-      expect(userContent, contains('[file:server-2]'));
+        final userContent = state.messages.first.content;
+        expect(userContent.startsWith('Two files'), isTrue);
+        expect(userContent, contains('[file:server-1]'));
+        expect(userContent, contains('[file:server-2]'));
 
-      expect(fileStore.saved, hasLength(2));
+        expect(fileStore.saved, hasLength(2));
       },
     );
 
     test(
       'failed uploads surface a failed status with error and no file ref',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
-          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
-        ],
-      );
-      final files = FakeFilesClient(
-        uploadError: const FilesServerError('upload boom'),
-      );
-      final fileStore = FakeFileStore();
-      final container = _container(
-        store: store,
-        client: client,
-        filesService: files,
-        fileStore: fileStore,
-      );
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
+            ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+          ],
+        );
+        final files = FakeFilesClient(
+          uploadError: const FilesServerError('upload boom'),
+        );
+        final fileStore = FakeFileStore();
+        final container = _container(
+          store: store,
+          client: client,
+          filesService: files,
+          fileStore: fileStore,
+        );
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
         await notifier.sendMessage(
           'Send file',
           attachments: const [
-        AttachmentDraft(
-          path: '/a.jpg',
-          filename: 'a.jpg',
-          sizeBytes: 1,
-          mimeType: 'image/jpeg',
-        ),
+            AttachmentDraft(
+              path: '/a.jpg',
+              filename: 'a.jpg',
+              sizeBytes: 1,
+              mimeType: 'image/jpeg',
+            ),
           ],
         );
-      await _settle();
+        await _settle();
 
-      final state = container.read(conversationProvider('c1')).value!;
-      final status = state.attachmentUploads.values.single;
-      expect(status.status, UploadStatus.failed);
-      expect(status.error, 'upload boom');
-      expect(status.serverFileId, isNull);
+        final state = container.read(conversationProvider('c1')).value!;
+        final status = state.attachmentUploads.values.single;
+        expect(status.status, UploadStatus.failed);
+        expect(status.error, 'upload boom');
+        expect(status.serverFileId, isNull);
 
-      // No ref appended; nothing persisted.
-      expect(state.messages.first.content, 'Send file');
-      expect(fileStore.saved, isEmpty);
+        // No ref appended; nothing persisted.
+        expect(state.messages.first.content, 'Send file');
+        expect(fileStore.saved, isEmpty);
       },
     );
 
     test(
       'sendMessage without attachments leaves attachmentUploads empty',
-        () async {
-      final store = FakeChatStore(initial: [_existingConversation()]);
-      final client = FakeChatClient(
-        results: const [
-          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
-        ],
-      );
-      final files = FakeFilesClient();
-      final container = _container(
-        store: store,
-        client: client,
-        filesService: files,
-      );
-      _keepAlive(container, 'c1');
-      final notifier = container.read(conversationProvider('c1').notifier);
-      await container.read(conversationProvider('c1').future);
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
+            ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+          ],
+        );
+        final files = FakeFilesClient();
+        final container = _container(
+          store: store,
+          client: client,
+          filesService: files,
+        );
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Hi');
+        await notifier.sendMessage('Hi');
 
-      final state = container.read(conversationProvider('c1')).value!;
-      expect(state.attachmentUploads, isEmpty);
-      expect(files.uploadCalls, isEmpty);
-      expect(state.messages.last.content, 'ok');
+        final state = container.read(conversationProvider('c1')).value!;
+        expect(state.attachmentUploads, isEmpty);
+        expect(files.uploadCalls, isEmpty);
+        expect(state.messages.last.content, 'ok');
       },
     );
 
@@ -1207,20 +1352,20 @@ void main() {
               ),
             ],
           ),
-        Conversation(
-          id: 'c2',
-          title: 'Second',
-          messages: const [
-            Message(
-              id: 'u2',
-              role: MessageRole.user,
-              content: 'b',
-              createdAt: null,
-            ),
-          ],
-          createdAt: DateTime(2024, 1, 2),
-          updatedAt: DateTime(2024, 1, 2),
-        ),
+          Conversation(
+            id: 'c2',
+            title: 'Second',
+            messages: const [
+              Message(
+                id: 'u2',
+                role: MessageRole.user,
+                content: 'b',
+                createdAt: null,
+              ),
+            ],
+            createdAt: DateTime(2024, 1, 2),
+            updatedAt: DateTime(2024, 1, 2),
+          ),
         ],
       );
       final container = _container(store: store);

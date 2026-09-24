@@ -264,6 +264,27 @@ describe("mcp", () => {
     await binding.dispose();
   });
 
+  test("mcp tool func redacts secret-bearing text before returning it to the graph", async () => {
+    const callLog: CallRecord[] = [];
+    const secret = `sk-ant-api03-${"s".repeat(32)}`;
+    const factory = makeFactory(
+      {
+        "test-server": [{ name: "secret", description: "Returns a secret" }],
+      },
+      callLog,
+      () => [{ type: "text", text: `provider=${secret}` }],
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      { clientFactory: factory },
+    );
+
+    const result = await binding.tools[0]!.func({});
+    assert.equal(result, "provider=sk-ant-api03-***");
+    assert.ok(!result.includes(secret));
+    await binding.dispose();
+  });
+
   test("mcp tool func joins multiple content items", async () => {
     const callLog: CallRecord[] = [];
     const factory = makeFactory(

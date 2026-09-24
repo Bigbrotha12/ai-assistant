@@ -1,4 +1,8 @@
 import './message_model.dart';
+
+import 'dart:async';
+
+import '../../auth/data/auth_client.dart';
 import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_credentials_store.dart';
 import '../../plugins/data/plugin_http.dart';
@@ -72,3 +76,17 @@ bool isAuthRequiredError(Object error) =>
         (error.code == ManagedErrorCodes.unauthorized ||
             error.code == ManagedErrorCodes.credentialsExpired ||
             error.code == ManagedErrorCodes.noCredentials);
+
+/// True only for the managed error envelope that explicitly says the owner is
+/// tombstoned. A missing status is accepted for typed test/adapter paths; a
+/// present status must be the server's 403.
+bool isAccountDeletedError(Object? error) {
+  if (error is ParallelWaitError) {
+    final nested = error.errors;
+    return nested is Iterable && nested.any(isAccountDeletedError);
+  }
+  return error is AuthAccountDeleted ||
+      error is PluginClientException &&
+          error.code == ManagedErrorCodes.accountDeleted &&
+          (error.statusCode == null || error.statusCode == 403);
+}

@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'account_deleted_handler.dart';
+import 'account_deleted_state.dart';
 import 'account_lifecycle.dart';
 import 'auth_client.dart';
 import 'auth_client_provider.dart';
@@ -239,10 +241,45 @@ class AuthCredentialsNotifier extends AsyncNotifier<AuthCredentials?> {
             normalizeBackendOrigin(ref.read(authBackendOriginProvider))) {
       return Future.error(const AccountLifecycleCancelled());
     }
+    final terminal = ref.read(accountDeletedProvider.notifier);
+    if (terminal.terminalWipeInFlight) {
+      return terminal.resetForNewAccount().then(
+        (_) => _transition(credentials),
+      );
+    }
+    terminal.reset();
     return _transition(credentials);
   }
 
-  Future<void> clear() => _transition(null);
+  Future<void> clear({
+    bool preserveAccountDeleted = false,
+    bool waitForTerminalWipe = true,
+  }) {
+    final terminal = ref.read(accountDeletedProvider.notifier);
+    if (waitForTerminalWipe) {
+      if (terminal.terminalWipeInFlight) {
+        return terminal.resetForNewAccount().then((_) => _transition(null));
+      }
+      if (!preserveAccountDeleted) terminal.reset();
+      return _transition(null);
+    }
+    return _transition(null);
+  }
+
+  Future<void> clearForTerminalWipe({
+    required AuthCredentials? expectedCredentials,
+    required int expectedEpoch,
+  }) {
+    final lifecycle = ref.read(accountLifecycleProvider);
+    if (lifecycle.epoch != expectedEpoch || _persisted != expectedCredentials) {
+      return Future<void>.value();
+    }
+    return _transition(
+      null,
+      terminalExpectedCredentials: expectedCredentials,
+      terminalExpectedEpoch: expectedEpoch,
+    );
+  }
 
   /// Starts the one-shot `get-session` ping (H2) chained with the C3 startup
   /// API-key pass. No-op when there is no session token — C1's tokenless
@@ -542,10 +579,22 @@ class AuthCredentialsNotifier extends AsyncNotifier<AuthCredentials?> {
           ? SessionStatus.invalid
           : SessionStatus.valid;
       ref.read(sessionStatusProvider.notifier).update(status);
+    } on AuthAccountDeleted catch (error) {
+      await ref.read(accountDeletedHandlerProvider).handle(error);
     } catch (_) {}
   }
 
-  Future<void> _transition(AuthCredentials? next) {
+  bool _terminalClearStillOwned(
+    AccountLifecycle lifecycle,
+    AuthCredentials? expectedCredentials,
+    int currentEpoch,
+  ) => lifecycle.epoch == currentEpoch && _persisted == expectedCredentials;
+
+  Future<void> _transition(
+    AuthCredentials? next, {
+    AuthCredentials? terminalExpectedCredentials,
+    int? terminalExpectedEpoch,
+  }) {
     final lifecycle = ref.read(accountLifecycleProvider);
     final epoch = lifecycle.begin();
     state = const AsyncData(null);
@@ -567,6 +616,15 @@ class AuthCredentialsNotifier extends AsyncNotifier<AuthCredentials?> {
         await _loaded;
         final cancellationError = await cancellationResult;
         if (cancellationError != null) throw cancellationError;
+        if (terminalExpectedEpoch != null &&
+            !_terminalClearStillOwned(
+              lifecycle,
+              terminalExpectedCredentials,
+              epoch,
+            )) {
+          if (epoch == lifecycle.epoch) lifecycle.complete(epoch);
+          return;
+        }
         final previousScope = _persisted?.accountScope;
         if (previousScope != null &&
             (next == null || previousScope != next.accountScope)) {
@@ -575,6 +633,15 @@ class AuthCredentialsNotifier extends AsyncNotifier<AuthCredentials?> {
         for (final scope in _cleanupScopes.toList()) {
           await lifecycle.clearLocal(scope);
           _cleanupScopes.remove(scope);
+        }
+        if (terminalExpectedEpoch != null &&
+            !_terminalClearStillOwned(
+              lifecycle,
+              terminalExpectedCredentials,
+              epoch,
+            )) {
+          if (epoch == lifecycle.epoch) lifecycle.complete(epoch);
+          return;
         }
         final store = ref.read(authCredentialsStoreProvider);
         if (next == null) {

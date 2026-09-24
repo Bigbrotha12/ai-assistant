@@ -67,6 +67,12 @@ class AuthEmailNotVerified extends AuthApiError {
   const AuthEmailNotVerified(super.message, {super.statusCode, super.code});
 }
 
+/// The account was permanently deleted on the server. This is terminal and
+/// must not be presented as a recoverable authentication failure.
+class AuthAccountDeleted extends AuthApiError {
+  const AuthAccountDeleted(super.message, {super.statusCode, super.code});
+}
+
 /// A request was rate-limited (HTTP 429, e.g. the per-address
 /// `send-verification-email` limiter). [retryAfterSeconds] carries the
 /// server-supplied wait when known, so the UI can surface it.
@@ -370,7 +376,10 @@ class BetterAuthClient implements AuthClient {
   }) async {
     // C1's no-session sentinel: nothing to authorize a list request with.
     if (sessionToken.isEmpty) return const [];
-    final response = await _get(_listKeysUri().toString(), bearer: sessionToken);
+    final response = await _get(
+      _listKeysUri().toString(),
+      bearer: sessionToken,
+    );
     final data = response.data;
     if (data is! Map<String, dynamic>) {
       throw const AuthServerError('malformed api-key list response');
@@ -547,10 +556,21 @@ class BetterAuthClient implements AuthClient {
             // INVALID_EMAIL_OR_PASSWORD code; surface it as a credential
             // error, not a session rejection.
             if (code == 'INVALID_EMAIL_OR_PASSWORD') {
-              throw AuthInvalidCredentials(message, statusCode: status, code: code);
+              throw AuthInvalidCredentials(
+                message,
+                statusCode: status,
+                code: code,
+              );
             }
             throw AuthUnauthorized(message, statusCode: status, code: code);
           case 403:
+            if (_isAccountDeletedBody(e)) {
+              throw AuthAccountDeleted(
+                message,
+                statusCode: status,
+                code: code ?? 'account_deleted',
+              );
+            }
             // C2: sign-in of an unverified account is a 403 carrying the
             // better-auth EMAIL_NOT_VERIFIED code (message match as a
             // fallback). Distinct from auth failure: the UI must offer the
@@ -589,7 +609,11 @@ class BetterAuthClient implements AuthClient {
             if (_isEmailTaken(code)) {
               throw AuthEmailTaken(message, statusCode: status, code: code);
             }
-            throw AuthInvalidCredentials(message, statusCode: status, code: code);
+            throw AuthInvalidCredentials(
+              message,
+              statusCode: status,
+              code: code,
+            );
           default:
             throw AuthServerError(message, statusCode: status, code: code);
         }
@@ -617,6 +641,23 @@ class BetterAuthClient implements AuthClient {
 
   static bool _isEmailTaken(String? code) =>
       code != null && code.startsWith('USER_ALREADY_EXISTS');
+
+  static bool _isAccountDeletedBody(DioException e) {
+    final data = e.response?.data;
+    if (data is Map<String, dynamic>) {
+      if (data['error'] == 'account_deleted' ||
+          data['code'] == 'account_deleted') {
+        return true;
+      }
+      final error = data['error'];
+      if (error is Map<String, dynamic> &&
+          (error['code'] == 'account_deleted' ||
+              error['error'] == 'account_deleted')) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   /// Fallback match for a 403 whose body carries the unverified-account
   /// message but no parseable code (the code check is primary).

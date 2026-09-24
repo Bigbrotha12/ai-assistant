@@ -28,6 +28,7 @@ class FakeFilesClient implements FilesClient {
   /// Peak number of uploads in flight simultaneously.
   int maxInFlight = 0;
   int _inFlight = 0;
+  bool honorCancellation = true;
 
   /// Completers that, when set, block the next upload until completed.
   final List<Completer<void>> gates = [];
@@ -46,31 +47,43 @@ class FakeFilesClient implements FilesClient {
     calls++;
     _inFlight++;
     if (_inFlight > maxInFlight) maxInFlight = _inFlight;
-    if (alwaysError != null) {
+    try {
+      if (alwaysError != null) {
+        throw alwaysError!;
+      }
+      if (_gateIndex < gates.length) {
+        final gate = gates[_gateIndex++];
+        if (cancelToken != null && honorCancellation) {
+          await Future.any<Object?>([gate.future, cancelToken.whenCancel]);
+        } else {
+          await gate.future;
+        }
+        if (cancelToken != null &&
+            honorCancellation &&
+            cancelToken.isCancelled) {
+          onProgress?.call(0, 100);
+          throw const FilesCancelledError('cancelled');
+        }
+      }
+      if (cancelToken != null) {
+        cancelToken.whenCancel.then((_) => onProgress?.call(0, 100));
+      }
+      if (failures > 0) {
+        failures--;
+        throw failWithServerError
+            ? const FilesServerError('HTTP 500', statusCode: 500)
+            : const FilesNetworkError('unreachable');
+      }
+      onProgress?.call(sizeBytes, sizeBytes);
+      return FileInfo(
+        id: 'file-$calls',
+        filename: filename,
+        sizeBytes: sizeBytes,
+        mimeType: mimeType,
+      );
+    } finally {
       _inFlight--;
-      throw alwaysError!;
     }
-    if (_gateIndex < gates.length) {
-      final gate = gates[_gateIndex++];
-      await gate.future;
-    }
-    if (cancelToken != null) {
-      cancelToken.whenCancel.then((_) => onProgress?.call(0, 100));
-    }
-    _inFlight--;
-    if (failures > 0) {
-      failures--;
-      throw failWithServerError
-          ? const FilesServerError('HTTP 500', statusCode: 500)
-          : const FilesNetworkError('unreachable');
-    }
-    onProgress?.call(sizeBytes, sizeBytes);
-    return FileInfo(
-      id: 'file-$calls',
-      filename: filename,
-      sizeBytes: sizeBytes,
-      mimeType: mimeType,
-    );
   }
 
   @override
@@ -251,6 +264,138 @@ void main() {
     for (final job in queue.jobs.value) {
       expect(job.status, isNot(UploadStatus.pending));
     }
+  });
+
+  test('cancelAndDrain waits for active uploads to settle', () async {
+    final gate = Completer<void>();
+    final fake = FakeFilesClient()
+      ..honorCancellation = false
+      ..gates.add(gate);
+    final queue = UploadQueue(filesService: fake, maxConcurrent: 1);
+    await queue.enqueue(
+      path: '/tmp/a.jpg',
+      filename: 'a.jpg',
+      sizeBytes: 1,
+      mimeType: 'image/jpeg',
+    );
+    while (fake.calls == 0) {
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    var drained = false;
+    final drain = queue.cancelAndDrain().then((_) => drained = true);
+    await Future<void>.delayed(Duration.zero);
+    expect(drained, isFalse);
+
+    gate.complete();
+    await drain;
+    expect(drained, isTrue);
+    expect(queue.jobs.value.single.status, UploadStatus.failed);
+  });
+
+  test(
+    'cancelAndDrain reports a deadline and rejects late enqueue work',
+    () async {
+      final gate = Completer<void>();
+      final fake = FakeFilesClient()
+        ..honorCancellation = false
+        ..gates.add(gate);
+      final queue = UploadQueue(
+        filesService: fake,
+        maxConcurrent: 1,
+        cancelDrainTimeout: const Duration(milliseconds: 20),
+      );
+      await queue.enqueue(
+        path: '/tmp/a.jpg',
+        filename: 'a.jpg',
+        sizeBytes: 1,
+        mimeType: 'image/jpeg',
+      );
+      while (fake.calls == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      await expectLater(
+        queue.cancelAndDrain(),
+        throwsA(isA<UploadDrainTimeout>()),
+      );
+      expect(queue.jobs.value.single.status, UploadStatus.failed);
+      final lateId = await queue.enqueue(
+        path: '/tmp/b.jpg',
+        filename: 'b.jpg',
+        sizeBytes: 1,
+        mimeType: 'image/jpeg',
+      );
+      expect(
+        queue.jobs.value.singleWhere((job) => job.id == lateId).status,
+        UploadStatus.failed,
+      );
+
+      gate.complete();
+      await Future<void>.delayed(Duration.zero);
+      expect(fake.calls, 1);
+    },
+  );
+
+  test('cancelAndDrain is safe when called repeatedly', () async {
+    final gate = Completer<void>();
+    final fake = FakeFilesClient()
+      ..honorCancellation = false
+      ..gates.add(gate);
+    final queue = UploadQueue(filesService: fake, maxConcurrent: 1);
+    await queue.enqueue(
+      path: '/tmp/a.jpg',
+      filename: 'a.jpg',
+      sizeBytes: 1,
+      mimeType: 'image/jpeg',
+    );
+    while (fake.calls == 0) {
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    final first = queue.cancelAndDrain();
+    final second = queue.cancelAndDrain();
+    expect(identical(first, second), isTrue);
+    gate.complete();
+    await Future.wait([first, second]);
+  });
+
+  test('cancelAndDrain completes immediately for an idle queue', () async {
+    final queue = UploadQueue(filesService: FakeFilesClient());
+    await expectLater(queue.cancelAndDrain(), completes);
+    await expectLater(queue.cancelAndDrain(), completes);
+  });
+
+  test('a canceled upload that completes late never emits success', () async {
+    final gate = Completer<void>();
+    final fake = FakeFilesClient()
+      ..honorCancellation = false
+      ..gates.add(gate);
+    final queue = UploadQueue(filesService: fake, maxConcurrent: 1);
+    final statuses = <UploadStatus>[];
+    queue.jobs.addListener(() {
+      if (queue.jobs.value.isNotEmpty) {
+        statuses.add(queue.jobs.value.single.status);
+      }
+    });
+    await queue.enqueue(
+      path: '/tmp/a.jpg',
+      filename: 'a.jpg',
+      sizeBytes: 1,
+      mimeType: 'image/jpeg',
+    );
+    while (fake.calls == 0) {
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    final drain = queue.cancelAndDrain();
+    gate.complete();
+    await drain;
+
+    final job = queue.jobs.value.single;
+    expect(job.status, UploadStatus.failed);
+    expect(job.serverFileId, isNull);
+    expect(statuses, isNot(contains(UploadStatus.done)));
   });
 
   test('sanitizes the filename before upload', () async {

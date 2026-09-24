@@ -27,26 +27,23 @@ Future<String?> _noKey() async => null;
 }
 
 DioBackendProbe probe(Dio dio, {Future<String?> Function()? apiKeyReader}) =>
-    DioBackendProbe(
-      dio: dio,
-      apiKeyReader: apiKeyReader ?? _key,
-    );
+    DioBackendProbe(dio: dio, apiKeyReader: apiKeyReader ?? _key);
 
 /// A non-2xx server response surfaced as a `badResponse` [DioException].
 DioException httpError(String path, int statusCode) => DioException(
-      requestOptions: RequestOptions(path: path),
-      response: Response(
-        requestOptions: RequestOptions(path: path),
-        statusCode: statusCode,
-      ),
-      type: DioExceptionType.badResponse,
-    );
+  requestOptions: RequestOptions(path: path),
+  response: Response(
+    requestOptions: RequestOptions(path: path),
+    statusCode: statusCode,
+  ),
+  type: DioExceptionType.badResponse,
+);
 
 /// A network-family failure with the given [DioExceptionType].
 DioException networkError(String path, DioExceptionType type) => DioException(
-      requestOptions: RequestOptions(path: path),
-      type: type,
-    );
+  requestOptions: RequestOptions(path: path),
+  type: type,
+);
 
 /// Registers healthy routes for every probe endpoint.
 void registerAllOk(DioAdapter adapter) {
@@ -81,9 +78,13 @@ class CapturingAdapter implements HttpClientAdapter {
     Future? cancelFuture,
   ) async {
     requests.add(requestOptions);
-    return ResponseBody.fromString('{"ok":true}', 200, headers: {
-      Headers.contentTypeHeader: [Headers.jsonContentType],
-    });
+    return ResponseBody.fromString(
+      '{"ok":true}',
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
   }
 
   @override
@@ -105,10 +106,7 @@ void main() {
 
     test('returns unauthorized on a 401 response', () async {
       final (dio, adapter) = makeDio();
-      adapter.onGet(
-        _authUrl,
-        (r) => r.throws(401, httpError(_authUrl, 401)),
-      );
+      adapter.onGet(_authUrl, (r) => r.throws(401, httpError(_authUrl, 401)));
 
       final status = await probe(dio).probe(_settings);
 
@@ -119,10 +117,7 @@ void main() {
 
     test('returns error on a 403 response', () async {
       final (dio, adapter) = makeDio();
-      adapter.onGet(
-        _authUrl,
-        (r) => r.throws(403, httpError(_authUrl, 403)),
-      );
+      adapter.onGet(_authUrl, (r) => r.throws(403, httpError(_authUrl, 403)));
 
       final status = await probe(dio).probe(_settings);
 
@@ -131,30 +126,60 @@ void main() {
       expect(result.detail, contains('403'));
     });
 
-    test('returns emailNotVerified on a 403 email_not_verified response',
-        () async {
-      // C2: a valid key whose owner is unverified gets a DISTINCT outcome —
-      // "verify your email", never the 401 re-auth flow.
+    test(
+      'returns emailNotVerified on a 403 email_not_verified response',
+      () async {
+        // C2: a valid key whose owner is unverified gets a DISTINCT outcome —
+        // "verify your email", never the 401 re-auth flow.
+        final (dio, adapter) = makeDio();
+        adapter.onGet(
+          _authUrl,
+          (r) => r.reply(403, {'error': 'email_not_verified'}),
+        );
+
+        final status = await probe(dio).probe(_settings);
+
+        final result = status.resultFor(BackendCheck.auth)!;
+        expect(result.status, ProbeStatus.emailNotVerified);
+        expect(result.status, isNot(ProbeStatus.unauthorized));
+        expect(result.detail, contains('verify your email'));
+      },
+    );
+
+    test('returns accountDeleted on a 403 account_deleted response', () async {
       final (dio, adapter) = makeDio();
       adapter.onGet(
         _authUrl,
-        (r) => r.reply(403, {'error': 'email_not_verified'}),
+        (r) => r.reply(403, {'error': 'account_deleted'}),
       );
 
       final status = await probe(dio).probe(_settings);
 
       final result = status.resultFor(BackendCheck.auth)!;
-      expect(result.status, ProbeStatus.emailNotVerified);
-      expect(result.status, isNot(ProbeStatus.unauthorized));
-      expect(result.detail, contains('verify your email'));
+      expect(result.status, ProbeStatus.accountDeleted);
+      expect(result.detail, contains('account deleted'));
+      expect(status.overall, ProbeStatus.accountDeleted);
+      expect(status.hasAuthenticatedAccountDeletedSignal, isTrue);
+    });
+
+    test('does not substring-match a raw authenticated error body', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onGet(
+        _authUrl,
+        (r) => r.reply(403, 'account_deleted is mentioned here'),
+      );
+
+      final status = await probe(dio).probe(_settings);
+
+      expect(
+        status.resultFor(BackendCheck.auth)!.status,
+        isNot(ProbeStatus.accountDeleted),
+      );
     });
 
     test('returns error on a 500 response', () async {
       final (dio, adapter) = makeDio();
-      adapter.onGet(
-        _authUrl,
-        (r) => r.throws(500, httpError(_authUrl, 500)),
-      );
+      adapter.onGet(_authUrl, (r) => r.throws(500, httpError(_authUrl, 500)));
 
       final status = await probe(dio).probe(_settings);
 
@@ -231,8 +256,7 @@ void main() {
       expect(result.detail, contains('gateway API key'));
     });
 
-    test('returns unauthorized when the gateway replies 401 (validateStatus bypass)',
-        () async {
+    test('returns unauthorized when the gateway replies 401 (validateStatus bypass)', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
         _inferenceUrl,
@@ -246,28 +270,41 @@ void main() {
       expect(result.detail, contains('gateway API key'));
     });
 
-    test('returns emailNotVerified on a 403 email_not_verified response',
-        () async {
+    test(
+      'returns emailNotVerified on a 403 email_not_verified response',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onPost(
+          _inferenceUrl,
+          (r) => r.reply(403, {'error': 'email_not_verified'}),
+        );
+
+        final status = await probe(dio).probe(_settings);
+
+        final result = status.resultFor(BackendCheck.inference)!;
+        expect(result.status, ProbeStatus.emailNotVerified);
+        expect(result.status, isNot(ProbeStatus.unauthorized));
+        expect(result.detail, contains('verify your email'));
+      },
+    );
+
+    test('returns accountDeleted on a 403 account_deleted response', () async {
       final (dio, adapter) = makeDio();
       adapter.onPost(
         _inferenceUrl,
-        (r) => r.reply(403, {'error': 'email_not_verified'}),
+        (r) => r.reply(403, {'error': 'account_deleted'}),
       );
 
       final status = await probe(dio).probe(_settings);
 
       final result = status.resultFor(BackendCheck.inference)!;
-      expect(result.status, ProbeStatus.emailNotVerified);
-      expect(result.status, isNot(ProbeStatus.unauthorized));
-      expect(result.detail, contains('verify your email'));
+      expect(result.status, ProbeStatus.accountDeleted);
+      expect(result.detail, contains('account deleted'));
     });
 
     test('returns error on a 500 response', () async {
       final (dio, adapter) = makeDio();
-      adapter.onPost(
-        _inferenceUrl,
-        (r) => r.reply(500, {'error': 'internal'}),
-      );
+      adapter.onPost(_inferenceUrl, (r) => r.reply(500, {'error': 'internal'}));
 
       final status = await probe(dio).probe(_settings);
 
@@ -327,9 +364,10 @@ void main() {
     test('returns noCredentials when no API key is stored', () async {
       final (dio, adapter) = makeDio();
 
-      final status =
-          await DioBackendProbe(dio: dio, apiKeyReader: _noKey)
-              .probe(_settings);
+      final status = await DioBackendProbe(
+        dio: dio,
+        apiKeyReader: _noKey,
+      ).probe(_settings);
 
       final inference = status.resultFor(BackendCheck.inference)!;
       expect(inference.status, ProbeStatus.noCredentials);
@@ -407,20 +445,36 @@ void main() {
       expect(result.detail, contains('gateway API key'));
     });
 
-    test('returns emailNotVerified on a 403 email_not_verified response',
-        () async {
+    test(
+      'returns emailNotVerified on a 403 email_not_verified response',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onGet(
+          _modelsUrl,
+          (r) => r.reply(403, {'error': 'email_not_verified'}),
+        );
+
+        final status = await probe(dio).probe(_settings);
+
+        final result = status.resultFor(BackendCheck.vision)!;
+        expect(result.status, ProbeStatus.emailNotVerified);
+        expect(result.status, isNot(ProbeStatus.unauthorized));
+        expect(result.detail, contains('verify your email'));
+      },
+    );
+
+    test('returns accountDeleted on a 403 account_deleted response', () async {
       final (dio, adapter) = makeDio();
       adapter.onGet(
         _modelsUrl,
-        (r) => r.reply(403, {'error': 'email_not_verified'}),
+        (r) => r.reply(403, {'error': 'account_deleted'}),
       );
 
       final status = await probe(dio).probe(_settings);
 
       final result = status.resultFor(BackendCheck.vision)!;
-      expect(result.status, ProbeStatus.emailNotVerified);
-      expect(result.status, isNot(ProbeStatus.unauthorized));
-      expect(result.detail, contains('verify your email'));
+      expect(result.status, ProbeStatus.accountDeleted);
+      expect(result.detail, contains('account deleted'));
     });
 
     test('returns error on a 500 response', () async {
@@ -496,19 +550,54 @@ void main() {
       expect(result.detail, contains('503'));
     });
 
-    test('any body saying degraded maps to gatewayDegraded (200 included)',
-        () async {
+    test(
+      'any body saying degraded maps to gatewayDegraded (200 included)',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onGet(
+          _healthUrl,
+          (r) => r.reply(200, {'status': 'degraded', 'checks': {}}),
+        );
+
+        final status = await probe(dio).probe(_settings);
+
+        expect(
+          status.resultFor(BackendCheck.health)!.status,
+          ProbeStatus.gatewayDegraded,
+        );
+      },
+    );
+
+    test(
+      'does not classify an account_deleted health body as terminal',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onGet(
+          _healthUrl,
+          (r) => r.reply(403, {'error': 'account_deleted'}),
+        );
+
+        final status = await probe(dio).probe(_settings);
+
+        final result = status.resultFor(BackendCheck.health)!;
+        expect(result.status, isNot(ProbeStatus.accountDeleted));
+        expect(result.status, ProbeStatus.error);
+        expect(status.hasAuthenticatedAccountDeletedSignal, isFalse);
+      },
+    );
+
+    test('does not substring-match a raw health body', () async {
       final (dio, adapter) = makeDio();
       adapter.onGet(
         _healthUrl,
-        (r) => r.reply(200, {'status': 'degraded', 'checks': {}}),
+        (r) => r.reply(403, 'account_deleted is mentioned here'),
       );
 
       final status = await probe(dio).probe(_settings);
 
       expect(
         status.resultFor(BackendCheck.health)!.status,
-        ProbeStatus.gatewayDegraded,
+        isNot(ProbeStatus.accountDeleted),
       );
     });
 
@@ -540,42 +629,44 @@ void main() {
       expect(status.overall, isNot(ProbeStatus.gatewayDegraded));
     });
 
-    test('overall surfaces gatewayDegraded even when auth/inference pass',
-        () async {
-      final (dio, adapter) = makeDio();
-      adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
-      adapter.onPost(_inferenceUrl, (r) => r.reply(200, {'id': 'chat-1'}));
-      adapter.onGet(_modelsUrl, (r) {
-        return r.reply(200, {
-          'data': [
-            {'id': 'model.vl', 'vision_capable': true},
-          ],
+    test(
+      'overall surfaces gatewayDegraded even when auth/inference pass',
+      () async {
+        final (dio, adapter) = makeDio();
+        adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
+        adapter.onPost(_inferenceUrl, (r) => r.reply(200, {'id': 'chat-1'}));
+        adapter.onGet(_modelsUrl, (r) {
+          return r.reply(200, {
+            'data': [
+              {'id': 'model.vl', 'vision_capable': true},
+            ],
+          });
         });
-      });
-      adapter.onGet(
-        _healthUrl,
-        (r) => r.reply(503, {'status': 'degraded', 'checks': {}}),
-      );
+        adapter.onGet(
+          _healthUrl,
+          (r) => r.reply(503, {'status': 'degraded', 'checks': {}}),
+        );
 
-      final status = await probe(dio).probe(_settings);
+        final status = await probe(dio).probe(_settings);
 
-      expect(status.resultFor(BackendCheck.auth)!.status, ProbeStatus.ok);
-      expect(status.resultFor(BackendCheck.inference)!.status, ProbeStatus.ok);
-      expect(status.resultFor(BackendCheck.vision)!.status, ProbeStatus.ok);
-      expect(
-        status.resultFor(BackendCheck.health)!.status,
-        ProbeStatus.gatewayDegraded,
-      );
-      expect(status.allOk, isFalse);
-      expect(status.overall, ProbeStatus.gatewayDegraded);
-    });
+        expect(status.resultFor(BackendCheck.auth)!.status, ProbeStatus.ok);
+        expect(
+          status.resultFor(BackendCheck.inference)!.status,
+          ProbeStatus.ok,
+        );
+        expect(status.resultFor(BackendCheck.vision)!.status, ProbeStatus.ok);
+        expect(
+          status.resultFor(BackendCheck.health)!.status,
+          ProbeStatus.gatewayDegraded,
+        );
+        expect(status.allOk, isFalse);
+        expect(status.overall, ProbeStatus.gatewayDegraded);
+      },
+    );
 
     test('overall prefers unauthorized over gatewayDegraded', () async {
       final (dio, adapter) = makeDio();
-      adapter.onGet(
-        _authUrl,
-        (r) => r.throws(401, httpError(_authUrl, 401)),
-      );
+      adapter.onGet(_authUrl, (r) => r.throws(401, httpError(_authUrl, 401)));
       adapter.onGet(
         _healthUrl,
         (r) => r.reply(503, {'status': 'degraded', 'checks': {}}),
@@ -587,8 +678,10 @@ void main() {
         status.resultFor(BackendCheck.health)!.status,
         ProbeStatus.gatewayDegraded,
       );
-      expect(status.resultFor(BackendCheck.auth)!.status,
-          ProbeStatus.unauthorized);
+      expect(
+        status.resultFor(BackendCheck.auth)!.status,
+        ProbeStatus.unauthorized,
+      );
       expect(status.overall, ProbeStatus.unauthorized);
     });
 
@@ -609,8 +702,10 @@ void main() {
         status.resultFor(BackendCheck.health)!.status,
         ProbeStatus.gatewayDegraded,
       );
-      expect(status.resultFor(BackendCheck.auth)!.status,
-          ProbeStatus.emailNotVerified);
+      expect(
+        status.resultFor(BackendCheck.auth)!.status,
+        ProbeStatus.emailNotVerified,
+      );
       expect(status.overall, ProbeStatus.emailNotVerified);
     });
 
@@ -620,8 +715,9 @@ void main() {
 
       await probe(dio).probe(_settings);
 
-      final healthRequest =
-          adapter.requests.firstWhere((r) => r.path.contains('/health'));
+      final healthRequest = adapter.requests.firstWhere(
+        (r) => r.path.contains('/health'),
+      );
       expect(healthRequest.method, 'GET');
       expect(healthRequest.headers['Authorization'], isNull);
       expect(healthRequest.followRedirects, isFalse);
@@ -629,95 +725,100 @@ void main() {
   });
 
   group('credential read', () {
-    test('returns a four-check status when the API key reader throws', () async {
-      final (dio, adapter) = makeDio();
-      var healthRequests = 0;
-      adapter.onGet(_healthUrl, (r) {
-        healthRequests++;
-        return r.reply(200, {'status': 'ok'});
-      });
-      const secret = 'storage-secret-value';
-
-      final status = await probe(
-        dio,
-        apiKeyReader: () async => throw StateError(secret),
-      ).probe(_settings);
-
-      expect(status.checks.map((check) => check.check), [
-        BackendCheck.auth,
-        BackendCheck.inference,
-        BackendCheck.vision,
-        BackendCheck.health,
-      ]);
-      expect(healthRequests, 1);
-      expect(status.resultFor(BackendCheck.health)!.status, ProbeStatus.ok);
-      for (final check in [
-        BackendCheck.auth,
-        BackendCheck.inference,
-        BackendCheck.vision,
-      ]) {
-        final result = status.resultFor(check)!;
-        expect(result.status, ProbeStatus.noCredentials);
-        expect(result.detail, isNot(contains(secret)));
-      }
-      expect(
-        status.checks.map((check) => check.detail).join('|'),
-        isNot(contains(_apiKey)),
-      );
-    });
-
-    test('reads the API key once and uses it for every authenticated leg',
-        () async {
-      final (dio, adapter) = makeDio();
-      final authorizationHeaders = <String?>[];
-      dio.interceptors.add(
-        InterceptorsWrapper(
-          onRequest: (options, handler) {
-            if (!options.path.contains('/health')) {
-              authorizationHeaders.add(
-                options.headers['Authorization'] as String?,
-              );
-            }
-            handler.next(options);
-          },
-        ),
-      );
-      adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
-      adapter.onPost(_inferenceUrl, (r) => r.reply(200, {'id': 'chat-1'}));
-      adapter.onGet(_modelsUrl, (r) {
-        return r.reply(200, {
-          'data': [
-            {'id': 'model.vl', 'vision_capable': true},
-          ],
+    test(
+      'returns a four-check status when the API key reader throws',
+      () async {
+        final (dio, adapter) = makeDio();
+        var healthRequests = 0;
+        adapter.onGet(_healthUrl, (r) {
+          healthRequests++;
+          return r.reply(200, {'status': 'ok'});
         });
-      });
-      adapter.onGet(_healthUrl, (r) {
-        return r.reply(200, {'status': 'ok'});
-      });
-      const firstKey = 'sk_first_probe_key';
-      var reads = 0;
+        const secret = 'storage-secret-value';
 
-      final status = await probe(
-        dio,
-        apiKeyReader: () async {
-          reads++;
-          if (reads > 1) throw StateError('rotated-key-secret');
-          return firstKey;
-        },
-      ).probe(_settings);
+        final status = await probe(
+          dio,
+          apiKeyReader: () async => throw StateError(secret),
+        ).probe(_settings);
 
-      expect(reads, 1);
-      expect(authorizationHeaders, hasLength(3));
-      expect(authorizationHeaders, everyElement('Bearer $firstKey'));
-      for (final check in [
-        BackendCheck.auth,
-        BackendCheck.inference,
-        BackendCheck.vision,
-      ]) {
-        expect(status.resultFor(check)!.status, ProbeStatus.ok);
-      }
-      expect(status.resultFor(BackendCheck.health)!.status, ProbeStatus.ok);
-    });
+        expect(status.checks.map((check) => check.check), [
+          BackendCheck.auth,
+          BackendCheck.inference,
+          BackendCheck.vision,
+          BackendCheck.health,
+        ]);
+        expect(healthRequests, 1);
+        expect(status.resultFor(BackendCheck.health)!.status, ProbeStatus.ok);
+        for (final check in [
+          BackendCheck.auth,
+          BackendCheck.inference,
+          BackendCheck.vision,
+        ]) {
+          final result = status.resultFor(check)!;
+          expect(result.status, ProbeStatus.noCredentials);
+          expect(result.detail, isNot(contains(secret)));
+        }
+        expect(
+          status.checks.map((check) => check.detail).join('|'),
+          isNot(contains(_apiKey)),
+        );
+      },
+    );
+
+    test(
+      'reads the API key once and uses it for every authenticated leg',
+      () async {
+        final (dio, adapter) = makeDio();
+        final authorizationHeaders = <String?>[];
+        dio.interceptors.add(
+          InterceptorsWrapper(
+            onRequest: (options, handler) {
+              if (!options.path.contains('/health')) {
+                authorizationHeaders.add(
+                  options.headers['Authorization'] as String?,
+                );
+              }
+              handler.next(options);
+            },
+          ),
+        );
+        adapter.onGet(_authUrl, (r) => r.reply(200, {'status': 'ok'}));
+        adapter.onPost(_inferenceUrl, (r) => r.reply(200, {'id': 'chat-1'}));
+        adapter.onGet(_modelsUrl, (r) {
+          return r.reply(200, {
+            'data': [
+              {'id': 'model.vl', 'vision_capable': true},
+            ],
+          });
+        });
+        adapter.onGet(_healthUrl, (r) {
+          return r.reply(200, {'status': 'ok'});
+        });
+        const firstKey = 'sk_first_probe_key';
+        var reads = 0;
+
+        final status = await probe(
+          dio,
+          apiKeyReader: () async {
+            reads++;
+            if (reads > 1) throw StateError('rotated-key-secret');
+            return firstKey;
+          },
+        ).probe(_settings);
+
+        expect(reads, 1);
+        expect(authorizationHeaders, hasLength(3));
+        expect(authorizationHeaders, everyElement('Bearer $firstKey'));
+        for (final check in [
+          BackendCheck.auth,
+          BackendCheck.inference,
+          BackendCheck.vision,
+        ]) {
+          expect(status.resultFor(check)!.status, ProbeStatus.ok);
+        }
+        expect(status.resultFor(BackendCheck.health)!.status, ProbeStatus.ok);
+      },
+    );
   });
 
   group('aggregation', () {
@@ -731,17 +832,21 @@ void main() {
         });
       });
 
-      final status =
-          await DioBackendProbe(dio: dio, apiKeyReader: _noKey)
-              .probe(_settings);
+      final status = await DioBackendProbe(
+        dio: dio,
+        apiKeyReader: _noKey,
+      ).probe(_settings);
 
       for (final check in [
         BackendCheck.auth,
         BackendCheck.inference,
         BackendCheck.vision,
       ]) {
-        expect(status.resultFor(check)!.status, ProbeStatus.noCredentials,
-            reason: '$check should be noCredentials');
+        expect(
+          status.resultFor(check)!.status,
+          ProbeStatus.noCredentials,
+          reason: '$check should be noCredentials',
+        );
       }
       final health = status.resultFor(BackendCheck.health)!;
       expect(health.status, ProbeStatus.ok);
@@ -761,8 +866,11 @@ void main() {
         BackendCheck.health,
       ]);
       for (final check in BackendCheck.values) {
-        expect(status.resultFor(check)!.status, ProbeStatus.ok,
-            reason: '$check should be ok');
+        expect(
+          status.resultFor(check)!.status,
+          ProbeStatus.ok,
+          reason: '$check should be ok',
+        );
       }
       expect(status.overall, ProbeStatus.ok);
     });
@@ -774,39 +882,45 @@ void main() {
         detail: 'ok',
       );
 
-      const allOk = BackendStatus(checks: [
-        ok,
-        CheckResult(
-          check: BackendCheck.inference,
-          status: ProbeStatus.ok,
-          detail: 'ok',
-        ),
-        CheckResult(
-          check: BackendCheck.vision,
-          status: ProbeStatus.ok,
-          detail: 'ok',
-        ),
-      ]);
+      const allOk = BackendStatus(
+        checks: [
+          ok,
+          CheckResult(
+            check: BackendCheck.inference,
+            status: ProbeStatus.ok,
+            detail: 'ok',
+          ),
+          CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.ok,
+            detail: 'ok',
+          ),
+        ],
+      );
       expect(allOk.allOk, isTrue);
 
-      const withUnauthorized = BackendStatus(checks: [
-        ok,
-        CheckResult(
-          check: BackendCheck.inference,
-          status: ProbeStatus.unauthorized,
-          detail: 'API key rejected (401)',
-        ),
-      ]);
+      const withUnauthorized = BackendStatus(
+        checks: [
+          ok,
+          CheckResult(
+            check: BackendCheck.inference,
+            status: ProbeStatus.unauthorized,
+            detail: 'API key rejected (401)',
+          ),
+        ],
+      );
       expect(withUnauthorized.allOk, isFalse);
 
-      const withNoCredentials = BackendStatus(checks: [
-        ok,
-        CheckResult(
-          check: BackendCheck.vision,
-          status: ProbeStatus.noCredentials,
-          detail: 'no API key stored',
-        ),
-      ]);
+      const withNoCredentials = BackendStatus(
+        checks: [
+          ok,
+          CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.noCredentials,
+            detail: 'no API key stored',
+          ),
+        ],
+      );
       expect(withNoCredentials.allOk, isFalse);
     });
 
@@ -819,93 +933,119 @@ void main() {
     });
 
     test('overall surfaces gatewayDegraded when only health is degraded', () {
-      const status = BackendStatus(checks: [
-        CheckResult(
-          check: BackendCheck.auth,
-          status: ProbeStatus.ok,
-          detail: 'ok',
-        ),
-        CheckResult(
-          check: BackendCheck.inference,
-          status: ProbeStatus.ok,
-          detail: 'ok',
-        ),
-        CheckResult(
-          check: BackendCheck.vision,
-          status: ProbeStatus.ok,
-          detail: 'ok',
-        ),
-        CheckResult(
-          check: BackendCheck.health,
-          status: ProbeStatus.gatewayDegraded,
-          detail: 'gateway degraded (HTTP 503)',
-        ),
-      ]);
+      const status = BackendStatus(
+        checks: [
+          CheckResult(
+            check: BackendCheck.auth,
+            status: ProbeStatus.ok,
+            detail: 'ok',
+          ),
+          CheckResult(
+            check: BackendCheck.inference,
+            status: ProbeStatus.ok,
+            detail: 'ok',
+          ),
+          CheckResult(
+            check: BackendCheck.vision,
+            status: ProbeStatus.ok,
+            detail: 'ok',
+          ),
+          CheckResult(
+            check: BackendCheck.health,
+            status: ProbeStatus.gatewayDegraded,
+            detail: 'gateway degraded (HTTP 503)',
+          ),
+        ],
+      );
       expect(status.overall, ProbeStatus.gatewayDegraded);
       expect(status.allOk, isFalse);
     });
 
     test('overall precedence follows unauthorized > emailNotVerified > '
-        'gatewayDegraded > unreachable > error > noCredentials > ok', () {
+        'accountDeleted > gatewayDegraded > unreachable > error > '
+        'noCredentials > ok', () {
       CheckResult r(BackendCheck check, ProbeStatus status) =>
           CheckResult(check: check, status: status, detail: 'd');
 
       // Credential-action statuses outrank a degraded gateway.
       expect(
-        BackendStatus(checks: [
-          r(BackendCheck.auth, ProbeStatus.unauthorized),
-          r(BackendCheck.health, ProbeStatus.gatewayDegraded),
-        ]).overall,
+        BackendStatus(
+          checks: [
+            r(BackendCheck.auth, ProbeStatus.unauthorized),
+            r(BackendCheck.health, ProbeStatus.gatewayDegraded),
+          ],
+        ).overall,
         ProbeStatus.unauthorized,
       );
       expect(
-        BackendStatus(checks: [
-          r(BackendCheck.auth, ProbeStatus.emailNotVerified),
-          r(BackendCheck.health, ProbeStatus.gatewayDegraded),
-        ]).overall,
+        BackendStatus(
+          checks: [
+            r(BackendCheck.auth, ProbeStatus.emailNotVerified),
+            r(BackendCheck.health, ProbeStatus.gatewayDegraded),
+          ],
+        ).overall,
         ProbeStatus.emailNotVerified,
+      );
+      expect(
+        BackendStatus(
+          checks: [
+            r(BackendCheck.auth, ProbeStatus.accountDeleted),
+            r(BackendCheck.health, ProbeStatus.gatewayDegraded),
+          ],
+        ).overall,
+        ProbeStatus.accountDeleted,
       );
       // Degraded outranks absence/failure signals below it.
       expect(
-        BackendStatus(checks: [
-          r(BackendCheck.health, ProbeStatus.gatewayDegraded),
-          r(BackendCheck.inference, ProbeStatus.unreachable),
-          r(BackendCheck.vision, ProbeStatus.error),
-          r(BackendCheck.auth, ProbeStatus.noCredentials),
-        ]).overall,
+        BackendStatus(
+          checks: [
+            r(BackendCheck.health, ProbeStatus.gatewayDegraded),
+            r(BackendCheck.inference, ProbeStatus.unreachable),
+            r(BackendCheck.vision, ProbeStatus.error),
+            r(BackendCheck.auth, ProbeStatus.noCredentials),
+          ],
+        ).overall,
         ProbeStatus.gatewayDegraded,
       );
       expect(
-        BackendStatus(checks: [
-          r(BackendCheck.auth, ProbeStatus.unreachable),
-          r(BackendCheck.inference, ProbeStatus.error),
-        ]).overall,
+        BackendStatus(
+          checks: [
+            r(BackendCheck.auth, ProbeStatus.unreachable),
+            r(BackendCheck.inference, ProbeStatus.error),
+          ],
+        ).overall,
         ProbeStatus.unreachable,
       );
       expect(
-        BackendStatus(checks: [
-          r(BackendCheck.auth, ProbeStatus.noCredentials),
-          r(BackendCheck.health, ProbeStatus.ok),
-        ]).overall,
+        BackendStatus(
+          checks: [
+            r(BackendCheck.auth, ProbeStatus.noCredentials),
+            r(BackendCheck.health, ProbeStatus.ok),
+          ],
+        ).overall,
         ProbeStatus.noCredentials,
       );
       expect(
-        BackendStatus(checks: [
-          r(BackendCheck.auth, ProbeStatus.ok),
-          r(BackendCheck.health, ProbeStatus.ok),
-        ]).overall,
+        BackendStatus(
+          checks: [
+            r(BackendCheck.auth, ProbeStatus.ok),
+            r(BackendCheck.health, ProbeStatus.ok),
+          ],
+        ).overall,
         ProbeStatus.ok,
       );
     });
 
     test('resultFor returns null for a check that was not run', () {
-      const status = BackendStatus(checks: [
-        CheckResult(
-          check: BackendCheck.auth,
-          status: ProbeStatus.ok,
-          detail: 'ok',
-        ),
-      ]);
+      const status = BackendStatus(
+        checks: [
+          CheckResult(
+            check: BackendCheck.auth,
+            status: ProbeStatus.ok,
+            detail: 'ok',
+          ),
+        ],
+      );
 
       expect(status.resultFor(BackendCheck.inference), isNull);
       expect(status.resultFor(BackendCheck.auth), isNotNull);
@@ -915,8 +1055,9 @@ void main() {
       final (dio, adapter) = makeDio();
       registerAllOk(adapter);
 
-      final status =
-          await probe(dio).probe(_settings).timeout(const Duration(seconds: 5));
+      final status = await probe(dio)
+          .probe(_settings)
+          .timeout(const Duration(seconds: 5));
 
       expect(status, isA<BackendStatus>());
       expect(status.checks, hasLength(4));
@@ -924,33 +1065,39 @@ void main() {
   });
 
   group('request hardening', () {
-    test('auth check sends the bearer API key and never follows redirects',
-        () async {
-      final adapter = CapturingAdapter();
-      final dio = Dio()..httpClientAdapter = adapter;
+    test(
+      'auth check sends the bearer API key and never follows redirects',
+      () async {
+        final adapter = CapturingAdapter();
+        final dio = Dio()..httpClientAdapter = adapter;
 
-      await probe(dio).probe(_settings);
+        await probe(dio).probe(_settings);
 
-      final authRequest = adapter.requests
-          .firstWhere((r) => r.path.contains('/v1/auth/check'));
-      expect(authRequest.method, 'GET');
-      expect(authRequest.headers['Authorization'], 'Bearer $_apiKey');
-      expect(authRequest.followRedirects, isFalse);
-    });
+        final authRequest = adapter.requests.firstWhere(
+          (r) => r.path.contains('/v1/auth/check'),
+        );
+        expect(authRequest.method, 'GET');
+        expect(authRequest.headers['Authorization'], 'Bearer $_apiKey');
+        expect(authRequest.followRedirects, isFalse);
+      },
+    );
 
-    test('inference check sends the stored API key and never follows redirects',
-        () async {
-      final adapter = CapturingAdapter();
-      final dio = Dio()..httpClientAdapter = adapter;
+    test(
+      'inference check sends the stored API key and never follows redirects',
+      () async {
+        final adapter = CapturingAdapter();
+        final dio = Dio()..httpClientAdapter = adapter;
 
-      await probe(dio).probe(_settings);
+        await probe(dio).probe(_settings);
 
-      final inferenceRequest =
-          adapter.requests.firstWhere((r) => r.path.contains('/v1/chat/completions'));
-      expect(inferenceRequest.method, 'POST');
-      expect(inferenceRequest.headers['Authorization'], 'Bearer $_apiKey');
-      expect(inferenceRequest.followRedirects, isFalse);
-    });
+        final inferenceRequest = adapter.requests.firstWhere(
+          (r) => r.path.contains('/v1/chat/completions'),
+        );
+        expect(inferenceRequest.method, 'POST');
+        expect(inferenceRequest.headers['Authorization'], 'Bearer $_apiKey');
+        expect(inferenceRequest.followRedirects, isFalse);
+      },
+    );
 
     test('vision check sends the stored API key on the models probe', () async {
       final adapter = CapturingAdapter();
@@ -958,8 +1105,9 @@ void main() {
 
       await probe(dio).probe(_settings);
 
-      final modelsRequest =
-          adapter.requests.firstWhere((r) => r.path.contains('/v1/models'));
+      final modelsRequest = adapter.requests.firstWhere(
+        (r) => r.path.contains('/v1/models'),
+      );
       expect(modelsRequest.method, 'GET');
       expect(modelsRequest.headers['Authorization'], 'Bearer $_apiKey');
     });
@@ -970,28 +1118,30 @@ void main() {
 
       await probe(dio).probe(_settings);
 
-      final inferenceRequest =
-          adapter.requests.firstWhere((r) => r.path.contains('/v1/chat/completions'));
+      final inferenceRequest = adapter.requests.firstWhere(
+        (r) => r.path.contains('/v1/chat/completions'),
+      );
       final body = inferenceRequest.data as Map;
       expect(body['model'], '_probe');
     });
   });
 
   group('invalid host', () {
-    test('probe with a URL-like host reports failures instead of throwing',
-        () async {
-      final (dio, adapter) = makeDio();
+    test(
+      'probe with a URL-like host reports failures instead of throwing',
+      () async {
+        final (dio, adapter) = makeDio();
 
-      // No routes registered: every request errors without throwing.
-      final status = await probe(dio).probe(
-        const BackendSettings(host: 'https://evil.example'),
-      );
+        // No routes registered: every request errors without throwing.
+        final status = await probe(dio)
+            .probe(const BackendSettings(host: 'https://evil.example'));
 
-      expect(status.checks, hasLength(4));
-      for (final check in status.checks) {
-        expect(check.status, isNot(ProbeStatus.ok));
-      }
-      expect(status.overall, isNot(ProbeStatus.gatewayDegraded));
-    });
+        expect(status.checks, hasLength(4));
+        for (final check in status.checks) {
+          expect(check.status, isNot(ProbeStatus.ok));
+        }
+        expect(status.overall, isNot(ProbeStatus.gatewayDegraded));
+      },
+    );
   });
 }

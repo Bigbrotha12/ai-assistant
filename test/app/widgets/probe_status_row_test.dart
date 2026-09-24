@@ -19,8 +19,9 @@ void main() {
     );
   }
 
-  testWidgets('renders the gatewayDegraded status without throwing',
-      (tester) async {
+  testWidgets('renders the gatewayDegraded status without throwing', (
+    tester,
+  ) async {
     await pumpRow(
       tester,
       const CheckResult(
@@ -36,8 +37,24 @@ void main() {
     expect(find.text('gateway degraded: ledgerDb (HTTP 503)'), findsOneWidget);
   });
 
-  testWidgets('renders the gatewayDegraded status in the dense variant',
-      (tester) async {
+  testWidgets('renders the terminal accountDeleted status', (tester) async {
+    await pumpRow(
+      tester,
+      const CheckResult(
+        check: BackendCheck.auth,
+        status: ProbeStatus.accountDeleted,
+        detail: 'account deleted (403)',
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.byIcon(Icons.person_off_outlined), findsOneWidget);
+    expect(find.text('account deleted (403)'), findsOneWidget);
+  });
+
+  testWidgets('renders the gatewayDegraded status in the dense variant', (
+    tester,
+  ) async {
     await pumpRow(
       tester,
       const CheckResult(

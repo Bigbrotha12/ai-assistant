@@ -6,6 +6,7 @@ import '../features/onboarding/ui/onboarding_screen.dart';
 import '../features/voice/ui/voice_screen.dart';
 import './widgets/launcher_shortcuts.dart';
 import './app_startup.dart';
+import '../features/auth/data/account_deleted_state.dart';
 import '../features/auth/data/auth_credentials_providers.dart';
 import '../features/settings/data/prefs_providers.dart';
 import '../features/settings/data/settings_providers.dart';
@@ -23,14 +24,37 @@ import '../features/settings/data/settings_providers.dart';
 ///   - configured → the launcher-shortcut target screen (`ChatScreen` for
 ///     `open_chat`, `VoiceScreen` otherwise), preserving deep-link behavior.
 ///   - not configured → [OnboardingScreen].
-class OnboardingGate extends ConsumerWidget {
+class OnboardingGate extends ConsumerStatefulWidget {
   const OnboardingGate({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<OnboardingGate> createState() => _OnboardingGateState();
+}
+
+class _OnboardingGateState extends ConsumerState<OnboardingGate> {
+  @override
+  void initState() {
+    super.initState();
+    ref.listenManual<bool>(accountDeletedProvider, (_, deleted) {
+      if (!deleted || !mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !ref.read(accountDeletedProvider)) return;
+        Navigator.of(context).popUntil((route) => route.isFirst);
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ref = this.ref;
     final settings = ref.watch(settingsProvider);
     final credentials = ref.watch(authCredentialsProvider);
     final prefs = ref.watch(appPrefsProvider);
+    final accountDeleted = ref.watch(accountDeletedProvider);
+
+    if (accountDeleted) {
+      return const OnboardingScreen(accountDeleted: true);
+    }
 
     if (settings.isLoading || credentials.isLoading || prefs.isLoading) {
       return const _SplashView();
@@ -117,10 +141,7 @@ class _ErrorView extends StatelessWidget {
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 16),
-                  FilledButton(
-                    onPressed: onRetry,
-                    child: const Text('Retry'),
-                  ),
+                  FilledButton(onPressed: onRetry, child: const Text('Retry')),
                 ],
               ),
             ),

@@ -157,7 +157,9 @@ Future<ManagedSelection> resolveManagedSelection({
           cancelToken: cancelToken,
         );
         check?.call();
-        final template = agents.where((a) => a.id == selectedAgentId).firstOrNull;
+        final template = agents
+            .where((a) => a.id == selectedAgentId)
+            .firstOrNull;
         if (template != null) {
           agentWire = selectedAgentId;
           agentModelRef = template.defaultModel;
@@ -184,13 +186,15 @@ Future<ManagedSelection> resolveManagedSelection({
       'no_credentials',
     );
   }
-  final enabled = config.plugins.entries
-      .where(
-        (entry) => entry.value.enabled && !models.any((m) => m.id == entry.key),
-      )
-      .map((entry) => entry.key)
-      .toList()
-    ..sort();
+  final enabled =
+      config.plugins.entries
+          .where(
+            (entry) =>
+                entry.value.enabled && !models.any((m) => m.id == entry.key),
+          )
+          .map((entry) => entry.key)
+          .toList()
+        ..sort();
   final provider = <String, Map<String, String>>{
     model.id: fields,
     for (final id in enabled) id: config.plugins[id]!.credentials,
@@ -232,6 +236,7 @@ ManagedConversationService buildManagedService({
   required Future<ManagedSelection> Function() resolve,
   bool stableSelection = false,
   LedgerPoller? poller,
+  Future<void> Function(Object error)? onAccountDeleted,
 }) => ManagedConversationService(
   client: client,
   repo: repo,
@@ -241,6 +246,7 @@ ManagedConversationService buildManagedService({
   agent: selection.agent,
   trimmer: trimmer,
   poller: poller,
+  onAccountDeleted: onAccountDeleted,
   credentials: () async {
     final fresh = await resolve();
     if (stableSelection &&
@@ -264,7 +270,8 @@ ManagedConversationService buildManagedService({
 /// missing, or a template reference no longer exists in the gateway catalog —
 /// callers then send no `agent` and the gateway runs the default supervisor
 /// prompt.
-({Object? wire, String? modelRef, List<String> toolPlugins})? resolveAgentForSend({
+({Object? wire, String? modelRef, List<String> toolPlugins})?
+resolveAgentForSend({
   required String? selectedAgentId,
   required PluginAccountConfiguration config,
   required List<AgentDto> agents,

@@ -154,6 +154,8 @@ class FilesClientImpl implements FilesClient {
         options: Options(
           headers: {'Authorization': 'Bearer $_bearerToken'},
           followRedirects: false,
+          connectTimeout: _timeout,
+          sendTimeout: _timeout,
           receiveTimeout: _timeout,
           responseType: ResponseType.bytes,
         ),

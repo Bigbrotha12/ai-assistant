@@ -1973,6 +1973,37 @@ describe("Phase 4, Wave B — sync path tool-result cache", () => {
     }
   });
 
+  test("a custom tool result is redacted on direct sync execution without a cache", async (t) => {
+    const recorded: BaseMessage[][] = [];
+    const raw = `sk-proj-${"x".repeat(32)}`;
+    const { app } = await makeApp(t, {
+      buildModel: toolCallingModel(recorded, "list_tasks", '{"projectId":"p1"}'),
+      toolHandler: {
+        async execute() {
+          return raw;
+        },
+      },
+    });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        messages: [{ role: "user", content: "list tasks" }],
+        credentials: {
+          openrouter: { apiKey: "sk-test-123" },
+          vikunja: { apiKey: "tok-123" },
+        },
+      }),
+    );
+    assert.equal(res.status, 200);
+    await res.text();
+
+    const toolMessage = recorded[1]?.find((message) => message.constructor.name === "ToolMessage");
+    assert.ok(toolMessage);
+    assert.equal(String(toolMessage.content), "sk-proj-***");
+    assert.ok(!String(toolMessage.content).includes(raw));
+  });
+
   test("a mutating tool is never cached: identical requests re-execute and the cache stays empty", async (t) => {
     const recorded: BaseMessage[][] = [];
     let handlerCalls = 0;

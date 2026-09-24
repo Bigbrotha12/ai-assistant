@@ -2,11 +2,13 @@ import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/http/dio_provider.dart';
+import '../../auth/data/account_deleted_handler.dart';
 import '../../auth/data/auth_client_provider.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/data/auth_credentials_store.dart';
 import '../../chat/data/message_model.dart';
 import '../../settings/data/settings_providers.dart';
+import '../../chat/data/chat_client.dart';
 import 'langchain_request.dart';
 import 'managed_resolution.dart';
 import 'plugin_credentials_providers.dart';
@@ -16,6 +18,20 @@ import 'plugin_http.dart';
 import 'plugin_registry_client.dart';
 
 enum PluginAccess { loading, signedOut, reauthenticate, error, ready }
+
+Future<T> _withAccountDeleted<T>(
+  Ref ref,
+  Future<T> Function() operation,
+) async {
+  try {
+    return await operation();
+  } catch (error, stack) {
+    if (isAccountDeletedError(error)) {
+      await ref.read(accountDeletedHandlerProvider).handle(error);
+    }
+    Error.throwWithStackTrace(error, stack);
+  }
+}
 
 final pluginAccessProvider = Provider.autoDispose<PluginAccess>((ref) {
   final auth = ref.watch(authCredentialsProvider);
@@ -45,27 +61,42 @@ final pluginRegistryClientProvider = Provider.autoDispose<PluginRegistryClient>(
   },
 );
 
-final skillsCatalogProvider = FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
-  final auth = ref.watch(authCredentialsProvider).requireValue!;
-  final client = ref.watch(pluginRegistryClientProvider);
-  return client.fetchSkills(gatewayKey: auth.apiKey);
-});
+final skillsCatalogProvider =
+    FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+      final auth = ref.watch(authCredentialsProvider).requireValue!;
+      final client = ref.watch(pluginRegistryClientProvider);
+      return _withAccountDeleted(
+        ref,
+        () => client.fetchSkills(gatewayKey: auth.apiKey),
+      );
+    });
 
-final mcpsCatalogProvider = FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
-  final auth = ref.watch(authCredentialsProvider).requireValue!;
-  final client = ref.watch(pluginRegistryClientProvider);
-  return client.fetchMcps(gatewayKey: auth.apiKey);
-});
+final mcpsCatalogProvider =
+    FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+      final auth = ref.watch(authCredentialsProvider).requireValue!;
+      final client = ref.watch(pluginRegistryClientProvider);
+      return _withAccountDeleted(
+        ref,
+        () => client.fetchMcps(gatewayKey: auth.apiKey),
+      );
+    });
 
-final agentTemplatesProvider = FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
-  final auth = ref.watch(authCredentialsProvider).requireValue!;
-  final client = ref.watch(pluginRegistryClientProvider);
-  return client.fetchAgentTemplates(gatewayKey: auth.apiKey);
-});
+final agentTemplatesProvider =
+    FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+      final auth = ref.watch(authCredentialsProvider).requireValue!;
+      final client = ref.watch(pluginRegistryClientProvider);
+      return _withAccountDeleted(
+        ref,
+        () => client.fetchAgentTemplates(gatewayKey: auth.apiKey),
+      );
+    });
 
 class PluginCatalog {
-  PluginCatalog(this.plugins, List<PluginModelDto> models, List<AgentDto> agents)
-    : models = List.unmodifiable(
+  PluginCatalog(
+    this.plugins,
+    List<PluginModelDto> models,
+    List<AgentDto> agents,
+  ) : models = List.unmodifiable(
         models.where(
           (model) => plugins.any(
             (plugin) =>
@@ -116,13 +147,22 @@ final pluginCatalogProvider = FutureProvider.autoDispose<PluginCatalog>(
     final auth = ref.watch(authCredentialsProvider).requireValue!;
     final client = ref.watch(pluginRegistryClientProvider);
     try {
-      final (plugins, models, agents) = await (
+      final results = await Future.wait<Object>([
         client.listPlugins(gatewayKey: auth.apiKey, cancelToken: token),
         client.listModels(gatewayKey: auth.apiKey, cancelToken: token),
         client.listAgents(gatewayKey: auth.apiKey, cancelToken: token),
-      ).wait;
+      ], eagerError: true);
       if (token.isCancelled) throw const PluginClientException('cancelled');
-      return PluginCatalog(plugins, models, agents);
+      return PluginCatalog(
+        results[0] as List<PluginDto>,
+        results[1] as List<PluginModelDto>,
+        results[2] as List<AgentDto>,
+      );
+    } catch (error, stack) {
+      if (isAccountDeletedError(error)) {
+        await ref.read(accountDeletedHandlerProvider).handle(error);
+      }
+      Error.throwWithStackTrace(error, stack);
     } finally {
       token.cancel();
     }
@@ -136,10 +176,12 @@ final stagedPluginRequestBuilderProvider =
       }
       final auth = ref.watch(authCredentialsProvider).requireValue!;
       final epoch = ref.watch(pluginCredentialsEpochProvider);
-      final (catalog, configuration) = await (
+      final results = await Future.wait<Object>([
         ref.watch(pluginCatalogProvider.future),
         ref.watch(pluginCredentialsProvider.future),
-      ).wait;
+      ], eagerError: true);
+      final catalog = results[0] as PluginCatalog;
+      final configuration = results[1] as PluginAccountConfiguration;
       void checkCurrent() {
         if (!ref.mounted ||
             ref.read(pluginAccessProvider) != PluginAccess.ready ||

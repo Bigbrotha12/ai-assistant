@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ai_assistant/features/attachments/data/file_cache.dart';
 import 'package:ai_assistant/features/attachments/data/file_model.dart';
 import 'package:ai_assistant/features/attachments/data/file_store.dart';
+import 'package:ai_assistant/features/attachments/data/upload_queue.dart';
 import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
 import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
@@ -473,55 +474,193 @@ void main() {
   );
 
   group('wipeLocalAccountData', () {
-    test('drains downloads before wiping files, memories, and cache', () async {
-      final scope = accountScope('a');
-      final order = <String>[];
-      final fileStore = _OrderFileStore(order, scopeKey: scope.storageId);
-      final memoryStore = _OrderMemoryStore(order, scopeKey: scope.storageId);
-      final fileCache = _OrderFileCache(order, scopeKey: scope.storageId);
-      final drainGate = Completer<void>();
-      final drainStarted = Completer<void>();
-      var credentialsCleared = false;
-      final download = lifecycle.runAttachmentDownload(scope.storageId, (
-        registration,
-      ) async {
-        order.add('drain');
-        drainStarted.complete();
-        await drainGate.future;
-        registration.checkCurrent();
-      });
-      final downloadFailure = expectLater(
-        download,
-        throwsA(isA<AttachmentDownloadCancelled>()),
-      );
-      await drainStarted.future;
+    test(
+      'drains gated uploads and downloads before wiping local account data',
+      () async {
+        final scope = accountScope('a');
+        final order = <String>[];
+        final fileStore = _OrderFileStore(order, scopeKey: scope.storageId);
+        final memoryStore = _OrderMemoryStore(order, scopeKey: scope.storageId);
+        final fileCache = _OrderFileCache(order, scopeKey: scope.storageId);
+        final uploadGate = Completer<FileInfo>();
+        final uploadSettled = Completer<void>();
+        final uploadFiles = FakeFilesClient(
+          uploadCompleter: uploadGate,
+          honorCancellation: false,
+          onUploadSettled: () {
+            order.add('uploads');
+            if (!uploadSettled.isCompleted) uploadSettled.complete();
+          },
+        );
+        final uploadQueue = UploadQueue(
+          filesService: uploadFiles,
+          maxConcurrent: 1,
+        );
+        lifecycle.registerUploadQueue(uploadQueue);
+        await uploadQueue.enqueue(
+          path: '/tmp/a.jpg',
+          filename: 'a.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+        );
+        while (uploadFiles.uploadCalls.isEmpty) {
+          await Future<void>.delayed(Duration.zero);
+        }
 
-      final wipe = wipeLocalAccountData(
-        scope: scope,
-        lifecycle: lifecycle,
-        clearCredentials: () async {
-          credentialsCleared = true;
-          order.add('credentials');
-        },
-        fileStore: fileStore,
-        memoryStore: memoryStore,
-        fileCache: fileCache,
-      );
-      await Future<void>.delayed(Duration.zero);
-      expect(order, ['drain']);
-      drainGate.complete();
-      await downloadFailure;
-      await wipe;
+        final drainGate = Completer<void>();
+        final drainStarted = Completer<void>();
+        final downloadCancelled = Completer<void>();
+        var credentialsCleared = false;
+        final download = lifecycle.runAttachmentDownload(scope.storageId, (
+          registration,
+        ) async {
+          registration.cancelToken.whenCancel.then((_) {
+            if (!downloadCancelled.isCompleted) downloadCancelled.complete();
+          });
+          drainStarted.complete();
+          await drainGate.future;
+          order.add('drain');
+          registration.checkCurrent();
+        });
+        final downloadFailure = expectLater(
+          download,
+          throwsA(isA<AttachmentDownloadCancelled>()),
+        );
+        await drainStarted.future;
 
-      expect(order, ['drain', 'files', 'memories', 'cache', 'credentials']);
-      expect(credentialsCleared, isTrue);
-      expect(fileStore.deleteAllCalls, 1);
-      expect(memoryStore.deleteAllCalls, 1);
-      expect(fileCache.evictAllForScopeCalls, 1);
-      expect(fileStore.deletedScopes, [scope.storageId]);
-      expect(memoryStore.deletedScopes, [scope.storageId]);
-      expect(fileCache.evictedScopes, [scope.storageId]);
-    });
+        var wipeCompleted = false;
+        final wipe = wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async {
+            credentialsCleared = true;
+            order.add('credentials');
+          },
+          fileStore: fileStore,
+          memoryStore: memoryStore,
+          fileCache: fileCache,
+        ).whenComplete(() => wipeCompleted = true);
+        await Future<void>.delayed(Duration.zero);
+        expect(order, isEmpty);
+        expect(wipeCompleted, isFalse);
+        expect(fileStore.deleteAllCalls, 0);
+
+        uploadGate.complete(
+          const FileInfo(
+            id: 'uploaded',
+            filename: 'a.jpg',
+            sizeBytes: 1,
+            mimeType: 'image/jpeg',
+          ),
+        );
+        await uploadSettled.future;
+        expect(order, ['uploads']);
+        expect(wipeCompleted, isFalse);
+        await downloadCancelled.future;
+        drainGate.complete();
+        await downloadFailure;
+        await wipe;
+
+        expect(order, [
+          'uploads',
+          'drain',
+          'files',
+          'memories',
+          'cache',
+          'credentials',
+        ]);
+        expect(credentialsCleared, isTrue);
+        expect(uploadQueue.jobs.value.single.status, UploadStatus.failed);
+        expect(fileStore.deleteAllCalls, 1);
+        expect(memoryStore.deleteAllCalls, 1);
+        expect(fileCache.evictAllForScopeCalls, 1);
+        expect(fileStore.deletedScopes, [scope.storageId]);
+        expect(memoryStore.deletedScopes, [scope.storageId]);
+        expect(fileCache.evictedScopes, [scope.storageId]);
+      },
+    );
+
+    test(
+      'rejects upload registration and enqueue while deletion is draining',
+      () async {
+        final scope = accountScope('a');
+        final lifecycle = AccountLifecycle();
+        final gate = Completer<FileInfo>();
+        final uploadFiles = FakeFilesClient(
+          honorCancellation: false,
+          uploadCompleter: gate,
+        );
+        final queue = UploadQueue(filesService: uploadFiles, maxConcurrent: 1);
+        lifecycle.registerUploadQueue(queue);
+        await queue.enqueue(
+          path: '/tmp/a.jpg',
+          filename: 'a.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+        );
+        while (uploadFiles.uploadCalls.isEmpty) {
+          await Future<void>.delayed(Duration.zero);
+        }
+
+        final wipe = wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async {},
+          fileStore: FakeFileStore(scopeKey: scope.storageId),
+          memoryStore: FakeMemoryStore(scopeKey: scope.storageId),
+          fileCache: _CountingFileCache(scopeKey: scope.storageId),
+        );
+        final newQueue = UploadQueue(filesService: FakeFilesClient());
+        expect(
+          () => lifecycle.registerUploadQueue(newQueue),
+          throwsA(isA<AccountLifecycleCancelled>()),
+        );
+        final id = await queue.enqueue(
+          path: '/tmp/b.jpg',
+          filename: 'b.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+        );
+        expect(uploadFiles.uploadCalls, hasLength(1));
+        expect(
+          queue.jobs.value.singleWhere((job) => job.id == id).status,
+          UploadStatus.failed,
+        );
+
+        gate.complete(
+          const FileInfo(
+            id: 'uploaded',
+            filename: 'a.jpg',
+            sizeBytes: 1,
+            mimeType: 'image/jpeg',
+          ),
+        );
+        await wipe;
+      },
+    );
+
+    test(
+      're-collects upload queues that are registered between drain passes',
+      () async {
+        final lifecycle = AccountLifecycle();
+        final first = _CountingUploadQueue();
+        final second = _CountingUploadQueue();
+        lifecycle.registerUploadQueue(first);
+        lifecycle.registerUploadQueue(second);
+        var registered = false;
+        second.onDrain = () {
+          if (!registered) {
+            registered = true;
+            lifecycle.registerUploadQueue(_CountingUploadQueue());
+          }
+        };
+
+        await lifecycle.cancelAndDrainUploads();
+
+        expect(first.drainCalls, 1);
+        expect(second.drainCalls, 1);
+      },
+    );
 
     test(
       'refuses a new attachment registration after scope invalidation',
@@ -580,6 +719,38 @@ void main() {
         await downloadFailure;
         await wipe;
         expect(await cache.totalBytes, 0);
+      },
+    );
+
+    test(
+      'times out a scope download drain and tombstones the operation',
+      () async {
+        final scope = accountScope('a');
+        final lifecycle = AccountLifecycle(
+          downloadCoordinator: AttachmentDownloadCoordinator(
+            drainTimeout: const Duration(milliseconds: 20),
+          ),
+        );
+        final started = Completer<void>();
+        final gate = Completer<void>();
+        final download = lifecycle.runAttachmentDownload(scope.storageId, (
+          registration,
+        ) async {
+          started.complete();
+          await gate.future;
+          registration.checkCurrent();
+        });
+
+        await started.future;
+        await expectLater(
+          lifecycle.cancelAndDrain(scope.storageId),
+          throwsA(isA<AttachmentDownloadDrainTimeout>()),
+        );
+        gate.complete();
+        await expectLater(
+          download,
+          throwsA(isA<AttachmentDownloadCancelled>()),
+        );
       },
     );
 
@@ -743,6 +914,20 @@ void main() {
       },
     );
   });
+}
+
+class _CountingUploadQueue extends UploadQueue {
+  _CountingUploadQueue() : super(filesService: FakeFilesClient());
+
+  int drainCalls = 0;
+  void Function()? onDrain;
+
+  @override
+  Future<void> cancelAndDrain() async {
+    drainCalls++;
+    await super.cancelAndDrain();
+    onDrain?.call();
+  }
 }
 
 class _GatedFileCache extends FileCache {

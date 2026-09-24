@@ -31,7 +31,7 @@ import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
 import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
-import { redactForOutbound } from "../redact.ts";
+import { redactForOutbound, redactBaseMessage } from "../redact.ts";
 import {
   credentialFingerprint,
   extractCredentialsFromBody,
@@ -1502,11 +1502,12 @@ async function finalizeSessionTurn(
   }
   if (outcome === "succeeded") {
     const finalReply = reply ?? new AIMessage({ content: "" });
+    const persistedReply = redactBaseMessage(finalReply);
     const replyAppend = await sessionStore.appendDelta(
       owner,
       sessionId,
       `${messageId}:assistant`,
-      finalReply,
+      persistedReply,
       { expectedGeneration: generation, evictOnOverflow: false },
     );
     if (isDeleting(owner)) {
@@ -1526,12 +1527,12 @@ async function finalizeSessionTurn(
       sessionStore.deleteSessionsForOwner(owner);
       return;
     }
-    await sessionStore.markCompleted(owner, sessionId, `${messageId}:assistant`, finalReply, generation);
+    await sessionStore.markCompleted(owner, sessionId, `${messageId}:assistant`, persistedReply, generation);
     if (isDeleting(owner)) {
       sessionStore.deleteSessionsForOwner(owner);
       return;
     }
-    const completed = await sessionStore.markCompleted(owner, sessionId, messageId, finalReply, generation);
+    const completed = await sessionStore.markCompleted(owner, sessionId, messageId, persistedReply, generation);
     if (completed.evicted) {
       console.warn(`chat: session ${sessionId} evicted mid-turn; completed outcome dropped`);
     }
@@ -1631,7 +1632,20 @@ function withToolResultCache(opts: {
   handler: JobToolHandler;
 }): JobToolHandler {
   const { registry, owner, cache, handler } = opts;
-  if (!cache) return handler;
+  const directRedacted = async (
+    pluginId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    credentials?: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    return redactForOutbound(
+      String(await handler.execute(pluginId, toolName, args, credentials, signal)),
+    );
+  };
+  if (!cache) {
+    return { execute: directRedacted };
+  }
 
   type ToolCallMeta = { readOnly: boolean; version: string };
   // Per-request memo: pluginId + toolName -> meta, or null when unresolvable.
@@ -1656,7 +1670,7 @@ function withToolResultCache(opts: {
         }
         resolved.set(lookup, meta);
       }
-      const direct = () => handler.execute(pluginId, toolName, args, credentials, signal);
+      const direct = () => directRedacted(pluginId, toolName, args, credentials, signal);
       if (meta === null || !canRetryTool({ readOnly: meta.readOnly })) {
         return direct();
       }
@@ -1670,12 +1684,12 @@ function withToolResultCache(opts: {
       };
       const hit = cache.get(key);
       if (hit !== undefined) return redactForOutbound(hit);
-       const result = String(await direct());
-       signal?.throwIfAborted();
-       if (isDeleting(owner)) throw new AccountDeletedError(owner);
-       cache.set(key, result);
+      const result = await direct();
+      signal?.throwIfAborted();
+      if (isDeleting(owner)) throw new AccountDeletedError(owner);
+      cache.set(key, result);
 
-      return redactForOutbound(result);
+      return result;
     },
   };
 }

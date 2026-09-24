@@ -2,15 +2,19 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/core/backend_settings.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_handler.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_state.dart';
 import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/plugins/data/agent_config.dart';
+import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_catalog_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_registry_client.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:dio/dio.dart';
@@ -19,6 +23,15 @@ import 'package:drift/native.dart';
 import '../../fakes.dart';
 import '../auth/auth_credentials_store_test.dart' show InMemorySecureStorage;
 import 'plugin_credentials_store_test.dart' show DelayedSecureStorage;
+
+class _TerminalHandler extends AccountDeletedHandler {
+  const _TerminalHandler(super.ref);
+
+  @override
+  Future<void> handle(Object? error) async {
+    await ref.read(accountDeletedProvider.notifier).runOnce(() async {});
+  }
+}
 
 class FakeRegistryClient extends PluginRegistryClient {
   FakeRegistryClient()
@@ -102,7 +115,7 @@ void main() {
       isTrue,
     );
   });
-test(
+  test(
     'owner switch and rotation invalidate epoch without transferring data',
     () async {
       final subscription = container.listen(
@@ -256,10 +269,7 @@ test(
       final config = await container.read(pluginCredentialsProvider.future);
       expect(config.plugins.keys, ['kitchen-copilot']);
       expect(config.plugins['kitchen-copilot']!.enabled, isTrue);
-      expect(
-        config.plugins['kitchen-copilot']!.agent!.id,
-        'kitchen-copilot',
-      );
+      expect(config.plugins['kitchen-copilot']!.agent!.id, 'kitchen-copilot');
       expect(config.selectedAgent, 'kitchen-copilot');
     },
   );
@@ -297,52 +307,92 @@ test(
   );
 
   test(
-    'setAgentConfig persists tools, modelRef, and inference; setSelectedAgent activates it',
+    'account_deleted template fetch aborts default-agent initialization',
     () async {
-      final subscription = container.listen(
-        pluginCredentialsProvider,
-        (_, _) {},
+      container.dispose();
+      container = ProviderContainer(
+        overrides: [
+          authCredentialsStoreProvider.overrideWithValue(authStore),
+          settingsStoreProvider.overrideWithValue(
+            FakeSettingsStore(
+              stored: const BackendSettings(host: 'example.com'),
+            ),
+          ),
+          pluginCredentialsStoreProvider.overrideWithValue(store),
+          pluginRegistryClientProvider.overrideWithValue(registry),
+          accountDeletedHandlerProvider.overrideWith(
+            (ref) => _TerminalHandler(ref),
+          ),
+        ],
       );
+      await container.read(authCredentialsProvider.future);
+      await container.read(settingsProvider.future);
+      registry.error = const PluginClientException(
+        ManagedErrorCodes.accountDeleted,
+        statusCode: 403,
+      );
+      Object? observedError;
+      final subscription = container
+          .listen<AsyncValue<PluginAccountConfiguration>>(
+            pluginCredentialsProvider,
+            (_, next) {
+              if (next.hasError) observedError = next.error;
+            },
+          );
       addTearDown(subscription.close);
-      await container.read(pluginCredentialsProvider.future);
-      final config = AgentConfig(
-        id: 'custom-full',
-        kind: AgentKind.custom,
-        name: 'Full Custom',
-        systemPrompt: 'Be terse.',
-        skills: ['skill-a'],
-        mcpServers: ['mcp-a'],
-        tools: [AgentToolGrantData(pluginId: 'web-search', required: true)],
-        modelRef: 'openrouter',
-        inference: AgentInferenceData(
-          temperature: 1.5,
-          maxTokens: 123456,
-          visionCapable: true,
-        ),
+      for (var i = 0; i < 20 && observedError == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+
+      expect(observedError, isA<PluginReauthenticationRequired>());
+      expect(
+        (await store.load(credentials('a').accountScope!)).plugins,
+        isEmpty,
       );
-      await container
-          .read(scopedPluginCredentialsProvider)
-          .setAgentConfig('custom-full', config);
-      // Each write bumps the credentials epoch: re-read a fresh scoped handle
-      // (the agent editor does the same around setAgentConfig +
-      // setSelectedAgent), otherwise the stale handle rejects the second write.
-      await container
-          .read(scopedPluginCredentialsProvider)
-          .setSelectedAgent('custom-full');
-      final published = await container.read(pluginCredentialsProvider.future);
-      expect(published.selectedAgent, 'custom-full');
-      final saved = published.plugins['custom-full']!.agent!;
-      expect(saved.kind, AgentKind.custom);
-      expect(saved.name, 'Full Custom');
-      expect(saved.systemPrompt, 'Be terse.');
-      expect(saved.skills, ['skill-a']);
-      expect(saved.mcpServers, ['mcp-a']);
-      expect(saved.tools.single.pluginId, 'web-search');
-      expect(saved.tools.single.required, isTrue);
-      expect(saved.modelRef, 'openrouter');
-      expect(saved.inference!.temperature, 1.5);
-      expect(saved.inference!.maxTokens, 123456);
-      expect(saved.inference!.visionCapable, isTrue);
     },
   );
+
+  test('setAgentConfig persists tools, modelRef, and inference; setSelectedAgent activates it', () async {
+    final subscription = container.listen(pluginCredentialsProvider, (_, _) {});
+    addTearDown(subscription.close);
+    await container.read(pluginCredentialsProvider.future);
+    final config = AgentConfig(
+      id: 'custom-full',
+      kind: AgentKind.custom,
+      name: 'Full Custom',
+      systemPrompt: 'Be terse.',
+      skills: ['skill-a'],
+      mcpServers: ['mcp-a'],
+      tools: [AgentToolGrantData(pluginId: 'web-search', required: true)],
+      modelRef: 'openrouter',
+      inference: AgentInferenceData(
+        temperature: 1.5,
+        maxTokens: 123456,
+        visionCapable: true,
+      ),
+    );
+    await container
+        .read(scopedPluginCredentialsProvider)
+        .setAgentConfig('custom-full', config);
+    // Each write bumps the credentials epoch: re-read a fresh scoped handle
+    // (the agent editor does the same around setAgentConfig +
+    // setSelectedAgent), otherwise the stale handle rejects the second write.
+    await container
+        .read(scopedPluginCredentialsProvider)
+        .setSelectedAgent('custom-full');
+    final published = await container.read(pluginCredentialsProvider.future);
+    expect(published.selectedAgent, 'custom-full');
+    final saved = published.plugins['custom-full']!.agent!;
+    expect(saved.kind, AgentKind.custom);
+    expect(saved.name, 'Full Custom');
+    expect(saved.systemPrompt, 'Be terse.');
+    expect(saved.skills, ['skill-a']);
+    expect(saved.mcpServers, ['mcp-a']);
+    expect(saved.tools.single.pluginId, 'web-search');
+    expect(saved.tools.single.required, isTrue);
+    expect(saved.modelRef, 'openrouter');
+    expect(saved.inference!.temperature, 1.5);
+    expect(saved.inference!.maxTokens, 123456);
+    expect(saved.inference!.visionCapable, isTrue);
+  });
 }

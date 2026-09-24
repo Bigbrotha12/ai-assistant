@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/features/auth/data/account_deleted_state.dart';
 import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
 import 'package:ai_assistant/features/auth/data/auth_client.dart';
 import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
@@ -447,6 +448,53 @@ void main() {
       // Still on the check-inbox state, able to retry later.
       expect(find.byKey(const Key('auth-resend')), findsOneWidget);
     });
+
+    testWidgets(
+      'AuthAccountDeleted latches the terminal notice and clears creds',
+      (tester) async {
+        final store = FakeAuthCredentialsStore();
+        final client = FakeAuthClient(
+          onSignIn: (email, password) async => throw const AuthAccountDeleted(
+            'account deleted',
+            statusCode: 403,
+            code: 'account_deleted',
+          ),
+        );
+        final container = ProviderContainer(
+          overrides: [
+            authCredentialsStoreProvider.overrideWithValue(store),
+            authClientProvider.overrideWithValue(client),
+            authBackendOriginProvider.overrideWithValue('https://example.com'),
+            accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
+          ],
+        );
+        addTearDown(container.dispose);
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: const MaterialApp(
+              home: Scaffold(body: AuthFlow(onSuccess: _noop)),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.byKey(const Key('auth-email')),
+          'user@example.com',
+        );
+        await tester.enterText(
+          find.byKey(const Key('auth-password')),
+          'password1',
+        );
+        await tester.tap(find.byKey(const Key('auth-submit')));
+        await tester.pumpAndSettle();
+
+        expect(container.read(accountDeletedProvider), isTrue);
+        expect(container.read(authCredentialsProvider).value, isNull);
+        expect(find.text(accountDeletedNotice), findsOneWidget);
+        expect(find.text('Verify your email — check your inbox'), findsNothing);
+      },
+    );
 
     testWidgets(
       'sign-in rejected with EMAIL_NOT_VERIFIED routes to check-inbox',

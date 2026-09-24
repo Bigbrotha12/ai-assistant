@@ -52,24 +52,65 @@ the ledger needs migrating.
 
 ## Environment
 
-| Variable            | Required | Default                | Description                                                                    |
-| ------------------- | -------- | ---------------------- | ------------------------------------------------------------------------------ |
-| `BETTER_AUTH_SECRET`| yes      | —                      | HMAC/verification secret, **≥ 32 chars**. `openssl rand -base64 32`.           |
-| `BETTER_AUTH_URL`   | yes      | —                      | Public base URL of the gateway, e.g. `http://localhost:17600`.                   |
-| `PORT`              | no       | `17600`                | Gateway port (the Flutter app derives this as its backend base).                |
-| `DB_PATH`           | no       | `./data/gateway.db`    | SQLite file for better-auth (dev only).                          |
-| `LEDGER_DB_PATH`    | no       | `./data/ledger.db`    | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
-| `LEDGER_STUCK_TIMEOUT_MS`| no | `10000`               | Heartbeat silence that marks a task `stuck`. **Must be < lease.** |
-| `LEDGER_LEASE_EXPIRY_MS`| no  | `60000`               | Worker lease expiry. Final tuning is Phase 4 (M5).               |
-| `NOTIFY_STORE_KEY`     | prod | *(dev default, warned)* | AES-256-GCM key for the notify store (ntfy topic + access token at rest). **Required when `NODE_ENV=production`** (fail-fast). Dev falls back to a stable development-only default with a loud warning. `openssl rand -hex 32`. |
-| `PLUGINS_STORE_PATH`    | no  | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests (Phase 1). Recreated empty on first boot. |
-| `PLUGINS_TRUSTED_HOSTS` | no  | `""`                  | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin baseUrls (admin-trusted internal hosts, e.g. `vikunja.local`, `*.local`). Scheme enforcement (`https` in production) is never bypassed. |
-| `INFERENCE_RATE_LIMIT`| no     | `60`                   | `/v1/chat/completions` sustained rate (requests/minute **per user**).            |
-| `INFERENCE_RATE_BURST`| no     | `20`                   | `/v1/chat/completions` burst ceiling (consecutive requests allowed at once).     |
-| `BUDGET_MAX_CONCURRENT`| no    | `2`                    | Per-user in-flight chat cap (sync streams + background jobs share the pool).     |
-| `BUDGET_QUEUE_MAX`    | no     | `3`                    | Per-user background queue depth before rejection (`503 busy` + `Retry-After`).   |
-| `NODE_ENV`          | no       | `development`          | `production` switches on secure cookies.                                        |
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | no | `""` / `587` / `""` / `""` / `""` | Relay for password-reset and email-verification mail. Empty `SMTP_HOST` disables sending and logs the link instead (dev fallback). Deployment points these at the k3s `mail` namespace. |
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `BETTER_AUTH_SECRET` | yes | — | HMAC/verification secret, **≥ 32 chars**; generate with `openssl rand -base64 32`. |
+| `BETTER_AUTH_URL` | yes | — | Public base URL of the gateway, e.g. `http://localhost:17600`. |
+| `PORT` | no | `17600` | Gateway port (the Flutter app derives this as its backend base). |
+| `DB_PATH` | no | `./data/gateway.db` | SQLite file for better-auth (development default). |
+| `CONFIG_DIR` | no | `/config` | Directory containing mounted skill, MCP, and agent-template catalogs; `.env.example` uses `./config` for local development. |
+| `INFERENCE_RATE_LIMIT` | no | `60` | `/v1/chat/completions` sustained rate (requests/minute **per user**). |
+| `INFERENCE_RATE_BURST` | no | `20` | `/v1/chat/completions` burst ceiling. |
+| `BUDGET_MAX_CONCURRENT` | no | `2` | Per-user in-flight chat cap (sync streams and background jobs share the pool). |
+| `BUDGET_QUEUE_MAX` | no | `3` | Per-user background queue depth before rejection (`503 busy` + `Retry-After`). |
+| `BUDGET_MODEL_CALL_LIMIT` | no | `60` | Maximum model calls per owner within the configured window. |
+| `BUDGET_MODEL_CALL_WINDOW_MS` | no | `60000` | Rolling per-owner model-call budget window in milliseconds. |
+| `CONTEXT_TOKEN_LIMIT` | no | `32768` | Context/session token ceiling used by context and session-size management. |
+| `AGENT_SKILL_BUDGET_TOKENS` | no | `6000` | Skill-injection token budget when composing an agent prompt. |
+| `AGENT_SPEC_MAX_SYSTEM_PROMPT` | no | `8000` | Maximum custom-agent system-prompt size. |
+| `AGENT_SPEC_MAX_SKILLS` | no | `50` | Maximum skill references in a custom-agent spec. |
+| `AGENT_SPEC_MAX_MCPS` | no | `20` | Maximum MCP references in a custom-agent spec. |
+| `AGENT_SPEC_MAX_TOOLS` | no | `100` | Maximum tool grants in a custom-agent spec. |
+| `WARMUP_ENABLED` | no | `false` | Enables startup/request tool warmups. |
+| `WARMUP_MAX_CONCURRENT` | no | `2` | Maximum concurrent warmup operations. |
+| `WARMUP_TIMEOUT_MS` | no | `10000` | Per-warmup timeout in milliseconds. |
+| `MODEL_CALL_TIMEOUT_MS` | no | `60000` | Outbound model-call timeout in milliseconds. |
+| `TOOL_CALL_TIMEOUT_MS` | no | `60000` | Outbound plugin-tool-call timeout in milliseconds. |
+| `MCP_CALL_TIMEOUT_MS` | no | `15000` | Per-call MCP JSON-RPC timeout in milliseconds. |
+| `MAX_REQUEST_BODY_BYTES` | no | `10000000` | Maximum body size for non-establish chat requests. |
+| `MAX_ESTABLISH_BODY_BYTES` | no | `25000000` | Maximum body size for session-establish requests. |
+| `LEDGER_DB_PATH` | no | `./data/ledger.db` | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
+| `LEDGER_STUCK_TIMEOUT_MS` | no | `10000` | Heartbeat silence that marks a task `stuck`; must be less than the lease timeout. |
+| `LEDGER_LEASE_EXPIRY_MS` | no | `60000` | Worker lease expiry. |
+| `LEDGER_RETENTION_MS` | no | `86400000` | Retention period for terminal ledger tasks and their steps/chain. |
+| `LEDGER_SWEEP_INTERVAL_MS` | no | `3600000` | Interval between ledger retention sweeps. |
+| `NOTIFY_STORE_KEY` | prod | *(dev default, warned)* | AES-256-GCM key for the notify store (ntfy topic and access token at rest); required when `NODE_ENV=production`. |
+| `SMTP_HOST` | no | `""` | SMTP relay host; empty disables sending and logs the link in development. |
+| `SMTP_PORT` | no | `587` | SMTP relay port. |
+| `SMTP_USER` | no | `""` | SMTP relay username. |
+| `SMTP_PASS` | no | `""` | SMTP relay password. |
+| `SMTP_FROM` | no | `""` | From address for password-reset and email-verification mail. |
+| `NOTIFY_BASE_URL` | no | `""` | ntfy base URL; empty disables push delivery while provisioning endpoints remain available. |
+| `PLUGINS_STORE_PATH` | no | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests. |
+| `PLUGINS_TRUSTED_HOSTS` | no | `""` | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin base URLs; scheme enforcement is not bypassed. |
+| `MCP_TRUSTED_HOSTS` | no | `""` | Comma-separated admin-vouched MCP hostnames/IPs; internal MCP services may use HTTP in production. |
+| `DEFAULT_MODEL_PROVIDER_BASE_URL` | no | `https://openrouter.ai/api/v1` | Provider-agnostic base URL for the built-in model plugin. |
+| `DEFAULT_MODEL_PROVIDER_MODEL` | no | `openrouter/auto` | Default model name for the built-in model plugin. |
+| `LOG_LEVEL` | no | `info` | Console log level: `error`, `warn`, `info`, or `debug`. |
+| `NODE_ENV` | no | `development` | Runtime mode; `production` enables secure cookies and production validation. |
+
+> **Single-replica contract (deliberate deployment choice).** The gateway runs
+> as **exactly one gateway replica; no overlapping rolling deployments**.
+> Process-local deletion tombstones/owner barriers, RAM-only managed sessions
+> and per-process tool-cache, budget, and rate-limit state, runner registries,
+> and the file-backed notify/ledger stores assume one writer. A second or
+> overlapping replica can miss a tombstone, admit work that raced deletion, lose
+> session coordination, or
+> overwrite a stale notify snapshot. This is a deliberate operational boundary,
+> not a temporary gap; multi-replica deletion coordination would be a separate
+> distributed-coordination project. There is no in-process replica-count
+> detection: an environment flag cannot assert the real replica count, so ops
+> must enforce the Deployment and rollout settings.
 
 The server refuses to start on invalid/missing env (fails fast). The `migrate`
 script also reads these via dotenv, so `.env` must exist before migrating.
@@ -136,12 +177,15 @@ not the session token):
 | `GET  /v1/skills`         | Redacted skill catalog (`id`, `title` only — content never serialized). |
 | `GET  /v1/mcps`           | Redacted MCP catalog (`name` only — url/headers never serialized).    |
 
-Invalid or missing key → `401 {"error":"unauthorized"}`. Upstream unreachable →
-`502 {"error":"inference_unavailable"}`. `POST /v1/chat/completions` is
-rate-limited per owner with an in-memory token bucket
-(`INFERENCE_RATE_LIMIT` sustained requests/minute, `INFERENCE_RATE_BURST`
-burst ceiling); exceeding it → `429 {"error":"rate_limited"}`. No CORS headers
-are set (this is a desktop/mobile client, not a browser).
+Invalid or missing key → `401 {"error":"unauthorized"}`. An account deletion
+tombstone or owner barrier rejects authenticated API-key and admission paths →
+`403 {"error":"account_deleted"}` (distinct from an unverified owner's `403
+{"error":"email_not_verified"}`). Upstream unreachable → `502
+{"error":"inference_unavailable"}`. `POST /v1/chat/completions` is rate-limited
+per owner with an in-memory token bucket (`INFERENCE_RATE_LIMIT` sustained
+requests/minute, `INFERENCE_RATE_BURST` burst ceiling); exceeding it → `429
+{"error":"rate_limited"}`. No CORS headers are set (this is a desktop/mobile
+client, not a browser).
 
 ### Streaming (SSE)
 
@@ -165,8 +209,16 @@ The gateway owns a gateway-side task ledger (M1 of
 `docs/archive/production-grade-improvement-plan.md` §3.3). It records worker steps,
 heartbeats/lease, a write-once hash chain, and owner binding. Since the stateless
 cutover it is a **transient journal**: terminal tasks (and their steps/chain rows)
-are swept after the retention window (`LEDGER_TERMINAL_RETENTION_MS`, default 24h);
-it is not a durable audit log.
+are swept after the retention window (`LEDGER_RETENTION_MS`, default 24h); it is
+not a durable audit log.
+
+**Single-replica contract.** The ledger's SQLite file, its process-local
+heartbeat/worker coordination, and deletion admission barriers require
+**exactly one gateway replica; no overlapping rolling deployments**. A second
+or overlapping process can miss a deletion tombstone or contend for work that
+was admitted before deletion. This is a deliberate deployment choice, not a
+temporary gap; multi-replica deletion coordination would be a separate
+distributed-coordination project.
 
 **Dedicated DB (decision).** The ledger lives in its own SQLite file
 (`LEDGER_DB_PATH`, default `./data/ledger.db`), *separate* from the better-auth
@@ -252,6 +304,15 @@ client-generated `session_id`; the gateway holds only an in-memory, evictable
 mirror (`src/sessions/store.ts`, no encryption, no durability, no disk) used
 for exactly-once `messageId` dedupe and reply read-back.
 
+**Single-replica contract.** The RAM-only session mirror, its mutexes and
+eviction tombstones, and the per-process tool cache, budget, and rate-limit
+state require the supported contract:
+**exactly one gateway replica; no overlapping rolling deployments**. A second or
+overlapping replica can miss the session tombstone and route a turn to a
+process that does not hold the caller's state; the client can recover with a
+same-`session_id` re-establish, but that is not shared-session coordination.
+This is a deliberate deployment choice, not a temporary gap.
+
 - **Establish vs delta** is classified by body shape: a full-history body
   (more than one message) is an establish — the server seeds/replaces the
   session's `messages` under `session_id` (this is also the client's §6
@@ -273,15 +334,41 @@ The legacy checkpoint surface (`/v1/threads`, `compileGraphWithCheckpointer`,
 `checkpointThreadId`) was removed with the sync-path cutover (plan §9); the
 client no longer routes through `thread_id`.
 
+## Notify store
+
+The ntfy topic and access token are encrypted at rest by `NotifyStore` in
+`./data/notify.json` (or the configured store path) and are provisioned through
+`/api/notify`. `NOTIFY_STORE_KEY` supplies the encryption key; `NOTIFY_BASE_URL`
+is the optional ntfy base URL, with an empty value disabling push delivery.
+The file is atomically replaced with `0600` permissions, and the store keeps a
+cached in-process snapshot behind a mutation mutex.
+
+**Single-replica contract.** The notify file, cached snapshot, and mutex require
+**exactly one gateway replica; no overlapping rolling deployments**. A second
+or overlapping process can write a stale snapshot over a newer credential set
+because the file-level coordination is process-local. This is a deliberate
+deployment choice, not a temporary gap; multi-replica deletion coordination
+would be a separate distributed-coordination project. An environment flag cannot
+assert the real replica count, so ops must enforce this in the k3s Deployment
+and rollout strategy.
+
 ## Production notes
 
-- **Scale to ONE replica.** Managed-session state (`src/sessions/store.ts`) is
-  in-memory and per-process by design (plan §4/§10): two replicas (or a
-  rolling restart where old and new pods overlap) mean turns land on a process
-  that does not hold the caller's session. Clients recover automatically
-  (`409 session_missing` → same-`session_id` re-establish, bounded retry) but
-  any in-flight stream is lost. There is no sticky-routing or shared-session
-  layer — add one before ever raising the replica count above 1.
+- **Single-replica deployment contract (deliberate, not temporary).** The gateway
+  is deployed under the supported contract:
+  **exactly one gateway replica; no overlapping rolling deployments**. This
+  covers process-local deletion tombstones/owner barriers,
+  RAM-only managed sessions and per-process tool-cache, budget, and rate-limit
+  state, runner pin/controller registries, and the file-backed notify/ledger
+  stores. A second or overlapping process can miss a tombstone, admit work that
+  raced deletion, lose session
+  coordination, or overwrite a stale notify snapshot. There is no in-process
+  way to detect the real replica count: an environment flag cannot assert it, so
+  ops must enforce `spec.replicas: 1` and a non-overlapping rollout. Multi-replica
+  deletion coordination would be a separate distributed-coordination project.
+  Clients recover from a missing managed session with `409 session_missing` and a
+  same-`session_id` re-establish, but that is recovery, not shared-session
+  coordination.
 - **Postgres**: swap the SQLite adapter in `src/auth.ts` for a `pg` Pool
   (`import { Pool } from "pg"; database: new Pool({ connectionString: … })`).
   Run `npx auth generate` against a Postgres config, or

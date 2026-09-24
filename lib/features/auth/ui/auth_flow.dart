@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/account_deleted_handler.dart';
+import '../data/account_deleted_state.dart';
 import '../data/auth_client.dart';
 import '../data/auth_client_provider.dart';
 import '../data/auth_credentials_providers.dart';
@@ -132,6 +134,16 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
       if (!mounted) return;
       widget.onSuccess(session);
       setState(() => _submitting = false);
+    } on AuthAccountDeleted catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _error = accountDeletedNotice;
+        _emailTaken = false;
+        _verifyMode = false;
+        _verifySent = false;
+      });
+      await ref.read(accountDeletedHandlerProvider).handle(error);
     } on AuthEmailNotVerified catch (_) {
       // Sign-in of an unverified account: route to the check-inbox state
       // with the typed email already in the controller for resend.
@@ -261,6 +273,7 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
     AuthInvalidCredentials() => 'Incorrect email or password',
     AuthEmailTaken() => 'An account already exists for this email',
     AuthEmailNotVerified() => 'Verify your email — check your inbox.',
+    AuthAccountDeleted() => accountDeletedNotice,
     AuthRateLimited(retryAfterSeconds: final seconds?) =>
       'Too many requests — try again in $seconds seconds.',
     AuthRateLimited() => 'Too many requests — try again in a minute.',

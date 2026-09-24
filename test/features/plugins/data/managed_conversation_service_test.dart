@@ -12,6 +12,7 @@ import 'package:ai_assistant/features/plugins/data/langchain_client.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_request.dart';
 import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_dto.dart';
+import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_repository.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_service.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
@@ -24,11 +25,9 @@ class FakeLangChainClient implements LangChainClient {
   FakeLangChainClient(this.respond);
 
   final Future<ManagedTurnResult> Function(LangChainRequest) respond;
-  Future<BackgroundTurnResult> Function(LangChainRequest) respondBackground =
-      (_) async => const BackgroundTurnResult(
-        status: 'accepted',
-        taskId: 'task-1',
-      );
+  Future<BackgroundTurnResult> Function(LangChainRequest) respondBackground = (
+    _,
+  ) async => const BackgroundTurnResult(status: 'accepted', taskId: 'task-1');
   final requests = <LangChainRequest>[];
   final cancelTokens = <CancelToken?>[];
   final sessionLoads = <String>[];
@@ -134,16 +133,14 @@ Map<String, dynamic> backgroundTaskJson({
   'last_heartbeat_ts': 2,
 };
 
-ResponseBody jsonResponse(
-  Object? value, {
-  int status = 200,
-}) => ResponseBody.fromString(
-  jsonEncode(value),
-  status,
-  headers: {
-    'content-type': ['application/json'],
-  },
-);
+ResponseBody jsonResponse(Object? value, {int status = 200}) =>
+    ResponseBody.fromString(
+      jsonEncode(value),
+      status,
+      headers: {
+        'content-type': ['application/json'],
+      },
+    );
 
 class FakeAdapter implements HttpClientAdapter {
   FakeAdapter(this.respond);
@@ -307,19 +304,21 @@ void main() {
     expect(mapped, outcome.sessionId);
   });
 
-  test('sendTurn threads onContent deltas through the dispatch wrapper',
-      () async {
-    client.emitDeltas = const ['Hel', 'lo'];
-    final seen = <String>[];
-    final outcome = await service.sendTurn(
-      'c1',
-      history: const [],
-      userText: 'hi',
-      onContent: seen.add,
-    );
-    expect(seen, ['Hel', 'lo']);
-    expect(outcome, isA<ManagedStreamedTurn>());
-  });
+  test(
+    'sendTurn threads onContent deltas through the dispatch wrapper',
+    () async {
+      client.emitDeltas = const ['Hel', 'lo'];
+      final seen = <String>[];
+      final outcome = await service.sendTurn(
+        'c1',
+        history: const [],
+        userText: 'hi',
+        onContent: seen.add,
+      );
+      expect(seen, ['Hel', 'lo']);
+      expect(outcome, isA<ManagedStreamedTurn>());
+    },
+  );
 
   test('onContent deltas are epoch-checked: cancelScope mid-stream drops the '
       'late delta and surfaces ManagedTurnError(cancelled)', () async {
@@ -378,11 +377,7 @@ void main() {
       'c1',
       history: const [
         Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-        Message(
-          id: 'm2',
-          role: MessageRole.assistant,
-          content: 'local reply',
-        ),
+        Message(id: 'm2', role: MessageRole.assistant, content: 'local reply'),
       ],
       userText: 'second',
     );
@@ -629,8 +624,11 @@ void main() {
 
     final first = await service.reconcileFromServer('c1');
     final ids = first.map((m) => m.id).toList();
-    expect(ids.every((id) => id.isNotEmpty), isTrue,
-        reason: 'a blank primary key collapses history to one row');
+    expect(
+      ids.every((id) => id.isNotEmpty),
+      isTrue,
+      reason: 'a blank primary key collapses history to one row',
+    );
     expect(ids.toSet(), hasLength(first.length));
     expect(first.any((m) => m.id.contains('call_1')), isFalse);
 
@@ -703,8 +701,11 @@ void main() {
     await expectLater(
       service.sendTurn('c1', history: const [], userText: 'second'),
       throwsA(
-        isA<PluginClientException>()
-            .having((e) => e.code, 'code', 'pending_turn_exists'),
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'pending_turn_exists',
+        ),
       ),
     );
     // The rejected send neither replaced the pending row nor appended.
@@ -786,7 +787,10 @@ void main() {
       state: 'resumed',
       alreadyCompleted: true,
     );
-    await expectLater(service.retryTurn('c1'), throwsA(isA<PluginClientException>()));
+    await expectLater(
+      service.retryTurn('c1'),
+      throwsA(isA<PluginClientException>()),
+    );
 
     final pending = await repo.pending(scope, 'c1');
     expect(pending, isNotNull);
@@ -800,8 +804,11 @@ void main() {
     await expectLater(
       service.retryTurn('c1'),
       throwsA(
-        isA<PluginClientException>()
-            .having((e) => e.code, 'code', 'reconcile_required'),
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'reconcile_required',
+        ),
       ),
     );
 
@@ -818,6 +825,35 @@ void main() {
     expect(await repo.pending(scope, 'c1'), isNull);
     expect(await repo.mappedSession('c1'), session);
   });
+
+  test(
+    'reconcileFromServer reports account_deleted to the terminal handler',
+    () async {
+      respondWith = (_) => throw const PluginClientException('network_error');
+      await expectLater(
+        service.sendTurn('c1', history: const [], userText: 'hi'),
+        throwsA(isA<ManagedTurnError>()),
+      );
+      final terminalErrors = <Object>[];
+      final terminalService = ManagedConversationService(
+        client: client,
+        repo: repo,
+        scope: scope,
+        credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+        onAccountDeleted: (error) async => terminalErrors.add(error),
+      );
+      client.loadSessionError = const PluginClientException(
+        ManagedErrorCodes.accountDeleted,
+        statusCode: 403,
+      );
+
+      await expectLater(
+        terminalService.reconcileFromServer('c1'),
+        throwsA(isA<PluginClientException>()),
+      );
+      expect(terminalErrors, hasLength(1));
+    },
+  );
 
   test('retryTurn replays the persisted envelope config, never the current '
       'service instance model/plugins', () async {
@@ -855,17 +891,15 @@ void main() {
 
   test('retryTurn fails loudly on a corrupted envelope instead of replaying '
       'the current config', () async {
-    await repo.savePending(
-      'c1',
-      scope,
-      'msg-broken',
-      {'model': 'anything'},
-    );
+    await repo.savePending('c1', scope, 'msg-broken', {'model': 'anything'});
     await expectLater(
       service.retryTurn('c1'),
       throwsA(
-        isA<PluginClientException>()
-            .having((e) => e.code, 'code', 'invalid_config'),
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'invalid_config',
+        ),
       ),
     );
     // The pending row survives an invalid config so a repair can replace it.
@@ -904,11 +938,7 @@ void main() {
       'c1',
       history: const [
         Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-        Message(
-          id: 'm2',
-          role: MessageRole.assistant,
-          content: 'local reply',
-        ),
+        Message(id: 'm2', role: MessageRole.assistant, content: 'local reply'),
       ],
       userText: 'second',
     );
@@ -923,12 +953,15 @@ void main() {
     expect(bodies[0]['session_id'], session);
     expect((bodies[0]['messages'] as List).map((m) => m['content']), ['hi']);
     expect(bodies[1]['session_id'], session);
-    expect((bodies[1]['messages'] as List).map((m) => m['content']), ['second']);
+    expect((bodies[1]['messages'] as List).map((m) => m['content']), [
+      'second',
+    ]);
     expect(bodies[2]['session_id'], session);
-    expect(
-      (bodies[2]['messages'] as List).map((m) => m['content']),
-      ['hi', 'local reply', 'second'],
-    );
+    expect((bodies[2]['messages'] as List).map((m) => m['content']), [
+      'hi',
+      'local reply',
+      'second',
+    ]);
     // A fresh messageId was minted for the re-establish.
     expect(messageIds.toSet(), hasLength(2));
     expect(await repo.pending(scope, 'c1'), isNull);
@@ -969,79 +1002,94 @@ void main() {
     expect(await repo.pending(scope, 'c1'), isNotNull);
   });
 
-  test('silent reseed: a DELTA answered seeded discards the context-free reply, '
-      're-establishes under the SAME session_id with the full local history + a '
-      'fresh messageId, and only then completes', () async {
-    final first = await service.sendTurn('c1', history: const [], userText: 'hi');
-    final session = first.sessionId;
-    final messageIds = <String>[];
-    var calls = 0;
-    respondWith = (request) {
-      calls++;
-      messageIds.add(request.turnId!);
-      if (calls == 1) {
-        // The single-message delta — the server (its session cache wiped by a
-        // restart) silently re-seeded and ran context-free.
+  test(
+    'silent reseed: a DELTA answered seeded discards the context-free reply, '
+    're-establishes under the SAME session_id with the full local history + a '
+    'fresh messageId, and only then completes',
+    () async {
+      final first = await service.sendTurn(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      final session = first.sessionId;
+      final messageIds = <String>[];
+      var calls = 0;
+      respondWith = (request) {
+        calls++;
+        messageIds.add(request.turnId!);
+        if (calls == 1) {
+          // The single-message delta — the server (its session cache wiped by a
+          // restart) silently re-seeded and ran context-free.
+          return Future.value(
+            ManagedTurnResult(
+              sessionId: request.conversationPublicId!,
+              state: 'seeded',
+              result: const ChatResult(
+                content: 'context-free reply',
+                toolCalls: [],
+                finishReason: 'stop',
+              ),
+            ),
+          );
+        }
+        // The recovery re-establish: full local history under the SAME id.
         return Future.value(
           ManagedTurnResult(
             sessionId: request.conversationPublicId!,
             state: 'seeded',
             result: const ChatResult(
-              content: 'context-free reply',
+              content: 'ok',
               toolCalls: [],
               finishReason: 'stop',
             ),
           ),
         );
-      }
-      // The recovery re-establish: full local history under the SAME id.
-      return Future.value(
-        ManagedTurnResult(
-          sessionId: request.conversationPublicId!,
-          state: 'seeded',
-          result: const ChatResult(
-            content: 'ok',
-            toolCalls: [],
-            finishReason: 'stop',
+      };
+      final outcome = await service.sendTurn(
+        'c1',
+        history: const [
+          Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+          Message(
+            id: 'm2',
+            role: MessageRole.assistant,
+            content: 'local reply',
           ),
-        ),
+        ],
+        userText: 'second',
       );
-    };
-    final outcome = await service.sendTurn(
-      'c1',
-      history: const [
-        Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-        Message(id: 'm2', role: MessageRole.assistant, content: 'local reply'),
-      ],
-      userText: 'second',
-    );
-    expect(calls, 2);
-    expect(outcome.sessionId, session);
-    expect(outcome.state, 'seeded');
-    final bodies = client.requests.map((r) => r.toJson()).toList();
-    // [0] first-turn establish; [1] the delta (answered seeded); [2] the
-    // re-establish under the SAME session id with the FULL local history.
-    expect(bodies, hasLength(3));
-    expect(bodies[2]['session_id'], session);
-    expect(
-      (bodies[2]['messages'] as List).map((m) => m['content']),
-      ['hi', 'local reply', 'second'],
-    );
-    // A fresh messageId was minted for the re-establish (the delta's was
-    // replaced, so only two distinct ids exist across three sends).
-    expect(messageIds.toSet(), hasLength(2));
-    // The context-free reply was discarded — the store only ever sees 'ok'.
-    final loaded = await repo.access(
-      scope,
-      repo.epoch(scope),
-      () {},
-      (store) => store.loadConversation('c1'),
-    );
-    expect(loaded!.messages.last.content, 'ok');
-    expect(loaded.messages.any((m) => m.content == 'context-free reply'), isFalse);
-    expect(await repo.pending(scope, 'c1'), isNull);
-    expect(await repo.mappedSession('c1'), session);
-  });
+      expect(calls, 2);
+      expect(outcome.sessionId, session);
+      expect(outcome.state, 'seeded');
+      final bodies = client.requests.map((r) => r.toJson()).toList();
+      // [0] first-turn establish; [1] the delta (answered seeded); [2] the
+      // re-establish under the SAME session id with the FULL local history.
+      expect(bodies, hasLength(3));
+      expect(bodies[2]['session_id'], session);
+      expect((bodies[2]['messages'] as List).map((m) => m['content']), [
+        'hi',
+        'local reply',
+        'second',
+      ]);
+      // A fresh messageId was minted for the re-establish (the delta's was
+      // replaced, so only two distinct ids exist across three sends).
+      expect(messageIds.toSet(), hasLength(2));
+      // The context-free reply was discarded — the store only ever sees 'ok'.
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages.last.content, 'ok');
+      expect(
+        loaded.messages.any((m) => m.content == 'context-free reply'),
+        isFalse,
+      );
+      expect(await repo.pending(scope, 'c1'), isNull);
+      expect(await repo.mappedSession('c1'), session);
+    },
+  );
 
   test('a legitimate first-turn establish answered seeded completes normally '
       'with no recovery', () async {
@@ -1054,7 +1102,11 @@ void main() {
         finishReason: 'stop',
       ),
     );
-    final outcome = await service.sendTurn('c1', history: const [], userText: 'hi');
+    final outcome = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
     expect(outcome.state, 'seeded');
     // Exactly one request: the empty-history establish (single message) is NOT
     // a delta, so a seeded response never triggers silent-reseed recovery.
@@ -1068,51 +1120,60 @@ void main() {
     expect(loaded!.messages.last.content, 'first reply');
   });
 
-  test('silent-reseed recovery is bounded: a re-established seeded is a '
-      'legitimate establish and never re-triggers recovery (no loop)',
-      () async {
-    final first = await service.sendTurn('c1', history: const [], userText: 'hi');
-    var calls = 0;
-    respondWith = (request) {
-      calls++;
-      return Future.value(
-        ManagedTurnResult(
-          sessionId: request.conversationPublicId!,
-          state: 'seeded',
-          result: ChatResult(
-            content: calls == 1 ? 'context-free reply' : 'ok',
-            toolCalls: const [],
-            finishReason: 'stop',
-          ),
-        ),
+  test(
+    'silent-reseed recovery is bounded: a re-established seeded is a '
+    'legitimate establish and never re-triggers recovery (no loop)',
+    () async {
+      final first = await service.sendTurn(
+        'c1',
+        history: const [],
+        userText: 'hi',
       );
-    };
-    final outcome = await service.sendTurn(
-      'c1',
-      history: const [
-        Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-        Message(id: 'm2', role: MessageRole.assistant, content: 'first reply'),
-      ],
-      userText: 'second',
-    );
-    // Establish + delta(seeded) + exactly ONE re-establish(seeded, legit) —
-    // the re-established seeded must NOT recurse into another reseed.
-    expect(client.requests, hasLength(3));
-    expect(outcome.state, 'seeded');
-    expect(outcome.sessionId, first.sessionId);
-    expect(await repo.pending(scope, 'c1'), isNull);
-    final loaded = await repo.access(
-      scope,
-      repo.epoch(scope),
-      () {},
-      (store) => store.loadConversation('c1'),
-    );
-    expect(loaded!.messages.last.content, 'ok');
-  });
+      var calls = 0;
+      respondWith = (request) {
+        calls++;
+        return Future.value(
+          ManagedTurnResult(
+            sessionId: request.conversationPublicId!,
+            state: 'seeded',
+            result: ChatResult(
+              content: calls == 1 ? 'context-free reply' : 'ok',
+              toolCalls: const [],
+              finishReason: 'stop',
+            ),
+          ),
+        );
+      };
+      final outcome = await service.sendTurn(
+        'c1',
+        history: const [
+          Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+          Message(
+            id: 'm2',
+            role: MessageRole.assistant,
+            content: 'first reply',
+          ),
+        ],
+        userText: 'second',
+      );
+      // Establish + delta(seeded) + exactly ONE re-establish(seeded, legit) —
+      // the re-established seeded must NOT recurse into another reseed.
+      expect(client.requests, hasLength(3));
+      expect(outcome.state, 'seeded');
+      expect(outcome.sessionId, first.sessionId);
+      expect(await repo.pending(scope, 'c1'), isNull);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages.last.content, 'ok');
+    },
+  );
 
   test('window filled: a mapped session COMPACTION re-establishes with the '
-      'trimmed full history under the SAME session id (never mints a new one)',
-      () async {
+      'trimmed full history under the SAME session id (never mints a new one)', () async {
     service = ManagedConversationService(
       client: client,
       repo: repo,
@@ -1130,7 +1191,11 @@ void main() {
         finishReason: 'stop',
       ),
     );
-    final first = await service.sendTurn('c1', history: const [], userText: 'hi');
+    final first = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
     final outcome = await service.sendTurn(
       'c1',
       history: const [
@@ -1143,8 +1208,9 @@ void main() {
     expect(outcome.state, 'seeded');
     final body = client.requests.last.toJson();
     expect(body['session_id'], first.sessionId);
-    final contents =
-        (body['messages'] as List).map((m) => m['content']).toList();
+    final contents = (body['messages'] as List)
+        .map((m) => m['content'])
+        .toList();
     // The newest user message is present; trimmed-away older messages are not.
     expect(
       contents,
@@ -1188,10 +1254,7 @@ void main() {
     final contents = (client.requests.last.toJson()['messages'] as List)
         .map((m) => m['content'])
         .toList();
-    expect(
-      contents,
-      ['this message alone exceeds the tiny four token budget'],
-    );
+    expect(contents, ['this message alone exceeds the tiny four token budget']);
   });
 
   test('session_missing recovery re-establishes with the TRIMMED full history '
@@ -1204,7 +1267,11 @@ void main() {
       enabledPlugins: const ['web'],
       trimmer: const ContextTrimmer(maxTokens: 8),
     );
-    final first = await service.sendTurn('c1', history: const [], userText: 'hi');
+    final first = await service.sendTurn(
+      'c1',
+      history: const [],
+      userText: 'hi',
+    );
     final session = first.sessionId;
     var calls = 0;
     respondWith = (request) {
@@ -1273,7 +1340,11 @@ void main() {
         'c1',
         history: const [
           Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-          Message(id: 'm2', role: MessageRole.assistant, content: 'local reply'),
+          Message(
+            id: 'm2',
+            role: MessageRole.assistant,
+            content: 'local reply',
+          ),
         ],
         userText: 'a much longer follow-up that pushes the window over',
       ),
@@ -1282,10 +1353,9 @@ void main() {
     final before = await repo.pending(scope, 'c1');
     final firstBody = client.requests.last.toJson();
     // The compaction establish was persisted as the trimmed single message.
-    expect(
-      (firstBody['messages'] as List).map((m) => m['content']).toList(),
-      ['a much longer follow-up that pushes the window over'],
-    );
+    expect((firstBody['messages'] as List).map((m) => m['content']).toList(), [
+      'a much longer follow-up that pushes the window over',
+    ]);
     respondWith = (request) async => ManagedTurnResult(
       sessionId: request.conversationPublicId!,
       state: 'seeded',
@@ -1312,13 +1382,18 @@ void main() {
       if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
         polls++;
         final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-        expect(byKey, messageId,
-            reason: 'the poll must use the submitted messageId');
-        return jsonResponse(backgroundTaskJson(
-          status: polls == 1 ? 'running' : 'succeeded',
-          messageId: byKey,
-          taskId: 'task-1',
-        ));
+        expect(
+          byKey,
+          messageId,
+          reason: 'the poll must use the submitted messageId',
+        );
+        return jsonResponse(
+          backgroundTaskJson(
+            status: polls == 1 ? 'running' : 'succeeded',
+            messageId: byKey,
+            taskId: 'task-1',
+          ),
+        );
       }
       if (request.uri.path == '/ledger/tasks/task-1') {
         return jsonResponse({
@@ -1389,11 +1464,13 @@ void main() {
     final adapter = FakeAdapter((request) {
       if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
         final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-        return jsonResponse(backgroundTaskJson(
-          status: 'failed',
-          messageId: byKey,
-          taskId: 'task-1',
-        ));
+        return jsonResponse(
+          backgroundTaskJson(
+            status: 'failed',
+            messageId: byKey,
+            taskId: 'task-1',
+          ),
+        );
       }
       throw StateError('unexpected ledger path ${request.uri.path}');
     });
@@ -1425,34 +1502,117 @@ void main() {
     expect(loaded.messages.single.role, MessageRole.user);
   });
 
-  test('background retry replays the same messageId with background: true',
-      () async {
-    client.respondBackground =
-        (_) => throw const PluginClientException('network_error');
-    await expectLater(
-      service.submitBackground('c1', history: const [], userText: 'hi'),
-      throwsA(
-        isA<PluginClientException>()
-            .having((e) => e.code, 'code', 'network_error'),
-      ),
-    );
-    final pending = (await repo.pending(scope, 'c1'))!;
-    final messageId = pending.messageId;
-    final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
-    expect(envelope['background'], isTrue);
+  test(
+    'a terminal poll error clears the pending marker and reports deletion once',
+    () async {
+      final clock = FakeScheduler();
+      final terminalErrors = <Object>[];
+      final adapter = FakeAdapter((request) {
+        if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+          return jsonResponse({
+            'error': ManagedErrorCodes.accountDeleted,
+          }, status: 403);
+        }
+        throw StateError('unexpected ledger path ${request.uri.path}');
+      });
+      final poller = testPoller(scope, adapter, clock);
+      final backgroundService = ManagedConversationService(
+        client: client,
+        repo: repo,
+        scope: scope,
+        credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+        poller: poller,
+        onAccountDeleted: (error) async => terminalErrors.add(error),
+      );
+      final handle = await backgroundService.submitBackground(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      poller.setForeground(true);
+      await clock.advance(Duration.zero);
 
-    client.respondBackground = (_) async =>
-        const BackgroundTurnResult(status: 'accepted', taskId: 'task-1');
-    final outcome = await service.retryTurn('c1');
-    expect(outcome, isA<ManagedBackgroundResubmitted>());
-    final last = client.requests.last;
-    expect(last.turnId, messageId);
-    expect(last.conversationPublicId, isNull);
-    expect(last.toJson()['background'], isTrue);
-    expect(last.toJson()['messageId'], messageId);
-    expect(await repo.pending(scope, 'c1'), isNotNull,
-        reason: 'pending stays until the terminal poll');
-  });
+      final result = await handle.done;
+      expect(result.end, LedgerPollEnd.error);
+      expect(result.error?.code, ManagedErrorCodes.accountDeleted);
+      await waitFor(() async => terminalErrors.length == 1);
+      expect(await repo.pending(scope, 'c1'), isNull);
+      expect(terminalErrors, hasLength(1));
+    },
+  );
+
+  test(
+    'a non-terminal poll error leaves the pending marker for retry',
+    () async {
+      final clock = FakeScheduler();
+      final terminalErrors = <Object>[];
+      final adapter = FakeAdapter((request) {
+        if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+          return jsonResponse({'error': 'unavailable'}, status: 400);
+        }
+        throw StateError('unexpected ledger path ${request.uri.path}');
+      });
+      final poller = testPoller(scope, adapter, clock);
+      final backgroundService = ManagedConversationService(
+        client: client,
+        repo: repo,
+        scope: scope,
+        credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+        poller: poller,
+        onAccountDeleted: (error) async => terminalErrors.add(error),
+      );
+      final handle = await backgroundService.submitBackground(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      poller.setForeground(true);
+      await clock.advance(const Duration(seconds: 3));
+
+      final result = await handle.done;
+      expect(result.end, LedgerPollEnd.error);
+      expect(result.error?.code, 'server_error');
+      expect(await repo.pending(scope, 'c1'), isNotNull);
+      expect(terminalErrors, isEmpty);
+    },
+  );
+
+  test(
+    'background retry replays the same messageId with background: true',
+    () async {
+      client.respondBackground = (_) =>
+          throw const PluginClientException('network_error');
+      await expectLater(
+        service.submitBackground('c1', history: const [], userText: 'hi'),
+        throwsA(
+          isA<PluginClientException>().having(
+            (e) => e.code,
+            'code',
+            'network_error',
+          ),
+        ),
+      );
+      final pending = (await repo.pending(scope, 'c1'))!;
+      final messageId = pending.messageId;
+      final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
+      expect(envelope['background'], isTrue);
+
+      client.respondBackground = (_) async =>
+          const BackgroundTurnResult(status: 'accepted', taskId: 'task-1');
+      final outcome = await service.retryTurn('c1');
+      expect(outcome, isA<ManagedBackgroundResubmitted>());
+      final last = client.requests.last;
+      expect(last.turnId, messageId);
+      expect(last.conversationPublicId, isNull);
+      expect(last.toJson()['background'], isTrue);
+      expect(last.toJson()['messageId'], messageId);
+      expect(
+        await repo.pending(scope, 'c1'),
+        isNotNull,
+        reason: 'pending stays until the terminal poll',
+      );
+    },
+  );
 
   test('background succeeded WITHOUT a stored reply keeps the pending marker '
       '(retryTurn still re-submits, no no_pending_turn)', () async {
@@ -1461,19 +1621,23 @@ void main() {
     final adapter = FakeAdapter((request) {
       if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
         final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-        return jsonResponse(backgroundTaskJson(
-          status: 'succeeded',
-          messageId: byKey,
-          taskId: 'task-1',
-        ));
+        return jsonResponse(
+          backgroundTaskJson(
+            status: 'succeeded',
+            messageId: byKey,
+            taskId: 'task-1',
+          ),
+        );
       }
       if (request.uri.path == '/ledger/tasks/task-1') {
         // Full task WITHOUT a reply step — the job succeeded but stored none.
-        return jsonResponse(backgroundTaskJson(
-          status: 'succeeded',
-          messageId: messageId,
-          taskId: 'task-1',
-        ));
+        return jsonResponse(
+          backgroundTaskJson(
+            status: 'succeeded',
+            messageId: messageId,
+            taskId: 'task-1',
+          ),
+        );
       }
       throw StateError('unexpected ledger path ${request.uri.path}');
     });
@@ -1496,11 +1660,15 @@ void main() {
     expect((await handle.done).task?.status, LedgerTaskStatus.succeeded);
     // Wait for the async terminal handler to run its full-task read-back.
     await waitFor(
-      () async => adapter.requests.any((r) => r.uri.path == '/ledger/tasks/task-1'),
+      () async =>
+          adapter.requests.any((r) => r.uri.path == '/ledger/tasks/task-1'),
     );
     await flush();
-    expect(await repo.pending(scope, 'c1'), isNotNull,
-        reason: 'a succeeded job with no stored reply keeps its retry identity');
+    expect(
+      await repo.pending(scope, 'c1'),
+      isNotNull,
+      reason: 'a succeeded job with no stored reply keeps its retry identity',
+    );
     // The retry identity survives: an explicit retryTurn still re-submits.
     client.respondBackground = (_) async =>
         const BackgroundTurnResult(status: 'accepted', taskId: 'task-2');
@@ -1519,8 +1687,8 @@ void main() {
       modelPluginId: 'model-a',
       enabledPlugins: const ['web'],
     );
-    client.respondBackground =
-        (_) => throw const PluginClientException('network_error');
+    client.respondBackground = (_) =>
+        throw const PluginClientException('network_error');
     await expectLater(
       serviceA.submitBackground('c1', history: const [], userText: 'hi'),
       throwsA(isA<PluginClientException>()),
@@ -1626,25 +1794,18 @@ void main() {
 
   test('request_too_large on a text-only establish surfaces (nothing to prune) '
       'and a repeated 413 after pruning still surfaces', () async {
-    await repo.savePending(
-      'c1',
-      scope,
-      'msg-1',
-      {
-        'session_id': 'session-1',
-        'model': 'openrouter',
-        'enabledPlugins': <String>[],
-        'messages': [
-          {'role': 'user', 'content': 'hi'},
-          {'role': 'assistant', 'content': 'local reply'},
-          {'role': 'user', 'content': 'second'},
-        ],
-      },
-    );
-    respondWith = (_) => throw const PluginClientException(
-      'request_too_large',
-      statusCode: 413,
-    );
+    await repo.savePending('c1', scope, 'msg-1', {
+      'session_id': 'session-1',
+      'model': 'openrouter',
+      'enabledPlugins': <String>[],
+      'messages': [
+        {'role': 'user', 'content': 'hi'},
+        {'role': 'assistant', 'content': 'local reply'},
+        {'role': 'user', 'content': 'second'},
+      ],
+    });
+    respondWith = (_) =>
+        throw const PluginClientException('request_too_large', statusCode: 413);
     await expectLater(
       service.retryTurn('c1'),
       throwsA(
@@ -1657,8 +1818,11 @@ void main() {
     );
     // Text-only history: no image to prune, so a single dispatch — no retry.
     expect(client.requests, hasLength(1));
-    expect(await repo.pending(scope, 'c1'), isNotNull,
-        reason: 'the failed turn stays retryable');
+    expect(
+      await repo.pending(scope, 'c1'),
+      isNotNull,
+      reason: 'the failed turn stays retryable',
+    );
   });
 
   test('logout racing the session_missing re-establish leaves no zombie '
@@ -1702,9 +1866,13 @@ void main() {
     gate.complete();
     await expectLater(sent, throwsA(isA<Exception>()));
     await clearing;
-    expect(await db.select(db.managedPendingTurns).get(), isEmpty,
-        reason: 'no zombie pending row may survive a logout racing the '
-            're-establish');
+    expect(
+      await db.select(db.managedPendingTurns).get(),
+      isEmpty,
+      reason:
+          'no zombie pending row may survive a logout racing the '
+          're-establish',
+    );
     expect(await db.select(db.conversations).get(), isEmpty);
   });
 
@@ -1716,11 +1884,13 @@ void main() {
       if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
         final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
         final taskId = messageIds[byKey] ?? 'task-x';
-        return jsonResponse(backgroundTaskJson(
-          status: 'succeeded',
-          messageId: byKey,
-          taskId: taskId,
-        ));
+        return jsonResponse(
+          backgroundTaskJson(
+            status: 'succeeded',
+            messageId: byKey,
+            taskId: taskId,
+          ),
+        );
       }
       final taskId = request.uri.pathSegments.last;
       final messageId = messageIds.entries
@@ -1758,10 +1928,17 @@ void main() {
 
     // Same conversation: one pending turn per conversation.
     await expectLater(
-      backgroundService.submitBackground('c1', history: const [], userText: 'dup'),
+      backgroundService.submitBackground(
+        'c1',
+        history: const [],
+        userText: 'dup',
+      ),
       throwsA(
-        isA<PluginClientException>()
-            .having((e) => e.code, 'code', 'pending_turn_exists'),
+        isA<PluginClientException>().having(
+          (e) => e.code,
+          'code',
+          'pending_turn_exists',
+        ),
       ),
     );
 
@@ -1777,9 +1954,11 @@ void main() {
     await clock.advance(Duration.zero);
     expect((await first.done).task?.status, LedgerTaskStatus.succeeded);
     expect((await second.done).task?.status, LedgerTaskStatus.succeeded);
-    await waitFor(() async =>
-        (await repo.pending(scope, 'c1')) == null &&
-        (await repo.pending(scope, 'c2')) == null);
+    await waitFor(
+      () async =>
+          (await repo.pending(scope, 'c1')) == null &&
+          (await repo.pending(scope, 'c2')) == null,
+    );
     final c1 = await repo.access(
       scope,
       repo.epoch(scope),
@@ -1806,11 +1985,13 @@ void main() {
       if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
         polls++;
         final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-        return jsonResponse(backgroundTaskJson(
-          status: polls == 1 ? 'running' : 'succeeded',
-          messageId: byKey,
-          taskId: 'task-1',
-        ));
+        return jsonResponse(
+          backgroundTaskJson(
+            status: polls == 1 ? 'running' : 'succeeded',
+            messageId: byKey,
+            taskId: 'task-1',
+          ),
+        );
       }
       if (request.uri.path == '/ledger/tasks/task-1') {
         return jsonResponse({
@@ -1888,141 +2069,161 @@ void main() {
     await controller.close();
   });
 
-  test('foreground resume re-watches a still-pending background job after the '
-      'original handle\'s deadline expired (exhausted handle misses nothing)',
-      () async {
-    final clock = FakeScheduler();
-    var messageId = '';
-    final adapter = FakeAdapter((request) {
-      if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
-        final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-        return jsonResponse(backgroundTaskJson(
-          status: 'succeeded',
-          messageId: byKey,
-          taskId: 'task-1',
-        ));
-      }
-      if (request.uri.path == '/ledger/tasks/task-1') {
-        return jsonResponse({
-          ...backgroundTaskJson(
-            status: 'succeeded',
-            messageId: messageId,
-            taskId: 'task-1',
-          ),
-          'steps': [
-            {
-              'stage': 'reply',
-              'action': 'assistant_message',
-              'result': 'bg reply',
-            },
-          ],
-        });
-      }
-      throw StateError('unexpected ledger path ${request.uri.path}');
-    });
-    final poller = testPoller(scope, adapter, clock);
-    final backgroundService = ManagedConversationService(
-      client: client,
-      repo: repo,
-      scope: scope,
-      credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
-      poller: poller,
-    );
-    await backgroundService.submitBackground(
-      'c1',
-      history: const [],
-      userText: 'hi',
-    );
-    messageId = (await repo.pending(scope, 'c1'))!.messageId;
+  test(
+    'foreground resume re-watches a still-pending background job after the '
+    'original handle\'s deadline expired (exhausted handle misses nothing)',
+    () async {
+      final clock = FakeScheduler();
+      var messageId = '';
+      final adapter = FakeAdapter((request) {
+        if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+          final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
+          return jsonResponse(
+            backgroundTaskJson(
+              status: 'succeeded',
+              messageId: byKey,
+              taskId: 'task-1',
+            ),
+          );
+        }
+        if (request.uri.path == '/ledger/tasks/task-1') {
+          return jsonResponse({
+            ...backgroundTaskJson(
+              status: 'succeeded',
+              messageId: messageId,
+              taskId: 'task-1',
+            ),
+            'steps': [
+              {
+                'stage': 'reply',
+                'action': 'assistant_message',
+                'result': 'bg reply',
+              },
+            ],
+          });
+        }
+        throw StateError('unexpected ledger path ${request.uri.path}');
+      });
+      final poller = testPoller(scope, adapter, clock);
+      final backgroundService = ManagedConversationService(
+        client: client,
+        repo: repo,
+        scope: scope,
+        credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+        poller: poller,
+      );
+      await backgroundService.submitBackground(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      messageId = (await repo.pending(scope, 'c1'))!.messageId;
 
-    // Backgrounded past the handle's fixed deadline (maxElapsed = 30s): a
-    // suspended app runs no timers, so the deadline elapses unseen.
-    poller.setForeground(false);
-    await clock.advance(const Duration(seconds: 31));
-    expect(adapter.requests, isEmpty,
-        reason: 'no polls may run while the app is backgrounded');
+      // Backgrounded past the handle's fixed deadline (maxElapsed = 30s): a
+      // suspended app runs no timers, so the deadline elapses unseen.
+      poller.setForeground(false);
+      await clock.advance(const Duration(seconds: 31));
+      expect(
+        adapter.requests,
+        isEmpty,
+        reason: 'no polls may run while the app is backgrounded',
+      );
 
-    // Resume: re-arm the poller, then re-watch with a FRESH handle (the old
-    // one would finish `exhausted` with zero polls).
-    poller.setForeground(true);
-    final fresh = await backgroundService.rewatchPendingBackground('c1');
-    expect(fresh, isNotNull);
-    await clock.advance(const Duration(seconds: 1));
-    final result = await fresh!.done;
-    expect(result.end, LedgerPollEnd.observed,
-        reason: 'the fresh watch must observe the terminal task, not expire');
-    expect(result.task?.status, LedgerTaskStatus.succeeded);
-    await waitFor(() async => (await repo.pending(scope, 'c1')) == null);
-    final loaded = await repo.access(
-      scope,
-      repo.epoch(scope),
-      () {},
-      (store) => store.loadConversation('c1'),
-    );
-    expect(loaded!.messages.last.role, MessageRole.assistant);
-    expect(loaded.messages.last.content, 'bg reply');
-  });
+      // Resume: re-arm the poller, then re-watch with a FRESH handle (the old
+      // one would finish `exhausted` with zero polls).
+      poller.setForeground(true);
+      final fresh = await backgroundService.rewatchPendingBackground('c1');
+      expect(fresh, isNotNull);
+      await clock.advance(const Duration(seconds: 1));
+      final result = await fresh!.done;
+      expect(
+        result.end,
+        LedgerPollEnd.observed,
+        reason: 'the fresh watch must observe the terminal task, not expire',
+      );
+      expect(result.task?.status, LedgerTaskStatus.succeeded);
+      await waitFor(() async => (await repo.pending(scope, 'c1')) == null);
+      final loaded = await repo.access(
+        scope,
+        repo.epoch(scope),
+        () {},
+        (store) => store.loadConversation('c1'),
+      );
+      expect(loaded!.messages.last.role, MessageRole.assistant);
+      expect(loaded.messages.last.content, 'bg reply');
+    },
+  );
 
-  test('foreground-gated polling: a submitted job does not poll until the '
-      'lifecycle path arms it, then completes on setForeground(true)',
-      () async {
-    final clock = FakeScheduler();
-    var messageId = '';
-    final adapter = FakeAdapter((request) {
-      if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
-        final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
-        return jsonResponse(backgroundTaskJson(
-          status: 'succeeded',
-          messageId: byKey,
-          taskId: 'task-1',
-        ));
-      }
-      if (request.uri.path == '/ledger/tasks/task-1') {
-        return jsonResponse({
-          ...backgroundTaskJson(
-            status: 'succeeded',
-            messageId: messageId,
-            taskId: 'task-1',
-          ),
-          'steps': [
-            {
-              'stage': 'reply',
-              'action': 'assistant_message',
-              'result': 'bg reply',
-            },
-          ],
-        });
-      }
-      throw StateError('unexpected ledger path ${request.uri.path}');
-    });
-    final poller = testPoller(scope, adapter, clock);
-    final backgroundService = ManagedConversationService(
-      client: client,
-      repo: repo,
-      scope: scope,
-      credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
-      poller: poller,
-    );
-    final handle = await backgroundService.submitBackground(
-      'c1',
-      history: const [],
-      userText: 'hi',
-    );
-    messageId = (await repo.pending(scope, 'c1'))!.messageId;
+  test(
+    'foreground-gated polling: a submitted job does not poll until the '
+    'lifecycle path arms it, then completes on setForeground(true)',
+    () async {
+      final clock = FakeScheduler();
+      var messageId = '';
+      final adapter = FakeAdapter((request) {
+        if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+          final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
+          return jsonResponse(
+            backgroundTaskJson(
+              status: 'succeeded',
+              messageId: byKey,
+              taskId: 'task-1',
+            ),
+          );
+        }
+        if (request.uri.path == '/ledger/tasks/task-1') {
+          return jsonResponse({
+            ...backgroundTaskJson(
+              status: 'succeeded',
+              messageId: messageId,
+              taskId: 'task-1',
+            ),
+            'steps': [
+              {
+                'stage': 'reply',
+                'action': 'assistant_message',
+                'result': 'bg reply',
+              },
+            ],
+          });
+        }
+        throw StateError('unexpected ledger path ${request.uri.path}');
+      });
+      final poller = testPoller(scope, adapter, clock);
+      final backgroundService = ManagedConversationService(
+        client: client,
+        repo: repo,
+        scope: scope,
+        credentials: () async => ManagedCredentials(gatewayKey: gatewayKey),
+        poller: poller,
+      );
+      final handle = await backgroundService.submitBackground(
+        'c1',
+        history: const [],
+        userText: 'hi',
+      );
+      messageId = (await repo.pending(scope, 'c1'))!.messageId;
 
-    // Backgrounded: advance well past initialDelay — no timer runs, no poll.
-    await clock.advance(const Duration(seconds: 5));
-    expect(adapter.requests, isEmpty,
-        reason: 'the poller must refuse to poll while suspended');
+      // Backgrounded: advance well past initialDelay — no timer runs, no poll.
+      await clock.advance(const Duration(seconds: 5));
+      expect(
+        adapter.requests,
+        isEmpty,
+        reason: 'the poller must refuse to poll while suspended',
+      );
 
-    // The lifecycle observer arms the poller on resume; the handle polls.
-    poller.setForeground(true);
-    await clock.advance(const Duration(seconds: 1));
-    expect(adapter.requests, isNotEmpty,
-        reason: 'setForeground(true) from the lifecycle path arms the handle');
-    expect((await handle.done).task?.status, LedgerTaskStatus.succeeded);
-    await waitFor(() async => (await repo.pending(scope, 'c1')) == null);
-  });
+      // The lifecycle observer arms the poller on resume; the handle polls.
+      poller.setForeground(true);
+      await clock.advance(const Duration(seconds: 1));
+      expect(
+        adapter.requests,
+        isNotEmpty,
+        reason: 'setForeground(true) from the lifecycle path arms the handle',
+      );
+      expect((await handle.done).task?.status, LedgerTaskStatus.succeeded);
+      await waitFor(() async => (await repo.pending(scope, 'c1')) == null);
+    },
+  );
 
   group('P1c: abandonTurn', () {
     Future<void> admitHangingTurn({
@@ -2044,55 +2245,60 @@ void main() {
       sent.ignore();
     }
 
-    test('abandonTurn mid-dispatch cancels the token, clears pending, and '
-        'persists the partial so the next send is immediately sendable',
-        () async {
-      final gate = Completer<ManagedTurnResult>();
-      await admitHangingTurn(gate: gate);
-      // Mid-flight first turn: the server has the user message but no reply
-      // yet — abandon must take the partial-retention path, not reconcile.
-      client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
-        'sessionId': sessionId,
-        'messages': [
-          {'role': 'user', 'content': 'hi'},
-        ],
-      });
-      final dispatched = client.cancelTokens.single;
-      expect(dispatched!.isCancelled, isFalse);
+    test(
+      'abandonTurn mid-dispatch cancels the token, clears pending, and '
+      'persists the partial so the next send is immediately sendable',
+      () async {
+        final gate = Completer<ManagedTurnResult>();
+        await admitHangingTurn(gate: gate);
+        // Mid-flight first turn: the server has the user message but no reply
+        // yet — abandon must take the partial-retention path, not reconcile.
+        client.historyBuilder = (sessionId) => ManagedSessionHistory.fromJson({
+          'sessionId': sessionId,
+          'messages': [
+            {'role': 'user', 'content': 'hi'},
+          ],
+        });
+        final dispatched = client.cancelTokens.single;
+        expect(dispatched!.isCancelled, isFalse);
 
-      await service.abandonTurn('c1', partialText: 'partial ');
+        await service.abandonTurn('c1', partialText: 'partial ');
 
-      expect(dispatched.isCancelled, isTrue,
-          reason: 'abandon cancels exactly this turn\'s dispatch token');
-      expect(await repo.pending(scope, 'c1'), isNull);
-      final loaded = await repo.access(
-        scope,
-        repo.epoch(scope),
-        () {},
-        (store) => store.loadConversation('c1'),
-      );
-      expect(loaded!.messages, hasLength(2));
-      expect(loaded.messages.last.role, MessageRole.assistant);
-      expect(loaded.messages.last.content, 'partial ');
+        expect(
+          dispatched.isCancelled,
+          isTrue,
+          reason: 'abandon cancels exactly this turn\'s dispatch token',
+        );
+        expect(await repo.pending(scope, 'c1'), isNull);
+        final loaded = await repo.access(
+          scope,
+          repo.epoch(scope),
+          () {},
+          (store) => store.loadConversation('c1'),
+        );
+        expect(loaded!.messages, hasLength(2));
+        expect(loaded.messages.last.role, MessageRole.assistant);
+        expect(loaded.messages.last.content, 'partial ');
 
-      // (b) a delta right after abandon is sendable — no pending_turn_exists.
-      respondWith = (request) async => ManagedTurnResult(
-        sessionId: request.conversationPublicId!,
-        state: 'resumed',
-        result: const ChatResult(
-          content: 'next',
-          toolCalls: [],
-          finishReason: 'stop',
-        ),
-      );
-      final next = await service.sendTurn(
-        'c1',
-        history: loaded.messages,
-        userText: 'second',
-      );
-      expect(next.state, 'resumed');
-      expect(await repo.pending(scope, 'c1'), isNull);
-    });
+        // (b) a delta right after abandon is sendable — no pending_turn_exists.
+        respondWith = (request) async => ManagedTurnResult(
+          sessionId: request.conversationPublicId!,
+          state: 'resumed',
+          result: const ChatResult(
+            content: 'next',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        );
+        final next = await service.sendTurn(
+          'c1',
+          history: loaded.messages,
+          userText: 'second',
+        );
+        expect(next.state, 'resumed');
+        expect(await repo.pending(scope, 'c1'), isNull);
+      },
+    );
 
     test('abandonTurn with no pending row is a no-op', () async {
       await service.abandonTurn('c1', partialText: 'ignored');
@@ -2157,7 +2363,8 @@ void main() {
       expect(
         loaded.messages.any((m) => m.content == 'partial '),
         isFalse,
-        reason: 'the server\'s terminal reply replaces the local partial');
+        reason: 'the server\'s terminal reply replaces the local partial',
+      );
     });
 
     test('abandonTurn when the server fetch fails falls back to the '
@@ -2220,7 +2427,8 @@ void main() {
       expect(
         loaded!.messages.any((m) => m.content == 'late reply'),
         isFalse,
-        reason: 'a completion after abandon must not persist');
+        reason: 'a completion after abandon must not persist',
+      );
       expect(await repo.pending(scope, 'c1'), isNull);
     });
   });
@@ -2239,9 +2447,7 @@ void main() {
         () {},
         (store) => store.loadConversation('c1'),
       );
-      final users = loaded!.messages.where(
-        (m) => m.role == MessageRole.user,
-      );
+      final users = loaded!.messages.where((m) => m.role == MessageRole.user);
       expect(users, hasLength(1));
       expect(outcome.userMessageId, users.single.id);
       expect(outcome.userMessageId, isNotEmpty);
@@ -2276,8 +2482,11 @@ void main() {
         ),
       );
       final outcome = await service.retryTurn('c1');
-      expect(outcome.userMessageId, admittedId,
-          reason: 'retry replays the envelope id, never re-mints');
+      expect(
+        outcome.userMessageId,
+        admittedId,
+        reason: 'retry replays the envelope id, never re-mints',
+      );
     });
 
     test('a pre-P1b envelope without userMessageId derives the trailing user '
@@ -2290,13 +2499,17 @@ void main() {
       final pending = (await repo.pending(scope, 'c1'))!;
       final envelope = jsonDecode(pending.envelope) as Map<String, dynamic>;
       final admittedId = envelope.remove('userMessageId');
-      expect(admittedId, isA<String>(),
-          reason: 'this test starts from a real envelope, then strips the '
-              'key to simulate a pre-P1b mint');
+      expect(
+        admittedId,
+        isA<String>(),
+        reason:
+            'this test starts from a real envelope, then strips the '
+            'key to simulate a pre-P1b mint',
+      );
       await repo.savePending('c1', scope, pending.messageId, envelope);
-      final rewritten =
-          jsonDecode((await repo.pending(scope, 'c1'))!.envelope)
-              as Map<String, dynamic>;
+      final rewritten = jsonDecode(
+        (await repo.pending(scope, 'c1'))!.envelope,
+      ) as Map<String, dynamic>;
       expect(rewritten.containsKey('userMessageId'), isFalse);
 
       respondWith = (request) async => ManagedTurnResult(
@@ -2309,14 +2522,17 @@ void main() {
         ),
       );
       final outcome = await service.retryTurn('c1');
-      expect(outcome.userMessageId, admittedId,
-          reason: 'derived from the conversation trailing user row');
+      expect(
+        outcome.userMessageId,
+        admittedId,
+        reason: 'derived from the conversation trailing user row',
+      );
     });
 
     test('submitBackground persists userMessageId and a background '
         'retryTurn surfaces it on ManagedBackgroundResubmitted', () async {
-      client.respondBackground =
-          (_) => throw const PluginClientException('network_error');
+      client.respondBackground = (_) =>
+          throw const PluginClientException('network_error');
       await expectLater(
         service.submitBackground('c1', history: const [], userText: 'hi'),
         throwsA(isA<PluginClientException>()),

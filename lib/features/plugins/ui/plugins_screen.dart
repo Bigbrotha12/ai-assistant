@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/auth_credentials_providers.dart';
+import '../../chat/data/chat_client.dart';
 import '../../settings/data/settings_providers.dart';
 import '../data/agent_config.dart';
 import '../data/plugin_catalog_providers.dart';
@@ -60,8 +62,11 @@ class _PluginPage extends ConsumerWidget {
         if (catalog.isLoading || configuration.isLoading) {
           body = const Center(child: CircularProgressIndicator());
         } else if (catalog.hasError || configuration.hasError) {
+          final terminal =
+              isAccountDeletedError(catalog.error) ||
+              isAccountDeletedError(configuration.error);
           body = _RetryNotice(
-            message: 'Could not load plugins. Check your connection or sign in again from Settings.',
+            message: terminal ? accountDeletedNotice : 'Could not load plugins. Check your connection or sign in again from Settings.',
             onRetry: () {
               ref.invalidate(pluginCatalogProvider);
               ref.invalidate(pluginCredentialsProvider);
@@ -114,7 +119,10 @@ class _PluginList extends ConsumerWidget {
     final selectedAgent = configuration.selectedAgent;
     final templates = ref.watch(agentTemplatesProvider);
     final customAgents = configuration.plugins.entries
-        .where((e) => e.value.agent != null && e.value.agent!.kind == AgentKind.custom)
+        .where(
+          (e) =>
+              e.value.agent != null && e.value.agent!.kind == AgentKind.custom,
+        )
         .toList();
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -151,10 +159,17 @@ class _PluginList extends ConsumerWidget {
             'No agents available. Ask your administrator to install an agent plugin.',
           ),
         if (catalog.agents.isNotEmpty) ...[
-          Text('Installed agent plugins:',
-              style: Theme.of(context).textTheme.titleSmall),
+          Text(
+            'Installed agent plugins:',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
           for (final agent in catalog.agents)
-            _agentTile(context, agent, selectedAgent == agent.id, configuration),
+            _agentTile(
+              context,
+              agent,
+              selectedAgent == agent.id,
+              configuration,
+            ),
           const SizedBox(height: 12),
         ],
         if (templates.isLoading)
@@ -167,15 +182,19 @@ class _PluginList extends ConsumerWidget {
             padding: EdgeInsets.only(bottom: 8),
             child: Text('Could not load agent templates.'),
           )
-        else if (templates.value != null && templates.requireValue.isNotEmpty) ...[
-          Text('Templates:',
-              style: Theme.of(context).textTheme.titleSmall),
+        else if (templates.value != null &&
+            templates.requireValue.isNotEmpty) ...[
+          Text('Templates:', style: Theme.of(context).textTheme.titleSmall),
           for (final template in templates.requireValue)
             _templateTile(
-              context, template, selectedAgent == template['id'],
+              context,
+              template,
+              selectedAgent == template['id'],
               onSelect: () async {
                 try {
-                  await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(template['id'] as String?);
+                  await ref
+                      .read(scopedPluginCredentialsProvider)
+                      .setSelectedAgent(template['id'] as String?);
                 } catch (_) {
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -185,11 +204,15 @@ class _PluginList extends ConsumerWidget {
               },
               onDeselect: () async {
                 try {
-                  await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(null);
+                  await ref
+                      .read(scopedPluginCredentialsProvider)
+                      .setSelectedAgent(null);
                 } catch (_) {
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Could not deselect template.')),
+                    const SnackBar(
+                      content: Text('Could not deselect template.'),
+                    ),
                   );
                 }
               },
@@ -197,19 +220,27 @@ class _PluginList extends ConsumerWidget {
           const SizedBox(height: 12),
         ],
         if (customAgents.isNotEmpty) ...[
-          Text('Custom agents:',
-              style: Theme.of(context).textTheme.titleSmall),
+          Text('Custom agents:', style: Theme.of(context).textTheme.titleSmall),
           for (final entry in customAgents)
             _customAgentTile(
-              context, entry.key, entry.value.agent!,
+              context,
+              entry.key,
+              entry.value.agent!,
               selectedAgent == entry.key,
-              onEdit: () => _openEditAgentEditor(context, entry.key, entry.value.agent!),
+              onEdit: () =>
+                  _openEditAgentEditor(context, entry.key, entry.value.agent!),
               onDelete: () async {
                 try {
-                  await ref.read(scopedPluginCredentialsProvider).removePlugin(entry.key);
+                  await ref
+                      .read(scopedPluginCredentialsProvider)
+                      .removePlugin(entry.key);
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Removed agent "${entry.value.agent!.name.isNotEmpty ? entry.value.agent!.name : entry.key}"')),
+                    SnackBar(
+                      content: Text(
+                        'Removed agent "${entry.value.agent!.name.isNotEmpty ? entry.value.agent!.name : entry.key}"',
+                      ),
+                    ),
                   );
                 } catch (_) {
                   if (!context.mounted) return;
@@ -251,52 +282,49 @@ class _PluginList extends ConsumerWidget {
     AgentDto agent,
     bool isSelected,
     PluginAccountConfiguration configuration,
-  ) =>
-      ListTile(
-        key: ValueKey('agent-${agent.id}'),
-        title: Text(agent.name),
-        subtitle: Text(
-          isSelected
-              ? 'Selected for this account'
-              : agent.description,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (agent.skillCount > 0)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text('${agent.skillCount} skills'),
-                  visualDensity: VisualDensity.compact,
-                ),
+  ) => ListTile(
+    key: ValueKey('agent-${agent.id}'),
+    title: Text(agent.name),
+    subtitle: Text(
+      isSelected ? 'Selected for this account' : agent.description,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+    ),
+    trailing: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (agent.skillCount > 0)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text('${agent.skillCount} skills'),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        if (agent.toolGrants.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text('${agent.toolGrants.length} tools'),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        if (agent.defaultModel != null)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text(
+                agent.defaultModel!,
+                style: const TextStyle(fontSize: 10),
               ),
-            if (agent.toolGrants.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text('${agent.toolGrants.length} tools'),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ),
-            if (agent.defaultModel != null)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text(
-                    agent.defaultModel!,
-                    style: const TextStyle(fontSize: 10),
-                  ),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ),
-            const Icon(Icons.chevron_right),
-          ],
-        ),
-        onTap: () => _openAgentEditor(context, agent, configuration),
-      );
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        const Icon(Icons.chevron_right),
+      ],
+    ),
+    onTap: () => _openAgentEditor(context, agent, configuration),
+  );
 
   Widget _templateTile(
     BuildContext context,
@@ -309,16 +337,16 @@ class _PluginList extends ConsumerWidget {
     final name = template['name'] as String? ?? id;
     final description = template['description'] as String? ?? '';
     final modelRef = template['defaultModel'] as String?;
-    final toolCount = template['toolGrants'] is List ? (template['toolGrants'] as List).length : 0;
+    final toolCount = template['toolGrants'] is List
+        ? (template['toolGrants'] as List).length
+        : 0;
     final skillCount = template['skillCount'] as int? ?? 0;
     final mcpCount = (template['mcpNames'] as List?)?.length ?? 0;
     return ListTile(
       key: ValueKey('template-$id'),
       title: Text(name),
       subtitle: Text(
-        isSelected
-            ? 'Selected for this account'
-            : description,
+        isSelected ? 'Selected for this account' : description,
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
       ),
@@ -373,74 +401,73 @@ class _PluginList extends ConsumerWidget {
     bool isSelected, {
     VoidCallback? onEdit,
     VoidCallback? onDelete,
-  }) =>
-      ListTile(
-        key: ValueKey('custom-$pluginId'),
-        title: Row(
-          children: [
-            Text(agent.name.isNotEmpty ? agent.name : pluginId),
-            const SizedBox(width: 8),
-            Chip(
-              label: const Text('Custom'),
+  }) => ListTile(
+    key: ValueKey('custom-$pluginId'),
+    title: Row(
+      children: [
+        Text(agent.name.isNotEmpty ? agent.name : pluginId),
+        const SizedBox(width: 8),
+        Chip(
+          label: const Text('Custom'),
+          visualDensity: VisualDensity.compact,
+          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        ),
+      ],
+    ),
+    subtitle: Text(
+      isSelected
+          ? 'Selected for this account'
+          : (agent.description ?? 'No description'),
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+    ),
+    trailing: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (agent.skills.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text('${agent.skills.length} skills'),
               visualDensity: VisualDensity.compact,
-              backgroundColor: Theme.of(context).colorScheme.primaryContainer,
             ),
-          ],
-        ),
-        subtitle: Text(
-          isSelected
-              ? 'Selected for this account'
-              : (agent.description ?? 'No description'),
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (agent.skills.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text('${agent.skills.length} skills'),
-                  visualDensity: VisualDensity.compact,
-                ),
+          ),
+        if (agent.mcpServers.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text('${agent.mcpServers.length} MCP'),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        if (agent.tools.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text('${agent.tools.length} tools'),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        if (agent.modelRef != null)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Chip(
+              label: Text(
+                agent.modelRef!,
+                style: const TextStyle(fontSize: 10),
               ),
-            if (agent.mcpServers.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text('${agent.mcpServers.length} MCP'),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ),
-            if (agent.tools.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text('${agent.tools.length} tools'),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ),
-            if (agent.modelRef != null)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Chip(
-                  label: Text(
-                    agent.modelRef!,
-                    style: const TextStyle(fontSize: 10),
-                  ),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ),
-            if (isSelected)
-              TextButton(onPressed: onEdit, child: const Text('Edit'))
-            else ...[
-              TextButton(onPressed: onEdit, child: const Text('Edit')),
-              TextButton(onPressed: onDelete, child: const Text('Delete')),
-            ],
-          ],
-        ),
-      );
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        if (isSelected)
+          TextButton(onPressed: onEdit, child: const Text('Edit'))
+        else ...[
+          TextButton(onPressed: onEdit, child: const Text('Edit')),
+          TextButton(onPressed: onDelete, child: const Text('Delete')),
+        ],
+      ],
+    ),
+  );
 
   void _openAgentEditor(
     BuildContext context,
@@ -462,14 +489,16 @@ class _PluginList extends ConsumerWidget {
   }
 
   void _openNewAgentEditor(BuildContext context) {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => const AgentEditorScreen(),
-      ),
-    );
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => const AgentEditorScreen()));
   }
 
-  void _openEditAgentEditor(BuildContext context, String pluginId, AgentConfig agent) {
+  void _openEditAgentEditor(
+    BuildContext context,
+    String pluginId,
+    AgentConfig agent,
+  ) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => AgentEditorScreen(existing: agent),
@@ -573,7 +602,8 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
     final saved = widget.configuration.plugins[plugin.id];
     final hasKey = saved?.credentials['apiKey']?.isNotEmpty ?? false;
     final savedEntry = saved?.credentials['baseUrlEntry'];
-    final hasBaseUrlOptions = plugin.credentials != null &&
+    final hasBaseUrlOptions =
+        plugin.credentials != null &&
         plugin.type != 'tool' &&
         plugin.baseUrls.isNotEmpty;
     final selectedEntry =
@@ -688,13 +718,10 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
                   );
                 } else {
                   _write(
-                    (store) => store.setCredentials(
-                      plugin.id,
-                      {
-                        ...?saved?.credentials,
-                        'baseUrlEntry': value,
-                      },
-                    ),
+                    (store) => store.setCredentials(plugin.id, {
+                      ...?saved?.credentials,
+                      'baseUrlEntry': value,
+                    }),
                   );
                 }
               },
@@ -711,8 +738,9 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
                     RadioListTile<String>(
                       key: ValueKey('plugin-baseurl-${instance.id}'),
                       value: instance.id,
-                      title:
-                          Text(instance.label ?? instance.url ?? instance.id),
+                      title: Text(
+                        instance.label ?? instance.url ?? instance.id,
+                      ),
                       subtitle: instance.url == null
                           ? null
                           : Text(instance.url!),
@@ -750,19 +778,24 @@ class _AgentEditor extends ConsumerWidget {
         Text(agent.name, style: Theme.of(context).textTheme.headlineSmall),
         Text(agent.description),
         const SizedBox(height: 16),
-        if (agent.defaultModel case final model?)
-          Text('Default model: $model'),
+        if (agent.defaultModel case final model?) Text('Default model: $model'),
         if (agent.toolGrants.isNotEmpty) ...[
           const SizedBox(height: 12),
-          Text('Grants access to:', style: Theme.of(context).textTheme.titleSmall),
+          Text(
+            'Grants access to:',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
           for (final grant in agent.toolGrants)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Row(
                 children: [
                   if (grant.required)
-                    Icon(Icons.lock, size: 16,
-                      color: Theme.of(context).colorScheme.error),
+                    Icon(
+                      Icons.lock,
+                      size: 16,
+                      color: Theme.of(context).colorScheme.error,
+                    ),
                   const SizedBox(width: 4),
                   Text(grant.pluginId),
                 ],
@@ -778,22 +811,25 @@ class _AgentEditor extends ConsumerWidget {
           Text('Settings:'),
           if (agent.temperature != null)
             Text('Temperature: ${agent.temperature}'),
-          if (agent.maxTokens != null)
-            Text('Max tokens: ${agent.maxTokens}'),
+          if (agent.maxTokens != null) Text('Max tokens: ${agent.maxTokens}'),
           Text('Vision: ${agent.visionCapable ? 'Yes' : 'No'}'),
         ],
         const SizedBox(height: 24),
         if (isSelected)
           FilledButton(
             onPressed: () async {
-              await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(null);
+              await ref
+                  .read(scopedPluginCredentialsProvider)
+                  .setSelectedAgent(null);
             },
             child: const Text('Deselect agent'),
           )
         else
           FilledButton(
             onPressed: () async {
-              await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(agent.id);
+              await ref
+                  .read(scopedPluginCredentialsProvider)
+                  .setSelectedAgent(agent.id);
             },
             child: const Text('Select agent'),
           ),

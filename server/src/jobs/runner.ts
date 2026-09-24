@@ -11,7 +11,7 @@ import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import { jsonSchemaToZod, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
-import { redactForOutbound } from "../redact.ts";
+import { redactForOutbound, redactMessages } from "../redact.ts";
 import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { env } from "../env.ts";
 import {
@@ -522,7 +522,7 @@ function bindJobTool(
           signal,
         );
         assertActive();
-        return result;
+        return redactForOutbound(String(result));
       };
       const toolCallId = (
         config as { toolCall?: { id?: string } } | undefined
@@ -545,7 +545,7 @@ function bindJobTool(
           toolCallId,
           opts.owner,
         );
-        return step?.result ?? "";
+        return redactForOutbound(step?.result ?? "");
       }
       // Phase 4, Wave B: the in-memory tool-result cache sits AFTER the ledger
       // replay dedupe (a stored step is always authoritative, never shadowed
@@ -714,7 +714,9 @@ export class JobRunner {
         ? null
         : JSON.stringify(
             mapChatMessagesToStoredMessages(
-              (input as { messages?: BaseMessage[] }).messages ?? [],
+              redactMessages(
+                (input as { messages?: BaseMessage[] }).messages ?? [],
+              ),
             ),
           );
 
@@ -946,7 +948,12 @@ export class JobRunner {
             this.deps.ledger.appendStep(
               claimed.id,
               owner,
-              { stage: "reply", action: "assistant_message", result: reply },
+              {
+                stage: "reply",
+                action: "assistant_message",
+                // Persisted replies are state: redact at this seam rather than altering model output.
+                result: redactForOutbound(reply),
+              },
               fenceToken,
             );
           } catch (err) {
@@ -1356,7 +1363,7 @@ function snapshotMessagesFromPayload(task: TaskRow): BaseMessage[] | null {
   try {
     const parsed: unknown = JSON.parse(task.payload);
     if (!Array.isArray(parsed)) return null;
-    return mapStoredMessagesToChatMessages(parsed as never[]);
+    return redactMessages(mapStoredMessagesToChatMessages(parsed as never[]));
   } catch {
     return null;
   }

@@ -37,6 +37,7 @@ function isNotFound(e: unknown): boolean {
   return e instanceof CredentialPinError && e.code === "pin_not_found";
 }
 import { recordToolResult } from "../../src/credentials/idempotency.ts";
+import { redactForOutbound } from "../../src/redact.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
@@ -383,16 +384,23 @@ describe("JobRunner.runJob", () => {
     );
   });
 
-  test("step 9: a succeeded job stores a `reply` step whose content is the assistant reply", async (t) => {
+  test("step 9: a succeeded job stores a redacted `reply` step for the assembled assistant reply", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     const pins = new CredentialPinStore();
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const randomPart = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const replyText = [
+      `here are your tasks: sk${randomPart}`,
+      `sk-${randomPart}`,
+      `sk_${randomPart}`,
+      "Authorization: Bearer opaque-provider-token",
+    ].join("\n");
 
     const model = new ScriptedChatModel({
       responses: [
         toolCallMessage("list_tasks", { projectId: "p1" }, "call_reply"),
-        new AIMessage("here are your tasks"),
+        new AIMessage(replyText),
       ],
     });
     const runner = createJobRunner(
@@ -408,12 +416,62 @@ describe("JobRunner.runJob", () => {
       .listSteps(result.taskId)
       .find((s) => s.stage === "reply");
     assert.ok(replyStep, "a reply step must be appended on success");
-    assert.equal(replyStep!.action, "assistant_message");
-    assert.ok(
-      String(replyStep!.result).includes("here are your tasks"),
-      "the reply step's result is the final assistant message content",
+    assert.equal(replyStep.action, "assistant_message");
+    assert.equal(
+      replyStep.result,
+      [
+        "here are your tasks: sk-***",
+        "sk-***",
+        "sk-***",
+        "Authorization: Bearer ***",
+      ].join("\n"),
     );
+    assert.ok(!String(replyStep.result).includes(randomPart));
     assert.equal(ledger.getTask(result.taskId)?.status, "succeeded");
+  });
+
+  test("recordToolResult redacts raw custom handler output at the persistence boundary", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const randomPart = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const rawResult = `echo sk${randomPart}\nAuthorization: Bearer opaque-provider-token`;
+    const customHandler: ToolCallHandler = {
+      async execute() {
+        return rawResult;
+      },
+    };
+    let graphToolContent: string | undefined;
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }, "call_custom"),
+        new AIMessage("done"),
+      ],
+      onGenerateMessages: (messages) => {
+        const toolMessage = messages.find((message) => message.getType() === "tool");
+        if (toolMessage && typeof toolMessage.content === "string") {
+          graphToolContent = toolMessage.content;
+        }
+      },
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, { buildModel: () => model }),
+    );
+
+    const result = await runner.runJob(descriptor({ toolHandler: customHandler }));
+
+    assert.equal(result.status, "succeeded");
+    const toolStep = ledger
+      .listSteps(result.taskId)
+      .find((step) => step.stage === "tool");
+    assert.ok(toolStep);
+    assert.equal(
+      toolStep.result,
+      "echo sk-***\nAuthorization: Bearer ***",
+    );
+    assert.ok(!String(toolStep.result).includes(randomPart));
+    assert.equal(graphToolContent, "echo sk-***\nAuthorization: Bearer ***");
   });
 
   test("step 9: a failed job stores no reply step", async (t) => {
@@ -487,12 +545,20 @@ describe("JobRunner.runJob", () => {
 
     const calls: RecordedCall[] = [];
     const toolCallId = "call_replay";
+    const storedSecret = `sk-ant-api03-${"r".repeat(32)}`;
     let seeded = false;
+    let graphToolContent: string | undefined;
     const model = new ScriptedChatModel({
       responses: [
         toolCallMessage("list_tasks", { projectId: "p1" }, toolCallId),
         new AIMessage("done"),
       ],
+      onGenerateMessages: (messages) => {
+        const toolMessage = messages.find((message) => message.getType() === "tool");
+        if (toolMessage && typeof toolMessage.content === "string") {
+          graphToolContent = toolMessage.content;
+        }
+      },
       onGenerate: () => {
         if (seeded) return;
         seeded = true;
@@ -504,7 +570,7 @@ describe("JobRunner.runJob", () => {
           fenceToken: task.fence_token,
           toolCallId,
           toolName: "list_tasks",
-          result: '{"stored":true}',
+          result: `{"stored":"${storedSecret}","plain":"value"}`,
         });
       },
     });
@@ -525,6 +591,12 @@ describe("JobRunner.runJob", () => {
         .some((s) => s.action === "tool:list_tasks" && String(s.result).includes("stored")),
       "the stored result is recorded as the tool step (replayed, not re-executed)",
     );
+    const expectedReplay = `{"stored":"sk-ant-api03-***","plain":"value"}`;
+    assert.equal(
+      ledger.listSteps(result.taskId).find((s) => s.action === "tool:list_tasks")?.result,
+      expectedReplay,
+    );
+    assert.equal(graphToolContent, expectedReplay);
   });
 
   test("expired credential pin: job fails credentials_expired, no graph invoke, no handler call", async (t) => {
@@ -858,6 +930,52 @@ describe("JobRunner.runJob", () => {
     assert.equal(resumed.status, "succeeded");
     const backfilled = ledger.getTask(preAdmitted.id);
     assert.ok(backfilled?.payload, "the pre-admitted task's payload must be backfilled");
+  });
+
+  test("background snapshot payloads redact nested message state before read-back", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const secret = `sk-ant-api03-${"a".repeat(32)}`;
+    const inputMessage = new AIMessage({
+      content: [
+        { type: "thinking", thinking: `private ${secret}` },
+        { type: "text", text: "ordinary snapshot text" },
+      ] as unknown as AIMessage["content"],
+      id: "snapshot-1",
+      tool_calls: [{
+        id: "call-snapshot",
+        name: "lookup",
+        type: "tool_call",
+        args: { token: `tok-${"b".repeat(32)}` },
+      }],
+    });
+    let graphMessages: BaseMessage[] | undefined;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => new ScriptedChatModel({
+          responses: [new AIMessage("done")],
+          onGenerateMessages: (messages) => {
+            graphMessages = messages;
+          },
+        }),
+      }),
+    );
+
+    const result = await runner.runJob(
+      descriptor({ intentKey: "payload-redaction", input: { messages: [inputMessage] } }),
+    );
+
+    assert.equal(result.status, "succeeded");
+    const payload = ledger.getTask(result.taskId)?.payload;
+    assert.ok(payload);
+    assert.ok(!payload.includes(secret));
+    assert.ok(!payload.includes(`tok-${"b".repeat(32)}`));
+    assert.ok(payload.includes("ordinary snapshot text"));
+    assert.ok(payload.includes("snapshot-1"));
+    assert.ok(payload.includes("call-snapshot"));
+    assert.ok(graphMessages?.some((message) => message.content === inputMessage.content));
   });
 
   test("Wave C2: the buildModel seam resolves the PINNED model credential by owner and builds the model", async (t) => {
@@ -2076,13 +2194,20 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
    * ScriptedChatModel's response queue is consumed per job, so each runJob call
    * needs its own instance).
    */
-  function modelFactory(toolName: string, callId: string, reply: string, args: Record<string, unknown>) {
+  function modelFactory(
+    toolName: string,
+    callId: string,
+    reply: string,
+    args: Record<string, unknown>,
+    onMessages?: (messages: BaseMessage[]) => void,
+  ) {
     return (_id: unknown, _config: unknown) =>
       new ScriptedChatModel({
         responses: [
           toolCallMessage(toolName, args, callId),
           new AIMessage(reply),
         ],
+        onGenerateMessages: onMessages,
       });
   }
 
@@ -2093,11 +2218,23 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
     const toolCache = createToolResultCache();
     const calls: RecordedCall[] = [];
+    const graphToolContents: string[] = [];
 
     const runner = createJobRunner(
       baseDeps(ledger, registry, pins, {
         toolCache,
-        buildModel: modelFactory("list_tasks", "call_ro_1", "done", { projectId: "p1" }),
+        buildModel: modelFactory(
+          "list_tasks",
+          "call_ro_1",
+          "done",
+          { projectId: "p1" },
+          (messages) => {
+            const toolMessage = messages.find((message) => message.getType() === "tool");
+            if (toolMessage && typeof toolMessage.content === "string") {
+              graphToolContents.push(toolMessage.content);
+            }
+          },
+        ),
       }),
     );
 
@@ -2135,6 +2272,10 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
       false,
       "a cache hit does not append a tool step to the second job",
     );
+    assert.deepEqual(graphToolContents, [
+      redactForOutbound(RAW_RESULT),
+      redactForOutbound(RAW_RESULT),
+    ]);
   });
 
   test("a mutating tool is never cached: identical runJob calls re-execute and cache stays empty", async (t) => {

@@ -38,6 +38,17 @@ import { createWarmupManager } from "./middleware/warmup.ts";
 import { loadCatalogs } from "./catalog/index.ts";
 import type { Catalogs } from "./catalog/index.ts";
 
+// SINGLE-REPLICA ASSUMPTION (deliberate deployment choice): the composition root
+// wires process-local deletion state, the RAM-only session store, per-process
+// tool-cache, budget, and rate-limit state, runner pin/controller registries,
+// and file-backed notify/ledger stores. These require **exactly one gateway
+// replica; no overlapping rolling deployments**. A second or overlapping
+// process can miss a deletion tombstone, admit work that raced deletion, lose
+// session state, or overwrite a stale notify snapshot. There is no in-process
+// way to detect the
+// real replica count; an environment flag cannot assert it, so ops must enforce
+// the Deployment and rollout. Multi-replica deletion coordination is a
+// separate distributed-coordination project.
 const auth = authModule.auth;
 const sendVerificationRateLimitGate = getSendVerificationRateLimitGate();
 const apiKeyEmailVerificationGate = createApiKeyEmailVerificationGate({

@@ -7,6 +7,8 @@ import 'package:ai_assistant/core/http/dio_provider.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_handler.dart';
+import 'package:ai_assistant/features/auth/data/account_deleted_state.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
@@ -45,6 +47,13 @@ class TestAuth extends AuthCredentialsNotifier {
   @override
   Future<AuthCredentials?> build() async => initial;
   void replace(AuthCredentials? value) => state = AsyncData(value);
+}
+
+class _NoopAccountDeletedHandler extends AccountDeletedHandler {
+  _NoopAccountDeletedHandler(super.ref);
+
+  @override
+  Future<void> handle(Object? error) async {}
 }
 
 ResponseBody jsonResponse(Object value, {int status = 200}) =>
@@ -153,6 +162,7 @@ void main() {
   late ProviderContainer container;
   late TestAuth auth;
   bool failed = false;
+  bool terminal = false;
   bool empty = false;
 
   Future<void> mount(
@@ -166,6 +176,9 @@ void main() {
       overrides: [
         dioProvider.overrideWithValue(dio),
         authCredentialsProvider.overrideWith(() => auth),
+        accountDeletedHandlerProvider.overrideWith(
+          (ref) => _NoopAccountDeletedHandler(ref),
+        ),
         settingsStoreProvider.overrideWithValue(
           FakeSettingsStore(stored: const BackendSettings(host: 'example.com')),
         ),
@@ -223,9 +236,13 @@ void main() {
 
   setUp(() {
     failed = false;
+    terminal = false;
     empty = false;
     store = PluginCredentialsStore(storage: InMemorySecureStorage());
     adapter = FakePluginAdapter((options) {
+      if (terminal) {
+        return jsonResponse({'error': 'account_deleted'}, status: 403);
+      }
       if (failed) {
         return jsonResponse({
           'error': 'internal',
@@ -434,6 +451,15 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('This plugin was removed'), findsOneWidget);
     expect(find.byType(TextField), findsNothing);
+  });
+
+  testWidgets('account_deleted catalog errors show the terminal copy', (
+    tester,
+  ) async {
+    terminal = true;
+    await mount(tester);
+    expect(find.text(accountDeletedNotice), findsOneWidget);
+    expect(find.textContaining('Could not load plugins'), findsNothing);
   });
 
   testWidgets('catalog requests cancel on key change and disposal', (

@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_file/open_file.dart';
 
+import '../../auth/data/account_deleted_handler.dart';
+import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/account_lifecycle.dart';
 import '../../auth/data/auth_client.dart';
 import '../../auth/data/auth_client_provider.dart';
@@ -30,6 +32,8 @@ import '../../voice/ui/voice_settings_providers.dart';
 import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
 import '../../auth/ui/sign_in_screen.dart';
+import '../../plugins/data/managed_error_codes.dart';
+import '../../plugins/data/plugin_http.dart';
 import '../../plugins/ui/plugins_screen.dart';
 
 /// App home screen: configure the gateway host for account services and
@@ -160,6 +164,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     var status = failureStatus;
     try {
       status = await ref.read(backendProbeProvider).probe(settings);
+      if (status.hasAuthenticatedAccountDeletedSignal) {
+        await ref
+            .read(accountDeletedHandlerProvider)
+            .handle(
+              const PluginClientException(
+                ManagedErrorCodes.accountDeleted,
+                statusCode: 403,
+              ),
+            );
+      }
     } catch (_) {
       status = failureStatus;
     } finally {
@@ -463,7 +477,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
     final auth = ref.read(authClientProvider);
     final sessionToken = creds?.sessionToken ?? '';
-    await auth.deleteAccount(sessionToken: sessionToken, password: password);
+    try {
+      await auth.deleteAccount(sessionToken: sessionToken, password: password);
+    } on AuthAccountDeleted catch (error) {
+      await ref.read(accountDeletedHandlerProvider).handle(error);
+      rethrow;
+    }
     await wipeLocalAccountData(
       scope: scope,
       lifecycle: ref.read(accountLifecycleProvider),
@@ -1093,6 +1112,7 @@ class _DeleteAccountDialogState extends State<_DeleteAccountDialog> {
   }
 
   static String _failureMessage(AuthApiError e) {
+    if (e is AuthAccountDeleted) return accountDeletedNotice;
     if (e is AuthUnauthorized || e.code == 'SESSION_EXPIRED') {
       return 'Your session has expired. Sign in again to delete your account.';
     }

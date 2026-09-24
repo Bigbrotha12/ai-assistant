@@ -70,7 +70,11 @@ class ManagedStreamedTurn extends ManagedTurnOutcome {
 /// duplicate; it carries no task metadata (the sync path admits no ledger
 /// tasks).
 class ManagedAlreadyCompleted extends ManagedTurnOutcome {
-  const ManagedAlreadyCompleted(super.sessionId, super.state, super.userMessageId);
+  const ManagedAlreadyCompleted(
+    super.sessionId,
+    super.state,
+    super.userMessageId,
+  );
 }
 
 /// Failure that keeps the server session id reachable for the caller.
@@ -119,6 +123,7 @@ class ManagedConversationService {
     this.trimmer = const ContextTrimmer(),
     this._poller,
     this._dio,
+    this.onAccountDeleted,
   });
 
   final LangChainClient client;
@@ -140,6 +145,15 @@ class ManagedConversationService {
   /// poller-scoped [AuthCredentials].
   LedgerPoller? _poller;
   final Dio? _dio;
+  final Future<void> Function(Object error)? onAccountDeleted;
+
+  Future<void> _notifyAccountDeleted(Object error) async {
+    final callback = onAccountDeleted;
+    if (callback == null || !isAccountDeletedError(error)) return;
+    try {
+      await callback(error);
+    } catch (_) {}
+  }
 
   LedgerPoller get _ledgerPoller {
     final existing = _poller;
@@ -568,7 +582,11 @@ class ManagedConversationService {
       );
       return outcome;
     } on PluginClientException catch (error) {
-      if (error.code == ManagedErrorCodes.sessionMissing && !reestablishAttempted) {
+      if (isAccountDeletedError(error)) {
+        await _notifyAccountDeleted(error);
+      }
+      if (error.code == ManagedErrorCodes.sessionMissing &&
+          !reestablishAttempted) {
         // Plan §5/R4: the server evicted/restarted its session cache. Do NOT
         // drop-and-mint a new id — re-establish under the SAME session_id from
         // the client-owned store (which already includes the user's message)
@@ -633,7 +651,9 @@ class ManagedConversationService {
     for (var i = 0; i < messages.length; i++) {
       final content = messages[i].content;
       if (content is! List) continue;
-      if (content.any((block) => block is Map && block['type'] == 'image_url')) {
+      if (content.any(
+        (block) => block is Map && block['type'] == 'image_url',
+      )) {
         imageIndexes.add(i);
       }
     }
@@ -648,7 +668,9 @@ class ManagedConversationService {
             content is List &&
             content.any((b) => b is Map && b['type'] == 'image_url')) {
           final filtered = List<Object?>.unmodifiable(
-            content.where((block) => !(block is Map && block['type'] == 'image_url')),
+            content.where(
+              (block) => !(block is Map && block['type'] == 'image_url'),
+            ),
           );
           return ApiMessage(
             role: message.role,
@@ -697,6 +719,11 @@ class ManagedConversationService {
     try {
       await client.backgroundTurn(request, cancelToken: token);
       _checkEpoch(epoch);
+    } on PluginClientException catch (error) {
+      if (isAccountDeletedError(error)) {
+        await _notifyAccountDeleted(error);
+      }
+      rethrow;
     } finally {
       repo.unregister(scope, token);
     }
@@ -722,24 +749,27 @@ class ManagedConversationService {
     required List<Message> history,
   }) {
     final handle = _ledgerPoller.watch(lookup);
-    unawaited(handle.done.then((result) async {
-      // A poll-completion failure (e.g. the reply read-back fetch) must never
-      // surface as an unhandled async error: the pending marker stays so the
-      // caller can retry explicitly.
-      try {
-        await _handleBackgroundTerminal(
-          conversationId,
-          epoch,
-          result,
-          history: history,
-        );
-      } on PluginClientException {
-        // Scope cancellation or a transient reconciliation failure — both
-        // leave the pending marker untouched (retryable).
-      } catch (_) {
-        // Unknown failure — the pending marker is retained.
-      }
-    }));
+    unawaited(
+      handle.done.then((result) async {
+        // A poll-completion failure (e.g. the reply read-back fetch) must never
+        // surface as an unhandled async error: the pending marker stays so the
+        // caller can retry explicitly.
+        try {
+          await _handleBackgroundTerminal(
+            conversationId,
+            epoch,
+            result,
+            messageId: lookup.isMessageId ? lookup.value : null,
+            history: history,
+          );
+        } on PluginClientException {
+          // Scope cancellation or a transient reconciliation failure — both
+          // leave the pending marker untouched (retryable).
+        } catch (_) {
+          // Unknown failure — the pending marker is retained.
+        }
+      }),
+    );
     return handle;
   }
 
@@ -772,12 +802,28 @@ class ManagedConversationService {
     String conversationId,
     int epoch,
     LedgerPollResult result, {
+    String? messageId,
     required List<Message> history,
   }) async {
     try {
       _checkEpoch(epoch);
     } on PluginClientException {
       return; // scope cancelled / logout — nothing to write.
+    }
+    if (result.end == LedgerPollEnd.error &&
+        result.error != null &&
+        isAccountDeletedError(result.error)) {
+      final pending = await repo.pending(scope, conversationId);
+      if (pending != null &&
+          (messageId == null || pending.messageId == messageId)) {
+        await repo.clearPending(
+          scope,
+          conversationId,
+          messageId: pending.messageId,
+        );
+      }
+      await _notifyAccountDeleted(result.error!);
+      return;
     }
     // Only an observed terminal status reconciles; exhaustion/error/cancelled
     // polls keep the pending marker for an explicit retry.
@@ -790,16 +836,23 @@ class ManagedConversationService {
     if (pending == null || pending.messageId != task.messageId) return;
     switch (task.status) {
       case LedgerTaskStatus.succeeded:
-        await _appendBackgroundReply(conversationId, epoch, task,
-            history: history);
+        await _appendBackgroundReply(
+          conversationId,
+          epoch,
+          task,
+          history: history,
+        );
         // Never fall through: a job that succeeded WITHOUT a stored reply keeps
         // the pending marker (the retry identity) per _appendBackgroundReply.
         break;
       case LedgerTaskStatus.failed:
       case LedgerTaskStatus.cancelled:
         // The server owns the failure; the client clears the retry identity.
-        await repo.clearPending(scope, conversationId,
-            messageId: task.messageId);
+        await repo.clearPending(
+          scope,
+          conversationId,
+          messageId: task.messageId,
+        );
         break;
       case LedgerTaskStatus.queued:
       case LedgerTaskStatus.running:
@@ -853,8 +906,7 @@ class ManagedConversationService {
       } else {
         await store.appendMessage(conversationId, assistant);
       }
-      await repo.clearPending(scope, conversationId,
-          messageId: task.messageId);
+      await repo.clearPending(scope, conversationId, messageId: task.messageId);
     });
   }
 
@@ -923,7 +975,9 @@ class ManagedConversationService {
       (store) => store.loadConversation(conversationId),
     );
     _checkEpoch(epoch);
-    if (stored == null) throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
+    if (stored == null) {
+      throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
+    }
     // The local conversation may itself be over budget — run the same trimmer
     // over the full history before re-seeding (plan §6).
     final trimmed = trimmer.trim(stored.messages);
@@ -1086,7 +1140,10 @@ class ManagedConversationService {
         await reconcileFromServer(conversationId);
         return;
       } on PluginClientException catch (error) {
-        if (error.code == ManagedErrorCodes.cancelled) rethrow;
+        if (error.code == ManagedErrorCodes.cancelled ||
+            isAccountDeletedError(error)) {
+          rethrow;
+        }
         // Fetch failed (network, reseed, …): fall through and clear the
         // partial so the conversation stays sendable; the partial is the
         // only content we still own.
@@ -1101,13 +1158,13 @@ class ManagedConversationService {
       );
       if (terminal != null) {
         try {
-          await reconcileFromServer(
-            conversationId,
-            preloadedHistory: terminal,
-          );
+          await reconcileFromServer(conversationId, preloadedHistory: terminal);
           return;
         } on PluginClientException catch (error) {
-          if (error.code == ManagedErrorCodes.cancelled) rethrow;
+          if (error.code == ManagedErrorCodes.cancelled ||
+              isAccountDeletedError(error)) {
+            rethrow;
+          }
         }
       }
     }
@@ -1199,9 +1256,14 @@ class ManagedConversationService {
       server = history.messages;
     } on PluginClientException catch (error) {
       if (error.code == ManagedErrorCodes.cancelled) rethrow;
+      if (isAccountDeletedError(error)) {
+        await _notifyAccountDeleted(error);
+        rethrow;
+      }
       return null;
     }
-    final terminal = server.length > local.length &&
+    final terminal =
+        server.length > local.length &&
         server.last.role == MessageRole.assistant;
     return terminal ? server : null;
   }
@@ -1252,7 +1314,8 @@ class ManagedConversationService {
     if (sessionId == null) {
       throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
     }
-    final messageId = (await repo.pending(scope, conversationId))?.messageId ??
+    final messageId =
+        (await repo.pending(scope, conversationId))?.messageId ??
         const Uuid().v4();
     await repo.access(scope, epoch, () {}, (store) async {
       if (await repo.pending(scope, conversationId) == null) {
@@ -1278,6 +1341,10 @@ class ManagedConversationService {
         );
         _checkEpoch(epoch);
       } on PluginClientException catch (error) {
+        if (isAccountDeletedError(error)) {
+          await _notifyAccountDeleted(error);
+          rethrow;
+        }
         if (error.code == ManagedErrorCodes.sessionMissing) {
           await repo.clearPending(scope, conversationId, messageId: messageId);
           _checkEpoch(epoch);
@@ -1434,8 +1501,8 @@ class ManagedConversationService {
     final agent = rawAgent is String || rawAgent is Map<String, dynamic>
         ? rawAgent
         : rawAgent == null
-              ? null
-              : throw const PluginClientException(ManagedErrorCodes.invalidConfig);
+        ? null
+        : throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     if (!background && (sessionId is! String || sessionId.trim().isEmpty)) {
       throw const PluginClientException(ManagedErrorCodes.invalidConfig);
     }

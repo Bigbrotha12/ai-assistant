@@ -41,6 +41,7 @@ StagedInferenceAdapters createStagedInferenceAdapters({
   })
   loadAgents,
   required AccountLifecycle lifecycle,
+  Future<void> Function(Object error)? onAccountDeleted,
 }) => StagedInferenceAdapters._(
   client,
   repository,
@@ -52,6 +53,7 @@ StagedInferenceAdapters createStagedInferenceAdapters({
   loadModels,
   loadAgents,
   lifecycle,
+  onAccountDeleted,
 );
 
 class StagedInferenceUnavailable implements Exception {
@@ -76,6 +78,7 @@ class StagedInferenceAdapters implements VisionClient {
     this._loadModels,
     this._loadAgents,
     this._lifecycle,
+    this._onAccountDeleted,
   ) : _lifecycleEpoch = _lifecycle.epoch {
     _unregister = _lifecycle.register(
       AccountCleanupRegistration(
@@ -116,6 +119,7 @@ class StagedInferenceAdapters implements VisionClient {
   })
   _loadAgents;
   final AccountLifecycle _lifecycle;
+  final Future<void> Function(Object error)? _onAccountDeleted;
   final int _lifecycleEpoch;
   late final void Function() _unregister;
   bool _disposed = false;
@@ -132,6 +136,14 @@ class StagedInferenceAdapters implements VisionClient {
     }
   }
 
+  Future<void> _notifyAccountDeleted(Object error) async {
+    final callback = _onAccountDeleted;
+    if (callback == null || !isAccountDeletedError(error)) return;
+    try {
+      await callback(error);
+    } catch (_) {}
+  }
+
   /// ONE resolver shared with the chat adapter (plan §3): delegates to
   /// [resolveManagedSelection], threading this adapter's per-load epoch/cancel
   /// guard and its scope-mismatch `cancel()` side effect.
@@ -139,17 +151,26 @@ class StagedInferenceAdapters implements VisionClient {
     int epoch,
     CancelToken? token, {
     required bool vision,
-  }) => resolveManagedSelection(
-    scope: _scope,
-    authStore: _authStore,
-    pluginStore: _pluginStore,
-    loadModels: _loadModels,
-    loadAgents: _loadAgents,
-    cancelToken: token,
-    vision: vision,
-    check: () => _check(epoch, token),
-    onScopeMismatch: cancel,
-  );
+  }) async {
+    try {
+      return await resolveManagedSelection(
+        scope: _scope,
+        authStore: _authStore,
+        pluginStore: _pluginStore,
+        loadModels: _loadModels,
+        loadAgents: _loadAgents,
+        cancelToken: token,
+        vision: vision,
+        check: () => _check(epoch, token),
+        onScopeMismatch: cancel,
+      );
+    } on PluginClientException catch (error) {
+      if (isAccountDeletedError(error)) {
+        await _notifyAccountDeleted(error);
+      }
+      rethrow;
+    }
+  }
 
   /// Non-vision [_resolve] with the chat adapter's error mapping: voice
   /// callers get typed [PluginClientException]s (`no_selected_model` /
@@ -207,6 +228,7 @@ class StagedInferenceAdapters implements VisionClient {
         selection: selection,
         resolve: () => _mappedResolve(epoch, cancelToken),
         stableSelection: true,
+        onAccountDeleted: _notifyAccountDeleted,
       );
       final outcome = await service.sendTurn(
         conversationId,
@@ -327,9 +349,8 @@ class _CurrentManagedClient implements LangChainClient {
   Future<BackgroundTurnResult> backgroundTurn(
     LangChainRequest request, {
     CancelToken? cancelToken,
-  }) => _current(
-    () => client.backgroundTurn(request, cancelToken: cancelToken),
-  );
+  }) =>
+      _current(() => client.backgroundTurn(request, cancelToken: cancelToken));
 
   @override
   Future<ChatResult> streamTurn(

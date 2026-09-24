@@ -592,6 +592,72 @@ describe("POST /v1/chat/completions — managed session path (plan §4/§5)", ()
     );
   });
 
+  test("persists assistant replies redacted while preserving streaming output and message metadata", async (t) => {
+    const rawSecret = "skAbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const replyText = `gateway=${rawSecret}\nAuthorization: Bearer opaque-provider-token`;
+    const expectedReply = "gateway=sk-***\nAuthorization: Bearer ***";
+    const responseMetadata = { model_name: "scripted-model", finish_reason: "stop" };
+    const usageMetadata = { input_tokens: 7, output_tokens: 5, total_tokens: 12 };
+    const additionalKwargs = {
+      marker: "preserved",
+      tool_calls: [
+        { id: "call_metadata", type: "function", function: { name: "lookup", arguments: "{}" } },
+      ],
+    };
+    const fake = makeFakeBuildModel([
+      [
+        {
+          content: replyText,
+          id: "assistant-reply-id",
+          response_metadata: responseMetadata,
+          usage_metadata: usageMetadata,
+          additional_kwargs: additionalKwargs,
+        },
+      ],
+    ]);
+    const { app, sessionStore } = await makeApp(t, { buildModel: fake.buildModelFn });
+
+    const res = await postChat(
+      app,
+      chatBody({
+        conversation_mode: "managed",
+        session_id: SID,
+        messageId: "m-secret",
+        messages: [{ role: "user", content: "repeat the credentials" }],
+      }),
+    );
+    assert.equal(res.status, 200);
+    const wire = await res.text();
+    assert.ok(wire.includes(rawSecret), "SSE keeps the same-owner raw streaming reply");
+    assert.ok(wire.includes("opaque-provider-token"), "SSE does not redact individual deltas");
+
+    const read = await getSession(app, SID);
+    assert.equal(read.status, 200);
+    const body = (await read.json()) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const assistant = body.messages.find((message) => message.role === "assistant");
+    assert.ok(assistant);
+    assert.equal(assistant.content, expectedReply);
+    assert.ok(!assistant.content.includes(rawSecret));
+
+    const record = sessionStore.get("test-user", SID);
+    const storedReply = record?.messages.at(-1);
+    assert.ok(storedReply instanceof AIMessage);
+    assert.equal(storedReply.getType(), "ai");
+    assert.equal(storedReply.id, "assistant-reply-id");
+    assert.deepEqual(storedReply.response_metadata, responseMetadata);
+    assert.deepEqual(storedReply.usage_metadata, usageMetadata);
+    assert.deepEqual(storedReply.additional_kwargs, additionalKwargs);
+
+    const turnOutcome = record?.outcomes.get("m-secret");
+    const assistantOutcome = record?.outcomes.get("m-secret:assistant");
+    assert.equal(turnOutcome?.status, "completed");
+    assert.equal(assistantOutcome?.status, "completed");
+    assert.equal(turnOutcome?.reply?.content, expectedReply);
+    assert.equal(assistantOutcome?.reply?.content, expectedReply);
+  });
+
   test("failed turn rolls back; same messageId retries as a clean re-run, then dedupes to already_completed", async (t) => {
     const fake = makeFakeBuildModel(
       [
@@ -1266,6 +1332,42 @@ describe("GET /v1/sessions/:id read-back (§5)", () => {
         ["assistant", "reply two"],
       ],
     );
+  });
+
+  test("redacts nested assistant tool arguments before serializing read-back", async (t) => {
+    const { app, sessionStore } = await makeApp(t);
+    const secret = `sk-or-v1-${"r".repeat(32)}`;
+    await sessionStore.establish("test-user", "tool-history", [
+      new AIMessage({
+        content: [{ type: "thinking", thinking: `private ${secret}` }] as unknown as AIMessage["content"],
+        id: "assistant-tool-history",
+        tool_calls: [{
+          id: "call-readback",
+          name: "lookup",
+          type: "tool_call",
+          args: { nested: { token: `tok-${"s".repeat(32)}` } },
+        }],
+      }),
+    ]);
+
+    const res = await getSession(app, "tool-history");
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      messages: Array<{
+        role: string;
+        content: unknown;
+        tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+      }>;
+    };
+    const assistant = body.messages[0];
+    assert.ok(assistant);
+    assert.deepEqual(assistant.content, [{ type: "thinking", thinking: "private sk-or-v1-***" }]);
+    assert.equal(assistant.tool_calls?.[0]?.id, "call-readback");
+    assert.equal(assistant.tool_calls?.[0]?.function.name, "lookup");
+    assert.deepEqual(JSON.parse(assistant.tool_calls?.[0]?.function.arguments ?? "{}"), {
+      nested: { token: "tok-***" },
+    });
+    assert.ok(!JSON.stringify(body).includes(secret));
   });
 
   test("cross-owner read is a 404 (never leaks the messages)", async (t) => {

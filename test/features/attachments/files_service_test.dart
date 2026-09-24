@@ -64,8 +64,9 @@ void main() {
         }),
       );
       final client = _client(dio);
-      final file = File('${Directory.systemTemp.createTempSync('fs').path}/a.jpg')
-        ..writeAsBytesSync([1, 2, 3, 4]);
+      final file = File(
+        '${Directory.systemTemp.createTempSync('fs').path}/a.jpg',
+      )..writeAsBytesSync([1, 2, 3, 4]);
       final progress = <int>[];
       final info = await client.uploadFile(
         path: file.path,
@@ -97,8 +98,9 @@ void main() {
         ),
       );
       final client = _client(dio);
-      final file = File('${Directory.systemTemp.createTempSync('fs').path}/a.jpg')
-        ..writeAsBytesSync([1]);
+      final file = File(
+        '${Directory.systemTemp.createTempSync('fs').path}/a.jpg',
+      )..writeAsBytesSync([1]);
 
       expect(
         () => client.uploadFile(
@@ -124,8 +126,9 @@ void main() {
         ),
       );
       final client = _client(dio);
-      final file = File('${Directory.systemTemp.createTempSync('fs').path}/a.jpg')
-        ..writeAsBytesSync([1]);
+      final file = File(
+        '${Directory.systemTemp.createTempSync('fs').path}/a.jpg',
+      )..writeAsBytesSync([1]);
 
       expect(
         () => client.uploadFile(
@@ -138,37 +141,46 @@ void main() {
       );
     });
 
-    test('sends multipart with bearer auth, no redirects, and wired progress',
-        () async {
-      final adapter = CaptureAdapter();
-      final dio = Dio()..httpClientAdapter = adapter;
-      final client = _client(dio);
-      final file = File('${Directory.systemTemp.createTempSync('fs').path}/a.jpg')
-        ..writeAsBytesSync([1]);
-      final progressCalls = <(int, int)>[];
+    test(
+      'sends multipart with bearer auth, no redirects, and wired progress',
+      () async {
+        final adapter = CaptureAdapter();
+        final dio = Dio()..httpClientAdapter = adapter;
+        final client = _client(dio);
+        final file = File(
+          '${Directory.systemTemp.createTempSync('fs').path}/a.jpg',
+        )..writeAsBytesSync([1]);
+        final progressCalls = <(int, int)>[];
 
-      await client.uploadFile(
-        path: file.path,
-        filename: 'a.jpg',
-        sizeBytes: 1,
-        mimeType: 'image/jpeg',
-        onProgress: (sent, total) => progressCalls.add((sent, total)),
-      );
+        await client.uploadFile(
+          path: file.path,
+          filename: 'a.jpg',
+          sizeBytes: 1,
+          mimeType: 'image/jpeg',
+          onProgress: (sent, total) => progressCalls.add((sent, total)),
+        );
 
-      final req = adapter.requests.single;
-      expect(req.method, 'POST');
-      expect(req.path, '$_base/files');
-      expect(req.headers['Authorization'], 'Bearer $_token');
-      expect(req.followRedirects, isFalse);
-      expect(req.data, isA<FormData>());
-      final form = req.data as FormData;
-      expect(form.files.single.key, 'file');
-      expect(form.files.single.value.filename, 'a.jpg');
-      expect(form.fields.map((f) => f.key), containsAll(['filename', 'mimeType']));
-      expect(req.onSendProgress, isNotNull);
-      expect(progressCalls, isEmpty,
-          reason: 'mock adapter emits no progress; the callback stays wired');
-    });
+        final req = adapter.requests.single;
+        expect(req.method, 'POST');
+        expect(req.path, '$_base/files');
+        expect(req.headers['Authorization'], 'Bearer $_token');
+        expect(req.followRedirects, isFalse);
+        expect(req.data, isA<FormData>());
+        final form = req.data as FormData;
+        expect(form.files.single.key, 'file');
+        expect(form.files.single.value.filename, 'a.jpg');
+        expect(
+          form.fields.map((f) => f.key),
+          containsAll(['filename', 'mimeType']),
+        );
+        expect(req.onSendProgress, isNotNull);
+        expect(
+          progressCalls,
+          isEmpty,
+          reason: 'mock adapter emits no progress; the callback stays wired',
+        );
+      },
+    );
   });
 
   group('listFiles', () {
@@ -177,7 +189,12 @@ void main() {
       adapter.onGet(
         '$_base/files',
         (r) => r.reply(200, [
-          {'id': 'f1', 'filename': 'a.jpg', 'sizeBytes': 1, 'mimeType': 'image/jpeg'},
+          {
+            'id': 'f1',
+            'filename': 'a.jpg',
+            'sizeBytes': 1,
+            'mimeType': 'image/jpeg',
+          },
         ]),
       );
       final client = _client(dio);
@@ -194,7 +211,12 @@ void main() {
         '$_base/files',
         (r) => r.reply(200, {
           'files': [
-            {'id': 'f2', 'filename': 'b.png', 'sizeBytes': 2, 'mimeType': 'image/png'},
+            {
+              'id': 'f2',
+              'filename': 'b.png',
+              'sizeBytes': 2,
+              'mimeType': 'image/png',
+            },
           ],
         }),
       );
@@ -226,6 +248,28 @@ void main() {
       final bytes = await client.fetchFile('f1');
 
       expect(bytes, Uint8List.fromList([1, 2, 3, 4]));
+    });
+
+    test('sets connect, send, and receive timeouts on fetches', () async {
+      final (dio, adapter) = _makeDio();
+      final requests = <RequestOptions>[];
+      dio.interceptors.add(
+        InterceptorsWrapper(
+          onRequest: (options, handler) {
+            requests.add(options);
+            handler.next(options);
+          },
+        ),
+      );
+      adapter.onGet('$_base/files/f1', (r) => r.reply(200, [1, 2, 3]));
+      final client = _client(dio);
+
+      await client.fetchFile('f1');
+
+      final request = requests.single;
+      expect(request.connectTimeout, const Duration(seconds: 120));
+      expect(request.sendTimeout, const Duration(seconds: 120));
+      expect(request.receiveTimeout, const Duration(seconds: 120));
     });
 
     test('rejects an unsafe file id before making a request', () async {
@@ -267,7 +311,10 @@ void main() {
       final (dio, adapter) = _makeDio();
       final client = _client(dio);
 
-      expect(() => client.deleteFile('a b'), throwsA(isA<FilesValidationError>()));
+      expect(
+        () => client.deleteFile('a b'),
+        throwsA(isA<FilesValidationError>()),
+      );
     });
   });
 

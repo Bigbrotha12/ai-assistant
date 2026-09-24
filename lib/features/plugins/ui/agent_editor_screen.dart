@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../auth/data/account_deleted_state.dart';
+import '../../chat/data/chat_client.dart';
 import '../data/agent_config.dart';
 import '../data/plugin_catalog_providers.dart';
 import '../data/plugin_credentials_providers.dart';
@@ -95,8 +97,10 @@ class _AgentEditorScreenState extends ConsumerState<AgentEditorScreen> {
     required bool isLoading,
     required bool hasError,
     required PluginCatalog? value,
+    Object? error,
   }) {
     if (isLoading) return _pluginCatalogLoadingMessage;
+    if (isAccountDeletedError(error)) return accountDeletedNotice;
     if (hasError || value == null) return _pluginCatalogUnavailableMessage;
     return null;
   }
@@ -148,6 +152,7 @@ class _AgentEditorScreenState extends ConsumerState<AgentEditorScreen> {
       isLoading: catalogState.isLoading,
       hasError: catalogState.hasError,
       value: catalogState.value,
+      error: catalogState.error,
     );
     if (catalogMessage != null) {
       return (error: catalogMessage, maxTokens: null);

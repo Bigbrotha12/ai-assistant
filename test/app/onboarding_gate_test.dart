@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/features/auth/data/account_deleted_state.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
@@ -112,24 +113,23 @@ void main() {
     required AuthCredentialsStore authStore,
     AppPrefsStore? prefsStore,
   }) => [
-      settingsStoreProvider.overrideWithValue(settingsStore),
-      authCredentialsStoreProvider.overrideWithValue(authStore),
-      appPrefsStoreProvider.overrideWithValue(prefsStore ?? FakePrefsStore()),
-      appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
-      backendProbeProvider.overrideWithValue(FakeProbe()),
-      chatStoreProvider.overrideWithValue(FakeChatStore()),
-      engineManagerProvider.overrideWithValue(FakeEngineManager()),
-      micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
-      audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
-      audioSessionManagerProvider
-          .overrideWithValue(FakeAudioSessionManager()),
-      vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
-      voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
-      // The platform wakelock channel is unavailable in tests; its provider
-      // onDispose fires an uncaught disable() otherwise (same override the
-      // other voice-hosting suites use).
-      screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
-    ];
+    settingsStoreProvider.overrideWithValue(settingsStore),
+    authCredentialsStoreProvider.overrideWithValue(authStore),
+    appPrefsStoreProvider.overrideWithValue(prefsStore ?? FakePrefsStore()),
+    appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
+    backendProbeProvider.overrideWithValue(FakeProbe()),
+    chatStoreProvider.overrideWithValue(FakeChatStore()),
+    engineManagerProvider.overrideWithValue(FakeEngineManager()),
+    micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
+    audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+    audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
+    vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
+    voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
+    // The platform wakelock channel is unavailable in tests; its provider
+    // onDispose fires an uncaught disable() otherwise (same override the
+    // other voice-hosting suites use).
+    screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+  ];
 
   /// Boots the real [AiAssistantApp] (theme + paper builder + [OnboardingGate])
   /// with a fully faked provider graph.
@@ -165,10 +165,9 @@ void main() {
     testWidgets('loading shows the branded splash', (tester) async {
       final store = _HangingSettingsStore();
       addTearDown(() => store.completer.complete(null));
-      await tester.pumpWidget(gateApp(
-        settingsStore: store,
-        authStore: FakeAuthCredentialsStore(),
-      ));
+      await tester.pumpWidget(
+        gateApp(settingsStore: store, authStore: FakeAuthCredentialsStore()),
+      );
       await tester.pump();
 
       expect(find.text('Voice Assist'), findsOneWidget);
@@ -179,12 +178,15 @@ void main() {
   });
 
   group('OnboardingGate not configured', () {
-    testWidgets('no API key routes to onboarding even with a valid host',
-        (tester) async {
-      await tester.pumpWidget(gateApp(
-        settingsStore: FakeSettingsStore(stored: validHost),
-        authStore: FakeAuthCredentialsStore(),
-      ));
+    testWidgets('no API key routes to onboarding even with a valid host', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        gateApp(
+          settingsStore: FakeSettingsStore(stored: validHost),
+          authStore: FakeAuthCredentialsStore(),
+        ),
+      );
       await pumpGate(tester);
 
       expect(find.byType(OnboardingScreen), findsOneWidget);
@@ -193,15 +195,18 @@ void main() {
       expect(find.byType(SpeakButton), findsNothing);
     });
 
-    testWidgets('API key but no usable host routes to onboarding',
-        (tester) async {
+    testWidgets('API key but no usable host routes to onboarding', (
+      tester,
+    ) async {
       // "Configured" requires an explicitly stored, valid host: a blank host
       // (or no store at all) never counts, even though the compile-time
       // default host is non-blank in tests.
-      await tester.pumpWidget(gateApp(
-        settingsStore: FakeSettingsStore(stored: blankHost),
-        authStore: FakeAuthCredentialsStore(stored: apiKey),
-      ));
+      await tester.pumpWidget(
+        gateApp(
+          settingsStore: FakeSettingsStore(stored: blankHost),
+          authStore: FakeAuthCredentialsStore(stored: apiKey),
+        ),
+      );
       await pumpGate(tester);
 
       expect(find.byType(OnboardingScreen), findsOneWidget);
@@ -210,27 +215,110 @@ void main() {
     });
   });
 
-  group('OnboardingGate configured', () {
-    testWidgets('stored settings + key route to the voice home', (tester) async {
-      await tester.pumpWidget(gateApp(
+  testWidgets('terminal latch shows a persistent deleted-account notice and '
+      'new-account action', (tester) async {
+    final container = ProviderContainer(
+      overrides: gateOverrides(
         settingsStore: FakeSettingsStore(stored: validHost),
         authStore: FakeAuthCredentialsStore(stored: apiKey),
-      ));
+      ),
+    );
+    addTearDown(container.dispose);
+    await container.read(accountDeletedProvider.notifier).runOnce(() async {});
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const AiAssistantApp(),
+      ),
+    );
+    await pumpGate(tester);
+
+    expect(find.byType(OnboardingScreen), findsOneWidget);
+    expect(find.text(accountDeletedNotice), findsOneWidget);
+    expect(find.text('Sign in or create your account'), findsNothing);
+    expect(
+      find.byKey(const Key('account-deleted-new-account')),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(const Key('account-deleted-new-account')));
+    await pumpGate(tester);
+
+    expect(container.read(accountDeletedProvider), isFalse);
+    expect(find.text('Sign in or create your account'), findsOneWidget);
+    expect(find.byKey(const Key('auth-submit')), findsOneWidget);
+  });
+
+  testWidgets('terminal latch collapses pushed routes to onboarding', (
+    tester,
+  ) async {
+    final container = ProviderContainer(
+      overrides: gateOverrides(
+        settingsStore: FakeSettingsStore(stored: validHost),
+        authStore: FakeAuthCredentialsStore(stored: apiKey),
+      ),
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const AiAssistantApp(),
+      ),
+    );
+    await pumpGate(tester);
+
+    final navigator = tester.state<NavigatorState>(find.byType(Navigator));
+    unawaited(
+      navigator.push(
+        MaterialPageRoute(
+          builder: (_) => const Scaffold(body: Text('pushed route')),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('pushed route'), findsOneWidget);
+
+    await container.read(accountDeletedProvider.notifier).runOnce(() async {});
+    expect(container.read(accountDeletedProvider), isTrue);
+    expect(navigator.canPop(), isTrue);
+    await pumpGate(tester);
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(find.byType(OnboardingScreen), findsOneWidget);
+    expect(find.text('pushed route'), findsNothing);
+    expect(find.byType(OnboardingScreen), findsOneWidget);
+    expect(find.text(accountDeletedNotice), findsOneWidget);
+  });
+
+  group('OnboardingGate configured', () {
+    testWidgets('stored settings + key route to the voice home', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        gateApp(
+          settingsStore: FakeSettingsStore(stored: validHost),
+          authStore: FakeAuthCredentialsStore(stored: apiKey),
+        ),
+      );
       await pumpGate(tester);
 
       expect(find.byType(SpeakButton), findsOneWidget);
       expect(find.byType(OnboardingScreen), findsNothing);
     });
 
-    testWidgets('key without stored settings routes to onboarding',
-        (tester) async {
+    testWidgets('key without stored settings routes to onboarding', (
+      tester,
+    ) async {
       // dart-define defaults alone do NOT count as configured: an explicitly
       // stored host is required, so a define-only build (no stored settings)
       // is still guided through onboarding (which prefills the defaults).
-      await tester.pumpWidget(gateApp(
-        settingsStore: FakeSettingsStore(),
-        authStore: FakeAuthCredentialsStore(stored: apiKey),
-      ));
+      await tester.pumpWidget(
+        gateApp(
+          settingsStore: FakeSettingsStore(),
+          authStore: FakeAuthCredentialsStore(stored: apiKey),
+        ),
+      );
       await pumpGate(tester);
 
       expect(find.byType(OnboardingScreen), findsOneWidget);
@@ -241,9 +329,9 @@ void main() {
       expect(find.text('Backend not configured'), findsNothing);
     });
 
-    testWidgets(
-        'post-verify sign-in (credentials ready) opens the gate',
-        (tester) async {
+    testWidgets('post-verify sign-in (credentials ready) opens the gate', (
+      tester,
+    ) async {
       // C2 return path: an unverified account cannot mint a key, so the gate
       // sits on onboarding. After the user verifies in the browser and signs
       // in, AuthFlow persists the minted key — the gate must open purely on
@@ -268,7 +356,9 @@ void main() {
 
       // Post-verify sign-in: AuthFlow mints and saves the key (what
       // `authCredentialsProvider.notifier.save` receives after a session).
-      await container.read(authCredentialsProvider.notifier).save(
+      await container
+          .read(authCredentialsProvider.notifier)
+          .save(
             const AuthCredentials(
               apiKey: 'verified-key',
               email: 'user@example.com',
@@ -289,7 +379,10 @@ void main() {
     // (`initialRoute`), which cannot be swapped in widget tests, so the widget
     // layer above only covers the voice default.
     test('open_chat maps to the chat target', () {
-      expect(targetForUri('aiassistant://open_chat'), LauncherShortcutTarget.chat);
+      expect(
+        targetForUri('aiassistant://open_chat'),
+        LauncherShortcutTarget.chat,
+      );
     });
 
     test('open_voice maps to the voice target', () {
@@ -304,8 +397,10 @@ void main() {
       expect(targetForUri('aiassistant://bogus'), isNull);
       expect(targetForUri('https://example.com'), isNull);
       expect(targetForUri(''), isNull);
-      expect(targetForUri('  aiassistant://open_chat  '),
-          LauncherShortcutTarget.chat);
+      expect(
+        targetForUri('  aiassistant://open_chat  '),
+        LauncherShortcutTarget.chat,
+      );
     });
   });
 
@@ -317,10 +412,9 @@ void main() {
         failFirstLoad: true,
       );
       final authStore = _CountingAuthStore(stored: apiKey);
-      await tester.pumpWidget(gateApp(
-        settingsStore: settingsStore,
-        authStore: authStore,
-      ));
+      await tester.pumpWidget(
+        gateApp(settingsStore: settingsStore, authStore: authStore),
+      );
       await pumpGate(tester);
 
       // A read failure must never be treated as "not configured".
@@ -345,15 +439,18 @@ void main() {
       expect(settingsStore.stored, validHost);
     });
 
-    testWidgets('an auth-store read failure recovers to onboarding (no wipe)',
-        (tester) async {
+    testWidgets('an auth-store read failure recovers to onboarding (no wipe)', (
+      tester,
+    ) async {
       // The auth store fails on load but has no stored key once recovered, so
       // retry lands on onboarding rather than a home screen — and never wipes.
       final authStore = _FlakyAuthStore(stored: null, failFirstLoad: true);
-      await tester.pumpWidget(gateApp(
-        settingsStore: FakeSettingsStore(stored: validHost),
-        authStore: authStore,
-      ));
+      await tester.pumpWidget(
+        gateApp(
+          settingsStore: FakeSettingsStore(stored: validHost),
+          authStore: authStore,
+        ),
+      );
       await pumpGate(tester);
 
       expect(find.text('Could not read your saved setup'), findsOneWidget);
