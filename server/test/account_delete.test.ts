@@ -31,6 +31,7 @@ import { Ledger, migrateLedger } from "../src/ledger.ts";
 import type { OwnerPurgeResult } from "../src/ledger.ts";
 import { NotifyStore } from "../src/notify/store.ts";
 import { createNotifyRoutes } from "../src/notify/routes.ts";
+import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 const BASE = "http://localhost:17600";
 const NOTIFY_KEY = "account-delete-test-notify-key-32";
@@ -149,6 +150,7 @@ async function buildFixture(
     database: db,
     emailAndPassword: {
       enabled: true,
+      password: testPasswordHasher,
       minPasswordLength: 8,
       autoSignIn: true,
     },

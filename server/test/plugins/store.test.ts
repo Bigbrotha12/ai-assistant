@@ -1070,6 +1070,23 @@ describe("PluginStore pinned-IP retention (Fix 1)", () => {
 });
 
 describe("PluginStore MCP server SSRF validation", () => {
+  test("catalog-validated MCP pins use the retained agent/server key", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store } = await makeStore(dir);
+    store.retainCatalogMcpPins([{
+      agentPluginId: "catalog-agent",
+      serverName: "filesystem",
+      url: "https://mcp.example.com",
+      pinnedIps: ["1.1.1.1"],
+    }]);
+    assert.deepEqual(store.getPinnedIps("catalog-agent:mcp:filesystem"), [{
+      entryId: "mcp:filesystem",
+      url: "https://mcp.example.com",
+      pinned: ["1.1.1.1"],
+    }]);
+    assert.equal(store.hasMcpPins("catalog-agent"), true);
+  });
+
   test("installing an agent plugin with valid mcpServers passes", async (t) => {
     const dir = await makeTempDir(t);
     const { store } = await makeStore(dir, {

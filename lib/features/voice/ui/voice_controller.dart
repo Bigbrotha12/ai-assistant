@@ -500,6 +500,18 @@ final class VoiceController {
 
   bool get _ttsAllowed => runtimeDecision.allowTts;
 
+  void _requestHealthRefreshForText() {
+    final policy = runtimePolicy;
+    if (policy == null) return;
+    unawaited(_refreshHealthSafely(policy));
+  }
+
+  Future<void> _refreshHealthSafely(VoiceRuntimePolicySource policy) async {
+    try {
+      await policy.refreshHealth();
+    } catch (_) {}
+  }
+
   void _onRuntimePolicyChanged() {
     if (_disposed) return;
     final decision = runtimeDecision;
@@ -758,7 +770,7 @@ final class VoiceController {
     if (trimmed.isEmpty) return;
     // A turn queued ahead of a teardown must not hit the network.
     if (!_state.isConnected) return;
-    await runtimePolicy?.refreshHealth();
+    _requestHealthRefreshForText();
     if (kDebugMode) {
       debugPrint('VoiceController: sendText (${trimmed.length} chars)');
     }
@@ -817,8 +829,7 @@ final class VoiceController {
         _update(_state.copyWith(notice: sentinelAdvisoryMessage));
       }
       final builder = contextBuilder;
-       final messages = builder != null
-
+      final messages = builder != null
           ? await builder(trimmed)
           : [ApiMessage(role: 'user', content: trimmed)];
       final buffer = StringBuffer();
@@ -890,10 +901,9 @@ final class VoiceController {
             // args fragment.
             if (reportedToolIndices.contains(index)) return;
             reportedToolIndices.add(index);
-             tracker.onToolCall(accName, buf.toString());
-           },
-         );
-
+            tracker.onToolCall(accName, buf.toString());
+          },
+        );
       } finally {
         tracker.cancel();
         _turnInFlight = false;

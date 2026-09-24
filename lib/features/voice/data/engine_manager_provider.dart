@@ -7,6 +7,7 @@ import './engine_config.dart';
 import './engine_manager.dart';
 import './engine_registry.dart';
 import './model_downloader.dart';
+import './voice_runtime_policy_provider.dart';
 import './stt_engine.dart';
 import './tts_engine.dart';
 import '../ui/voice_settings_providers.dart';
@@ -78,6 +79,7 @@ class VoiceEngineStatusNotifier
   /// Triggers a download of all missing models and updates the status map
   /// after each model completes or fails.
   Future<void> downloadAllModels() async {
+    if (!await _canDownloadModels()) return;
     final manager = ref.read(engineManagerProvider);
     await manager.ensureModelsDownloaded(
       progress: (modelId) {
@@ -92,9 +94,16 @@ class VoiceEngineStatusNotifier
   /// retry — e.g. re-downloading Supertonic after a failed attempt without
   /// re-touching Whisper) and snapshots the status map afterwards.
   Future<void> downloadModel(String modelId) async {
+    if (!await _canDownloadModels()) return;
     final manager = ref.read(engineManagerProvider);
     await manager.downloadModel(modelId);
     state = manager.allStatuses;
+  }
+
+  Future<bool> _canDownloadModels() async {
+    final policy = ref.read(voiceRuntimePolicyProvider);
+    await policy.refreshHealth();
+    return policy.decision.allowModelDownload;
   }
 }
 

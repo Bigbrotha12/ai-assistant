@@ -1,9 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { loadMcpCatalog } from "../../src/catalog/mcp.ts";
+import { loadCatalogs } from "../../src/catalog/index.ts";
+import type { RetainedCatalogMcpPin } from "../../src/catalog/index.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 
 async function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -48,6 +50,56 @@ describe("loadMcpCatalog", () => {
       assert.equal(entries.length, 1);
       assert.equal(entries[0]!.name, "my-server");
       assert.equal(entries[0]!.url, "https://example.com/api");
+    });
+  });
+
+  test("retains every validated address pin on the catalog entry", async () => {
+    await withDir(async (dir) => {
+      const filePath = join(dir, "mcp.json");
+      await writeFile(
+        filePath,
+        JSON.stringify([validEntry({ url: "https://93.184.216.34/api" })]),
+        "utf8",
+      );
+      const entries = await loadMcpCatalog(filePath);
+      assert.deepEqual(entries[0]?.pinnedIps, ["93.184.216.34"]);
+    });
+  });
+
+  test("loadCatalogs propagates pins to agents and retains them under the agent/server key", async () => {
+    await withDir(async (dir) => {
+      await mkdir(join(dir, "agents"));
+      await writeFile(
+        join(dir, "mcp.json"),
+        JSON.stringify([validEntry({ name: "filesystem", url: "https://93.184.216.34/mcp" })]),
+        "utf8",
+      );
+      await writeFile(
+        join(dir, "agents", "kitchen.json"),
+        JSON.stringify({
+          id: "kitchen",
+          version: "1.0.0",
+          schemaVersion: 1,
+          type: "agent",
+          name: "Kitchen",
+          description: "Kitchen agent",
+          mcpServers: [{ name: "filesystem" }],
+        }),
+        "utf8",
+      );
+      const retained: RetainedCatalogMcpPin[][] = [];
+      const catalogs = await loadCatalogs(dir, {
+        getInstalled: () => [],
+        retainCatalogMcpPins: (entries) => retained.push(entries),
+      });
+      assert.deepEqual(catalogs.mcps[0]?.pinnedIps, ["93.184.216.34"]);
+      assert.deepEqual(catalogs.agents[0]?.mcpServers[0]?.pinnedIps, ["93.184.216.34"]);
+      assert.deepEqual(retained[0], [{
+        agentPluginId: "kitchen",
+        serverName: "filesystem",
+        url: "https://93.184.216.34/mcp",
+        pinnedIps: ["93.184.216.34"],
+      }]);
     });
   });
 

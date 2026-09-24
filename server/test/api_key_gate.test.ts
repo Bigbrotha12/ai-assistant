@@ -20,6 +20,7 @@ import {
   createAccountDeletionHooks,
 } from "../src/auth.ts";
 import { createApiKeyEmailVerificationGate } from "../src/verify_email.ts";
+import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 const BASE = "http://localhost:17600";
 const SECRET = "test-secret-at-least-thirty-two-characters";
@@ -43,12 +44,17 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitFor(
+  predicate: () => boolean,
+  { timeoutMs = 5000, pollMs = 10 } = {},
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     if (predicate()) return;
-    await delay(1);
+    await delay(pollMs);
   }
-  throw new Error("condition was not reached");
+  if (predicate()) return;
+  throw new Error(`condition was not reached within ${timeoutMs}ms`);
 }
 
 async function buildFixture(options: BuildFixtureOptions = {}) {
@@ -72,6 +78,7 @@ async function buildFixture(options: BuildFixtureOptions = {}) {
     database,
     emailAndPassword: {
       enabled: true,
+      password: testPasswordHasher,
       minPasswordLength: 8,
       autoSignIn: true,
     },
@@ -289,7 +296,7 @@ test("an in-flight create paused before insert is swept by deletion and leaves n
       { password: PASSWORD },
       user.cookie,
     );
-    await waitFor(() => isDeleting(user.userId));
+    await waitFor(() => isDeleting(user.userId), { timeoutMs: 10_000 });
     assert.equal(countKeys(database, user.userId), 0);
     releaseKeygen.resolve();
 

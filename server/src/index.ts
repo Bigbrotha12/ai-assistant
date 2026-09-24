@@ -8,6 +8,8 @@ import { env } from "./env.ts";
 import { createHealthRoutes } from "./health.ts";
 import { inferenceRoutes, requireApiKey } from "./api_key.ts";
 import { createSentinelRoutes } from "./sentinel/routes.ts";
+import { createSentinelService } from "./sentinel/service.ts";
+import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { createLedgerRoutes, ledger } from "./ledger.routes.ts";
@@ -87,10 +89,16 @@ app.use("/api/auth/delete-user", (c, next) => {
 });
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 app.route("/v1", inferenceRoutes);
+const sentinelService = createSentinelService({
+  ledger,
+  policy: policyForMode(env.SENTINEL_POLICY_MODE ?? "advisory"),
+});
+const sentinelShadowReporter = sentinelService.shadow;
 app.route(
   "/v1",
   createSentinelRoutes({
     ledger,
+    service: sentinelService,
     verifyKey: requireApiKey,
     policyMode: env.SENTINEL_POLICY_MODE,
     maxBodyBytes: env.SENTINEL_MAX_BODY_BYTES,
@@ -203,6 +211,7 @@ try {
   jobPins = new CredentialPinStore();
   jobRunner = createJobRunner({
     ledger,
+    shadowReporter: sentinelShadowReporter,
     registry: pluginRegistry,
     pins: jobPins,
     getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
@@ -297,6 +306,7 @@ app.route(
     pluginStore,
     catalogs,
     sessionStore,
+    shadowReporter: sentinelShadowReporter,
     ledger,
     jobRunner,
     pins: jobPins,
@@ -307,6 +317,7 @@ app.route(
     warmups,
   }),
 );
+
 
 // M5 watchdog: unauthenticated probe for k8s liveness/readiness (200 when
 // both DB checks pass, 503 `degraded` otherwise). The probes themselves are
@@ -340,6 +351,7 @@ app.onError((err, c) => {
 const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
   console.log(`ai-assistant gateway listening on http://localhost:${info.port}`);
 });
+const SENTINEL_SHADOW_FLUSH_TIMEOUT_MS = 2_000;
 const cleanup = (name: string, dispose: () => void) => {
   try {
     dispose();
@@ -363,6 +375,22 @@ const shutdown = async (): Promise<void> => {
   cleanup("plugin watcher", () => pluginRegistry.disposeWatch());
   cleanup("tool cache", () => toolCache.dispose());
   await serverClosed;
+  // Drain queued shadow reports before closing the ledger, but never let a stuck report block shutdown.
+  let shadowFlushTimeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      sentinelShadowReporter.flush(),
+      new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, SENTINEL_SHADOW_FLUSH_TIMEOUT_MS);
+        shadowFlushTimeout = timeout;
+        timeout.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    console.error("gateway: sentinel shadow report flush failed", err);
+  } finally {
+    if (shadowFlushTimeout !== undefined) clearTimeout(shadowFlushTimeout);
+  }
   // Close the ledger DB once no request can touch it anymore.
   cleanup("ledger", () => ledger.close());
 };

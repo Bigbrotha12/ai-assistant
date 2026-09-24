@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { keyGateResponse, requireApiKey } from "../api_key.ts";
@@ -8,6 +9,10 @@ import type { PluginRegistry } from "./registry.ts";
 import { PluginStoreError } from "./store.ts";
 import type { PluginStore } from "./store.ts";
 import { PluginSchemaError } from "./types.ts";
+import {
+  emitPluginManagementAudit,
+  type AuditOutcome,
+} from "../audit/telemetry.ts";
 
 /**
  * Plugin HTTP surface (Phase 1, Step 6), mounted under `/v1` by the app.
@@ -92,6 +97,45 @@ export type PluginRoutesOptions = {
 
 const managementLimiter = createTokenBucketLimiter(30, 10);
 
+function managementRequestId(c: Context): string {
+  const header = c.req.header("x-request-id")?.trim();
+  if (header && /^[A-Za-z0-9_.:-]{1,64}$/.test(header)) return header;
+  return `plugin_${randomUUID()}`;
+}
+
+function managementErrorCode(error: unknown): string | undefined {
+  if (error instanceof PluginStoreError || error instanceof PluginRegistryError) return error.code;
+  if (error instanceof PluginSchemaError) return "INVALID_CONFIG";
+  return undefined;
+}
+
+function emitManagementAudit(input: {
+  owner?: string;
+  requestId: string;
+  operation: string;
+  pluginId?: string;
+  startedAt: number;
+  outcome: AuditOutcome;
+  status?: number;
+  errorCode?: string;
+  error?: unknown;
+}): void {
+  try {
+    emitPluginManagementAudit({
+      ...(input.owner === undefined ? {} : { owner: input.owner }),
+      requestId: input.requestId,
+      operation: input.operation,
+      ...(input.pluginId === undefined ? {} : { pluginId: input.pluginId }),
+      outcome: input.outcome,
+      durationMs: Math.max(0, Date.now() - input.startedAt),
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+      ...(input.error === undefined ? {} : { errorCode: managementErrorCode(input.error) }),
+    });
+  } catch {
+  }
+}
+
 export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
   const { registry, store } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
@@ -117,44 +161,195 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
   });
 
   routes.post("/plugins/reload", async (c) => {
+    const requestId = managementRequestId(c);
+    const startedAt = Date.now();
     const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
+    if (!auth.ok) {
+      const response = keyGateResponse(c, auth);
+      emitManagementAudit({
+        requestId,
+        operation: "reload",
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        errorCode: auth.reason.toUpperCase(),
+      });
+      return response;
+    }
+    if (!limiter(auth.owner)) {
+      const response = c.json({ error: "rate_limited" }, 429);
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "reload",
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        errorCode: "RATE_LIMITED",
+      });
+      return response;
+    }
     try {
       await registry.hotReload();
-      return c.json({ status: "ok" });
+      const response = c.json({ status: "ok" });
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "reload",
+        startedAt,
+        outcome: "ok",
+        status: response.status,
+      });
+      return response;
     } catch (e) {
-      return pluginError(c, e);
+      const response = pluginError(c, e);
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "reload",
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        error: e,
+      });
+      return response;
     }
   });
 
   // Install an admin-curated manifest. No credentials ride this request; keys
   // are configured client-side per request at call time (credential.ts).
   routes.post("/plugins/:id/install", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
     const id = c.req.param("id");
+    const requestId = managementRequestId(c);
+    const startedAt = Date.now();
+    const auth = await verifyKey(c);
+    if (!auth.ok) {
+      const response = keyGateResponse(c, auth);
+      emitManagementAudit({
+        requestId,
+        operation: "install",
+        pluginId: id,
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        errorCode: auth.reason.toUpperCase(),
+      });
+      return response;
+    }
+    if (!limiter(auth.owner)) {
+      const response = c.json({ error: "rate_limited" }, 429);
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "install",
+        pluginId: id,
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        errorCode: "RATE_LIMITED",
+      });
+      return response;
+    }
     try {
       if (store.getPlugin(id) && !store.needsManifestReapproval(id)) {
-        return c.json({ error: "plugin_already_installed" }, 409);
+        const response = c.json({ error: "plugin_already_installed" }, 409);
+        emitManagementAudit({
+          owner: auth.owner,
+          requestId,
+          operation: "install",
+          pluginId: id,
+          startedAt,
+          outcome: "error",
+          status: response.status,
+        });
+        return response;
       }
       await store.install(id);
-      return c.json({ status: "ok" });
+      const response = c.json({ status: "ok" });
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "install",
+        pluginId: id,
+        startedAt,
+        outcome: "ok",
+        status: response.status,
+      });
+      return response;
     } catch (e) {
-      return pluginError(c, e);
+      const response = pluginError(c, e);
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "install",
+        pluginId: id,
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        error: e,
+      });
+      return response;
     }
   });
 
   routes.post("/plugins/:id/uninstall", async (c) => {
+    const id = c.req.param("id");
+    const requestId = managementRequestId(c);
+    const startedAt = Date.now();
     const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
+    if (!auth.ok) {
+      const response = keyGateResponse(c, auth);
+      emitManagementAudit({
+        requestId,
+        operation: "uninstall",
+        pluginId: id,
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        errorCode: auth.reason.toUpperCase(),
+      });
+      return response;
+    }
+    if (!limiter(auth.owner)) {
+      const response = c.json({ error: "rate_limited" }, 429);
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "uninstall",
+        pluginId: id,
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        errorCode: "RATE_LIMITED",
+      });
+      return response;
+    }
     try {
-      await store.uninstall(c.req.param("id"));
-      return c.json({ status: "ok" });
+      await store.uninstall(id);
+      const response = c.json({ status: "ok" });
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "uninstall",
+        pluginId: id,
+        startedAt,
+        outcome: "ok",
+        status: response.status,
+      });
+      return response;
     } catch (e) {
-      return pluginError(c, e);
+      const response = pluginError(c, e);
+      emitManagementAudit({
+        owner: auth.owner,
+        requestId,
+        operation: "uninstall",
+        pluginId: id,
+        startedAt,
+        outcome: "error",
+        status: response.status,
+        error: e,
+      });
+      return response;
     }
   });
 

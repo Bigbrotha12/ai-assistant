@@ -1,4 +1,5 @@
 export const SENTINEL_SCHEMA_VERSION = 1 as const;
+export const SENTINEL_SHADOW_SCHEMA_VERSION = 1 as const;
 
 export const SENTINEL_DIRECTIONS = [
   "input",
@@ -9,6 +10,13 @@ export const SENTINEL_DIRECTIONS = [
 ] as const;
 export type SentinelDirection = (typeof SENTINEL_DIRECTIONS)[number];
 export type SentinelPublicDirection = Exclude<SentinelDirection, "input">;
+
+export const SENTINEL_SHADOW_DIRECTIONS = [
+  "input",
+  "tool_result",
+  "output",
+] as const;
+export type SentinelShadowDirection = (typeof SENTINEL_SHADOW_DIRECTIONS)[number];
 
 export const SENTINEL_CATEGORIES = [
   "self_harm",

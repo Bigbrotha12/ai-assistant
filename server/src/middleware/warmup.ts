@@ -4,6 +4,11 @@ import { credentialFingerprint, validateCredentials } from "../plugins/credentia
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isToolPlugin } from "../plugins/types.ts";
 import { BudgetExhaustedError, type BudgetManager } from "./budget.ts";
+import {
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  invokeBoundedToolHandler,
+  serializeBoundedToolArguments,
+} from "../tool_bounds.ts";
 import type { ToolCacheKey, ToolResultCache } from "./cache.ts";
 
 export type WarmupCall = {
@@ -81,9 +86,10 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
       }
       let args: Record<string, unknown>;
       let key: ToolCacheKey;
-      try {
-        args = JSON.parse(JSON.stringify(call.args)) as Record<string, unknown>;
-        if (!args || Array.isArray(args) || typeof args !== "object") {
+       try {
+         const serializedArgs = serializeBoundedToolArguments(call.args);
+         args = JSON.parse(serializedArgs) as Record<string, unknown>;
+         if (!args || Array.isArray(args) || typeof args !== "object") {
           return { ok: false, reason: "invalid_request" };
         }
         key = {
@@ -116,15 +122,27 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
         controller.abort();
       }, timeoutMs);
       timer.unref();
-      const context: WarmupContext = {
-        owner: key.owner,
-        signal: controller.signal,
-        beforeModelCall() {
-          controller.signal.throwIfAborted();
-          opts.budget.beforeModelCall(key.owner, "warmup");
-        },
-      };
-      void Promise.resolve().then(async (): Promise<WarmupOutcome> => {
+       const context: WarmupContext = {
+         owner: key.owner,
+         signal: controller.signal,
+         beforeModelCall() {
+           controller.signal.throwIfAborted();
+           opts.budget.beforeModelCall(key.owner, "warmup");
+         },
+       };
+       let released = false;
+       let handlerSettled = true;
+       let releaseAfterHandler: (() => void) | undefined;
+       const cleanup = () => {
+         if (released) return;
+         released = true;
+         clearTimeout(timer);
+         controller.signal.removeEventListener("abort", onAbort);
+         controller.abort();
+         running.delete(id);
+         slot.release();
+       };
+       void Promise.resolve().then(async (): Promise<WarmupOutcome> => {
         controller.signal.throwIfAborted();
         const current = opts.registry.requirePlugin(key.pluginId);
         if (!isToolPlugin(current) || current.version !== key.pluginVersion ||
@@ -134,10 +152,38 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
         if (opts.cache.get(key) !== undefined) {
           return { status: "cached" };
         }
-        const handler = opts.createHandler(context);
-        const result = await handler.execute(key.pluginId, key.tool, args, credentials);
-        controller.signal.throwIfAborted();
-        opts.cache.set(key, String(result));
+         const result = await opts.budget.withToolCallBudget(
+           key.owner,
+           key.pluginId,
+           () => {
+             const handler = opts.createHandler(context);
+             const handlerPromise = Promise.resolve().then(() =>
+               handler.execute(key.pluginId, key.tool, args, credentials, controller.signal),
+             );
+             handlerSettled = false;
+             void handlerPromise.then(
+               () => {
+                 handlerSettled = true;
+                 releaseAfterHandler?.();
+               },
+               () => {
+                 handlerSettled = true;
+                 releaseAfterHandler?.();
+               },
+             );
+             return invokeBoundedToolHandler(
+               () => handlerPromise,
+               {
+                 timeoutMs,
+                 signal: controller.signal,
+                 maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+                 timeoutMessage: `warmup tool '${key.tool}' exceeded ${timeoutMs}ms`,
+               },
+             );
+           },
+         );
+         controller.signal.throwIfAborted();
+         opts.cache.set(key, result);
         return { status: "warmed" };
       }).catch((error: unknown): WarmupOutcome => {
         if (controller.signal.aborted) return { status: timedOut ? "timed_out" : "cancelled" };
@@ -145,13 +191,10 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
           return { status: "budget_exhausted", retryAfterSeconds: error.retryAfterSeconds };
         }
         return { status: "failed" };
-      }).finally(() => {
-        clearTimeout(timer);
-        controller.signal.removeEventListener("abort", onAbort);
-        controller.abort();
-        running.delete(id);
-        slot.release();
-      }).then(finish);
+       }).finally(() => {
+         if (handlerSettled) cleanup();
+         else releaseAfterHandler = cleanup;
+       }).then(finish);
       return { ok: true, done };
     },
     get activeCount() {

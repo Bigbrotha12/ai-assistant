@@ -1,6 +1,6 @@
-# Sentinel S1–S3
+# Sentinel S1–S4
 
-S1 is the gateway-side deterministic Sentinel backbone. S2 adds the offline on-device input preflight, and S3 adds the deterministic JSONL evaluation harness. None of these slices runs an L2 classifier, changes the server policy default, or adds a second network check for client input.
+S1 is the gateway-side deterministic Sentinel backbone. S2 adds the offline on-device input preflight, S3 adds the deterministic JSONL evaluation harness, and S4 adds server-side shadow reporting. None of these slices runs an L2 classifier or enforces Sentinel on the chat path.
 
 ## Rule set
 
@@ -22,7 +22,7 @@ The Dart evaluator uses the same literal phrase model as `l1.ts`: NFKC-compatibl
 
 ## Client advisory (S2)
 
-`ManagedConversationService.sendTurn` runs the local gate before admission and before the managed request. Text chat and the voice transcript path both use that synchronous send path. S2 is advisory and non-blocking: a high- or medium-severity finding displays a dismissible inline chat banner (or the existing voice notice line), then the message is still sent. A gate failure is fail-open for the send and does not create a server request. `SENTINEL_POLICY_MODE` remains `advisory` by default; the server environment setting is unchanged. Background submission is left to the later M4 remainder rather than adding a second client send-path seam in S2.
+`ManagedConversationService.sendTurn` runs the local gate before admission and before the managed request. Text chat and the voice transcript path both use that synchronous send path. S2 is advisory and non-blocking: a high- or medium-severity finding displays a dismissible inline chat banner (or the existing voice notice line), then the message is still sent. A gate failure is fail-open for the send and does not create a server request. `SENTINEL_POLICY_MODE` remains `advisory` by default; the server environment setting is unchanged. Client background submission remains outside the S2 client seam; S4 adds the server-side runner classification.
 
 ## S3 evaluation
 
@@ -57,14 +57,52 @@ That command reports `passed: false` and exits `1`. A release threshold, corpus 
 
 The current policy is `sentinel-policy.v1.0.0`.
 
-- `SENTINEL_POLICY_MODE=advisory` is the default. Any non-harmless L1 hit returns `verdict: "flag"`; the request is not rejected.
-- `SENTINEL_POLICY_MODE=blocking` is the explicit flip. The same hits return `verdict: "block"`.
+- `SENTINEL_POLICY_MODE=advisory` is the default for the standalone check endpoint. Any non-harmless L1 hit returns `verdict: "flag"`; the request is not rejected.
+- `SENTINEL_POLICY_MODE=blocking` is the explicit flip for the standalone check endpoint only. The same hits return `verdict: "block"`; this setting does not enforce chat traffic.
+- Chat traffic always uses shadow reporting in S4. Its `verdictWouldBe` is the hypothetical blocking-policy result, and no finding changes the request, tool call, stream, or output.
 - No L1 hit returns `verdict: "allow"`.
 - `harmless` findings remain allowed.
 
 `SENTINEL_MAX_BODY_BYTES` defaults to `65536`. `SENTINEL_RATE_LIMIT` and `SENTINEL_RATE_BURST` default to `60` and `20`; the limiter is per authenticated owner and process-local, consistent with the single-replica deployment contract.
 
 The severity threshold remains an open product decision. S1 exposes the binary policy mode first so the threshold can be refined without changing the endpoint or rule format.
+
+## Shadow reporting (S4)
+
+`SENTINEL_POLICY_MODE` configures the standalone `POST /v1/sentinel/check` surface only. It is **not enforced on chat, tool, or streaming paths**. Chat traffic is classified in shadow mode and records the hypothetical blocking-policy verdict; it is never blocked, cancelled, withheld, or changed. Chat-path enforcement remains deferred until the owner reviews the shadow data.
+
+The gateway classifies the last user message at admission, each redacted and bounded tool result at the graph seam, and the assembled assistant reply post-hoc. Internal chat admission uses the `input` direction even though the public standalone check endpoint continues to reject caller-supplied `direction: "input"` (that endpoint remains for non-input directions). The stateless streaming path classifies the final assembled reply captured at the root `on_chain_end`; no output buffering or withholding is added. Background replies are classified from the same redacted text persisted by the runner.
+
+Each report is metadata-only. It is stored as a dedicated owner-scoped ledger task with `worker: "sentinel"`, a fence-protected `sentinel:shadow` step, `shadow: true`, and terminal status `awaiting_review`; it contains no evaluated text, matched substring, or rule pattern. Reports use the ledger's existing transient retention window (24 hours by default), so this surface is single-replica and is a tuning aid rather than a durable audit archive.
+
+Shadow persistence is serialized through a process-local bounded queue. The request and graph paths classify and enqueue metadata but never await ledger I/O. The queue holds 256 reports, caps each authenticated owner plus `requestId` turn at 32 reports, and uses an explicit `drop-newest` policy. `SentinelShadowReporter.getQueueStats(owner)` exposes queued, accepted, persisted, dropped, turn-cap, queue-cap, and failed counters; `getDroppedCount()` exposes the process total. Queue entries and turn counters are owner-scoped, and the queued item does not retain evaluated text. `flush()` drains deterministically for shutdown/integration tests; the scheduled immediate otherwise keeps normal process shutdown best-effort and fail-open.
+
+Persistence uses repair rather than a multi-call transaction. A report intent checks the legacy base key and up to eight `:attempt:<n>` keys. A queued partial task is repaired to `cancelled`; a running or stuck partial task is repaired to `failed` using the current fence; a completed `awaiting_review` step is reused. A retry scans attempts in order and returns the first valid completed report, so a one-shot failure cannot leave an active orphan or create a second visible report. Telemetry runs after completion and remains fail-open.
+
+`GET /v1/sentinel/reports` is the owner-scoped tuning surface. It returns aggregate counts and rates for a time window, plus a recent metadata-only page:
+
+```json
+{
+  "window": { "from": "2026-01-01T00:00:00.000Z", "to": "2026-01-08T00:00:00.000Z" },
+  "filters": { "direction": null, "category": null, "severity": null, "verdict": null },
+  "summary": {
+    "totalReports": 12,
+    "turns": 8,
+    "byDirection": { "input": 8, "tool_result": 2, "output": 2 },
+    "byCategory": { "self_harm": 0, "violence": 0, "illegal": 0, "pii": 0, "child_safety": 0, "sexual_content": 1, "medical_guardrail": 0, "jailbreak_attempt": 1, "harmless": 0 },
+    "bySeverity": { "low": 0, "medium": 1, "high": 1 },
+    "byVerdictWouldBe": { "allow": 9, "flag": 0, "block": 3 },
+    "wouldBlock": 3,
+    "ratesPer1000Turns": { "reports": 1500, "wouldBlock": 375 },
+    "topRules": [{ "ruleId": "illegal.weapon_or_fraud", "count": 2 }],
+    "trendByDay": [{ "date": "2026-01-01", "reports": 5, "wouldBlock": 1 }]
+  },
+  "reports": [],
+  "pagination": { "limit": 50, "offset": 0, "total": 12, "nextOffset": null }
+}
+```
+
+The `byCategory` and `bySeverity` maps always contain every Sentinel enum key, including zero counts. The default window is the last 30 days. Use `from`, `to` (epoch milliseconds or ISO-8601), `limit` (1–100), `offset`, and optional `direction`, `category`, `severity`, and `verdict` filters. Timestamps must be non-negative safe integers whose `Date` round-trip is exact, remain inside the JavaScript Date range, be no more than five minutes ahead of gateway time, and satisfy `from <= to`; every violation is `400 {"error":"invalid_request"}` rather than a serialization failure. The list uses the v8 owner/worker/status/spec/time-window index and selects only task id, creation time, and the bounded metadata step result. Paging and all aggregate counts run in SQL; `payload` and `job_spec` are never selected. `GET /v1/sentinel/reports/:reportId` returns one owner-scoped report; a cross-owner or unknown id is `404`.
 
 ## Endpoint
 
@@ -115,8 +153,42 @@ Error responses:
 - `413 {"error":"request_too_large"}` for an oversized body.
 - `429 {"error":"rate_limited"}` with `Retry-After` for the owner limiter.
 
+`GET /v1/sentinel/reports` uses the same key gate. It returns `401 {"error":"unauthorized"}`, `403 {"error":"email_not_verified"}`, `403 {"error":"account_deleted"}`, or `400 {"error":"invalid_request"}` for invalid window/filter parameters. It never returns report content, raw text, or another owner's metadata.
+
 ## Ledger record
 
 A `flag` or `block` creates a dedicated owner-scoped ledger task with `worker: "sentinel"`, a metadata-only Sentinel step, and terminal status `awaiting_review`. The step stores request id, direction, L1-only mode, verdict, action id, categories, severity, rule ids, versions, and an optional validated source task id. It never stores the evaluated text or matched pattern. The public ledger completion route cannot select `awaiting_review`; the internal service claims and completes the review task with its fence token.
 
-The ledger remains a transient 24-hour journal. S1 does not add durable retention or a review queue; review authority, resolution, and retention remain open decisions for S5.
+Shadow reports use the same task/step mechanism and fence protection, with a `shadow: true` marker, `verdictWouldBe`, aggregate/per-finding rule metadata, and the source request/task id. Allow results are recorded too so rates per 1,000 turns are meaningful. The ledger remains a transient 24-hour journal; S4 does not add durable retention or a review queue.
+
+A stored shadow step has this shape (the owner is the ledger task's implicit owner):
+
+```json
+{
+  "schemaVersion": 1,
+  "shadow": true,
+  "mode": "l1_only",
+  "policyMode": "blocking",
+  "direction": "input",
+  "categories": ["jailbreak_attempt"],
+  "severities": ["high"],
+  "ruleIds": ["jailbreak_attempt.instruction_override"],
+  "matchedRuleIds": ["jailbreak_attempt.instruction_override"],
+  "findings": [{ "ruleId": "jailbreak_attempt.instruction_override", "category": "jailbreak_attempt", "severity": "high" }],
+  "severity": "high",
+  "verdictWouldBe": "block",
+  "policyVersion": "sentinel-policy.v1.0.0",
+  "ruleSetVersion": "sentinel-rules.v1.0.0",
+  "requestId": "turn-1",
+  "taskId": null,
+  "sourceTaskId": null,
+  "timestamp": "2026-01-08T00:00:00.000Z",
+  "ts": 1767820800000
+}
+```
+
+## Follow-ups
+
+- Enforcement switch: review the shadow data, choose a policy threshold, then add an explicit chat-path enforcement decision; do not infer it from `SENTINEL_POLICY_MODE`.
+- Client report view: add a settings-screen view over `GET /v1/sentinel/reports`; no client UI is included in S4.
+- Client finding aggregation: a future client may send category/rule ids only (never text) if on-device and server rates need to be reconciled.

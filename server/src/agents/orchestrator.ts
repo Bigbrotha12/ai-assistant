@@ -6,6 +6,13 @@ import type {
   ToolPluginDefinition,
 } from "../plugins/types.ts";
 import { jsonSchemaToZod } from "./mcp.ts";
+import {
+  DEFAULT_TOOL_HANDLER_TIMEOUT_MS,
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  invokeBoundedToolHandler,
+  serializeBoundedToolArguments,
+} from "../tool_bounds.ts";
+import { emitPluginToolAudit } from "../audit/telemetry.ts";
 
 // Single source of truth for JSON-Schema -> zod translation lives in
 // `agents/mcp.ts` (it also infers `type` for schema-less MCP tools). Re-export
@@ -37,14 +44,23 @@ export interface ToolCallHandler {
     toolName: string,
     args: Record<string, unknown>,
     credentials?: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<string>;
 }
+
+export type BindPluginToolsOptions = {
+  owner?: string;
+  requestId?: string;
+  timeoutMs?: number;
+  maxResultChars?: number;
+};
 
 /** Translate installed tool plugins into LangChain tools. Exported for tests. */
 export function bindPluginTools(
   registry: PluginRegistry,
   toolHandler: ToolCallHandler,
   enabledPlugins?: readonly string[],
+  options: BindPluginToolsOptions = {},
 ): DynamicStructuredTool[] {
   const tools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
@@ -60,7 +76,7 @@ export function bindPluginTools(
         continue;
       }
       seen.add(toolDef.name);
-      tools.push(bindPluginTool(plugin, toolDef, toolHandler));
+      tools.push(bindPluginTool(plugin, toolDef, toolHandler, options));
     }
   }
   return tools;
@@ -70,13 +86,58 @@ function bindPluginTool(
   plugin: ToolPluginDefinition,
   toolDef: ToolDefinition,
   toolHandler: ToolCallHandler,
+  options: BindPluginToolsOptions,
 ): DynamicStructuredTool {
   return new DynamicStructuredTool({
     name: toolDef.name,
     description: toolDef.description,
     schema: jsonSchemaToZod(toolDef.inputSchema),
-    func: async (args) => {
-      return toolHandler.execute(plugin.id, toolDef.name, args);
+    func: async (args, _runManager, config) => {
+      const startedAt = Date.now();
+      let inputBytes = 0;
+      let outputBytes = 0;
+      let outcome: "ok" | "error" | "timeout" | "cancelled" = "ok";
+      let errorCode: string | undefined;
+      try {
+        const serialized = serializeBoundedToolArguments(args);
+        inputBytes = Buffer.byteLength(serialized, "utf8");
+        const result = await invokeBoundedToolHandler(
+          (signal) => toolHandler.execute(plugin.id, toolDef.name, args, undefined, signal),
+          {
+            timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_HANDLER_TIMEOUT_MS,
+            maxResultChars: options.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
+            signal: config?.signal,
+            timeoutMessage: `tool '${toolDef.name}' of plugin '${plugin.id}' exceeded the handler timeout`,
+          },
+        );
+        outputBytes = Buffer.byteLength(result, "utf8");
+        return result;
+      } catch (error) {
+        outcome = config?.signal?.aborted || (error instanceof Error && error.name === "AbortError")
+          ? "cancelled"
+          : error instanceof Error && "code" in error && error.code === "tool_timeout"
+            ? "timeout"
+            : "error";
+        errorCode = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+          ? error.code
+          : undefined;
+        throw error;
+      } finally {
+        try {
+          emitPluginToolAudit({
+            owner: options.owner,
+            pluginId: plugin.id,
+            tool: toolDef.name,
+            requestId: options.requestId,
+            outcome,
+            durationMs: Math.max(0, Date.now() - startedAt),
+            inputBytes,
+            outputBytes,
+            ...(errorCode === undefined ? {} : { errorCode }),
+          });
+        } catch {
+        }
+      }
     },
   });
 }

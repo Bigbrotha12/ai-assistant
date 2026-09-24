@@ -13,6 +13,12 @@ import { createPluginRoutes } from "../../src/plugins/routes.ts";
 import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
 import type { AgentPluginDefinition, ModelPluginDefinition, ToolPluginDefinition } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
+import { logger } from "../../src/logger.ts";
+import {
+  configureAuditTelemetry,
+  flushAuditTelemetry,
+  resetAuditTelemetryConfig,
+} from "../../src/audit/telemetry.ts";
 
 function openRouterBuiltin(): ModelPluginDefinition {
   return {
@@ -397,6 +403,135 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     });
     assert.equal(res.status, 404);
     assert.deepEqual(await json(res), { error: "plugin_not_found" });
+  });
+
+  test("management mutations emit one request-scoped redacted audit record", async (t) => {
+    const originalInfo = logger.info;
+    const lines: string[] = [];
+    logger.info = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    configureAuditTelemetry({ enabled: true, level: "info" });
+    try {
+      const { app } = await makeApp(t, undefined, () => true);
+      const response = await app.request("/v1/plugins/vikunja/install", {
+        method: "POST",
+        headers: { ...auth, "x-request-id": "mgmt-request-1" },
+      });
+      assert.equal(response.status, 200);
+      await flushAuditTelemetry();
+      const records = lines.flatMap((line) => {
+        try {
+          return [JSON.parse(line) as Record<string, unknown>];
+        } catch {
+          return [];
+        }
+      });
+      const management = records.filter((record) => record.event === "plugin.management");
+      assert.equal(management.length, 1);
+      assert.equal(management[0]?.operation, "install");
+      assert.equal(management[0]?.pluginId, "vikunja");
+      assert.equal(management[0]?.requestId, "mgmt-request-1");
+      assert.equal(lines.some((line) => line.includes("test-key")), false);
+    } finally {
+      await flushAuditTelemetry();
+      logger.info = originalInfo;
+      resetAuditTelemetryConfig();
+    }
+  });
+
+  test("unauthenticated management mutations emit an ownerless redacted rejection record", async (t) => {
+    const originalInfo = logger.info;
+    const lines: string[] = [];
+    logger.info = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    configureAuditTelemetry({ enabled: true, level: "info" });
+    try {
+      const { app } = await makeApp(t, async () => ({ ok: false as const, reason: "bad_key" as const }));
+      const response = await app.request("/v1/plugins/vikunja/install", {
+        method: "POST",
+        headers: { authorization: "Bearer test-key", "x-request-id": "mgmt-unauth" },
+      });
+      assert.equal(response.status, 401);
+      await flushAuditTelemetry();
+      const management = lines.flatMap((line) => {
+        try {
+          const record = JSON.parse(line) as Record<string, unknown>;
+          return record.event === "plugin.management" ? [record] : [];
+        } catch {
+          return [];
+        }
+      });
+      assert.equal(management.length, 1);
+      assert.equal(management[0]?.operation, "install");
+      assert.equal(management[0]?.pluginId, "vikunja");
+      assert.equal(management[0]?.requestId, "mgmt-unauth");
+      assert.equal(management[0]?.outcome, "error");
+      assert.equal(management[0]?.errorCode, "BAD_KEY");
+      assert.equal("ownerHash" in management[0]!, false);
+      assert.equal(lines.some((line) => line.includes("test-key")), false);
+    } finally {
+      await flushAuditTelemetry();
+      logger.info = originalInfo;
+      resetAuditTelemetryConfig();
+    }
+  });
+
+  test("rate-limited management mutations emit one rejected audit record each", async (t) => {
+    const originalInfo = logger.info;
+    const lines: string[] = [];
+    logger.info = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    configureAuditTelemetry({ enabled: true, level: "info" });
+    try {
+      const { app } = await makeApp(t, undefined, () => false);
+      const requests = [
+        ["/v1/plugins/vikunja/install", "install", "vikunja", "mgmt-install-denied"],
+        ["/v1/plugins/reload", "reload", undefined, "mgmt-reload-denied"],
+        ["/v1/plugins/vikunja/uninstall", "uninstall", "vikunja", "mgmt-uninstall-denied"],
+      ] as const;
+      for (const [path, , , requestId] of requests) {
+        const response = await app.request(path, {
+          method: "POST",
+          headers: {
+            ...auth,
+            "x-request-id": requestId,
+          },
+        });
+        assert.equal(response.status, 429);
+      }
+      await flushAuditTelemetry();
+      const management = lines.flatMap((line) => {
+        try {
+          const record = JSON.parse(line) as Record<string, unknown>;
+          return record.event === "plugin.management" ? [record] : [];
+        } catch {
+          return [];
+        }
+      });
+      assert.equal(management.length, 3);
+      assert.deepEqual(
+        management.map((record) => [
+          record.operation,
+          record.pluginId,
+          record.requestId,
+          record.outcome,
+          record.status,
+          record.errorCode,
+        ]),
+        [
+          ["install", "vikunja", "mgmt-install-denied", "error", 429, "RATE_LIMITED"],
+          ["reload", undefined, "mgmt-reload-denied", "error", 429, "RATE_LIMITED"],
+          ["uninstall", "vikunja", "mgmt-uninstall-denied", "error", 429, "RATE_LIMITED"],
+        ],
+      );
+    } finally {
+      await flushAuditTelemetry();
+      logger.info = originalInfo;
+      resetAuditTelemetryConfig();
+    }
   });
 });
 

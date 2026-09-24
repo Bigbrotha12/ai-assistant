@@ -7,12 +7,23 @@ import type { BaseMessage } from "@langchain/core/messages";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { createAgentGraph } from "../agents/graph.ts";
-import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
+import {
+  bindMcpServers,
+  type McpBinding,
+  type McpClientFactory,
+  type McpServerConfig,
+} from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import type { TrackedExecution } from "../agents/execution.ts";
 import { jsonSchemaToZod, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
+import {
+  lastUserTextFromMessages,
+  tryReportSentinelShadow,
+} from "../sentinel/shadow.ts";
+import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 import { redactForOutbound, redactMessages } from "../redact.ts";
+import { emitPluginToolAudit } from "../audit/telemetry.ts";
 import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { env } from "../env.ts";
 import {
@@ -26,7 +37,10 @@ import type { CredentialPin, CredentialPinHandle, CredentialPinStore } from "../
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
-import { BudgetExhaustedError } from "../middleware/budget.ts";
+import {
+  BudgetExhaustedError,
+  DEFAULT_TOOL_CALL_QUARANTINE_MS,
+} from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 import { LedgerError, projectTaskProgress } from "../ledger.ts";
 import type {
@@ -51,6 +65,8 @@ import {
   boundToolResult,
   DEFAULT_TOOL_RESPONSE_MAX_BYTES,
   DEFAULT_TOOL_RESULT_MAX_CHARS,
+  invokeBoundedToolHandler,
+  serializeBoundedToolArguments,
   readBoundedResponseText,
   ToolResourceError,
 } from "../tool_bounds.ts";
@@ -312,6 +328,7 @@ export class ToolExecutor implements ToolCallHandler {
     signal?: AbortSignal,
   ): Promise<string> {
     signal?.throwIfAborted();
+    const serializedArgs = serializeBoundedToolArguments(args);
     const pinned = this.opts.getPinnedIps(pluginId);
     if (!pinned || pinned.length === 0) {
       throw new JobError(
@@ -354,7 +371,7 @@ export class ToolExecutor implements ToolCallHandler {
             "content-type": "application/json",
             ...buildAuthHeader(credentials),
           },
-          body: JSON.stringify(args ?? {}),
+          body: serializedArgs,
         },
         {
           policy,
@@ -423,6 +440,8 @@ export type JobDescriptor = {
   owner: string;
   /** Client idempotency key (messageId) — maps to exactly ONE task. */
   intentKey: string;
+  requestId?: string;
+  shadowRequestId?: string;
   /** Short, non-sensitive job label (ledger `spec`; notify title). */
   spec: string;
   /**
@@ -464,6 +483,8 @@ export type PersistedJobSpec = {
   mcpServers?: {
     name: string;
     url: string;
+    id?: string;
+    pinnedIps?: readonly string[];
     headers?: Record<string, string>;
   }[];
 };
@@ -484,10 +505,12 @@ export function serializeJobSpec(
         unresolvedHeaders = true;
       }
     }
-    return {
-      name: server.name,
-      url: server.url,
-      ...(Object.keys(headerRefs).length > 0 ? { headerRefs } : {}),
+     return {
+       name: server.name,
+       url: server.url,
+       ...(server.id === undefined ? {} : { id: server.id }),
+       ...(server.pinnedIps === undefined ? {} : { pinnedIps: [...server.pinnedIps] }),
+       ...(Object.keys(headerRefs).length > 0 ? { headerRefs } : {}),
       ...(unresolvedHeaders ? { unresolvedHeaders: true } : {}),
     };
   });
@@ -534,9 +557,24 @@ export function parsePersistedJobSpec(
     for (const item of record.mcpServers) {
       if (typeof item !== "object" || item === null || Array.isArray(item)) return null;
       const server = item as Record<string, unknown>;
-      if (server.unresolvedHeaders === true) return null;
-      if (typeof server.name !== "string" || typeof server.url !== "string") return null;
-      const headers: Record<string, string> = {};
+       if (server.unresolvedHeaders === true) return null;
+       if (typeof server.name !== "string" || typeof server.url !== "string") return null;
+       if (server.id !== undefined && (typeof server.id !== "string" || server.id.trim() === "")) {
+         return null;
+       }
+       let pinnedIps: string[] | undefined;
+       if (server.pinnedIps !== undefined) {
+         if (
+           !Array.isArray(server.pinnedIps) ||
+           server.pinnedIps.length === 0 ||
+           server.pinnedIps.length > 32 ||
+           server.pinnedIps.some(
+             (pin) => typeof pin !== "string" || pin.length === 0 || pin.length > 64 || /[\r\n\u0000]/.test(pin),
+           )
+         ) return null;
+         pinnedIps = [...server.pinnedIps] as string[];
+       }
+       const headers: Record<string, string> = {};
       if (server.headerRefs !== undefined) {
         if (typeof server.headerRefs !== "object" || server.headerRefs === null || Array.isArray(server.headerRefs)) {
           return null;
@@ -554,11 +592,13 @@ export function parsePersistedJobSpec(
           headers[name] = resolved;
         }
       }
-      mcpServers.push({
-        name: server.name,
-        url: server.url,
-        ...(Object.keys(headers).length > 0 ? { headers } : {}),
-      });
+       mcpServers.push({
+         name: server.name,
+         url: server.url,
+         ...(server.id === undefined ? {} : { id: server.id as string }),
+         ...(pinnedIps === undefined ? {} : { pinnedIps }),
+         ...(Object.keys(headers).length > 0 ? { headers } : {}),
+       });
     }
   }
   return {
@@ -630,11 +670,13 @@ export type CredentialSource = (
 
 export type JobRunnerDeps = {
   ledger: Ledger;
+  shadowReporter?: SentinelShadowSink;
   registry: PluginRegistry;
   /** In-memory credential pin store. */
   pins: CredentialPinStore;
   /** SSRF-validated pins per plugin (defaults to a no-pins resolver). */
   getPinnedIps?: (pluginId: string) => PinnedUrlEntry[] | undefined;
+  mcpClientFactory?: McpClientFactory;
   notification?: NotificationHook;
   /** Model factory seam (the transport provides it; absent → plugin_unavailable). */
   buildModel?: (
@@ -677,6 +719,8 @@ export type JobRunnerDeps = {
    * no per-owner model-call budget.
    */
   budget?: BudgetManager;
+  toolHandlerTimeoutMs?: number;
+  maxToolResultChars?: number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
 };
@@ -716,6 +760,9 @@ export type BindJobToolsOptions = {
   /** True for a fresh run; false in a replay/resume context where a mutating
    *  tool with no stored result must NOT be re-executed. */
   allowMutatingRetry: boolean;
+  requestId?: string;
+  handlerTimeoutMs?: number;
+  maxResultChars?: number;
   /**
    * Optional in-memory tool-result cache (Phase 4, Wave B): a READ-ONLY tool
    * call that missed the ledger replay dedupe is served from here when
@@ -733,6 +780,8 @@ export type BindJobToolsOptions = {
   fingerprintsByPlugin?: Record<string, string>;
   onToolStart?: (actionId: string) => void;
   onToolEnd?: (actionId: string) => void;
+  track?: <T>(run: () => Promise<T>) => Promise<T>;
+  trackUntil?: <T>(run: () => Promise<T>, maxDurationMs: number) => Promise<T | undefined>;
   budget?: BudgetManager;
 };
 
@@ -792,119 +841,201 @@ function bindJobTool(
     description: toolDef.description,
     schema: jsonSchemaToZod(toolDef.inputSchema),
     func: async (input, _runManager, config) => {
-      const assertActive = () => {
-        opts.signal?.throwIfAborted();
-        config?.signal?.throwIfAborted();
-        const task = opts.ledger.getTask(opts.taskId, opts.owner);
-        if (!task || task.status !== "running" || task.fence_token !== opts.fenceToken) {
-          throw new JobError("task_conflict", "background job no longer holds a running task fence");
-        }
-        opts.assertActive?.();
-      };
-      assertActive();
-      const pin = opts.getCredentials?.(plugin.id);
-      const invocationCredentials = pin?.credentials ?? { ...credentials };
-      const signal = opts.signal && config?.signal
-        ? AbortSignal.any([opts.signal, config.signal])
-        : opts.signal ?? config?.signal;
-      const toolCallId = (
-        config as { toolCall?: { id?: string } } | undefined
-      )?.toolCall?.id;
-      const actionId =
-        toolCallId ??
-        `tool:${plugin.id}:${toolDef.name}:${nextAnonymousToolSequence()}`;
-      const execute = async () => {
-        const invoke = async () => {
-          assertActive();
-          opts.onToolStart?.(actionId);
-          try {
-            const result = await opts.handler.execute(
-              plugin.id,
-              toolDef.name,
-              input as Record<string, unknown>,
-              invocationCredentials,
-              signal,
-            );
-            assertActive();
-            return boundToolResult(String(result));
-          } finally {
-            opts.onToolEnd?.(actionId);
+      const startedAt = Date.now();
+      let inputBytes = 0;
+      let outputBytes = 0;
+      let outcome: "ok" | "error" | "timeout" | "cancelled" = "ok";
+      let errorCode: string | undefined;
+      try {
+        const assertActive = () => {
+          opts.signal?.throwIfAborted();
+          config?.signal?.throwIfAborted();
+          const task = opts.ledger.getTask(opts.taskId, opts.owner);
+          if (!task || task.status !== "running" || task.fence_token !== opts.fenceToken) {
+            throw new JobError("task_conflict", "background job no longer holds a running task fence");
           }
+          opts.assertActive?.();
         };
-        return opts.budget
-          ? opts.budget.withToolCallBudget(opts.owner, invoke)
-          : invoke();
-      };
-      if (!toolCallId) {
-        if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
-          throw new JobError("tool_retry_forbidden", "cannot replay a mutating tool without a stored result");
+        assertActive();
+        const serializedArgs = serializeBoundedToolArguments(input);
+        inputBytes = Buffer.byteLength(serializedArgs, "utf8");
+        const pin = opts.getCredentials?.(plugin.id);
+        const invocationCredentials = pin?.credentials ?? { ...credentials };
+        const signal = opts.signal && config?.signal
+          ? AbortSignal.any([opts.signal, config.signal])
+          : opts.signal ?? config?.signal;
+        const toolCallId = (
+          config as { toolCall?: { id?: string } } | undefined
+        )?.toolCall?.id;
+        const actionId =
+          toolCallId ??
+          `tool:${plugin.id}:${toolDef.name}:${nextAnonymousToolSequence()}`;
+        const execute = async () => {
+          let settleRaw!: () => void;
+          const rawSettled = new Promise<void>((resolve) => { settleRaw = resolve; });
+          let rawStarted = false;
+          const timeoutMs = opts.handlerTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS;
+          const invoke = async () => {
+            assertActive();
+            opts.onToolStart?.(actionId);
+            try {
+              const bounded = invokeBoundedToolHandler(
+                (boundedSignal) => {
+                  rawStarted = true;
+                  let raw: Promise<string>;
+                  try {
+                    raw = Promise.resolve(opts.handler.execute(
+                      plugin.id,
+                      toolDef.name,
+                      input as Record<string, unknown>,
+                      invocationCredentials,
+                      boundedSignal,
+                    ));
+                  } catch (error) {
+                    settleRaw();
+                    throw error;
+                  }
+                  void raw.then(settleRaw, settleRaw);
+                  return raw;
+                },
+                {
+                  timeoutMs,
+                  maxResultChars: opts.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
+                  signal,
+                  timeoutMessage: `tool '${toolDef.name}' of plugin '${plugin.id}' exceeded the handler timeout`,
+                },
+              );
+              if (opts.budget) {
+                void opts.trackUntil?.(
+                  () => rawSettled,
+                  timeoutMs + DEFAULT_TOOL_CALL_QUARANTINE_MS,
+                );
+              }
+              const result = opts.track ? await opts.track(() => bounded) : await bounded;
+              assertActive();
+              return result;
+            } finally {
+              if (!rawStarted) settleRaw();
+              opts.onToolEnd?.(actionId);
+            }
+          };
+          return opts.budget
+            ? opts.budget.withToolCallBudget(opts.owner, plugin.id, invoke, {
+                requestId: opts.requestId,
+                tool: toolDef.name,
+                timeoutMs,
+                rawSettled,
+              })
+            : invoke();
+        };
+        if (!toolCallId) {
+          if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
+            throw new JobError("tool_retry_forbidden", "cannot replay a mutating tool without a stored result");
+          }
+          return await execute();
         }
-        return execute();
-      }
-      if (
-        hasToolResult(opts.ledger, {
+        if (
+          hasToolResult(opts.ledger, {
+            taskId: opts.taskId,
+            owner: opts.owner,
+            toolCallId,
+          })
+        ) {
+          const step = opts.ledger.getStepByToolCallId(
+            opts.taskId,
+            toolCallId,
+            opts.owner,
+          );
+          const result = boundToolResult(step?.result ?? "");
+          outputBytes = Buffer.byteLength(result, "utf8");
+          return result;
+        }
+        const cache = opts.toolCache;
+        let cacheKey: ToolCacheKey | undefined;
+        if (cache && canRetryTool({ readOnly: toolDef.readOnly })) {
+          cacheKey = {
+            owner: opts.owner,
+            pluginId: plugin.id,
+            pluginVersion: plugin.version,
+            credentialFingerprint:
+              pin?.fingerprint ?? opts.fingerprintsByPlugin?.[plugin.id] ??
+              credentialFingerprint(invocationCredentials),
+            tool: toolDef.name,
+            argsHash: cache.argsHash(input as Record<string, unknown>),
+          };
+          const cached = cache.get(cacheKey);
+          if (cached !== undefined) {
+            const result = boundToolResult(cached);
+            outputBytes = Buffer.byteLength(result, "utf8");
+            return result;
+          }
+        }
+        if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
+          throw new JobError(
+            "tool_retry_forbidden",
+            `tool '${toolDef.name}' of plugin '${plugin.id}' is not read-only and has ` +
+              "no stored result; refusing to re-execute a possibly-applied side effect",
+          );
+        }
+         const result = boundToolResult(String(await execute()));
+         outputBytes = Buffer.byteLength(result, "utf8");
+        if (cacheKey) cache?.set(cacheKey, result);
+        recordToolResult(opts.ledger, {
           taskId: opts.taskId,
           owner: opts.owner,
+          fenceToken: opts.fenceToken,
           toolCallId,
-        })
-      ) {
-        const step = opts.ledger.getStepByToolCallId(
-          opts.taskId,
-          toolCallId,
-          opts.owner,
-        );
-        return boundToolResult(step?.result ?? "");
+          toolName: toolDef.name,
+          result,
+        });
+        return result;
+      } catch (error) {
+        outcome = opts.signal?.aborted || config?.signal?.aborted || (error instanceof Error && error.name === "AbortError")
+          ? "cancelled"
+          : error instanceof Error && "code" in error && error.code === "tool_timeout"
+            ? "timeout"
+            : "error";
+        errorCode = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+          ? error.code
+          : undefined;
+        throw error;
+      } finally {
+        try {
+          emitPluginToolAudit({
+            owner: opts.owner,
+            pluginId: plugin.id,
+            tool: toolDef.name,
+            requestId: opts.requestId,
+            outcome,
+            durationMs: Math.max(0, Date.now() - startedAt),
+            inputBytes,
+            outputBytes,
+            ...(errorCode === undefined ? {} : { errorCode }),
+          });
+        } catch {
+        }
       }
-      // Phase 4, Wave B: the in-memory tool-result cache sits AFTER the ledger
-      // replay dedupe (a stored step is always authoritative, never shadowed
-      // by a warm cache) and BEFORE the mutating-retry guard (read-only tools
-      // may be served from the cache even during a replay). Only read-only
-      // tools are cacheable; a hit returns the redacted cached result and
-      // SKIPS recordToolResult — the per-task ledger stays untouched for a
-      // cached serve.
-      const cache = opts.toolCache;
-      let cacheKey: ToolCacheKey | undefined;
-      if (cache && canRetryTool({ readOnly: toolDef.readOnly })) {
-        cacheKey = {
-          owner: opts.owner,
-          pluginId: plugin.id,
-          pluginVersion: plugin.version,
-          credentialFingerprint:
-            pin?.fingerprint ?? opts.fingerprintsByPlugin?.[plugin.id] ??
-            credentialFingerprint(invocationCredentials),
-          tool: toolDef.name,
-          argsHash: cache.argsHash(input as Record<string, unknown>),
-        };
-        const cached = cache.get(cacheKey);
-        if (cached !== undefined) return boundToolResult(cached);
-      }
-      if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
-        throw new JobError(
-          "tool_retry_forbidden",
-          `tool '${toolDef.name}' of plugin '${plugin.id}' is not read-only and has ` +
-            "no stored result; refusing to re-execute a possibly-applied side effect",
-        );
-      }
-      const result = String(await execute());
-      if (cacheKey) cache?.set(cacheKey, result);
-      recordToolResult(opts.ledger, {
-        taskId: opts.taskId,
-        owner: opts.owner,
-        fenceToken: opts.fenceToken,
-        toolCallId,
-        toolName: toolDef.name,
-        result,
-      });
-      return result;
     },
   });
 }
+
+type McpReplayOptions = {
+  ledger: Ledger;
+  taskId: string;
+  owner: string;
+  fenceToken: string;
+  allowMutatingRetry: boolean;
+  requestId: string;
+  safeToolNames: ReadonlySet<string>;
+  assertActive: () => void;
+};
 
 function trackMcpTools(
   tools: readonly DynamicStructuredTool[],
   execution: TrackedExecution,
   onToolStart: (actionId: string) => void,
   onToolEnd: (actionId: string) => void,
+  replay: McpReplayOptions,
 ): DynamicStructuredTool[] {
   let sequence = 0;
   return tools.map((tool) =>
@@ -919,7 +1050,41 @@ function trackMcpTools(
         const actionId = toolCallId ?? `mcp:${tool.name}:${++sequence}`;
         onToolStart(actionId);
         try {
-          return await execution.track(() => tool.invoke(input, config));
+          serializeBoundedToolArguments(input);
+          replay.assertActive();
+          if (toolCallId && hasToolResult(replay.ledger, {
+            taskId: replay.taskId,
+            owner: replay.owner,
+            toolCallId,
+          })) {
+            const step = replay.ledger.getStepByToolCallId(
+              replay.taskId,
+              toolCallId,
+              replay.owner,
+            );
+            return boundToolResult(step?.result ?? "");
+          }
+          if (!replay.allowMutatingRetry && !replay.safeToolNames.has(tool.name)) {
+            throw new JobError(
+              "tool_retry_forbidden",
+              `MCP tool '${tool.name}' is not explicitly read-only and has no stored result; ` +
+                "refusing to re-execute a possibly-applied side effect",
+            );
+          }
+           const raw = await execution.track(async () => tool.func(input));
+           const result = boundToolResult(String(raw));
+          replay.assertActive();
+          if (toolCallId) {
+            recordToolResult(replay.ledger, {
+              taskId: replay.taskId,
+              owner: replay.owner,
+              fenceToken: replay.fenceToken,
+              toolCallId,
+              toolName: tool.name,
+              result,
+            });
+          }
+          return result;
         } finally {
           onToolEnd(actionId);
         }
@@ -1203,12 +1368,14 @@ export class JobRunner {
     clientThreadId = storedSpec.clientThreadId;
     toolPlugins = storedSpec.toolPlugins;
     input = { messages: storedMessages };
+    const requestId = descriptor.requestId ?? descriptor.shadowRequestId ?? intentKey;
     descriptor = {
       ...descriptor,
-      owner,
-      intentKey,
-      spec,
-      clientThreadId,
+       owner,
+       intentKey,
+       requestId,
+       spec,
+       clientThreadId,
       toolPlugins,
       modelPluginId: storedSpec.modelPluginId,
       modelRequestConfig: storedSpec.modelRequestConfig,
@@ -1217,6 +1384,18 @@ export class JobRunner {
       input,
     };
     threadId = clientThreadId;
+    const shadowRequestId = requestId;
+    const shadowInput = lastUserTextFromMessages(storedMessages);
+    if (shadowInput !== null) {
+      tryReportSentinelShadow(this.deps.shadowReporter, {
+        owner,
+        text: shadowInput,
+        direction: "input",
+        requestId: shadowRequestId,
+        taskId: claimed.id,
+        reportKey: `input:${shadowRequestId}`,
+      });
+    }
     if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
 
 
@@ -1314,10 +1493,8 @@ export class JobRunner {
       const handler = descriptor.toolHandler ?? executor;
       const tools = bindJobTools({
         registry: this.deps.registry,
-        handler: {
-          execute: (...args) => execution.track(() => handler.execute(...args)),
-        },
-        credentialsByPlugin,
+         handler,
+         credentialsByPlugin,
         getCredentials,
         assertActive,
         signal,
@@ -1326,25 +1503,38 @@ export class JobRunner {
           if (!activeJob.cancelRequested) activeJob.stage = "running";
           activeJob.activeToolCallIds.add(actionId);
         },
-        onToolEnd: (actionId) => {
-          activeJob.activeToolCallIds.delete(actionId);
-        },
-        toolCache: this.deps.toolCache,
+         onToolEnd: (actionId) => {
+           activeJob.activeToolCallIds.delete(actionId);
+         },
+         track: (run) => execution.track(run),
+         trackUntil: (run, maxDurationMs) => execution.trackUntil(run, maxDurationMs),
+         toolCache: this.deps.toolCache,
         budget: this.deps.budget,
         ledger: this.deps.ledger,
         taskId: claimed.id,
         owner,
-        fenceToken,
-        allowMutatingRetry: !replaying,
-      });
-      const mcpBinding = descriptor.mcpServers
-         ? await bindMcpServers(descriptor.mcpServers, {
-             owner,
-             requestId: claimed.id,
-             signal,
+         fenceToken,
+         allowMutatingRetry: !replaying,
+          requestId,
+          handlerTimeoutMs: this.deps.toolHandlerTimeoutMs,
+          maxResultChars: this.deps.maxToolResultChars,
+        });
+      const mcpBinding: McpBinding | undefined = descriptor.mcpServers
+        ? await bindMcpServers(descriptor.mcpServers, {
+            owner,
+            requestId,
+            signal,
              trustedHosts: env.MCP_TRUSTED_HOSTS,
-           })
-
+             clientFactory: this.deps.mcpClientFactory,
+             resolvePins: async (server) => {
+              const agentPluginId = server.id?.trim();
+              if (!agentPluginId) return undefined;
+              const entry = this.deps.getPinnedIps?.(
+                `${agentPluginId}:mcp:${server.name}`,
+              )?.[0];
+               return entry?.pinned === undefined ? undefined : [...entry.pinned];
+            },
+          })
         : undefined;
       const mcpTools = trackMcpTools(
         mcpBinding?.tools ?? [],
@@ -1353,17 +1543,38 @@ export class JobRunner {
           if (!activeJob.cancelRequested) activeJob.stage = "running";
           activeJob.activeToolCallIds.add(actionId);
         },
-        (actionId) => {
-          activeJob.activeToolCallIds.delete(actionId);
-        },
-      );
+         (actionId) => {
+           activeJob.activeToolCallIds.delete(actionId);
+         },
+         {
+           ledger: this.deps.ledger,
+           taskId: claimed.id,
+           owner,
+           fenceToken,
+           allowMutatingRetry: !replaying,
+           requestId,
+           safeToolNames: mcpBinding?.toolReadOnly ?? new Set<string>(),
+           assertActive,
+         },
+       );
       const allTools = mergePluginAndMcpTools(tools, mcpTools, "[jobs]");
       const graph = createAgentGraph({
         model,
         tools: allTools,
         systemPrompt: descriptor.systemPrompt,
         beforeModelCall,
+        onToolResult: (content, observation) => {
+          tryReportSentinelShadow(this.deps.shadowReporter, {
+            owner,
+            text: content,
+            direction: "tool_result",
+            requestId: shadowRequestId,
+            taskId: claimed.id,
+            reportKey: `tool:${shadowRequestId}:${observation.toolCallId ?? observation.sequence}`,
+          });
+        },
       });
+
 
       // 7. Run the graph on the SNAPSHOT. No thread lock, no `getState` resume
       //    branch, no compaction — the checkpointer is gone.
@@ -1388,6 +1599,15 @@ export class JobRunner {
         //    sweep).
         const reply = lastAssistantReply(invokeResult);
         if (reply !== null) {
+          const persistedReply = redactForOutbound(reply);
+          tryReportSentinelShadow(this.deps.shadowReporter, {
+            owner,
+            text: persistedReply,
+            direction: "output",
+            requestId: shadowRequestId,
+            taskId: claimed.id,
+            reportKey: `output:${shadowRequestId}`,
+          });
           try {
             this.deps.ledger.appendStep(
               claimed.id,
@@ -1396,7 +1616,7 @@ export class JobRunner {
                 stage: "reply",
                 action: "assistant_message",
                 // Persisted replies are state: redact at this seam rather than altering model output.
-                result: redactForOutbound(reply),
+                result: persistedReply,
               },
               fenceToken,
             );
@@ -1551,9 +1771,10 @@ export class JobRunner {
           continue;
         }
         const replay = await this.runJob({
-          owner: task.owner,
-          intentKey: task.intent_key,
-          spec: task.spec,
+           owner: task.owner,
+           intentKey: task.intent_key,
+           requestId: task.intent_key,
+           spec: task.spec,
           clientThreadId: task.worker ?? storedSpec.clientThreadId,
           toolPlugins: storedSpec.toolPlugins,
           modelPluginId: storedSpec.modelPluginId,

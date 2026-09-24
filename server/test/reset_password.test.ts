@@ -10,6 +10,7 @@ import { bearer } from "better-auth/plugins";
 import Database from "better-sqlite3";
 import { createResetPasswordRoutes } from "../src/reset_password.ts";
 import { getMigrations } from "better-auth/db/migration";
+import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 // Mirrors src/auth.ts wiring (same config surface) but with a throwaway
 // SQLite DB and a captured reset URL, so the forgot-password loop can be
@@ -24,6 +25,7 @@ async function buildTestAuth(captured: { url: string; token: string; to: string 
     database: new Database(dbPath),
     emailAndPassword: {
       enabled: true,
+      password: testPasswordHasher,
       minPasswordLength: 8,
       autoSignIn: true,
       sendResetPassword: async ({ user, token }: { user: { email: string }; token: string }) => {

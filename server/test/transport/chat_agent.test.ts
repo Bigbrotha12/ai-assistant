@@ -2,6 +2,12 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import {
+  bindMcpServers,
+  resetMcpRuntimeState,
+  resetMcpToolListCache,
+  type McpClientFactory,
+} from "../../src/agents/mcp.ts";
 import { createChatRoutes, resolveChatRequest } from "../../src/transport/chat.ts";
 import type { Catalogs, ResolvedAgentDef } from "../../src/catalog/index.ts";
 import type {
@@ -11,6 +17,7 @@ import type {
 } from "../../src/plugins/types.ts";
 import { PluginRegistryError } from "../../src/plugins/registry.ts";
 import type { PluginRegistry } from "../../src/plugins/registry.ts";
+import type { LookupFn } from "../../src/plugins/ssrf.ts";
 
 /**
  * Tests for the build-on-the-fly agent request pipeline in the chat route.
@@ -228,6 +235,58 @@ describe("POST /v1/chat/completions — build-on-the-fly agent resolution", () =
       makeCatalogs([defaultTemplate]),
     );
     assert.equal(result.ok, true);
+  });
+
+  test("custom agent MCP binding uses the catalog-retained pin without DNS", async (t) => {
+    const lookupCalls = { count: 0 };
+    const lookup: LookupFn = async () => {
+      lookupCalls.count += 1;
+      return [{ address: "198.51.100.20", family: 4 }];
+    };
+    const catalogs: Catalogs = {
+      skills: [],
+      mcps: [{
+        name: "filesystem",
+        url: "https://mcp.example.com/mcp",
+        pinnedIps: ["203.0.113.10"],
+      }],
+      agents: [],
+    };
+    const result = resolveOk(
+      chatBody({ agent: { mcpServers: [{ name: "filesystem" }] } }),
+      makeRegistryWithModelOnly(),
+      catalogs,
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const server = result.value.agentOverride?.mcpServers?.[0];
+    assert.ok(server);
+    assert.deepEqual(server.pinnedIps, ["203.0.113.10"]);
+
+    let receivedPins: readonly string[] | undefined;
+    const factory: McpClientFactory = async (_server, deps) => {
+      receivedPins = deps.pinnedIps;
+      return {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {},
+      };
+    };
+    resetMcpRuntimeState();
+    resetMcpToolListCache();
+    t.after(() => {
+      resetMcpRuntimeState();
+      resetMcpToolListCache();
+    });
+    const binding = await bindMcpServers([server], {
+      owner: "test-user",
+      trustedHosts: [],
+      clientFactory: factory,
+      lookup,
+    });
+    await binding.dispose();
+    assert.deepEqual(receivedPins, ["203.0.113.10"]);
+    assert.equal(lookupCalls.count, 0);
   });
 
   test("4. Custom agent unknown skill → ok (skill skipped with warn)", async (_t) => {

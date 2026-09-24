@@ -4,11 +4,20 @@ import { redactForOutbound } from "../redact.ts";
 
 export const AUDIT_TELEMETRY_ENABLED_ENV = "AUDIT_TELEMETRY_ENABLED";
 export const AUDIT_TELEMETRY_LEVEL_ENV = "AUDIT_TELEMETRY_LEVEL";
+export const DEFAULT_AUDIT_TELEMETRY_QUEUE_SIZE = 1_024;
+export const AUDIT_TELEMETRY_DROP_POLICY = "drop-newest" as const;
 
 export type AuditLogLevel = "error" | "warn" | "info" | "debug";
 export type AuditOutcome = "ok" | "error" | "timeout" | "circuit-open" | "policy-denied" | "cancelled";
-export type AuditEventName = "plugin.tool" | "mcp.connect" | "mcp.list" | "mcp.tool" | "mcp.policy";
-export type AuditKind = "plugin" | "mcp";
+export type AuditEventName =
+  | "plugin.tool"
+  | "plugin.management"
+  | "mcp.connect"
+  | "mcp.list"
+  | "mcp.tool"
+  | "mcp.policy"
+  | "sentinel.shadow";
+export type AuditKind = "plugin" | "mcp" | "sentinel";
 export type AuditCircuitState = "closed" | "open" | "half-open";
 
 export type AuditEventInput = {
@@ -29,21 +38,34 @@ export type AuditEventInput = {
   cacheHit?: boolean;
   ownerBound?: boolean;
   circuitState?: AuditCircuitState;
+  direction?: "input" | "tool_result" | "output";
+  verdict?: "allow" | "flag" | "block";
+  category?: string;
+  categories?: readonly string[];
+  severity?: string;
+  severities?: readonly string[];
+  ruleIds?: readonly string[];
+  shadow?: boolean;
+  taskId?: string;
+  operation?: string;
 };
 
 type AuditTelemetryConfig = {
   enabled: boolean;
   level: AuditLogLevel;
+  maxQueueSize: number;
 };
 
 const VALID_EVENTS = new Set<AuditEventName>([
   "plugin.tool",
+  "plugin.management",
   "mcp.connect",
   "mcp.list",
   "mcp.tool",
   "mcp.policy",
+  "sentinel.shadow",
 ]);
-const VALID_KINDS = new Set<AuditKind>(["plugin", "mcp"]);
+const VALID_KINDS = new Set<AuditKind>(["plugin", "mcp", "sentinel"]);
 const VALID_OUTCOMES = new Set<AuditOutcome>([
   "ok",
   "error",
@@ -54,8 +76,13 @@ const VALID_OUTCOMES = new Set<AuditOutcome>([
 ]);
 const VALID_CIRCUIT_STATES = new Set<AuditCircuitState>(["closed", "open", "half-open"]);
 const MAX_STRING_LENGTH = 512;
+type QueuedAuditRecord = { level: AuditLogLevel; line: string };
+const auditQueue: QueuedAuditRecord[] = [];
 let configOverride: Partial<AuditTelemetryConfig> | undefined;
 let telemetryFailureLogged = false;
+let auditDraining = false;
+let auditDrainScheduled = false;
+let auditTelemetryDropped = 0;
 
 function isLogLevel(value: string | undefined): value is AuditLogLevel {
   return value === "error" || value === "warn" || value === "info" || value === "debug";
@@ -71,9 +98,14 @@ function currentConfig(): AuditTelemetryConfig {
   const levelValue = configOverride?.level ?? process.env[AUDIT_TELEMETRY_LEVEL_ENV];
   const aliasLevel = process.env.AUDIT_LOG_LEVEL;
   const level = isLogLevel(levelValue) ? levelValue : isLogLevel(aliasLevel) ? aliasLevel : "info";
+  const maxQueueSize = configOverride?.maxQueueSize ?? DEFAULT_AUDIT_TELEMETRY_QUEUE_SIZE;
+  if (!Number.isSafeInteger(maxQueueSize) || maxQueueSize <= 0) {
+    throw new RangeError("maxQueueSize must be a positive safe integer");
+  }
   return {
     enabled: configOverride?.enabled ?? !isFalseFlag(process.env[AUDIT_TELEMETRY_ENABLED_ENV]),
     level,
+    maxQueueSize,
   };
 }
 
@@ -131,9 +163,15 @@ function makeRecord(input: AuditEventInput): Record<string, unknown> | undefined
     ["pluginId", input.pluginId],
     ["tool", input.tool],
     ["requestId", auditCode(input.requestId)],
+    ["taskId", auditCode(input.taskId)],
+    ["operation", auditCode(input.operation)],
     ["errorCode", auditCode(input.errorCode)],
     ["policyCode", auditCode(input.policyCode)],
     ["status", typeof input.status === "string" ? auditCode(input.status) : input.status],
+    ["direction", auditCode(input.direction)],
+    ["verdict", auditCode(input.verdict)],
+    ["category", auditCode(input.category)],
+    ["severity", auditCode(input.severity)],
   ];
   for (const [key, value] of fields) {
     if (value === undefined || value === null) continue;
@@ -146,6 +184,16 @@ function makeRecord(input: AuditEventInput): Record<string, unknown> | undefined
     ["outputBytes", input.outputBytes],
     ["cacheHit", input.cacheHit],
     ["ownerBound", input.ownerBound],
+    ["shadow", input.shadow],
+  ] as const) {
+    if (value === undefined) continue;
+    const safe = redactAuditValue(value);
+    if (safe !== undefined) record[key] = safe;
+  }
+  for (const [key, value] of [
+    ["categories", input.categories],
+    ["severities", input.severities],
+    ["ruleIds", input.ruleIds],
   ] as const) {
     if (value === undefined) continue;
     const safe = redactAuditValue(value);
@@ -158,9 +206,48 @@ function makeRecord(input: AuditEventInput): Record<string, unknown> | undefined
 function reportFailure(): void {
   if (telemetryFailureLogged) return;
   telemetryFailureLogged = true;
+  const maxQueueSize = configOverride?.maxQueueSize ?? DEFAULT_AUDIT_TELEMETRY_QUEUE_SIZE;
+  if (auditQueue.length < maxQueueSize) {
+    auditQueue.push({ level: "warn", line: "[audit] telemetry emission failed" });
+    scheduleAuditDrain();
+  }
+}
+
+function scheduleAuditDrain(): void {
+  if (auditDraining || auditDrainScheduled || auditQueue.length === 0) return;
+  auditDrainScheduled = true;
+  setImmediate(() => {
+    auditDrainScheduled = false;
+    void drainAuditQueue();
+  });
+}
+
+async function drainAuditQueue(): Promise<void> {
+  if (auditDraining) return;
+  auditDraining = true;
   try {
-    logger.warn("[audit] telemetry emission failed");
-  } catch {
+    while (auditQueue.length > 0) {
+      const record = auditQueue.shift()!;
+      try {
+        await logger[record.level](record.line);
+      } catch {
+        reportFailure();
+      }
+    }
+  } finally {
+    auditDraining = false;
+    scheduleAuditDrain();
+  }
+}
+
+export function getAuditTelemetryDroppedCount(): number {
+  return auditTelemetryDropped;
+}
+
+export async function flushAuditTelemetry(): Promise<void> {
+  while (auditDraining || auditDrainScheduled || auditQueue.length > 0) {
+    scheduleAuditDrain();
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
 }
 
@@ -171,6 +258,7 @@ export function configureAuditTelemetry(config: Partial<AuditTelemetryConfig>): 
 export function resetAuditTelemetryConfig(): void {
   configOverride = undefined;
   telemetryFailureLogged = false;
+  auditTelemetryDropped = 0;
 }
 
 export function getAuditTelemetryConfig(): AuditTelemetryConfig {
@@ -183,8 +271,12 @@ export function emitAuditEvent(input: AuditEventInput): void {
     if (!config.enabled) return;
     const record = makeRecord(input);
     if (!record) return;
-    const line = JSON.stringify(record);
-    logger[config.level](line);
+    if (auditQueue.length >= config.maxQueueSize) {
+      auditTelemetryDropped += 1;
+      return;
+    }
+    auditQueue.push({ level: config.level, line: JSON.stringify(record) });
+    scheduleAuditDrain();
   } catch {
     reportFailure();
   }
@@ -196,8 +288,29 @@ export function emitPluginToolAudit(
   emitAuditEvent({ ...input, event: "plugin.tool", kind: "plugin" });
 }
 
+export function emitPluginManagementAudit(
+  input: Omit<AuditEventInput, "event" | "kind">,
+): void {
+  emitAuditEvent({ ...input, event: "plugin.management", kind: "plugin" });
+}
+
 export function emitMcpToolAudit(
   input: Omit<AuditEventInput, "event" | "kind">,
 ): void {
   emitAuditEvent({ ...input, event: "mcp.tool", kind: "mcp" });
+}
+
+export function emitSentinelShadowAudit(
+  input: Omit<AuditEventInput, "event" | "kind" | "outcome"> & {
+    direction: "input" | "tool_result" | "output";
+    verdict: "allow" | "flag" | "block";
+  },
+): void {
+  emitAuditEvent({
+    ...input,
+    event: "sentinel.shadow",
+    kind: "sentinel",
+    outcome: "ok",
+    shadow: true,
+  });
 }

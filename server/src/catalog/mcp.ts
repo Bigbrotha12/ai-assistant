@@ -8,12 +8,20 @@ import {
   validateStaticUrl,
   resolveAndValidateHost,
 } from "../plugins/ssrf.ts";
+import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 
 export type McpEntry = {
   name: string;
   url: string;
   headers?: Record<string, string>;
   headerRefs?: Record<string, string>;
+  pinnedIps?: readonly string[];
+};
+
+export type McpCatalogLoadOptions = {
+  lookup?: LookupFn;
+  trustedHosts?: readonly string[];
+  mode?: Mode;
 };
 
 const envVarRe = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
@@ -52,7 +60,10 @@ function resolveHeaderValue(value: string): string {
   return resolved;
 }
 
-export async function loadMcpCatalog(filePath: string): Promise<McpEntry[]> {
+export async function loadMcpCatalog(
+  filePath: string,
+  options: McpCatalogLoadOptions = {},
+): Promise<McpEntry[]> {
   let raw: string;
   try {
     raw = await readFile(filePath, "utf-8");
@@ -85,13 +96,15 @@ export async function loadMcpCatalog(filePath: string): Promise<McpEntry[]> {
     }
     seen.add(entry.name);
 
+    const trustedHosts = options.trustedHosts ?? env.MCP_TRUSTED_HOSTS;
     const parsedUrl = validateStaticUrl(entry.url, {
-      mode: env.NODE_ENV,
-      trustedHosts: env.MCP_TRUSTED_HOSTS,
-      httpAllowedHosts: env.MCP_TRUSTED_HOSTS,
+      mode: options.mode ?? env.NODE_ENV,
+      trustedHosts,
+      httpAllowedHosts: trustedHosts,
     });
-    await resolveAndValidateHost(parsedUrl.hostname, {
-      trustedHosts: env.MCP_TRUSTED_HOSTS,
+    entry.pinnedIps = await resolveAndValidateHost(parsedUrl.hostname, {
+      trustedHosts,
+      lookup: options.lookup,
     });
 
     if (entry.headers) {

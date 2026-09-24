@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Ledger } from "../ledger.ts";
 import { DEFAULT_RULE_SET, evaluateL1 } from "./l1.ts";
 import { decideSentinel, DEFAULT_SENTINEL_POLICY } from "./policy.ts";
+import { SentinelShadowReporter } from "./shadow.ts";
 import type {
   SentinelCheckRequest,
   SentinelCheckResult,
@@ -9,6 +10,10 @@ import type {
   SentinelRuleSet,
   SentinelVerdict,
 } from "./types.ts";
+import type {
+  SentinelShadowInput,
+  SentinelShadowWriteResult,
+} from "./shadow.ts";
 import { SENTINEL_RUNTIME_MODE } from "./types.ts";
 
 export class SentinelTaskNotFoundError extends Error {
@@ -30,14 +35,27 @@ export class SentinelService {
   private readonly ruleSet: SentinelRuleSet;
   private readonly policy: SentinelPolicy;
   private readonly requestId: () => string;
+  readonly shadow: SentinelShadowReporter;
 
   constructor(options: SentinelServiceOptions) {
     this.ledger = options.ledger;
     this.ruleSet = options.ruleSet ?? DEFAULT_RULE_SET;
     this.policy = options.policy ?? DEFAULT_SENTINEL_POLICY;
     this.requestId = options.requestId ?? (() => `sentinel_${randomUUID()}`);
+    this.shadow = new SentinelShadowReporter({ ledger: this.ledger, ruleSet: this.ruleSet });
   }
 
+  recordShadow(
+    owner: string,
+    input: Omit<SentinelShadowInput, "owner">,
+  ): Promise<SentinelShadowWriteResult | null> {
+    return this.shadow.report({ ...input, owner });
+  }
+
+  /**
+   * SENTINEL_POLICY_MODE configures the standalone check surface only. Chat
+   * traffic uses the shadow reporter and is never enforced here.
+   */
   check(owner: string, request: SentinelCheckRequest): SentinelCheckResult {
     if (owner.trim() === "") throw new Error("sentinel owner is required");
     const sourceTaskId = request.context?.taskId;

@@ -12,7 +12,9 @@ import {
 import { SsrfValidationError, validateMcpHeaderName } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import {
+  authorizeEgressRequest,
   buildPinnedAgent,
+  createEgressPolicy,
   normalizeHostname,
   resolveAndValidateHost,
   validateStaticUrl,
@@ -20,6 +22,7 @@ import {
 import { credentialFingerprint } from "../plugins/credential.ts";
 import {
   boundToolResult,
+  serializeBoundedToolArguments,
   TOOL_RESULT_TRUNCATION_MARKER,
 } from "../tool_bounds.ts";
 import { redactForOutbound } from "../redact.ts";
@@ -36,7 +39,14 @@ export type McpServerConfig = {
   url: string;
   headers?: Record<string, string>;
   headerRefs?: Record<string, string>;
+  id?: string;
+  pinnedIps?: readonly string[];
 };
+
+export type McpPinResolver = (
+  server: McpServerConfig,
+) => readonly string[] | undefined | Promise<readonly string[] | undefined>;
+export type McpPinOption = readonly string[] | McpPinResolver;
 
 export class McpError extends Error {
   readonly code: string;
@@ -53,6 +63,12 @@ export type McpTool = {
   name: string;
   description?: string;
   inputSchema?: JsonSchema;
+  readOnly?: boolean;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+  };
 };
 
 export type McpCallResult = {
@@ -66,6 +82,24 @@ export const DEFAULT_MCP_MAX_IN_FLIGHT_CALLS_PER_OWNER = 4;
 export const DEFAULT_MCP_CIRCUIT_FAILURE_THRESHOLD = 3;
 export const DEFAULT_MCP_CIRCUIT_FAILURE_WINDOW_MS = 60_000;
 export const DEFAULT_MCP_CIRCUIT_COOLDOWN_MS = 30_000;
+export const DEFAULT_MCP_IDLE_TIMEOUT_MS = 15 * 60_000;
+export const DEFAULT_MCP_MAX_SESSION_LIFETIME_MS = 24 * 60 * 60_000;
+export const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = DEFAULT_MCP_IDLE_TIMEOUT_MS;
+export const DEFAULT_MCP_SESSION_MAX_LIFETIME_MS = DEFAULT_MCP_MAX_SESSION_LIFETIME_MS;
+export const MCP_EVICTION_ERROR_CODES = {
+  idle: "MCP_SESSION_IDLE_TIMEOUT",
+  max_lifetime: "MCP_SESSION_MAX_LIFETIME",
+} as const;
+export const MCP_RESOURCE_LIMIT_CODES = {
+  runtime: "MCP_RUNTIME_LIMIT",
+  close: "MCP_CLOSE_TIMEOUT",
+} as const;
+export type McpEvictionReason = keyof typeof MCP_EVICTION_ERROR_CODES;
+export function isMcpToolSafeToRepeat(tool: Pick<McpTool, "readOnly" | "annotations">): boolean {
+  const explicitlyReadOnly = tool.readOnly === true || tool.annotations?.readOnlyHint === true;
+  return explicitlyReadOnly && tool.annotations?.destructiveHint !== true;
+}
+
 export const DEFAULT_MCP_BOUNDARY_LIMITS = {
   maxToolCount: 100,
   maxToolListBytes: 1_048_576,
@@ -113,7 +147,7 @@ export class McpResourceError extends Error {
 
 /** MCP limits and circuit state are process-local and assume the supported single-replica deployment. */
 export const MCP_SINGLE_REPLICA_NOTICE =
-  "MCP connection, concurrency, and circuit state is process-local; the supported gateway deployment has exactly one replica.";
+  "MCP connection, concurrency, session lifetime, and circuit state are process-local; the supported gateway deployment has exactly one replica.";
 
 export type McpLimits = {
   maxConnectionsPerServer: number;
@@ -124,6 +158,10 @@ export type McpLimits = {
   circuitFailureWindowMs: number;
   circuitCooldownMs: number;
   now: () => number;
+  idleTimeoutMs?: number;
+  maxSessionLifetimeMs?: number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 };
 
 export type McpCircuitState = "closed" | "open" | "half-open";
@@ -135,12 +173,39 @@ export type McpCircuitSnapshot = {
   probeInFlight: boolean;
 };
 
+type McpSessionConfig = {
+  idleTimeoutMs: number;
+  maxSessionLifetimeMs: number;
+  now: () => number;
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+};
+
 type McpConnectionRecord = {
   id: number;
   ownerScope: string;
+  owner?: string;
+  requestId?: string;
+  serverName: string;
+  bookkeepingKey: string;
+  runtime: McpRuntime;
+  session: McpSessionConfig;
+  startedAt?: number;
+  lastUsedAt: number;
+  connectStartedAt: number;
+  connectAuditEmitted: boolean;
+  activeOperations: number;
+  sessionTimer?: ReturnType<typeof setTimeout>;
+  sessionAbortController: AbortController;
+  lifetimeStarted: boolean;
+  evictionStarted: boolean;
+  evictionReason?: McpEvictionReason;
   closePromise?: Promise<void>;
+  evictionPromise?: Promise<void>;
   releaseImpl: () => void;
-  clientCloseStarted: boolean;
+  forceCloseStarted: boolean;
+  clientClosePromise?: Promise<boolean>;
+  closeForceTimer?: ReturnType<typeof setTimeout>;
   rawClient?: McpClientLike;
   rawFactorySettled: boolean;
   rawFactoryPromise?: Promise<McpClientLike>;
@@ -152,6 +217,11 @@ type McpConnectionRecord = {
 type McpConnectionLease = {
   record: McpConnectionRecord;
   release: () => void;
+};
+
+type McpClientHandle = {
+  client: McpClientLike;
+  record: McpConnectionRecord;
 };
 
 type McpRuntime = {
@@ -195,11 +265,13 @@ export type McpClientFactory = (
     lookup?: LookupFn;
     mode?: Mode;
     signal?: AbortSignal;
+    pinnedIps?: readonly string[];
   },
 ) => Promise<McpClientLike>;
 
 export type McpBinding = {
   tools: DynamicStructuredTool[];
+  toolReadOnly: ReadonlySet<string>;
   dispose: () => Promise<void>;
 };
 
@@ -245,7 +317,7 @@ export type McpSseFactoryOverrides = {
   timeoutMs?: number;
 };
 
-const MAX_MCP_RUNTIME_STATES = 256;
+export const MAX_MCP_RUNTIME_STATES = 256;
 
 function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -276,13 +348,41 @@ function resolveMcpLimits(overrides?: Partial<McpLimits>): McpLimits {
   return limits;
 }
 
-function serverRuntimeKey(server: Pick<McpServerConfig, "url">): string {
+function normalizedMcpOrigin(server: Pick<McpServerConfig, "url">): string {
   try {
-    const parsed = new URL(server.url);
-    return `${parsed.origin}${parsed.pathname}`;
+    return new URL(server.url).origin.toLowerCase();
   } catch {
     return server.url;
   }
+}
+
+function serverRuntimeKey(server: Pick<McpServerConfig, "url">): string {
+  return normalizedMcpOrigin(server);
+}
+
+function serverBookkeepingKey(
+  server: Pick<McpServerConfig, "url" | "name" | "id">,
+): string {
+  let pathname = server.url;
+  try {
+    const parsed = new URL(server.url);
+    pathname = `${parsed.pathname}${parsed.search}`;
+  } catch {
+  }
+  const configuredId = server.id?.trim() || server.name.trim();
+  return `${normalizedMcpOrigin(server)}\u0000${configuredId}\u0000${pathname}`;
+}
+
+export function mcpServerRuntimeKey(
+  server: Pick<McpServerConfig, "url">,
+): string {
+  return serverRuntimeKey(server);
+}
+
+export function mcpServerBookkeepingKey(
+  server: Pick<McpServerConfig, "url" | "name" | "id">,
+): string {
+  return serverBookkeepingKey(server);
 }
 
 function ownerScope(owner: string | undefined): string {
@@ -321,7 +421,13 @@ function getRuntime(key: string, now: number): McpRuntime {
           oldestAt = candidate.lastUsedAt;
         }
       }
-      if (oldestKey !== undefined) mcpRuntimes.delete(oldestKey);
+      if (oldestKey === undefined) {
+        throw new McpError(
+          `MCP runtime limit reached (max ${MAX_MCP_RUNTIME_STATES})`,
+          MCP_RESOURCE_LIMIT_CODES.runtime,
+        );
+      }
+      mcpRuntimes.delete(oldestKey);
     }
     runtime = newRuntime(now);
     mcpRuntimes.set(key, runtime);
@@ -343,6 +449,10 @@ function reserveMcpConnection(
   scope: string,
   limits: McpLimits,
   closeTimeoutMs: number,
+  session: McpSessionConfig,
+  server: Pick<McpServerConfig, "name" | "url" | "id">,
+  owner?: string,
+  requestId?: string,
 ): McpConnectionLease {
   if (
     runtime.connections.size >= limits.maxConnectionsPerServer ||
@@ -357,8 +467,21 @@ function reserveMcpConnection(
   const record: McpConnectionRecord = {
     id: ++mcpConnectionSequence,
     ownerScope: scope,
+    owner,
+    requestId,
+    serverName: server.name,
+    bookkeepingKey: serverBookkeepingKey(server),
+    runtime,
+    session,
+     lastUsedAt: session.now(),
+     connectStartedAt: session.now(),
+     connectAuditEmitted: false,
+     activeOperations: 0,
+    sessionAbortController: new AbortController(),
+    lifetimeStarted: false,
+    evictionStarted: false,
     releaseImpl: () => {},
-    clientCloseStarted: false,
+    forceCloseStarted: false,
     rawFactorySettled: false,
     closeTimeoutMs,
   };
@@ -375,45 +498,283 @@ function reserveMcpConnection(
 async function closeMcpClientOnce(
   record: McpConnectionRecord,
   client: McpClientLike,
-): Promise<void> {
-  if (record.clientCloseStarted) return;
-  record.clientCloseStarted = true;
-  try {
-    await withMcpTimeout(
-      () => client.close(),
-      record.closeTimeoutMs,
-      "close",
-      "mcp-client",
-    );
-  } catch {
+): Promise<boolean> {
+  if (record.clientClosePromise !== undefined) return record.clientClosePromise;
+  const promise = (async (): Promise<boolean> => {
     try {
-      void Promise.resolve(client.forceClose?.()).catch(() => undefined);
+      await withMcpTimeout(
+        () => client.close(),
+        record.closeTimeoutMs,
+        "close",
+        "mcp-client",
+      );
+      return false;
     } catch {
+      forceMcpClientClose(record, client);
+      return true;
     }
+  })();
+  record.clientClosePromise = promise;
+  return promise;
+}
+
+function forceMcpClientClose(
+  record: McpConnectionRecord,
+  candidate: McpClientLike | undefined = record.rawClient,
+): void {
+  if (record.forceCloseStarted || candidate === undefined) return;
+  record.forceCloseStarted = true;
+  try {
+    void Promise.resolve(candidate.forceClose?.()).catch(() => undefined);
+  } catch {
   }
 }
 
 async function closeMcpConnection(lease: McpConnectionLease): Promise<void> {
   const { record } = lease;
-  if (record.closePromise) return record.closePromise;
+  if (record.closePromise !== undefined) return record.closePromise;
+  clearMcpSessionTimer(record);
+  if (!record.sessionAbortController.signal.aborted) {
+    record.sessionAbortController.abort(mcpClosedError(record));
+  }
+  try {
+    record.onClosed?.();
+  } catch {
+  }
   record.closePromise = (async () => {
-    lease.release();
-    try {
-      record.onClosed?.();
-    } catch {
-    }
-    if (record.rawFactorySettled) {
-      if (record.rawClient) await closeMcpClientOnce(record, record.rawClient);
-      return;
-    }
-    if (record.rawFactoryPromise) {
-      void record.rawFactoryPromise.then(
-        (client) => closeMcpClientOnce(record, client),
-        () => undefined,
+    let forceReleaseTelemetryEmitted = false;
+    const emitForceRelease = (): void => {
+      if (forceReleaseTelemetryEmitted) return;
+      forceReleaseTelemetryEmitted = true;
+      emitAuditEvent({
+        event: "mcp.connect",
+        kind: "mcp",
+        outcome: "cancelled",
+        owner: record.owner,
+        server: record.serverName,
+        requestId: record.requestId,
+        errorCode: MCP_RESOURCE_LIMIT_CODES.close,
+        status: "force_released",
+        ownerBound: record.owner !== undefined,
+        circuitState: record.runtime.circuit.state,
+      });
+    };
+    const finishClose = async (): Promise<boolean> => {
+      if (record.rawFactorySettled) {
+        if (record.rawClient === undefined) return false;
+        return closeMcpClientOnce(record, record.rawClient);
+      }
+      if (record.rawFactoryPromise === undefined) return false;
+      try {
+        const client = await record.rawFactoryPromise;
+        return closeMcpClientOnce(record, client);
+      } catch {
+        return false;
+      }
+    };
+    const deadline = new Promise<"deadline">((resolve) => {
+      record.closeForceTimer = record.session.setTimeout(
+        () => resolve("deadline"),
+        record.closeTimeoutMs,
       );
+      if (typeof (record.closeForceTimer as { unref?: () => void }).unref === "function") {
+        (record.closeForceTimer as { unref: () => void }).unref();
+      }
+    });
+    try {
+      const outcome = await Promise.race([
+        finishClose().then((forced) => forced ? "forced" : "closed"),
+        deadline,
+      ]);
+      if (outcome === "deadline") {
+        forceMcpClientClose(record);
+        emitForceRelease();
+      } else if (outcome === "forced") {
+        emitForceRelease();
+      }
+    } finally {
+      if (record.closeForceTimer !== undefined) {
+        record.session.clearTimeout(record.closeForceTimer);
+        record.closeForceTimer = undefined;
+      }
+      lease.release();
     }
   })();
   return record.closePromise;
+}
+
+function mcpEvictionCode(reason: McpEvictionReason): string {
+  return MCP_EVICTION_ERROR_CODES[reason];
+}
+
+function mcpClosedError(record: McpConnectionRecord): McpError {
+  if (record.evictionReason) {
+    return new McpError(
+      `MCP client for '${redactForOutbound(record.serverName)}' was evicted (${record.evictionReason})`,
+      mcpEvictionCode(record.evictionReason),
+    );
+  }
+  return new McpError(
+    `MCP client for '${redactForOutbound(record.serverName)}' is closed`,
+    "MCP_DISPOSED",
+  );
+}
+
+function clearMcpSessionTimer(record: McpConnectionRecord): void {
+  if (record.sessionTimer === undefined) return;
+  record.session.clearTimeout(record.sessionTimer);
+  record.sessionTimer = undefined;
+}
+
+function scheduleMcpSessionTimer(record: McpConnectionRecord): void {
+  if (
+    record.evictionStarted ||
+    record.closePromise !== undefined ||
+    !record.lifetimeStarted ||
+    record.startedAt === undefined
+  ) {
+    return;
+  }
+  clearMcpSessionTimer(record);
+  const now = record.session.now();
+  const maxDeadline = record.startedAt + record.session.maxSessionLifetimeMs;
+  const idleDeadline = record.activeOperations === 0
+    ? record.lastUsedAt + record.session.idleTimeoutMs
+    : Number.POSITIVE_INFINITY;
+  const deadline = Math.min(maxDeadline, idleDeadline);
+  const handle = record.session.setTimeout(() => {
+    record.sessionTimer = undefined;
+    checkMcpSessionExpiry(record);
+  }, Math.max(0, deadline - now));
+  record.sessionTimer = handle;
+  if (typeof (handle as { unref?: () => void }).unref === "function") {
+    (handle as { unref: () => void }).unref();
+  }
+}
+
+function startMcpSession(record: McpConnectionRecord): void {
+  if (record.evictionStarted || record.closePromise !== undefined || record.lifetimeStarted) return;
+  const now = record.session.now();
+  record.startedAt = now;
+  record.lastUsedAt = now;
+  record.lifetimeStarted = true;
+  scheduleMcpSessionTimer(record);
+}
+
+function startMcpEviction(
+  record: McpConnectionRecord,
+  reason: McpEvictionReason,
+): Promise<void> {
+  if (record.evictionPromise) return record.evictionPromise;
+  if (record.evictionReason !== undefined) {
+    return closeMcpConnection({ record, release: record.releaseImpl });
+  }
+  record.evictionStarted = true;
+  record.evictionReason = reason;
+  clearMcpSessionTimer(record);
+  if (!record.sessionAbortController.signal.aborted) {
+    record.sessionAbortController.abort(mcpClosedError(record));
+  }
+  emitMcpAudit({
+    event: "mcp.connect",
+    kind: "mcp",
+    outcome: reason === "max_lifetime" ? "timeout" : "cancelled",
+    owner: record.owner,
+    server: record.serverName,
+    requestId: record.requestId,
+    errorCode: mcpEvictionCode(reason),
+    status: reason,
+    circuitState: record.runtime.circuit.state,
+  });
+  const promise = closeMcpConnection({ record, release: record.releaseImpl });
+  record.evictionPromise = promise;
+  return promise;
+}
+
+function checkMcpSessionExpiry(record: McpConnectionRecord): boolean {
+  if (!record.lifetimeStarted || record.evictionStarted || record.closePromise !== undefined) {
+    return false;
+  }
+  const now = record.session.now();
+  if (record.startedAt !== undefined && now - record.startedAt >= record.session.maxSessionLifetimeMs) {
+    void startMcpEviction(record, "max_lifetime");
+    return true;
+  }
+  if (record.activeOperations === 0 && now - record.lastUsedAt >= record.session.idleTimeoutMs) {
+    void startMcpEviction(record, "idle");
+    return true;
+  }
+  scheduleMcpSessionTimer(record);
+  return false;
+}
+
+function touchMcpConnection(record: McpConnectionRecord): void {
+  if (record.evictionStarted || record.closePromise !== undefined || !record.lifetimeStarted) return;
+  record.lastUsedAt = record.session.now();
+  checkMcpSessionExpiry(record);
+  if (!record.evictionStarted && record.closePromise === undefined) {
+    scheduleMcpSessionTimer(record);
+  }
+}
+
+async function runMcpClientOperation<T>(
+  handle: McpClientHandle,
+  externalSignal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const { record } = handle;
+  if (checkMcpSessionExpiry(record) || record.evictionStarted || record.closePromise !== undefined) {
+    throw mcpClosedError(record);
+  }
+  record.activeOperations += 1;
+  record.lastUsedAt = record.session.now();
+  scheduleMcpSessionTimer(record);
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        record.sessionAbortController.signal.removeEventListener("abort", onSessionAbort);
+        externalSignal?.removeEventListener("abort", onExternalAbort);
+      };
+      const onSessionAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(mcpClosedError(record));
+      };
+      const onExternalAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new DOMException("MCP operation aborted", "AbortError"));
+      };
+      record.sessionAbortController.signal.addEventListener("abort", onSessionAbort, { once: true });
+      externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+      if (externalSignal?.aborted) {
+        onExternalAbort();
+        return;
+      }
+      void Promise.resolve()
+        .then(operation)
+        .then(
+          (value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(value);
+          },
+          (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(error);
+          },
+        );
+    });
+  } finally {
+    record.activeOperations = Math.max(0, record.activeOperations - 1);
+    touchMcpConnection(record);
+  }
 }
 
 function openMcpCircuit(runtime: McpRuntime, now: number): void {
@@ -563,9 +924,37 @@ export type McpBindOptions = {
   requestId?: string;
   timeoutMs?: number;
   closeTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  maxSessionLifetimeMs?: number;
+  now?: () => number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
+  pinnedIps?: McpPinOption;
+  resolvePins?: McpPinResolver;
   limits?: Partial<McpLimits>;
   bounds?: Partial<McpBoundaryLimits>;
 };
+
+function resolveMcpSessionConfig(
+  opts: McpBindOptions | undefined,
+  limits: McpLimits,
+): McpSessionConfig {
+  const idleTimeoutMs = positiveInteger(
+    opts?.idleTimeoutMs ?? opts?.limits?.idleTimeoutMs ?? DEFAULT_MCP_IDLE_TIMEOUT_MS,
+    "MCP idle timeout",
+  );
+  const maxSessionLifetimeMs = positiveInteger(
+    opts?.maxSessionLifetimeMs ?? opts?.limits?.maxSessionLifetimeMs ?? DEFAULT_MCP_MAX_SESSION_LIFETIME_MS,
+    "MCP maximum session lifetime",
+  );
+  return {
+    idleTimeoutMs,
+    maxSessionLifetimeMs,
+    now: opts?.now ?? limits.now,
+    setTimeout: opts?.setTimeout ?? opts?.limits?.setTimeout ?? globalThis.setTimeout.bind(globalThis),
+    clearTimeout: opts?.clearTimeout ?? opts?.limits?.clearTimeout ?? globalThis.clearTimeout.bind(globalThis),
+  };
+}
 
 function resolveTimeoutMs(timeoutMs: number | undefined): number {
   return positiveInteger(timeoutMs ?? env.MCP_CALL_TIMEOUT_MS, "MCP timeout");
@@ -868,10 +1257,17 @@ function classifyMcpFailure(err: unknown, signal?: AbortSignal): McpFailure {
   if (
     code === "MCP_CIRCUIT_OPEN" ||
     code === "MCP_CONCURRENCY_LIMIT" ||
-    code === "MCP_DISPOSED"
+    code === MCP_RESOURCE_LIMIT_CODES.runtime ||
+    code === "MCP_DISPOSED" ||
+    code === MCP_EVICTION_ERROR_CODES.idle ||
+    code === MCP_EVICTION_ERROR_CODES.max_lifetime
   ) {
     return {
-      outcome: code === "MCP_CIRCUIT_OPEN" ? "circuit-open" : "error",
+      outcome: code === "MCP_CIRCUIT_OPEN"
+        ? "circuit-open"
+        : code === "MCP_DISPOSED" || code === MCP_EVICTION_ERROR_CODES.idle || code === MCP_EVICTION_ERROR_CODES.max_lifetime
+          ? "cancelled"
+          : "error",
       errorCode: code,
       countable: false,
     };
@@ -899,13 +1295,55 @@ function callResultBytes(value: unknown): number {
   return byteLength(redactForOutbound(content.map((item) => item.text ?? "").join("\n")));
 }
 
-type McpAuditEvent = "mcp.list" | "mcp.tool";
+type McpAuditEvent = "mcp.connect" | "mcp.list" | "mcp.tool";
 
 function emitMcpAudit(event: AuditEventInput): void {
   try {
     emitAuditEvent(event);
   } catch {
   }
+}
+
+function emitMcpConnectAudit(
+  record: McpConnectionRecord,
+  outcome: AuditOutcome,
+  errorCode?: string,
+): void {
+  if (record.connectAuditEmitted) return;
+  record.connectAuditEmitted = true;
+  emitMcpAudit({
+    event: "mcp.connect",
+    kind: "mcp",
+    outcome,
+    owner: record.owner,
+    server: record.serverName,
+    requestId: record.requestId,
+    durationMs: Math.max(0, record.session.now() - record.connectStartedAt),
+    ownerBound: record.owner !== undefined,
+    circuitState: record.runtime.circuit.state,
+    ...(errorCode === undefined ? {} : { errorCode }),
+  });
+}
+
+function emitMcpCircuitTransition(
+  server: McpServerConfig,
+  owner: string | undefined,
+  requestId: string | undefined,
+  from: McpCircuitState,
+  to: McpCircuitState,
+): void {
+  if (from === to) return;
+  emitMcpAudit({
+    event: "mcp.connect",
+    kind: "mcp",
+    outcome: to === "open" ? "circuit-open" : "ok",
+    owner,
+    server: server.name,
+    requestId,
+    status: to,
+    circuitState: to,
+    ownerBound: owner !== undefined,
+  });
 }
 
 type McpOperationOptions<T> = {
@@ -931,11 +1369,19 @@ async function runMcpOperation<T>(
   const key = serverRuntimeKey(server);
   const scope = options.ownerKey ?? ownerScope(owner);
   const runtime = getRuntime(key, limits.now());
+  const initialCircuitState = runtime.circuit.state;
   const startedAt = limits.now();
   let permit: McpOperationPermit | undefined;
   let releaseCall: (() => void) | undefined;
   try {
     permit = beginMcpOperation(runtime, limits);
+    emitMcpCircuitTransition(
+       server,
+       owner,
+      options.requestId,
+      initialCircuitState,
+      runtime.circuit.state,
+    );
     try {
       releaseCall = reserveMcpCall(runtime, scope, limits);
     } catch (err) {
@@ -946,6 +1392,13 @@ async function runMcpOperation<T>(
     }
     const value = await options.run();
     const state = completeMcpOperation(runtime, permit, limits, true, false);
+    emitMcpCircuitTransition(
+       server,
+       owner,
+      options.requestId,
+      initialCircuitState,
+      state,
+    );
     emitMcpAudit({
       event: options.event,
       kind: "mcp",
@@ -964,9 +1417,16 @@ async function runMcpOperation<T>(
     return value;
   } catch (err) {
     const failure = classifyMcpFailure(err, options.signal);
-    if (permit) {
-      completeMcpOperation(runtime, permit, limits, false, failure.countable);
-      try {
+     if (permit) {
+       const state = completeMcpOperation(runtime, permit, limits, false, failure.countable);
+        emitMcpCircuitTransition(
+          server,
+          owner,
+         options.requestId,
+         initialCircuitState,
+         state,
+       );
+       try {
         if (failure.countable || failure.outcome === "cancelled" || failure.outcome === "policy-denied") {
           options.onFailure();
         }
@@ -1081,12 +1541,29 @@ function resolveMcpRequestHeaders(
   return headers;
 }
 
-/**
- * Default client: opens an SSRF-pinned SSE session to the MCP server. The
- * pinned Agent is kept open for the lifetime of the session (the SSE stream is
- * long-lived) and destroyed on close — it must NOT be closed right after the
- * initial response, which would kill the stream.
- */
+async function validateMcpRetainedPins(
+  parsed: URL,
+  pinnedIps: readonly string[],
+  trustedHosts: readonly string[],
+  mode: Mode | undefined,
+): Promise<readonly string[]> {
+  const validationUrl = new URL(`${parsed.origin}${parsed.pathname}`);
+  const policy = createEgressPolicy({
+    subject: "mcp",
+    destinations: [{
+      baseUrl: validationUrl.href,
+      pinnedIps,
+      methods: ["GET", "POST"],
+      exactPaths: [validationUrl.pathname],
+    }],
+    trustedHosts,
+    mode,
+  });
+  const authorized = await authorizeEgressRequest(policy, validationUrl.href, "GET");
+  return authorized.pinnedIps;
+}
+
+
 export async function defaultSseClientFactory(
   server: McpServerConfig,
   deps: {
@@ -1094,6 +1571,7 @@ export async function defaultSseClientFactory(
     lookup?: LookupFn;
     mode?: Mode;
     signal?: AbortSignal;
+    pinnedIps?: readonly string[];
   },
   overrides: McpSseFactoryOverrides = {},
 ): Promise<McpClientLike> {
@@ -1104,10 +1582,13 @@ export async function defaultSseClientFactory(
     mode: deps.mode,
   });
   const hostname = normalizeHostname(parsed.hostname);
-  const pinned = await resolveAndValidateHost(hostname, {
-    trustedHosts: trusted,
-    lookup: deps.lookup,
-  });
+  const retainedPins = deps.pinnedIps ?? server.pinnedIps;
+  const pinned = retainedPins === undefined
+    ? await resolveAndValidateHost(hostname, {
+        trustedHosts: trusted,
+        lookup: deps.lookup,
+      })
+    : await validateMcpRetainedPins(parsed, retainedPins, trusted, deps.mode);
   const agent = overrides.createAgent?.(hostname, parsed, pinned) ?? buildPinnedAgent(hostname, parsed, pinned);
   const mcpFetch = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -1227,6 +1708,8 @@ export async function defaultSseClientFactory(
           name: t.name,
           description: t.description,
           inputSchema: t.inputSchema as JsonSchema,
+          ...(t.annotations === undefined ? {} : { annotations: t.annotations }),
+          ...(t.readOnly === undefined ? {} : { readOnly: t.readOnly }),
         })),
       };
     },
@@ -1289,16 +1772,20 @@ export async function bindMcpServers(
 ): Promise<McpBinding> {
   const tools: DynamicStructuredTool[] = [];
   const disposers: Array<() => Promise<void>> = [];
+  const toolSafety = new Map<string, boolean>();
   const factory = opts?.clientFactory ?? defaultSseClientFactory;
   const limits = resolveMcpLimits(opts?.limits);
   const boundaryLimits = resolveMcpBoundaryLimits(opts?.bounds);
   const timeoutMs = resolveTimeoutMs(opts?.timeoutMs);
   const closeTimeoutMs = resolveTimeoutMs(opts?.closeTimeoutMs ?? opts?.timeoutMs);
+  const session = resolveMcpSessionConfig(opts, limits);
+  const bindingPins = new Map<string, Promise<readonly string[]>>();
 
   for (const server of mcpServers) {
     if (opts?.signal?.aborted) break;
     const cache = getMcpToolListCache();
-    const key = mcpToolListCacheKey(server);
+    const cacheKey = mcpToolListCacheKey(server);
+    const runtimeKey = serverRuntimeKey(server);
     const scope = ownerScope(opts?.owner ?? `binding-${++mcpBindingSequence}`);
     const records = new Set<McpConnectionLease>();
     let current: McpConnectionLease | undefined;
@@ -1318,33 +1805,117 @@ export async function bindMcpServers(
       current = undefined;
       await Promise.allSettled(leases.map((lease) => closeMcpConnection(lease)));
     };
-    const getClient = (): Promise<McpClientLike> => {
+    let retainedPins: readonly string[] | undefined = server.pinnedIps === undefined || server.pinnedIps.length === 0
+      ? undefined
+      : [...server.pinnedIps];
+    let retainedPinsPromise: Promise<readonly string[] | undefined> | undefined;
+    const resolvePinsForBinding = async (): Promise<readonly string[] | undefined> => {
+      if (retainedPins !== undefined) return retainedPins;
+      const configuredPinOption = opts?.resolvePins ?? opts?.pinnedIps;
+      if (configuredPinOption !== undefined) {
+        let configuredPins: readonly string[] | undefined;
+        if (typeof configuredPinOption === "function") {
+          if (retainedPinsPromise === undefined) {
+            const pending = Promise.resolve(configuredPinOption(server)).then((pins) => {
+              if (pins === undefined || pins.length === 0) return undefined;
+              const retained = [...pins];
+              retainedPins = retained;
+              return retained;
+            });
+            retainedPinsPromise = pending;
+            void pending.catch(() => {
+              if (retainedPinsPromise === pending) retainedPinsPromise = undefined;
+            });
+          }
+          configuredPins = await retainedPinsPromise;
+        } else if (configuredPinOption.length > 0) {
+          configuredPins = [...configuredPinOption];
+          retainedPins = configuredPins;
+        }
+        if (configuredPins !== undefined && configuredPins.length > 0) return configuredPins;
+      }
+      if (factory !== defaultSseClientFactory && opts?.lookup === undefined) {
+        return undefined;
+      }
+      let pending = bindingPins.get(runtimeKey);
+      if (pending === undefined) {
+        pending = Promise.resolve().then(async () => {
+          const parsed = validateStaticUrl(server.url, {
+            trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
+            httpAllowedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
+            mode: opts?.mode,
+          });
+          const pins = await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
+            trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
+            lookup: opts?.lookup,
+          });
+          retainedPins = pins;
+          return pins;
+        });
+        bindingPins.set(runtimeKey, pending);
+        void pending.catch(() => {
+          if (bindingPins.get(runtimeKey) === pending) bindingPins.delete(runtimeKey);
+        });
+      }
+      return pending;
+    };
+    const getClient = async (): Promise<McpClientHandle> => {
       if (disposed) {
-        return Promise.reject(
-          new McpError(`MCP binding for '${redactForOutbound(server.name)}' already disposed`, "MCP_DISPOSED"),
+        throw new McpError(
+          `MCP binding for '${redactForOutbound(server.name)}' already disposed`,
+          "MCP_DISPOSED",
         );
       }
-      if (current?.record.clientPromise) return current.record.clientPromise;
-      const runtime = getRuntime(key, limits.now());
-      const lease = reserveMcpConnection(runtime, scope, limits, closeTimeoutMs);
+      const existing = current;
+      if (existing?.record.clientPromise !== undefined) {
+        const client = await existing.record.clientPromise;
+        if (
+          checkMcpSessionExpiry(existing.record) ||
+          existing.record.evictionStarted ||
+          existing.record.closePromise !== undefined
+        ) {
+          throw mcpClosedError(existing.record);
+        }
+        return { client, record: existing.record };
+      }
+      const runtime = getRuntime(runtimeKey, limits.now());
+      const lease = reserveMcpConnection(
+        runtime,
+        scope,
+        limits,
+        closeTimeoutMs,
+        session,
+        server,
+        opts?.owner,
+        opts?.requestId,
+      );
       records.add(lease);
       current = lease;
       lease.record.onClosed = () => removeRecord(lease);
 
-      const rawFactoryPromise = Promise.resolve().then(() =>
-        factory(server, {
+      const factorySignal = opts?.signal
+        ? AbortSignal.any([opts.signal, lease.record.sessionAbortController.signal])
+        : lease.record.sessionAbortController.signal;
+      const rawFactoryPromise = Promise.resolve().then(async () => {
+        const pinnedIps = await resolvePinsForBinding();
+        return factory(server, {
           trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
           lookup: opts?.lookup,
           mode: opts?.mode,
-          signal: opts?.signal,
-        }),
-      );
+          signal: factorySignal,
+          pinnedIps,
+        });
+      });
       lease.record.rawFactoryPromise = rawFactoryPromise;
       void rawFactoryPromise.then(
         (client) => {
           lease.record.rawFactorySettled = true;
           lease.record.rawClient = client;
-          if (lease.record.closePromise) void closeMcpClientOnce(lease.record, client);
+          if (lease.record.closePromise === undefined) {
+            startMcpSession(lease.record);
+          } else {
+            void closeMcpClientOnce(lease.record, client);
+          }
         },
         () => {
           lease.record.rawFactorySettled = true;
@@ -1356,12 +1927,19 @@ export async function bindMcpServers(
         "connect",
         server.name,
       );
-      lease.record.clientPromise = clientPromise;
-      void clientPromise.then(undefined, () => {
-        removeRecord(lease);
-        void closeMcpConnection(lease);
-      });
-      return clientPromise;
+       lease.record.clientPromise = clientPromise;
+       void clientPromise.then(
+         () => {
+           emitMcpConnectAudit(lease.record, "ok");
+         },
+         (error: unknown) => {
+           const failure = classifyMcpFailure(error, factorySignal);
+           emitMcpConnectAudit(lease.record, failure.outcome, failure.errorCode);
+           removeRecord(lease);
+           void closeMcpConnection(lease);
+         },
+       );
+      return clientPromise.then((client) => ({ client, record: lease.record }));
     };
     const invalidateCurrent = (): void => {
       if (current) void closeLease(current);
@@ -1372,11 +1950,23 @@ export async function bindMcpServers(
     };
 
     try {
-      let listed = cache.get(key);
+      let listed = cache.get(cacheKey);
       const cacheHit = listed !== undefined;
-      if (listed !== undefined) {
-        assertMcpToolList(listed, boundaryLimits);
-      }
+       if (listed !== undefined) {
+         assertMcpToolList(listed, boundaryLimits);
+         emitMcpAudit({
+           event: "mcp.list",
+           kind: "mcp",
+           outcome: "ok",
+           owner: opts?.owner,
+           server: server.name,
+           requestId: opts?.requestId,
+           cacheHit: true,
+           outputBytes: listResultBytes(listed),
+           ownerBound: opts?.owner !== undefined,
+           circuitState: getMcpCircuitState(server).state,
+         });
+       }
       if (listed === undefined) {
         const result = await runMcpOperation({
            server,
@@ -1390,29 +1980,35 @@ export async function bindMcpServers(
            inputBytes: 0,
            limits,
 
-          run: async () => {
-            const client = await getClient();
-             const result = await withMcpTimeout(
-               () => client.listTools(),
-               timeoutMs,
-               "list",
-               server.name,
+           run: async () => {
+             const handle = await getClient();
+             const result = await runMcpClientOperation(
+               handle,
+               opts?.signal,
+               () => withMcpTimeout(
+                 () => handle.client.listTools(),
+                 timeoutMs,
+                 "list",
+                 server.name,
+               ),
              );
              assertMcpToolList(result.tools, boundaryLimits);
              return result;
 
-          },
+           },
           onFailure: invalidateCurrent,
            outputBytes: listResultBytes,
 
          });
          assertMcpToolList(result.tools, boundaryLimits);
          listed = result.tools;
-         cache.set(key, listed);
+         cache.set(cacheKey, listed);
 
       }
       for (const tool of listed) {
         if (!tool.name) continue;
+        const safe = isMcpToolSafeToRepeat(tool);
+        toolSafety.set(tool.name, (toolSafety.get(tool.name) ?? true) && safe);
         const schema = tool.inputSchema
           ? jsonSchemaToZod(tool.inputSchema as JsonSchema)
           : z.object({});
@@ -1422,8 +2018,9 @@ export async function bindMcpServers(
             name: tool.name,
             description: tool.description ?? "",
             schema,
-            func: async (args: Record<string, unknown>) => {
-                   const result = await runMcpOperation({
+             func: async (args: Record<string, unknown>) => {
+               const serializedArgs = serializeBoundedToolArguments(args);
+                    const result = await runMcpOperation({
                   server,
                   owner: opts?.owner,
                   ownerKey: scope,
@@ -1433,19 +2030,23 @@ export async function bindMcpServers(
                  event: "mcp.tool",
                   tool: tool.name,
                   cacheHit,
-                  inputBytes: byteLength(args),
-                  limits,
+                   inputBytes: Buffer.byteLength(serializedArgs, "utf8"),
+                   limits,
 
-                 run: async () => {
-                   const client = await getClient();
-                   const raw = await withMcpTimeout(
-                     () => client.callTool({ name: tool.name, arguments: args }),
-                     timeoutMs,
-                     "invoke",
-                     server.name,
-                   );
-                   return boundMcpCallResult(raw, boundaryLimits);
-                 },
+                  run: async () => {
+                    const handle = await getClient();
+                    const raw = await runMcpClientOperation(
+                      handle,
+                      opts?.signal,
+                      () => withMcpTimeout(
+                        () => handle.client.callTool({ name: tool.name, arguments: args }),
+                        timeoutMs,
+                        "invoke",
+                        server.name,
+                      ),
+                    );
+                    return boundMcpCallResult(raw, boundaryLimits);
+                  },
                  onFailure: invalidateCurrent,
                   outputBytes: callResultBytes,
 
@@ -1460,7 +2061,12 @@ export async function bindMcpServers(
       disposers.push(dispose);
     } catch (err) {
       await closeAll();
-      if (err instanceof McpResourceError) throw err;
+      if (
+        err instanceof McpResourceError ||
+        (err instanceof McpError && err.code === MCP_RESOURCE_LIMIT_CODES.runtime)
+      ) {
+        throw err;
+      }
       const code = errorCode(err);
       logger.warn(
         `[mcp] failed to bind tools from server '${redactForOutbound(server.name)}' (${code})`,
@@ -1475,5 +2081,9 @@ export async function bindMcpServers(
     ).then(() => undefined);
     return disposePromise;
   };
-  return { tools, dispose: disposeBinding };
+  return {
+    tools,
+    toolReadOnly: new Set([...toolSafety].filter(([, safe]) => safe).map(([name]) => name)),
+    dispose: disposeBinding,
+  };
 }

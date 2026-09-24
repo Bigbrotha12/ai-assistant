@@ -46,6 +46,16 @@ export type BeforeModelCall = (
   config: RunnableConfig,
 ) => void | Promise<void>;
 
+export type ToolResultObservation = {
+  sequence: number;
+  toolCallId?: string;
+};
+
+export type OnToolResult = (
+  content: string,
+  observation: ToolResultObservation,
+) => void | Promise<void>;
+
 export type AgentGraphDeps = {
   model: BaseChatModel;
   tools: StructuredToolInterface[];
@@ -53,6 +63,7 @@ export type AgentGraphDeps = {
   maxIterations?: number;
   prepareMessages?: PrepareMessages;
   beforeModelCall?: BeforeModelCall;
+  onToolResult?: OnToolResult;
 };
 
 export function createAgentGraph({
@@ -62,6 +73,7 @@ export function createAgentGraph({
   maxIterations = MAX_TOOL_ROUNDS,
   prepareMessages,
   beforeModelCall,
+  onToolResult,
 }: AgentGraphDeps) {
   if (!Number.isSafeInteger(maxIterations) || maxIterations < 0) {
     throw new RangeError("maxIterations must be a non-negative safe integer");
@@ -81,6 +93,7 @@ export function createAgentGraph({
   }
   const modelWithTools = hasTools ? model.bindTools(tools) : model;
   const toolNode = new ToolNode(tools, { handleToolErrors: false });
+  let toolResultSequence = 0;
 
   const orchestrator = async (
     state: AgentState,
@@ -112,6 +125,21 @@ export function createAgentGraph({
         message.content = boundToolResultContent(message.content);
         return message;
       });
+    for (const message of boundedToolMessages) {
+      try {
+        const result = onToolResult?.(String(message.content), {
+          sequence: ++toolResultSequence,
+          ...(message.tool_call_id ? { toolCallId: message.tool_call_id } : {}),
+        });
+        if (
+          result !== undefined &&
+          typeof (result as PromiseLike<unknown>).then === "function"
+        ) {
+          void Promise.resolve(result).catch(() => {});
+        }
+      } catch {
+      }
+    }
     const outputs = boundedToolMessages.map((message) => String(message.content));
     return {
       messages: toolMessages,

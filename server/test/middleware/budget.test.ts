@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { BudgetExhaustedError, createBudgetManager } from "../../src/middleware/budget.ts";
+import { logger } from "../../src/logger.ts";
+import {
+  configureAuditTelemetry,
+  flushAuditTelemetry,
+  resetAuditTelemetryConfig,
+} from "../../src/audit/telemetry.ts";
 import type {
   AsyncReservation,
   BudgetClearTimeout,
@@ -329,6 +335,191 @@ describe("createBudgetManager", () => {
     assert.equal(budget.toolCallCount("owner-a"), 0);
     assert.equal(budget.globalToolCallCount(), 0);
     assert.equal(await budget.withToolCallBudget("owner-c", async () => "ok"), "ok");
+  });
+
+  it("isolates per-plugin tool concurrency so one backend cannot consume the global pool", async () => {
+    const budget = createBudgetManager({
+      maxToolCallsPerOwner: 4,
+      maxToolCallsPerPlugin: 1,
+      maxGlobalToolCalls: 2,
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = budget.withToolCallBudget("owner", "plugin-a", () => gate);
+    const second = await budget.withToolCallBudget("owner", "plugin-b", async () => "plugin-b-ok");
+    assert.equal(second, "plugin-b-ok");
+    await assert.rejects(
+      budget.withToolCallBudget("owner", "plugin-a", async () => "blocked"),
+      (error: unknown) =>
+        error instanceof BudgetExhaustedError &&
+        /plugin-a/.test(error.message),
+    );
+    assert.equal(budget.pluginToolCallCount("plugin-a"), 1);
+    assert.equal(budget.pluginToolCallCount("plugin-b"), 0);
+    assert.equal(budget.globalToolCallCount(), 1);
+    release();
+    await first;
+    assert.equal(budget.globalToolCallCount(), 0);
+  });
+
+  it("caps one tool per owner and turn while leaving another tool in the plugin unaffected", async () => {
+    const budget = createBudgetManager({
+      maxToolCallsPerOwnerPluginPerTurn: 2,
+      maxToolCallsPerOwnerPluginPerWindow: 10,
+      now: () => 1_000,
+    });
+    await budget.withToolCallBudget("owner", "plugin-a", async () => "a1", {
+      requestId: "turn-1", tool: "alpha",
+    });
+    await budget.withToolCallBudget("owner", "plugin-a", async () => "a2", {
+      requestId: "turn-1", tool: "alpha",
+    });
+    assert.equal(await budget.withToolCallBudget("owner", "plugin-a", async () => "b1", {
+      requestId: "turn-1", tool: "beta",
+    }), "b1");
+    await assert.rejects(
+      budget.withToolCallBudget("owner", "plugin-a", async () => "blocked", {
+        requestId: "turn-1", tool: "alpha",
+      }),
+      (error: unknown) =>
+        error instanceof BudgetExhaustedError &&
+        /in this turn/.test(error.message) &&
+        error.retryAfterSeconds > 0,
+    );
+    assert.equal(await budget.withToolCallBudget("owner", "plugin-a", async () => "next", {
+      requestId: "turn-2", tool: "alpha",
+    }), "next");
+  });
+
+  it("resets the per-owner plugin window and reports retry-after semantics", async () => {
+    let now = 0;
+    const budget = createBudgetManager({
+      maxToolCallsPerOwnerPluginPerTurn: 10,
+      maxToolCallsPerOwnerPluginPerWindow: 2,
+      toolCallRateWindowMs: 1_000,
+      now: () => now,
+    });
+    await budget.withToolCallBudget("owner", "plugin", async () => "one");
+    await budget.withToolCallBudget("owner", "plugin", async () => "two");
+    await assert.rejects(
+      budget.withToolCallBudget("owner", "plugin", async () => "blocked"),
+      (error: unknown) =>
+        error instanceof BudgetExhaustedError &&
+        error.retryAfterSeconds === 1 &&
+        /in this window/.test(error.message),
+    );
+    now = 1_000;
+    assert.equal(await budget.withToolCallBudget("owner", "plugin", async () => "next"), "next");
+  });
+
+  it("holds tool slots until a timed-out raw handler settles", async () => {
+    const clock = createFakeClock();
+    const budget = createBudgetManager({
+      toolCallQuarantineMs: 100,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    });
+    let settleRaw!: () => void;
+    const rawSettled = new Promise<void>((resolve) => { settleRaw = resolve; });
+    const timeout = Object.assign(new Error("tool timeout"), { code: "tool_timeout" });
+    await assert.rejects(
+      budget.withToolCallBudget("owner", "plugin", async () => { throw timeout; }, { rawSettled }),
+      /tool timeout/,
+    );
+    assert.equal(budget.toolCallCount("owner"), 1);
+    assert.equal(budget.pluginToolCallCount("plugin"), 1);
+    assert.equal(budget.globalToolCallCount(), 1);
+    settleRaw();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(budget.toolCallCount("owner"), 0);
+    assert.equal(budget.pluginToolCallCount("plugin"), 0);
+    assert.equal(budget.globalToolCallCount(), 0);
+    assert.equal(clock.pendingCount(), 0);
+  });
+
+  it("quarantines a non-cooperative timed-out handler until the force-release bound", async () => {
+    const clock = createFakeClock();
+    const originalInfo = logger.info;
+    const records: Record<string, unknown>[] = [];
+    logger.info = (...args: unknown[]) => {
+      const line = args.map(String).join(" ");
+      try {
+        records.push(JSON.parse(line) as Record<string, unknown>);
+      } catch {
+      }
+    };
+    configureAuditTelemetry({ enabled: true, level: "info" });
+    try {
+      const budget = createBudgetManager({
+        toolCallQuarantineMs: 100,
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout,
+      });
+      const timeout = Object.assign(new Error("tool timeout"), { code: "tool_timeout" });
+      await assert.rejects(
+        budget.withToolCallBudget(
+          "owner",
+          "plugin",
+          async () => { throw timeout; },
+          { requestId: "quarantined-request", tool: "side-effect", rawSettled: new Promise<void>(() => undefined) },
+        ),
+        /tool timeout/,
+      );
+      await assert.rejects(
+        budget.withToolCallBudget("owner", "plugin", async () => "overlap"),
+        (error: unknown) => error instanceof BudgetExhaustedError && /plugin/.test(error.message),
+      );
+      assert.equal(budget.pluginToolCallCount("plugin"), 1);
+      clock.fire(clock.ids()[0]!);
+      await flushAuditTelemetry();
+      assert.equal(budget.pluginToolCallCount("plugin"), 0);
+      assert.equal(budget.globalToolCallCount(), 0);
+      assert.equal(
+        records.some((record) =>
+          record.requestId === "quarantined-request" &&
+          record.errorCode === "tool_quarantine_forced"),
+        true,
+      );
+    } finally {
+      await flushAuditTelemetry();
+      logger.info = originalInfo;
+      resetAuditTelemetryConfig();
+    }
+  });
+
+  it("force-releases a never-settling budget run after timeout plus quarantine", async () => {
+    const clock = createFakeClock();
+    const budget = createBudgetManager({
+      toolCallTimeoutMs: 10,
+      toolCallQuarantineMs: 50,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    });
+    let entered!: () => void;
+    const isEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const pending = budget.withToolCallBudget("owner", "plugin", async () => {
+      entered();
+      return new Promise<string>(() => undefined);
+    }, { tool: "side-effect" });
+    void pending.catch(() => undefined);
+    await isEntered;
+    clock.fire(clock.ids()[0]!);
+    await assert.rejects(
+      budget.withToolCallBudget("owner", "plugin", async () => "overlap"),
+      (error: unknown) => error instanceof BudgetExhaustedError && /quarantined/.test(error.message),
+    );
+    assert.equal(budget.pluginToolCallCount("plugin"), 1);
+    clock.fire(clock.ids()[0]!);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(budget.pluginToolCallCount("plugin"), 0);
+    assert.equal(budget.globalToolCallCount(), 0);
+  });
+
+  it("rejects invalid per-plugin tool concurrency limits", () => {
+    assert.throws(
+      () => createBudgetManager({ maxToolCallsPerPlugin: 0 }),
+      /maxToolCallsPerPlugin/,
+    );
   });
 
   it("rejects invalid tool concurrency limits", () => {

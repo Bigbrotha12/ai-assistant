@@ -68,7 +68,9 @@ describe("warmups", () => {
     call.args.page = 9;
     call.credentials.apiKey = "changed";
     assert.deepEqual(await done, { status: "warmed" });
-    assert.deepEqual(executions[0], ["tasks", "list", { page: 1 }, { apiKey: "secret" }]);
+    const firstExecution = executions[0] as unknown[] | undefined;
+    assert.deepEqual(firstExecution?.slice(0, 4), ["tasks", "list", { page: 1 }, { apiKey: "secret" }]);
+    assert.ok(firstExecution?.[4] instanceof AbortSignal);
     assert.equal(cache.get({
       owner: "user", pluginId: "tasks", pluginVersion: "1.0.0", tool: "list",
       credentialFingerprint: credentialFingerprint({ apiKey: "secret" }), argsHash: cache.argsHash({ page: 1 }),
@@ -122,6 +124,29 @@ describe("warmups", () => {
     assert.deepEqual(manager.schedule({ ...call, args: { page: 2 } }), { ok: false, reason: "busy" });
     first.release();
     second.release();
+  });
+
+  it("does not start a handler when the per-plugin tool budget rejects", async (t) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const budget = createBudgetManager({
+      maxToolCallsPerOwner: 1,
+      maxToolCallsPerPlugin: 1,
+      maxGlobalToolCalls: 1,
+    });
+    const held = budget.withToolCallBudget("user", "tasks", () => gate);
+    await tick();
+    const { manager, executions, call } = setup(t, { budget });
+
+    assert.deepEqual(
+      await admitted(manager.schedule(call)),
+      { status: "budget_exhausted", retryAfterSeconds: 1 },
+    );
+    assert.equal(executions.length, 0);
+    assert.equal(manager.activeCount, 0);
+
+    release();
+    await held;
   });
 
   it("deduplicates identical in-flight cache keys below the global cap", async (t) => {

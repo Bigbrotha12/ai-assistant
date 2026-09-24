@@ -30,6 +30,38 @@ export {
   createSentinelRoutes,
   parseSentinelRequest,
 } from "./routes.ts";
+export {
+  SENTINEL_SHADOW_DEFAULT_QUEUE_SIZE,
+  SENTINEL_SHADOW_DROP_POLICY,
+  SENTINEL_SHADOW_MAX_PERSISTENCE_ATTEMPTS,
+  SENTINEL_SHADOW_MAX_REPORTS_PER_TURN,
+  SentinelShadowReporter,
+  lastUserTextFromMessages,
+  parseSentinelShadowMetadata,
+  readSentinelShadowReport,
+  sentinelTextFromContent,
+  sentinelTextFromMessage,
+  tryReportSentinelShadow,
+} from "./shadow.ts";
+export type {
+  SentinelShadowInput,
+  SentinelShadowMetadata,
+  SentinelShadowQueueStats,
+  SentinelShadowReport,
+  SentinelShadowReporterOptions,
+  SentinelShadowSink,
+  SentinelShadowWriteResult,
+} from "./shadow.ts";
+export {
+  SENTINEL_REPORT_MAX_FUTURE_SKEW_MS,
+  SentinelReportStore,
+  parseSentinelReportQuery,
+} from "./reports.ts";
+export type {
+  SentinelReportPage,
+  SentinelReportQuery,
+  SentinelReportSummary,
+} from "./reports.ts";
 export * from "./eval.ts";
 export {
   SENTINEL_RULE_SET_SOURCE_JSON,

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -16,7 +17,7 @@ import { logger } from "../logger.ts";
 import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_key.ts";
 import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { bindPluginTools, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
-import { bindMcpServers } from "../agents/mcp.ts";
+import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import { isRecord } from "../util.ts";
 import { createAgentGraph } from "../agents/graph.ts";
@@ -62,8 +63,18 @@ import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
 import type { SessionStore, SessionMissingReason } from "../sessions/store.ts";
-import { boundToolResult } from "../tool_bounds.ts";
+import {
+  boundToolResult,
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  invokeBoundedToolHandler,
+} from "../tool_bounds.ts";
 import type { AppendDeltaResult, ReestablishResult } from "../sessions/store.ts";
+import {
+  lastUserTextFromMessages,
+  sentinelTextFromMessage,
+  tryReportSentinelShadow,
+} from "../sentinel/shadow.ts";
+import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 
 /**
  * Server-side caps on the CUSTOM agent spec (`body.agent` as an object) —
@@ -340,6 +351,8 @@ export type ChatRoutesOptions = {
    * (H2) so a fake can assert them.
    */
   toolHandler?: JobToolHandler;
+  toolTimeoutMs?: number;
+  mcpClientFactory?: McpClientFactory;
   warmups?: WarmupManager;
   /**
    * Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the sync tool
@@ -363,6 +376,7 @@ export type ChatRoutesOptions = {
    * stateless run). Constructed in index.ts and shared with createSessionRoutes.
    */
   sessionStore?: SessionStore;
+  shadowReporter?: SentinelShadowSink;
 };
 
 /**
@@ -438,6 +452,64 @@ function createStreamExecution(requestSignal: AbortSignal) {
   };
 }
 
+function chatRequestId(c: Context, body: Record<string, unknown>): string {
+  const messageId = typeof body["messageId"] === "string" ? body["messageId"].trim() : "";
+  if (messageId !== "") return messageId;
+  const header = c.req.header("x-request-id")?.trim();
+  return header && header !== "" ? header : `chat_${randomUUID()}`;
+}
+
+function reportShadowText(
+  reporter: SentinelShadowSink | undefined,
+  owner: string,
+  text: string,
+  direction: "input" | "tool_result" | "output",
+  requestId: string,
+  reportKey: string,
+  taskId?: string | null,
+): void {
+  tryReportSentinelShadow(reporter, {
+    owner,
+    text,
+    direction,
+    requestId,
+    taskId,
+    reportKey,
+  });
+}
+
+function resolveMcpPins(
+  store: PluginStore,
+  server: McpServerConfig,
+): readonly string[] | undefined {
+  const agentPluginId = server.id?.trim();
+  if (!agentPluginId) return undefined;
+  const pinned = store.getPinnedIps(`${agentPluginId}:mcp:${server.name}`)?.[0]?.pinned;
+  return pinned === undefined ? undefined : [...pinned];
+}
+
+function resolveMcpServers(
+  store: PluginStore,
+  servers: readonly McpServerConfig[],
+): McpServerConfig[] {
+  return servers.map((server) => {
+    const pinnedIps = resolveMcpPins(store, server);
+    return pinnedIps === undefined ? { ...server } : { ...server, pinnedIps };
+  });
+}
+
+function reportShadowInput(
+  reporter: SentinelShadowSink | undefined,
+  owner: string,
+  messages: readonly unknown[],
+  requestId: string,
+  taskId?: string | null,
+): void {
+  const text = lastUserTextFromMessages(messages);
+  if (text === null) return;
+  reportShadowText(reporter, owner, text, "input", requestId, `input:${requestId}`, taskId);
+}
+
 /** The compiled agent graph the sync path streams (createAgentGraph's type). */
 type AgentGraph = ReturnType<typeof createAgentGraph>;
 
@@ -505,6 +577,7 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
     // Wave C2 sync-vs-async decision (see the module doc): only an explicit
     // boolean `true` selects the async path; `false`/absent is the C1 stream,
     // and any other value is rejected rather than silently running sync.
+    const requestId = chatRequestId(c, body);
     const background = body["background"];
     if (background !== undefined && background !== false) {
       if (background !== true) {
@@ -513,9 +586,9 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
           400,
         );
       }
-      return handleBackground(c, owner, body, opts, budget);
+      return handleBackground(c, owner, body, opts, budget, requestId);
     }
-    return handleSyncStream(c, owner, body, opts, budget);
+    return handleSyncStream(c, owner, body, opts, budget, requestId);
   });
 
   return routes;
@@ -553,6 +626,8 @@ type ResolvedChat = {
     mcpServers?: {
       name: string;
       url: string;
+      id?: string;
+      pinnedIps?: readonly string[];
       headers?: Record<string, string>;
       headerRefs?: Record<string, string>;
     }[];
@@ -779,6 +854,7 @@ export function resolveChatRequest(
         url: string;
         headers?: Record<string, string>;
         headerRefs?: Record<string, string>;
+        pinnedIps?: readonly string[];
       }[] = [];
       for (const mcpRef of spec.mcpServers ?? []) {
         const entry = catalogs.mcps.find(m => m.name === mcpRef.name);
@@ -788,6 +864,7 @@ export function resolveChatRequest(
             url: entry.url,
             headers: entry.headers,
             headerRefs: entry.headerRefs,
+            pinnedIps: entry.pinnedIps,
           });
         } else {
           logger.warn(`[chat] custom agent: MCP server '${mcpRef.name}' not found in catalog; skipping`);
@@ -922,11 +999,15 @@ export function resolveChatRequest(
       env.AGENT_SKILL_BUDGET_TOKENS,
     );
 
+    const mcpPinOwnerId = typeof rawAgent === "string" ? resolvedAgentDef.id : undefined;
     agentOverride = {
       systemPrompt,
       toolGrants: resolvedAgentDef.tools,
       inference: resolvedAgentDef.inference,
-      mcpServers: resolvedAgentDef.mcpServers,
+      mcpServers: resolvedAgentDef.mcpServers.map((server) => ({
+        ...server,
+        ...(mcpPinOwnerId === undefined ? {} : { id: mcpPinOwnerId }),
+      })),
     };
   }
 
@@ -965,10 +1046,12 @@ async function handleSyncStream(
   body: Record<string, unknown>,
   opts: ChatRoutesOptions,
   budget: BudgetManager,
+  requestId: string,
 ): Promise<Response> {
   const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
   if (isDeleting(owner)) return accountDeletedResponse(c);
+  reportShadowInput(opts.shadowReporter, owner, resolved.value.rawMessages, requestId);
   const { managed } = resolved.value;
 
   // Managed-session path (plan §5): a managed request carries a validated
@@ -983,7 +1066,7 @@ async function handleSyncStream(
         503,
       );
     }
-    return handleManagedSessionStream(c, owner, resolved.value, opts, budget);
+    return handleManagedSessionStream(c, owner, resolved.value, opts, budget, requestId);
   }
 
   const {
@@ -1036,32 +1119,45 @@ async function handleSyncStream(
   });
   const execution = createStreamExecution(c.req.raw.signal);
   trackModelExecution(model, execution);
-  const pluginTools = bindPluginTools(opts.registry, {
-    async execute(pluginId, toolName, args) {
-      execution.signal.throwIfAborted();
-      return execution.track(async () => {
-        const result = await cachedHandler.execute(
-          pluginId,
-          toolName,
-          args,
-          toolCredentialsByPlugin[pluginId],
-          execution.signal,
-        );
-        execution.signal.throwIfAborted();
-        return result;
-      });
-    },
-  }, resolved.value.enabledPlugins);
-  const mcpBinding = resolved.value.agentOverride?.mcpServers
-      ? await bindMcpServers(resolved.value.agentOverride.mcpServers, {
-        owner,
-        requestId:
-          typeof body["messageId"] === "string"
-            ? body["messageId"]
-            : c.req.header("x-request-id"),
-        signal: execution.signal,
-        trustedHosts: env.MCP_TRUSTED_HOSTS,
-      })
+   const pluginTools = bindPluginTools(opts.registry, {
+     async execute(pluginId, toolName, args, _credentials, signal) {
+       execution.signal.throwIfAborted();
+       const callSignal = signal && signal !== execution.signal
+         ? AbortSignal.any([execution.signal, signal])
+         : execution.signal;
+       return execution.track(() => invokeBoundedToolHandler(
+         (boundedSignal) => cachedHandler.execute(
+           pluginId,
+           toolName,
+           args,
+           toolCredentialsByPlugin[pluginId],
+           boundedSignal,
+         ),
+         {
+           timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
+           maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+           signal: callSignal,
+           timeoutMessage: `tool '${toolName}' exceeded the handler timeout`,
+         },
+       ));
+     },
+   }, resolved.value.enabledPlugins, {
+     owner,
+     requestId,
+     timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
+   });
+   const mcpServers = resolved.value.agentOverride?.mcpServers
+     ? resolveMcpServers(opts.pluginStore, resolved.value.agentOverride.mcpServers)
+     : undefined;
+   const mcpBinding = mcpServers
+       ? await bindMcpServers(mcpServers, {
+         owner,
+         requestId,
+         signal: execution.signal,
+         trustedHosts: env.MCP_TRUSTED_HOSTS,
+         clientFactory: opts.mcpClientFactory,
+         resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
+       })
 
     : undefined;
   // The MCP binding owns live SSE connections + pinned Agents until the stream
@@ -1094,6 +1190,16 @@ async function handleSyncStream(
         if (isDeleting(owner)) throw new AccountDeletedError(owner);
         budget.beforeModelCall(owner, "sync");
       },
+      onToolResult: (content, observation) => {
+        reportShadowText(
+          opts.shadowReporter,
+          owner,
+          content,
+          "tool_result",
+          requestId,
+          `tool:${requestId}:${observation.toolCallId ?? observation.sequence}`,
+        );
+      },
     });
     const modelId = requestModel ?? plugin.inference.defaultModel;
 
@@ -1125,6 +1231,16 @@ async function handleSyncStream(
         undefined,
         undefined,
         disposeMcp,
+        (finalReply) => {
+          reportShadowText(
+            opts.shadowReporter,
+            owner,
+            sentinelTextFromMessage(finalReply),
+            "output",
+            requestId,
+            `output:${requestId}`,
+          );
+        },
       );
     } catch (err) {
       reservation.release();
@@ -1171,6 +1287,7 @@ async function handleManagedSessionStream(
   resolved: ResolvedChat,
   opts: ChatRoutesOptions,
   budget: BudgetManager,
+  requestId: string,
 ): Promise<Response> {
   const sessionStore = opts.sessionStore!;
   const sessionId = resolved.sessionId!; // dispatch gate guarantees non-null
@@ -1374,31 +1491,46 @@ async function handleManagedSessionStream(
     });
     const execution = createStreamExecution(c.req.raw.signal);
     trackModelExecution(model, execution);
-    const pluginTools = bindPluginTools(opts.registry, {
-      async execute(pluginId, toolName, args) {
-        execution.signal.throwIfAborted();
-        return execution.track(async () => {
-          const result = await cachedHandler.execute(
-            pluginId,
-            toolName,
-            args,
-            toolCredentialsByPlugin[pluginId],
-            execution.signal,
-          );
-          execution.signal.throwIfAborted();
-          return result;
-        });
-      },
-    }, resolved.enabledPlugins);
-    const mcpBinding = resolved.agentOverride?.mcpServers
-      ? await bindMcpServers(resolved.agentOverride.mcpServers, {
-          owner,
-          requestId:
-            resolved.managedMessageId ?? c.req.header("x-request-id"),
-          signal: execution.signal,
-          trustedHosts: env.MCP_TRUSTED_HOSTS,
-        })
-      : undefined;
+     const pluginTools = bindPluginTools(opts.registry, {
+       async execute(pluginId, toolName, args, _credentials, signal) {
+         execution.signal.throwIfAborted();
+         const callSignal = signal && signal !== execution.signal
+           ? AbortSignal.any([execution.signal, signal])
+           : execution.signal;
+          return execution.track(() => invokeBoundedToolHandler(
+            (boundedSignal) => cachedHandler.execute(
+              pluginId,
+              toolName,
+              args,
+              toolCredentialsByPlugin[pluginId],
+              boundedSignal,
+            ),
+            {
+              timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
+              maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+              signal: callSignal,
+              timeoutMessage: `tool '${toolName}' exceeded the handler timeout`,
+            },
+          ));
+       },
+     }, resolved.enabledPlugins, {
+       owner,
+       requestId,
+       timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
+     });
+     const mcpServers = resolved.agentOverride?.mcpServers
+       ? resolveMcpServers(opts.pluginStore, resolved.agentOverride.mcpServers)
+       : undefined;
+     const mcpBinding = mcpServers
+       ? await bindMcpServers(mcpServers, {
+           owner,
+           requestId,
+           signal: execution.signal,
+           trustedHosts: env.MCP_TRUSTED_HOSTS,
+           clientFactory: opts.mcpClientFactory,
+           resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
+         })
+       : undefined;
     let mcpHandedOff = false;
     let mcpDisposed = false;
     const disposeMcp = async (): Promise<void> => {
@@ -1420,6 +1552,16 @@ async function handleManagedSessionStream(
         beforeModelCall: () => {
           execution.signal.throwIfAborted();
           budget.beforeModelCall(owner, "sync");
+        },
+        onToolResult: (content, observation) => {
+          reportShadowText(
+            opts.shadowReporter,
+            owner,
+            content,
+            "tool_result",
+            requestId,
+            `tool:${requestId}:${observation.toolCallId ?? observation.sequence}`,
+          );
         },
       });
       // Deliberately NO checkpointer: sessions are stateless, compiled per
@@ -1464,8 +1606,20 @@ async function handleManagedSessionStream(
           disposeMcp,
           (finalReply) => {
             reply = finalReply;
+            try {
+              reportShadowText(
+                opts.shadowReporter,
+                owner,
+                sentinelTextFromMessage(redactBaseMessage(finalReply)),
+                "output",
+                requestId,
+                `output:${requestId}`,
+              );
+            } catch {
+            }
           },
         );
+
         stream.headers.set("x-session-id", sessionId);
         stream.headers.set("x-conversation-state", state);
         return stream;
@@ -1673,10 +1827,11 @@ function withToolResultCache(opts: {
     credentials?: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<string> =>
-    budget.withToolCallBudget(
-      owner,
-      () => invokeTool(pluginId, toolName, args, credentials, signal),
-    );
+     budget.withToolCallBudget(
+       owner,
+       pluginId,
+       () => invokeTool(pluginId, toolName, args, credentials, signal),
+     );
   if (!cache) {
     return { execute: executeBounded };
   }
@@ -1759,6 +1914,7 @@ async function handleBackground(
   body: Record<string, unknown>,
   opts: ChatRoutesOptions,
   budget: BudgetManager,
+  requestId: string,
 ): Promise<Response> {
   const { jobRunner, ledger, pins } = opts;
   // The async path needs the runner, an owner-scoped ledger to admit against,
@@ -1811,7 +1967,10 @@ async function handleBackground(
   if (isDeleting(owner)) return accountDeletedResponse(c);
   if (existing) {
     const duplicate = inspectManagedTurn(existing, clientThread);
-    if (duplicate) return managedDuplicateResponse(c, duplicate);
+    if (duplicate) {
+      reportShadowInput(opts.shadowReporter, owner, rawMessages, requestId, existing.id);
+      return managedDuplicateResponse(c, duplicate);
+    }
   }
 
   // The job's immutable snapshot: the request's `messages` converted exactly
@@ -1851,8 +2010,11 @@ async function handleBackground(
     return accountDeletedResponse(c);
   }
 
-  const durablePayload = serializeJobPayload({ messages: snapshot });
-  const modelRequestConfig = {
+   const mcpServers = resolved.value.agentOverride?.mcpServers
+     ? resolveMcpServers(opts.pluginStore, resolved.value.agentOverride.mcpServers)
+     : undefined;
+   const durablePayload = serializeJobPayload({ messages: snapshot });
+   const modelRequestConfig = {
     owner,
     requestModel,
     requestParameters,
@@ -1863,8 +2025,8 @@ async function handleBackground(
     modelPluginId,
     modelRequestConfig,
     systemPrompt: resolved.value.agentOverride?.systemPrompt,
-    mcpServers: resolved.value.agentOverride?.mcpServers,
-  });
+     mcpServers,
+   });
 
   // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
   // so a queue-full 503 leaves no phantom task row. A queued admission parks
@@ -1919,10 +2081,19 @@ async function handleBackground(
     releasePins();
     return accountDeletedResponse(c);
   }
+  reportShadowInput(
+    opts.shadowReporter,
+    owner,
+    rawMessages,
+    requestId,
+    task.id,
+  );
 
   const completion = jobRunner.runJob({
-    owner,
-    intentKey: messageId,
+     owner,
+     intentKey: messageId,
+     requestId,
+     shadowRequestId: requestId,
     spec: task.spec,
     clientThreadId: clientThread,
     toolPlugins,
@@ -1933,8 +2104,8 @@ async function handleBackground(
       requestParameters,
     } satisfies JobModelRequestConfig,
     systemPrompt: resolved.value.agentOverride?.systemPrompt,
-    mcpServers: resolved.value.agentOverride?.mcpServers,
-    pinHandles,
+     mcpServers,
+     pinHandles,
     input: { messages: snapshot },
   });
   void completion.then(

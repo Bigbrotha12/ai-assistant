@@ -129,6 +129,12 @@ function emptyStore(): PluginStoreConfig {
 
 type PinnedUrlEntry = { entryId: string; url: string; pinned: string[] };
 type PinnedUrls = Map<string, PinnedUrlEntry[]>;
+export type CatalogMcpPinRetention = {
+  agentPluginId: string;
+  serverName: string;
+  url: string;
+  pinnedIps: readonly string[];
+};
 type StoreWriteFile = typeof writeFile;
 type PluginStoreState = {
   config: PluginStoreConfig;
@@ -162,6 +168,7 @@ export class PluginStore {
    * resolve-then-validate result is never discarded.
    */
   private pinnedUrls: PinnedUrls = new Map();
+  private catalogMcpPins: PinnedUrls = new Map();
 
   constructor(opts: PluginStoreOptions) {
     this.storePath = opts.storePath;
@@ -781,15 +788,36 @@ export class PluginStore {
    * call MUST pass these pins (the resolve-then-validate result) into
    * `validatedFetch`; never resolve a plugin URL ad-hoc.
    */
+  retainCatalogMcpPins(entries: readonly CatalogMcpPinRetention[]): void {
+    const retained: PinnedUrls = new Map();
+    for (const entry of entries) {
+      if (
+        entry.agentPluginId.trim() === "" ||
+        entry.serverName.trim() === "" ||
+        entry.pinnedIps.length === 0
+      ) {
+        continue;
+      }
+      const key = `${entry.agentPluginId}:mcp:${entry.serverName}`;
+      retained.set(key, [{
+        entryId: `mcp:${entry.serverName}`,
+        url: entry.url,
+        pinned: [...entry.pinnedIps],
+      }]);
+    }
+    this.catalogMcpPins = retained;
+  }
+
   getPinnedIps(
     pluginId: string,
   ): Array<{ entryId: string; url: string; pinned: string[] }> | undefined {
-    return this.pinnedUrls.get(pluginId);
+    return this.pinnedUrls.get(pluginId) ?? this.catalogMcpPins.get(pluginId);
   }
 
   hasMcpPins(pluginId: string): boolean {
-    for (const key of this.pinnedUrls.keys()) {
-      if (key.startsWith(`${pluginId}:mcp:`)) return true;
+    const prefix = `${pluginId}:mcp:`;
+    for (const key of [...this.pinnedUrls.keys(), ...this.catalogMcpPins.keys()]) {
+      if (key.startsWith(prefix)) return true;
     }
     return false;
   }

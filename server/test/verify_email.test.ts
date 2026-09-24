@@ -17,6 +17,7 @@ import {
   type SendVerificationRateLimitGate,
 } from "../src/verify_email.ts";
 import { smtpUnconfigured } from "../src/email.ts";
+import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 // Mirrors src/auth.ts C2 wiring (emailVerification + autoSignIn:false +
 // requireEmailVerification + sliding session) but with a throwaway SQLite DB
@@ -46,6 +47,7 @@ async function buildTestAuth(
     database,
     emailAndPassword: {
       enabled: true,
+      password: testPasswordHasher,
       minPasswordLength: 8,
       autoSignIn: false,
       requireEmailVerification: true,

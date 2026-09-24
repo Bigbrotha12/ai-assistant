@@ -13,6 +13,7 @@ import {
   API_KEY_DEFAULT_EXPIRES_IN_SECONDS,
   API_KEY_PLUGIN_OPTIONS,
 } from "../src/auth.ts";
+import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 const BASE = "http://localhost:17600";
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
@@ -30,6 +31,7 @@ async function buildTestAuth() {
     database: new Database(dbPath),
     emailAndPassword: {
       enabled: true,
+      password: testPasswordHasher,
       minPasswordLength: 8,
       autoSignIn: true,
     },

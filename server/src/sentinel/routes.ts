@@ -9,7 +9,16 @@ import type { PerOwnerRateLimiter, RateLimitResult } from "../middleware/rate_li
 import { isRecord } from "../util.ts";
 import { SentinelService, SentinelTaskNotFoundError } from "./service.ts";
 import { policyForMode } from "./policy.ts";
-import type { SentinelCategory, SentinelCheckRequest, SentinelDirection, SentinelPolicyMode } from "./types.ts";
+import {
+  parseSentinelReportQuery,
+  SentinelReportStore,
+} from "./reports.ts";
+import type {
+  SentinelCategory,
+  SentinelCheckRequest,
+  SentinelDirection,
+  SentinelPolicyMode,
+} from "./types.ts";
 import { SENTINEL_CATEGORIES, SENTINEL_DIRECTIONS } from "./types.ts";
 import type { Ledger } from "../ledger.ts";
 
@@ -27,6 +36,7 @@ export type SentinelRoutesOptions = {
   policyMode?: SentinelPolicyMode;
   maxBodyBytes?: number;
   rateLimiter?: SentinelRateLimiter;
+  reportStore?: SentinelReportStore;
 };
 
 type ParsedRequest =
@@ -134,6 +144,7 @@ export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono {
       ledger: opts.ledger,
       policy: policyForMode(opts.policyMode ?? "advisory"),
     });
+  const reportStore = opts.reportStore ?? new SentinelReportStore(opts.ledger);
   const limiter =
     opts.rateLimiter ??
     createPerOwnerRateLimiter({ ratePerMinute: 60, burst: 20 });
@@ -145,6 +156,28 @@ export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono {
       onError: (c) => c.json({ error: "request_too_large" }, 413),
     }),
   );
+
+  routes.get("/sentinel/reports", async (c) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    c.header("cache-control", "no-store");
+    const parsed = parseSentinelReportQuery(c.req.query());
+    if (!parsed.ok) return c.json({ error: parsed.code }, 400);
+    return c.json(reportStore.list(owner, parsed.value));
+  });
+
+  routes.get("/sentinel/reports/:reportId", async (c) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    c.header("cache-control", "no-store");
+    const report = reportStore.get(owner, c.req.param("reportId"));
+    if (report === null) return c.json({ error: "not_found" }, 404);
+    return c.json(report);
+  });
 
   routes.post("/sentinel/check", async (c) => {
     const auth = await verifyKey(c);

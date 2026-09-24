@@ -10,6 +10,7 @@ import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 export type TrackedExecution = {
   signal: AbortSignal;
   track<T>(run: () => Promise<T>): Promise<T>;
+  trackUntil<T>(run: () => Promise<T>, maxDurationMs: number): Promise<T | undefined>;
   settle(): Promise<void>;
 };
 
@@ -29,6 +30,26 @@ export function createTrackedExecution(signal: AbortSignal): TrackedExecution {
       } finally {
         pending.delete(work);
       }
+    },
+    trackUntil<T>(run: () => Promise<T>, maxDurationMs: number): Promise<T | undefined> {
+      if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs <= 0) {
+        throw new RangeError("maxDurationMs must be a positive safe integer");
+      }
+      const work = Promise.resolve().then(run);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), maxDurationMs);
+        if (typeof timer.unref === "function") timer.unref();
+      });
+      const tracked = Promise.race([work, deadline]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+      });
+      pending.add(tracked);
+      void tracked.then(
+        () => pending.delete(tracked),
+        () => pending.delete(tracked),
+      );
+      return tracked;
     },
     async settle(): Promise<void> {
       while (pending.size) await Promise.allSettled([...pending]);

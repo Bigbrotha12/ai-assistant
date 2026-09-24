@@ -155,6 +155,75 @@ describe("agent graph — supervisor loop", () => {
     assert.ok(result.toolResults.every((entry) => entry.length <= 65_536));
   });
 
+  test("observes redacted and bounded tool results after the graph seam", async () => {
+    const secret = "skAbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const observations: Array<{ content: string; sequence: number }> = [];
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }),
+        new AIMessage("done"),
+      ],
+    });
+    const tool = new DynamicStructuredTool({
+      name: "list_tasks",
+      description: "returns sensitive output",
+      schema: z.object({ projectId: z.string() }),
+      func: async () => `${secret} ${"x".repeat(100_000)}`,
+    });
+    const graph = createAgentGraph({
+      model,
+      tools: [tool],
+      onToolResult: (content, observation) => {
+        observations.push({ content, sequence: observation.sequence });
+      },
+    });
+
+    await graph.invoke({ messages: [new HumanMessage("go")] });
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0]?.sequence, 1);
+    assert.ok((observations[0]?.content.length ?? 0) <= 65_536);
+    assert.equal(observations[0]?.content.includes(secret), false);
+    assert.ok(observations[0]?.content.endsWith(TOOL_RESULT_TRUNCATION_MARKER));
+  });
+
+  test("does not wait for an async tool-result observer before continuing the graph", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let observerFinished = false;
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }),
+        new AIMessage("done"),
+      ],
+    });
+    const graph = createAgentGraph({
+      model,
+      tools: [listTasksTool()],
+      onToolResult: async () => {
+        await gate;
+        observerFinished = true;
+      },
+    });
+
+    let timeout!: ReturnType<typeof setTimeout>;
+    const result = await Promise.race([
+      graph.invoke({ messages: [new HumanMessage("go")] }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("graph waited for the observer")),
+          500,
+        );
+      }),
+    ]);
+    clearTimeout(timeout);
+    assert.equal(String(result.messages.at(-1)?.content), "done");
+    assert.equal(observerFinished, false);
+    release();
+    await gate;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(observerFinished, true);
+  });
+
   test("streamEvents (v2) yields on_chat_model_stream and on_chain_end", async () => {
     const model = new ScriptedChatModel({
       responses: [new AIMessage("hello from the assistant")],

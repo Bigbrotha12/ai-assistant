@@ -22,6 +22,7 @@ enum VoiceRuntimeReason {
   invalidProcessMemory,
   highProcessMemory,
   systemLowMemory,
+  telemetryUnknown,
   sustainedLoad,
   thermalFair,
   thermalSerious,
@@ -42,6 +43,7 @@ extension VoiceRuntimeReasonCode on VoiceRuntimeReason {
     VoiceRuntimeReason.invalidProcessMemory => 'invalid_process_memory',
     VoiceRuntimeReason.highProcessMemory => 'high_process_memory',
     VoiceRuntimeReason.systemLowMemory => 'system_low_memory',
+    VoiceRuntimeReason.telemetryUnknown => 'telemetry_unknown',
     VoiceRuntimeReason.sustainedLoad => 'sustained_load',
     VoiceRuntimeReason.thermalFair => 'thermal_fair',
     VoiceRuntimeReason.thermalSerious => 'thermal_serious',
@@ -63,6 +65,8 @@ class VoiceRuntimeInputs {
     this.processRssBytes,
     this.processMemoryLimitBytes,
     this.sustainedLoad,
+    this.criticalTelemetryUnknown = false,
+    this.telemetryGraceElapsed = true,
     this.recentSttInferenceFailures,
     this.recentTtsInferenceFailures,
   });
@@ -78,6 +82,8 @@ class VoiceRuntimeInputs {
   final int? processRssBytes;
   final int? processMemoryLimitBytes;
   final bool? sustainedLoad;
+  final bool criticalTelemetryUnknown;
+  final bool telemetryGraceElapsed;
   final int? recentSttInferenceFailures;
   final int? recentTtsInferenceFailures;
 }
@@ -182,6 +188,13 @@ class VoiceRuntimePolicy {
 
     void add(VoiceRuntimeReason reason) {
       if (!reasons.contains(reason)) reasons.add(reason);
+    }
+
+    if (inputs.telemetryGraceElapsed && inputs.criticalTelemetryUnknown) {
+      allowCapture = false;
+      allowTts = false;
+      allowModelDownload = false;
+      add(VoiceRuntimeReason.telemetryUnknown);
     }
 
     if (inputs.captureSupported == false) {
@@ -416,26 +429,17 @@ class VoiceRuntimePolicyController extends ChangeNotifier
     this.evaluator = const VoiceRuntimePolicy(),
     this.recoveryDuration = const Duration(minutes: 2),
     this.sustainedLoadThreshold = const Duration(seconds: 30),
-  }) : _healthSnapshot = healthMonitor.snapshot,
+    Duration? telemetryGracePeriod,
+    DateTime? telemetryStartedAt,
+  }) : telemetryGracePeriod =
+           telemetryGracePeriod ?? defaultVoiceTelemetryGracePeriod,
+       _healthSnapshot = healthMonitor.snapshot,
        _modelReadiness = engineManager.modelReadiness,
-       _decision = evaluator.evaluate(
-         VoiceRuntimeInputs(
-           physicalMemoryBytes: healthMonitor.snapshot.physicalMemoryBytes,
-           freeStorageBytes: healthMonitor.snapshot.freeStorageBytes,
-           captureSupported: healthMonitor.snapshot.captureSupported,
-           sttReady: engineManager.modelReadiness?.sttReady,
-           ttsReady: engineManager.modelReadiness?.ttsReady,
-           thermalStatus: healthMonitor.snapshot.thermalStatus,
-           systemLowMemory: healthMonitor.snapshot.systemLowMemory,
-           processRssBytes: healthMonitor.snapshot.processRssBytes,
-           processMemoryLimitBytes:
-               healthMonitor.snapshot.processMemoryLimitBytes,
-           requiredDownloadBytes:
-               engineManager.modelReadiness?.requiredDownloadBytes,
-         ),
-       ) {
+       _telemetryGraceStartedAt = telemetryStartedAt ?? healthMonitor.startedAt,
+       _decision = VoiceRuntimeDecision.ready {
     healthMonitor.addListener(_healthChanged);
     engineManager.addListener(_engineChanged);
+    _recompute();
   }
 
   final DeviceHealthMonitor healthMonitor;
@@ -443,6 +447,7 @@ class VoiceRuntimePolicyController extends ChangeNotifier
   final VoiceRuntimePolicy evaluator;
   final Duration recoveryDuration;
   final Duration sustainedLoadThreshold;
+  final Duration telemetryGracePeriod;
 
   DeviceHealthSnapshot _healthSnapshot;
   VoiceModelReadiness? _modelReadiness;
@@ -450,9 +455,11 @@ class VoiceRuntimePolicyController extends ChangeNotifier
   VoiceRuntimeDecision? _pendingRecovery;
   VoiceRuntimeDecision? _lastRawDecision;
   Timer? _recoveryTimer;
+  Timer? _telemetryGraceTimer;
   Timer? _sttFailureTimer;
   Timer? _ttsFailureTimer;
   Timer? _sustainedLoadTimer;
+  final DateTime _telemetryGraceStartedAt;
   bool _sustainedLoad = false;
   int _activeLoadCount = 0;
   int _sttFailures = 0;
@@ -490,8 +497,38 @@ class VoiceRuntimePolicyController extends ChangeNotifier
     _recompute();
   }
 
+  bool get _telemetryGraceElapsed {
+    if (telemetryGracePeriod <= Duration.zero) return true;
+    if (!voiceTelemetryPlatformSupported) return false;
+    return DateTime.now().difference(_telemetryGraceStartedAt) >=
+        telemetryGracePeriod;
+  }
+
+  void _syncTelemetryGraceTimer() {
+    if (_disposed ||
+        !voiceTelemetryPlatformSupported ||
+        !_healthSnapshot.hasUnknownCriticalTelemetry) {
+      _telemetryGraceTimer?.cancel();
+      _telemetryGraceTimer = null;
+      return;
+    }
+    final remaining =
+        telemetryGracePeriod -
+        DateTime.now().difference(_telemetryGraceStartedAt);
+    if (remaining <= Duration.zero) {
+      _telemetryGraceTimer?.cancel();
+      _telemetryGraceTimer = null;
+      return;
+    }
+    _telemetryGraceTimer ??= Timer(remaining, () {
+      _telemetryGraceTimer = null;
+      _recompute();
+    });
+  }
+
   void _recompute() {
     if (_disposed) return;
+    _syncTelemetryGraceTimer();
     final next = evaluator.evaluate(
       VoiceRuntimeInputs(
         physicalMemoryBytes: _healthSnapshot.physicalMemoryBytes,
@@ -505,6 +542,8 @@ class VoiceRuntimePolicyController extends ChangeNotifier
         processMemoryLimitBytes: _healthSnapshot.processMemoryLimitBytes,
         requiredDownloadBytes: _modelReadiness?.requiredDownloadBytes,
         sustainedLoad: _forcedSustainedLoad ?? _sustainedLoad,
+        criticalTelemetryUnknown: _healthSnapshot.hasUnknownCriticalTelemetry,
+        telemetryGraceElapsed: _telemetryGraceElapsed,
         recentSttInferenceFailures: _sttFailures,
         recentTtsInferenceFailures: _ttsFailures,
       ),
@@ -641,6 +680,7 @@ class VoiceRuntimePolicyController extends ChangeNotifier
     if (_disposed) return;
     _disposed = true;
     _recoveryTimer?.cancel();
+    _telemetryGraceTimer?.cancel();
     _sttFailureTimer?.cancel();
     _ttsFailureTimer?.cancel();
     _sustainedLoadTimer?.cancel();

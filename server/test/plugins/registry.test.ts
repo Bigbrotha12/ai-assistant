@@ -407,7 +407,7 @@ describe("PluginRegistry file watch", () => {
       // Watch delivery is platform/timing dependent; skip instead of failing CI.
       const pickedUp = await waitFor(
         () => registry.canResolveToolPlugin("vikunja") === false,
-        2000,
+        5000,
       );
       if (!pickedUp) {
         t.skip(
@@ -427,11 +427,24 @@ describe("PluginRegistry file watch", () => {
     const { store, registry } = await makeEnv(dir);
 
     const abort = new AbortController();
+    let reloadCalls = 0;
+    const hotReload = registry.hotReload.bind(registry);
+    registry.hotReload = async () => {
+      reloadCalls += 1;
+      await hotReload();
+    };
     registry.watch({ signal: abort.signal, onError: () => undefined });
     try {
       await store.install("vikunja");
-      // Let the debounced reload (150ms) fire over our own write.
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      // Wait for the actual self-save event, then observe several debounce
+      // intervals for a reload cascade.
+      const pickedUp = await waitFor(() => reloadCalls > 0, 5000);
+      assert.equal(pickedUp, true, "the self-save must trigger one reload attempt");
+      assert.equal(
+        await waitFor(() => reloadCalls > 1, 1000),
+        false,
+        "the self-save reload must not cascade",
+      );
       assert.equal(registry.canResolveToolPlugin("vikunja"), true);
     } finally {
       abort.abort();

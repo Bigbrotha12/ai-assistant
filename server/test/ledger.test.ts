@@ -8,6 +8,11 @@ import {
   applyMigrations,
   CURRENT_LEDGER_VERSION,
   heartbeatIntervalMs,
+  projectPublicTaskProgress,
+  PUBLIC_STEP_FIELD_MAX_BYTES,
+  PUBLIC_STEP_RESULT_MAX_BYTES,
+  PUBLIC_STEP_LIMIT,
+  PUBLIC_TASK_PAGE_MAX_LIMIT,
   SPEC_MAX_LENGTH,
 } from "../src/ledger.ts";
 import type { Database as DatabaseType } from "better-sqlite3";
@@ -34,6 +39,16 @@ function makeLedger(
     clearInterval: opts.clearInterval,
   });
   return { db, ledger };
+}
+
+function recordPreparedSql(db: Database.Database): string[] {
+  const statements: string[] = [];
+  const originalPrepare = db.prepare.bind(db) as (sql: string) => unknown;
+  (db as unknown as { prepare: (sql: string) => unknown }).prepare = (sql) => {
+    statements.push(sql);
+    return originalPrepare(sql);
+  };
+  return statements;
 }
 
 function completeRunning(
@@ -460,6 +475,121 @@ describe("owner-scoped reads (IDOR)", () => {
     assert.equal(ledger.listTasks().length, 3);
   });
 
+  test("public task pages are stable, owner-scoped, and omit internal columns", () => {
+    const { db, ledger } = makeLedger();
+    const created = Array.from({ length: 5 }, (_, index) =>
+      ledger.createTask({
+        owner: "user-1",
+        intentKey: `page-${index}`,
+        spec: "s",
+        payload: "private-payload",
+        jobSpec: "private-job-spec",
+      }),
+    );
+    const statements = recordPreparedSql(db);
+    const page = ledger.listPublicTasks("user-1", 2, 1);
+    assert.equal(page.tasks.length, 2);
+    assert.equal(page.nextOffset, 3);
+    assert.ok(page.tasks.every((task) => !("payload" in task) && !("job_spec" in task)));
+    const expected = created
+      .slice()
+      .sort((left, right) => left.created_ts - right.created_ts || left.id.localeCompare(right.id))
+      .map((task) => task.id);
+    assert.deepEqual(page.tasks.map((task) => task.id), expected.slice(1, 3));
+    assert.deepEqual(ledger.listPublicTasks("intruder").tasks, []);
+    assert.equal(ledger.listPublicTasks("user-1", PUBLIC_TASK_PAGE_MAX_LIMIT + 1).tasks.length, 5);
+    const sql = statements.find(
+      (statement) => statement.includes("FROM ledger_task") && statement.includes("ORDER BY created_ts, id"),
+    );
+    assert.ok(sql);
+    assert.doesNotMatch(sql, /\bpayload\b/);
+    assert.doesNotMatch(sql, /\bjob_spec\b/);
+    assert.equal(ledger.listPublicTasks("user-1", 1, 4).nextOffset, null);
+  });
+
+  test("task-step metadata reads are owner-scoped, windowed, filtered, and SQL-projected", () => {
+    const now = Date.parse("2026-01-08T00:00:00.000Z");
+    const { db, ledger } = makeLedger({ now: () => now });
+    const report = ledger.createTask({
+      owner: "user-1",
+      intentKey: "shadow-report",
+      spec: "sentinel:shadow:input",
+      worker: "sentinel",
+      payload: "private-payload",
+      jobSpec: "private-job-spec",
+    });
+    const claimed = ledger.claimTask(report.id, "user-1");
+    const metadata = {
+      requestId: "turn-1",
+      ts: now,
+      direction: "input",
+      categories: ["jailbreak_attempt"],
+      severities: ["high"],
+      ruleIds: ["jailbreak_attempt.instruction_override"],
+      verdictWouldBe: "block",
+    };
+    ledger.appendStep(
+      report.id,
+      "user-1",
+      { stage: "sentinel", action: "sentinel:shadow", result: JSON.stringify(metadata) },
+      claimed.fence_token,
+    );
+    completeRunning(ledger, report.id, "user-1", "awaiting_review");
+    ledger.createTask({
+      owner: "user-1",
+      intentKey: "unrelated",
+      spec: "ordinary",
+      worker: "other",
+      payload: "not selected",
+    });
+    const statements = recordPreparedSql(db);
+    const query = {
+      owner: "user-1",
+      worker: "sentinel",
+      status: "awaiting_review" as const,
+      specPrefix: "sentinel:shadow:",
+      stage: "sentinel",
+      action: "sentinel:shadow",
+      from: 0,
+      to: now,
+      filters: [{ path: "$.categories", contains: "jailbreak_attempt" }],
+    };
+
+    const page = ledger.listTaskStepMetadata({ ...query, limit: 1, offset: 0 });
+    assert.equal(page.total, 1);
+    assert.equal(page.rows.length, 1);
+    assert.equal(page.rows[0]?.task_id, report.id);
+    assert.equal(page.nextOffset, null);
+    assert.deepEqual(
+      ledger.listTaskStepMetadata({ ...query, owner: "intruder" }).rows,
+      [],
+    );
+    const aggregate = ledger.aggregateTaskStepMetadata(
+      query,
+      "$.requestId",
+      [
+        { key: "direction", path: "$.direction", mode: "value" },
+        { key: "category", path: "$.categories", mode: "array_distinct" },
+      ],
+    );
+    assert.equal(aggregate.total, 1);
+    assert.equal(aggregate.distinct, 1);
+    assert.deepEqual(aggregate.groups.direction, [{ value: "input", count: 1 }]);
+    assert.deepEqual(aggregate.groups.category, [
+      { value: "jailbreak_attempt", count: 1 },
+    ]);
+    const metadataSql = statements.find(
+      (sql) => sql.includes("SELECT task_id, created_ts, result") && sql.includes("LIMIT @limit"),
+    );
+    assert.ok(metadataSql);
+    assert.doesNotMatch(metadataSql, /\bpayload\b/);
+    assert.doesNotMatch(metadataSql, /\bjob_spec\b/);
+    const index = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_ledger_task_metadata_window");
+    assert.deepEqual(index, { name: "idx_ledger_task_metadata_window" });
+  });
+
   test("a second owner cannot read another's task by id (404 semantics)", () => {
     const { ledger } = makeLedger();
     const task = ledger.createTask({ owner: "user-1", intentKey: "k", spec: "s" });
@@ -475,6 +605,91 @@ describe("owner-scoped reads (IDOR)", () => {
     assert.equal(ledger.getTask(task.id, "intruder"), null);
     assert.deepEqual(ledger.listSteps(task.id, "intruder"), []);
     assert.deepEqual(ledger.readChain(task.id, "intruder"), []);
+  });
+});
+
+describe("public ledger read projections", () => {
+  test("limits the latest public steps and chain without changing internal reads", () => {
+    const { ledger } = makeLedger();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "public-window", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    const internalResult = "x".repeat(PUBLIC_STEP_RESULT_MAX_BYTES + 500);
+    for (let index = 0; index < PUBLIC_STEP_LIMIT + 1; index++) {
+      ledger.appendStep(
+        task.id,
+        "user-1",
+        { stage: "tool", action: `tool:${index}`, result: internalResult },
+        claimed.fence_token,
+      );
+    }
+
+    const publicSteps = ledger.listPublicSteps(task.id, "user-1");
+    const publicChain = ledger.readPublicChain(task.id, "user-1");
+    const stats = ledger.getPublicStepStats(task.id, "user-1");
+    assert.equal(publicSteps.length, PUBLIC_STEP_LIMIT);
+    assert.equal(publicChain.length, PUBLIC_STEP_LIMIT);
+    assert.equal(publicSteps[0]?.seq, 2);
+    assert.equal(publicSteps.at(-1)?.seq, PUBLIC_STEP_LIMIT + 1);
+    assert.equal(publicChain[0]?.seq, 2);
+    assert.equal(publicChain.at(-1)?.seq, PUBLIC_STEP_LIMIT + 1);
+    assert.ok(
+      publicSteps.every(
+        (step) => Buffer.byteLength(step.result ?? "", "utf8") <= PUBLIC_STEP_RESULT_MAX_BYTES,
+      ),
+    );
+    assert.equal(stats?.stepCount, PUBLIC_STEP_LIMIT + 1);
+    assert.equal(
+      stats?.resultBytes,
+      (PUBLIC_STEP_LIMIT + 1) * Buffer.byteLength(internalResult, "utf8"),
+    );
+
+    const internal = ledger.listSteps(task.id, "user-1");
+    assert.equal(internal.length, PUBLIC_STEP_LIMIT + 1);
+    assert.equal(internal[0]?.result, internalResult);
+    assert.deepEqual(ledger.listPublicSteps(task.id, "intruder"), []);
+    assert.deepEqual(ledger.readPublicChain(task.id, "intruder"), []);
+    assert.equal(ledger.getPublicStepStats(task.id, "intruder"), null);
+
+    const projection = projectPublicTaskProgress(task, publicSteps, undefined, stats ?? undefined);
+    assert.equal(projection.schemaVersion, 1);
+    assert.equal(projection.completedActions.length, PUBLIC_STEP_LIMIT);
+    assert.equal(projection.stepCount, PUBLIC_STEP_LIMIT + 1);
+    assert.equal(projection.resultBytes, stats?.resultBytes);
+    assert.ok(
+      projection.completedActions.every(
+        (action) => !("result" in action) && action.status === "completed",
+      ),
+    );
+  });
+
+  test("bounds public metadata fields by UTF-8 bytes", () => {
+    const { ledger } = makeLedger();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "public-metadata", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    ledger.appendStep(
+      task.id,
+      "user-1",
+      {
+        stage: "é".repeat(PUBLIC_STEP_FIELD_MAX_BYTES),
+        action: "🙂".repeat(PUBLIC_STEP_FIELD_MAX_BYTES),
+        result: null,
+      },
+      claimed.fence_token,
+    );
+
+    const [step] = ledger.listPublicSteps(task.id, "user-1");
+    assert.ok(step);
+    assert.ok(Buffer.byteLength(step.stage, "utf8") <= PUBLIC_STEP_FIELD_MAX_BYTES);
+    assert.ok(Buffer.byteLength(step.action, "utf8") <= PUBLIC_STEP_FIELD_MAX_BYTES);
+    const projection = projectPublicTaskProgress(task, [step]);
+    assert.ok(
+      Buffer.byteLength(projection.completedActions[0]!.stage, "utf8") <=
+        PUBLIC_STEP_FIELD_MAX_BYTES,
+    );
+    assert.ok(
+      Buffer.byteLength(projection.completedActions[0]!.action, "utf8") <=
+        PUBLIC_STEP_FIELD_MAX_BYTES,
+    );
   });
 });
 
@@ -1207,12 +1422,16 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
-    assert.equal(CURRENT_LEDGER_VERSION, 7);
+    assert.equal(CURRENT_LEDGER_VERSION, 8);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get("idx_tasks_status_updated") as { name: string } | undefined;
     assert.equal(retentionIndex?.name, "idx_tasks_status_updated");
+    const metadataIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_ledger_task_metadata_window") as { name: string } | undefined;
+    assert.equal(metadataIndex?.name, "idx_ledger_task_metadata_window");
     const tables = db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ledger_%'",
@@ -1223,25 +1442,29 @@ describe("migration", () => {
     assert.deepEqual(tables, ["ledger_chain", "ledger_step", "ledger_task"]);
   });
 
-  test("v7 migration adds the durable job-spec column when upgrading from v6", () => {
+  test("v7-v8 migrations add job-spec storage and the metadata window index from v6", () => {
     const db = new Database(":memory:");
     migrateLedger(db);
-     db.exec("DROP INDEX idx_tasks_status_updated");
-     db.exec("ALTER TABLE ledger_task DROP COLUMN job_spec");
-     db.pragma("user_version = 6");
-     assert.equal(db.pragma("user_version", { simple: true }), 6);
-
+    db.exec("DROP INDEX idx_tasks_status_updated");
+    db.exec("DROP INDEX idx_ledger_task_metadata_window");
+    db.exec("ALTER TABLE ledger_task DROP COLUMN job_spec");
+    db.pragma("user_version = 6");
+    assert.equal(db.pragma("user_version", { simple: true }), 6);
 
     migrateLedger(db);
 
-    assert.equal(db.pragma("user_version", { simple: true }), 7);
+    assert.equal(db.pragma("user_version", { simple: true }), 8);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
-     const columns = db
-       .prepare("PRAGMA table_info(ledger_task)")
-       .all()
-       .map((row) => (row as { name: string }).name);
-     assert.ok(columns.includes("job_spec"));
-   });
+    const columns = db
+      .prepare("PRAGMA table_info(ledger_task)")
+      .all()
+      .map((row) => (row as { name: string }).name);
+    assert.ok(columns.includes("job_spec"));
+    const metadataIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_ledger_task_metadata_window");
+    assert.deepEqual(metadataIndex, { name: "idx_ledger_task_metadata_window" });
+  });
 
 
   test("migration is idempotent and preserves data on re-run", () => {

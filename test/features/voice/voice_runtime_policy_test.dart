@@ -17,6 +17,7 @@ class _PolicyHarness {
   _PolicyHarness({
     DeviceHealthSnapshot snapshot = const DeviceHealthSnapshot.unknown(),
     Duration recoveryDuration = Duration.zero,
+    Duration telemetryGracePeriod = voiceTelemetryGracePeriod,
   }) {
     source = InMemoryDeviceHealthSource(snapshot);
     monitor = DeviceHealthMonitor(
@@ -28,6 +29,7 @@ class _PolicyHarness {
       healthMonitor: monitor,
       engineManager: manager,
       recoveryDuration: recoveryDuration,
+      telemetryGracePeriod: telemetryGracePeriod,
     );
   }
 
@@ -157,6 +159,71 @@ void main() {
       expect(ttsMissing.allowCapture, isTrue);
       expect(ttsMissing.allowTts, isFalse);
       expect(ttsMissing.level, VoiceRuntimeLevel.reduced);
+    });
+  });
+
+  group('startup telemetry grace', () {
+    test('keeps unknown critical telemetry capable during grace and blocks after it', () async {
+      final before = _PolicyHarness(
+        snapshot: const DeviceHealthSnapshot(
+          thermalStatus: ThermalStatus.nominal,
+        ),
+        telemetryGracePeriod: const Duration(hours: 1),
+      );
+      addTearDown(before.dispose);
+      await before.settle();
+
+      expect(before.policy.decision.level, VoiceRuntimeLevel.ready);
+      expect(before.policy.decision.allowCapture, isTrue);
+      expect(before.policy.decision.allowModelDownload, isTrue);
+
+      final after = _PolicyHarness(
+        snapshot: const DeviceHealthSnapshot(
+          thermalStatus: ThermalStatus.nominal,
+        ),
+        telemetryGracePeriod: Duration.zero,
+      );
+      addTearDown(after.dispose);
+      await after.settle();
+
+      expect(after.policy.decision.level, VoiceRuntimeLevel.blocked);
+      expect(after.policy.decision.allowCapture, isFalse);
+      expect(after.policy.decision.allowTts, isFalse);
+      expect(after.policy.decision.allowModelDownload, isFalse);
+      expect(
+        after.policy.decision.hasReason(VoiceRuntimeReason.telemetryUnknown),
+        isTrue,
+      );
+      expect(after.policy.decision.textChatAvailable, isTrue);
+      expect(after.policy.decision.notice, contains('Continue in text'));
+    });
+
+    test(
+      'unknown non-critical thermal telemetry does not block after grace',
+      () async {
+        final harness = _PolicyHarness(
+          snapshot: const DeviceHealthSnapshot(
+            physicalMemoryBytes: 8 * 1024 * 1024 * 1024,
+            freeStorageBytes: 1024 * 1024 * 1024,
+            systemLowMemory: false,
+          ),
+          telemetryGracePeriod: Duration.zero,
+        );
+        addTearDown(harness.dispose);
+        await harness.settle();
+
+        expect(harness.policy.decision.level, VoiceRuntimeLevel.ready);
+        expect(harness.policy.decision.allowCapture, isTrue);
+        expect(harness.policy.decision.allowModelDownload, isTrue);
+      },
+    );
+
+    test('critical set names the safety inputs covered by the gate', () {
+      expect(voiceCriticalTelemetryFields, {
+        DeviceHealthTelemetryField.physicalMemory,
+        DeviceHealthTelemetryField.freeStorage,
+        DeviceHealthTelemetryField.systemLowMemory,
+      });
     });
   });
 

@@ -3,15 +3,24 @@ import 'package:flutter_riverpod/legacy.dart';
 
 import './device_health.dart';
 
-final thermalSignalSourceProvider = Provider<ThermalSignalSource>(
-  (ref) => const NoopThermalSignalSource(),
+final platformDeviceHealthBridgeProvider = Provider<PlatformDeviceHealthBridge>(
+  (ref) {
+    final bridge = PlatformDeviceHealthBridge();
+    ref.onDispose(bridge.dispose);
+    return bridge;
+  },
 );
 
-final deviceHealthSourceProvider = Provider<DeviceHealthSource>((ref) {
-  final source = DartRuntimeHealthSource();
-  ref.onDispose(source.dispose);
-  return source;
-});
+final thermalSignalSourceProvider = Provider<ThermalSignalSource>(
+  (ref) => PlatformThermalSignalSource(
+    ref.watch(platformDeviceHealthBridgeProvider),
+  ),
+);
+
+final deviceHealthSourceProvider = Provider<DeviceHealthSource>(
+  (ref) =>
+      PlatformDeviceHealthSource(ref.watch(platformDeviceHealthBridgeProvider)),
+);
 
 final deviceHealthProvider = ChangeNotifierProvider<DeviceHealthMonitor>((ref) {
   return DeviceHealthMonitor(
