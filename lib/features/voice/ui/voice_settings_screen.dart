@@ -6,6 +6,7 @@ import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/engine_registry.dart';
 import '../data/model_downloader.dart';
+import '../data/voice_runtime_policy_provider.dart';
 import '../data/stt_engine.dart';
 import '../data/voice_settings.dart';
 import './voice_settings_providers.dart';
@@ -79,9 +80,7 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
   /// the dropdown value never runs ahead of its items.
   List<String> _sttOptions() {
     final registered = EngineRegistry.instance.sttEngineIds.toList();
-    final ids = registered.isEmpty
-        ? [EngineConfig.whisperTinyId]
-        : registered;
+    final ids = registered.isEmpty ? [EngineConfig.whisperTinyId] : registered;
     return ids.contains(_sttEngine) ? ids : [...ids, _sttEngine];
   }
 
@@ -155,9 +154,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
       return;
     }
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Voice settings saved')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Voice settings saved')));
   }
 
   Future<void> _reset() async {
@@ -204,7 +202,8 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
           InputDecorator(
             decoration: const InputDecoration(
               labelText: 'STT Engine',
-              helperText: 'Speech-to-text model used for on-device '
+              helperText:
+                  'Speech-to-text model used for on-device '
                   'transcription',
               border: OutlineInputBorder(),
             ),
@@ -346,7 +345,9 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
   bool _busy = false;
 
   Future<void> _downloadAll() async {
-    if (_busy) return;
+    if (_busy || !ref.read(voiceRuntimeDecisionProvider).allowModelDownload) {
+      return;
+    }
     setState(() => _busy = true);
     try {
       await ref.read(voiceEngineStatusProvider.notifier).downloadAllModels();
@@ -360,6 +361,7 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
     final theme = Theme.of(context);
     final statuses = ref.watch(voiceEngineStatusProvider);
     final progress = ref.watch(modelDownloadProgressProvider).value;
+    final decision = ref.watch(voiceRuntimeDecisionProvider);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -370,10 +372,13 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
             Expanded(
               child: _ModelStatusChip(
                 label: 'Whisper',
-                status: statuses[EngineConfig.whisperTinyId] ??
+                status:
+                    statuses[EngineConfig.whisperTinyId] ??
                     VoiceEngineStatus.notStarted,
                 progress: progress,
-                onAction: _busy ? null : _downloadAll,
+                onAction: _busy || !decision.allowModelDownload
+                    ? null
+                    : _downloadAll,
               ),
             ),
             const SizedBox(width: 12),
@@ -382,15 +387,26 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
               Expanded(
                 child: _ModelStatusChip(
                   label: 'Supertonic 3',
-                  status: statuses[EngineConfig.supertonic3Id] ??
+                  status:
+                      statuses[EngineConfig.supertonic3Id] ??
                       VoiceEngineStatus.notStarted,
                   progress: progress,
-                  onAction: _busy ? null : _downloadAll,
+                  onAction: _busy || !decision.allowModelDownload
+                      ? null
+                      : _downloadAll,
                 ),
               ),
             ],
           ],
         ),
+        if (!decision.allowModelDownload && decision.downloadNotice != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              decision.downloadNotice!,
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
         if (_busy) ...[
           const SizedBox(height: 8),
           const LinearProgressIndicator(minHeight: 2),
@@ -422,38 +438,39 @@ class _ModelStatusChip extends StatelessWidget {
     final needsAction =
         status == VoiceEngineStatus.failed ||
         status == VoiceEngineStatus.notStarted;
-    final actionLabel =
-        status == VoiceEngineStatus.failed ? 'Retry' : 'Download';
+    final actionLabel = status == VoiceEngineStatus.failed
+        ? 'Retry'
+        : 'Download';
     final percent = progress?.percent;
 
     final (icon, color, subtitle) = switch (status) {
       VoiceEngineStatus.ready => (
-          Icons.check_circle,
-          Colors.green.shade600,
-          'ready',
-        ),
+        Icons.check_circle,
+        Colors.green.shade600,
+        'ready',
+      ),
       VoiceEngineStatus.downloading => (
-          Icons.downloading,
-          scheme.primary,
-          percent == null
-              ? 'downloading…'
-              : 'downloading ${(percent * 100).round()}%',
-        ),
+        Icons.downloading,
+        scheme.primary,
+        percent == null
+            ? 'downloading…'
+            : 'downloading ${(percent * 100).round()}%',
+      ),
       VoiceEngineStatus.failed => (
-          Icons.error_outline,
-          scheme.error,
-          'download failed',
-        ),
+        Icons.error_outline,
+        scheme.error,
+        'download failed',
+      ),
       VoiceEngineStatus.notStarted => (
-          Icons.download_outlined,
-          scheme.onSurfaceVariant,
-          'not downloaded',
-        ),
+        Icons.download_outlined,
+        scheme.onSurfaceVariant,
+        'not downloaded',
+      ),
       VoiceEngineStatus.unavailable => (
-          Icons.block,
-          scheme.onSurfaceVariant,
-          'unavailable',
-        ),
+        Icons.block,
+        scheme.onSurfaceVariant,
+        'unavailable',
+      ),
     };
 
     return Container(

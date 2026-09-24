@@ -13,16 +13,19 @@ import {
   isAgentPlugin,
   isModelPlugin,
   isToolPlugin,
+  isMcpHeaderReference,
   pluginDefinitionSchema,
-  parsePluginStoreConfig,
+  migratePluginStoreConfig,
   PluginSchemaError,
 } from "./types.ts";
 import type {
   CredentialSpec,
+  ManifestHashMismatch,
   PluginDefinition,
   PluginStoreConfig,
   ToolPluginDefinition,
 } from "./types.ts";
+import { computeManifestDigest } from "./digest.ts";
 import {
   NODE_ENV,
   SsrfValidationError,
@@ -75,16 +78,23 @@ export type PluginStoreErrorCode =
   | "INVALID_PLUGIN"
   | "SSRF_REJECTED"
   | "CREDENTIAL_VALUES_FORBIDDEN"
+  | "PIN_MISMATCH"
   | "FILE_IO"
   | "CONFIG";
 
 export class PluginStoreError extends Error {
   readonly code: PluginStoreErrorCode;
+  readonly mismatches?: readonly ManifestHashMismatch[];
 
-  constructor(code: PluginStoreErrorCode, message: string) {
+  constructor(
+    code: PluginStoreErrorCode,
+    message: string,
+    mismatches?: readonly ManifestHashMismatch[],
+  ) {
     super(message);
     this.name = "PluginStoreError";
     this.code = code;
+    this.mismatches = mismatches;
   }
 }
 
@@ -113,6 +123,7 @@ function emptyStore(): PluginStoreConfig {
   return {
     schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
     plugins: [],
+    approvedDigests: {},
   };
 }
 
@@ -122,11 +133,13 @@ type StoreWriteFile = typeof writeFile;
 type PluginStoreState = {
   config: PluginStoreConfig;
   pinnedUrls: PinnedUrls;
+  hashMismatches: Map<string, ManifestHashMismatch>;
 };
 
 export class PluginStore {
   private config: PluginStoreConfig | null = null;
   private loaded = false;
+  private hashMismatches: Map<string, ManifestHashMismatch> = new Map();
   private readonly stateMutex = new AsyncMutex();
   /**
    * The exact JSON this instance last wrote. `reload()` skips a re-read that
@@ -166,6 +179,7 @@ export class PluginStore {
     return {
       config: structuredClone(this.config!),
       pinnedUrls: this.clonePinnedUrls(this.pinnedUrls),
+      hashMismatches: this.cloneHashMismatches(this.hashMismatches),
     };
   }
 
@@ -178,9 +192,18 @@ export class PluginStore {
     );
   }
 
-  private commitState(state: PluginStoreState, lastWrittenContent: string): void {
+  private cloneHashMismatches(
+    mismatches: Map<string, ManifestHashMismatch>,
+  ): Map<string, ManifestHashMismatch> {
+    return new Map(
+      [...mismatches].map(([id, mismatch]) => [id, { ...mismatch }]),
+    );
+  }
+
+  private commitState(state: PluginStoreState, lastWrittenContent: string | null): void {
     this.config = state.config;
     this.pinnedUrls = state.pinnedUrls;
+    this.hashMismatches = state.hashMismatches;
     this.lastWrittenContent = lastWrittenContent;
   }
 
@@ -200,6 +223,53 @@ export class PluginStore {
       }
       seen.add(plugin.id);
     }
+  }
+
+  private prepareConfig(
+    config: PluginStoreConfig,
+  ): { config: PluginStoreConfig; migrated: boolean } {
+    const pluginIds = new Set(config.plugins.map((plugin) => plugin.id));
+    const approved: Record<string, string> = {};
+    let migrated = false;
+    for (const [pluginId, digest] of Object.entries(config.approvedDigests ?? {})) {
+      if (pluginIds.has(pluginId)) approved[pluginId] = digest;
+      else migrated = true;
+    }
+    return {
+      config: { ...config, approvedDigests: approved },
+      migrated,
+    };
+  }
+
+  private findHashMismatches(config: PluginStoreConfig): Map<string, ManifestHashMismatch> {
+    const mismatches = new Map<string, ManifestHashMismatch>();
+    for (const plugin of config.plugins) {
+      const expected = config.approvedDigests?.[plugin.id];
+      const actual = computeManifestDigest(plugin);
+      if (expected === actual) continue;
+      mismatches.set(plugin.id, {
+        pluginId: plugin.id,
+        expected: expected ?? null,
+        actual,
+      });
+    }
+    return mismatches;
+  }
+
+  private pinMismatchError(
+    mismatches: Map<string, ManifestHashMismatch>,
+  ): PluginStoreError {
+    const details = [...mismatches.values()]
+      .map(
+        (mismatch) =>
+          `${mismatch.pluginId}: expected ${mismatch.expected ?? "<missing>"}, actual ${mismatch.actual}`,
+      )
+      .join("; ");
+    return new PluginStoreError(
+      "PIN_MISMATCH",
+      `installed plugin manifest content differs from its approved digest: ${details}`,
+      [...mismatches.values()],
+    );
   }
 
   private assertLoaded(): void {
@@ -247,6 +317,7 @@ export class PluginStore {
         const staged: PluginStoreState = {
           config: emptyStore(),
           pinnedUrls: new Map(),
+          hashMismatches: new Map(),
         };
         const lastWrittenContent = await this._saveConfigUnlocked(staged.config);
         this.commitState(staged, lastWrittenContent);
@@ -272,11 +343,29 @@ export class PluginStore {
     // re-validate the persisted URLs against the CURRENT network policy so a
     // store written under a looser trusted-hosts setting cannot survive a
     // policy tightening (Fix 6).
-    const config = parsePluginStoreConfig(parsed);
-    this.assertNoBuiltinCollisions(config);
-    const pinnedUrls = await this.revalidateSsrSafe(config);
-    this.config = config;
-    this.pinnedUrls = pinnedUrls;
+    const migration = migratePluginStoreConfig(parsed);
+    const parsedConfig = migration.config;
+    this.assertNoBuiltinCollisions(parsedConfig);
+    const prepared = this.prepareConfig(parsedConfig);
+    this.assertNoBuiltinCollisions(prepared.config);
+    const mismatches = this.findHashMismatches(prepared.config);
+    if (mismatches.size > 0 && !migration.legacyUnpinned) {
+      this.hashMismatches = this.cloneHashMismatches(mismatches);
+      throw this.pinMismatchError(mismatches);
+    }
+    const pinnedUrls = await this.revalidateSsrSafe(prepared.config);
+    const staged: PluginStoreState = {
+      config: prepared.config,
+      pinnedUrls,
+      hashMismatches: migration.legacyUnpinned
+        ? this.cloneHashMismatches(mismatches)
+        : new Map(),
+    };
+    const lastWrittenContent =
+      migration.migratedFromVersion !== null || prepared.migrated
+        ? await this._saveConfigUnlocked(prepared.config)
+        : null;
+    this.commitState(staged, lastWrittenContent);
     this.loaded = true;
   }
 
@@ -316,11 +405,29 @@ export class PluginStore {
     // Same revalidation as load(): shape, builtin collisions, then a full SSRF
     // pass over every persisted URL. On failure the previous config stays in
     // effect (the store is left untouched), so a bad hand-edit never activates.
-    const config = parsePluginStoreConfig(parsed);
-    this.assertNoBuiltinCollisions(config);
-    const pinnedUrls = await this.revalidateSsrSafe(config);
-    this.config = config;
-    this.pinnedUrls = pinnedUrls;
+    const migration = migratePluginStoreConfig(parsed);
+    const parsedConfig = migration.config;
+    this.assertNoBuiltinCollisions(parsedConfig);
+    const prepared = this.prepareConfig(parsedConfig);
+    this.assertNoBuiltinCollisions(prepared.config);
+    const mismatches = this.findHashMismatches(prepared.config);
+    if (mismatches.size > 0 && !migration.legacyUnpinned) {
+      this.hashMismatches = this.cloneHashMismatches(mismatches);
+      throw this.pinMismatchError(mismatches);
+    }
+    const pinnedUrls = await this.revalidateSsrSafe(prepared.config);
+    const staged: PluginStoreState = {
+      config: prepared.config,
+      pinnedUrls,
+      hashMismatches: migration.legacyUnpinned
+        ? this.cloneHashMismatches(mismatches)
+        : new Map(),
+    };
+    const lastWrittenContent =
+      migration.migratedFromVersion !== null || prepared.migrated
+        ? await this._saveConfigUnlocked(prepared.config)
+        : this.lastWrittenContent;
+    this.commitState(staged, lastWrittenContent);
   }
 
   /** Installed plugins = builtins (always available) + user-installed manifests. */
@@ -331,6 +438,31 @@ export class PluginStore {
 
   getPlugin(id: string): PluginDefinition | undefined {
     return this.getInstalled().find((p) => p.id === id);
+  }
+
+  getApprovedManifestDigest(pluginId: string): string | undefined {
+    this.assertLoaded();
+    return this.config!.approvedDigests?.[pluginId];
+  }
+
+  getManifestHashMismatch(pluginId: string): ManifestHashMismatch | undefined {
+    this.assertLoaded();
+    const mismatch = this.hashMismatches.get(pluginId);
+    return mismatch === undefined ? undefined : { ...mismatch };
+  }
+
+  hasManifestHashMismatch(pluginId: string): boolean {
+    this.assertLoaded();
+    return this.hashMismatches.has(pluginId);
+  }
+
+  needsManifestReapproval(pluginId: string): boolean {
+    this.assertLoaded();
+    if (this.builtinPlugins.some((plugin) => plugin.id === pluginId)) return false;
+    return (
+      this.hashMismatches.has(pluginId) ||
+      this.config!.approvedDigests?.[pluginId] === undefined
+    );
   }
 
   /** Everything the client can see/use: installed + still-installable manifests. */
@@ -362,18 +494,16 @@ export class PluginStore {
         `no installable manifest '${manifestId}'; ensure it is curated in the plugin manifests`,
       );
     }
-    if (this.installedIds.has(manifest.id)) return;
+    const existingIndex = this.config!.plugins.findIndex((plugin) => plugin.id === manifest.id);
+    const hasApprovedDigest = this.config!.approvedDigests?.[manifest.id] !== undefined;
+    if (existingIndex !== -1 && !this.hashMismatches.has(manifest.id) && hasApprovedDigest) {
+      return;
+    }
 
     const staged = this.stageState();
     const validated = await this.validateAllowedUrls(manifest);
-
     const mcpValidated = await this.validateMcpUrls(manifest);
 
-    if (this.installedIds.has(manifest.id)) return;
-
-    // Re-validate against the plugin schema so unknown keys — including any
-    // smuggled credential VALUES — are stripped before the definition reaches
-    // disk or memory.
     let definition: PluginDefinition;
     try {
       definition = pluginDefinitionSchema.parse(manifest);
@@ -383,7 +513,17 @@ export class PluginStore {
         `manifest '${manifest.id}' failed plugin schema validation: ${(err as Error).message}`,
       );
     }
-    staged.config.plugins.push(definition);
+    const digest = computeManifestDigest(definition);
+    if (existingIndex === -1) {
+      staged.config.plugins.push(definition);
+    } else {
+      staged.config.plugins[existingIndex] = definition;
+    }
+    staged.config.approvedDigests = {
+      ...(staged.config.approvedDigests ?? {}),
+      [manifest.id]: digest,
+    };
+    staged.hashMismatches.delete(manifest.id);
     staged.pinnedUrls.set(manifest.id, validated);
     for (const entry of mcpValidated) {
       staged.pinnedUrls.set(`${manifest.id}:${entry.entryId}`, [entry]);
@@ -418,6 +558,10 @@ export class PluginStore {
     }
     const staged = this.stageState();
     staged.config.plugins.splice(index, 1);
+    if (staged.config.approvedDigests) {
+      delete staged.config.approvedDigests[pluginId];
+    }
+    staged.hashMismatches.delete(pluginId);
     staged.pinnedUrls.delete(pluginId);
     for (const key of staged.pinnedUrls.keys()) {
       if (key.startsWith(`${pluginId}:mcp:`)) {
@@ -530,6 +674,12 @@ export class PluginStore {
           );
         }
         throw e;
+      }
+      if (!isMcpHeaderReference(headers[name]!)) {
+        throw new PluginStoreError(
+          "CREDENTIAL_VALUES_FORBIDDEN",
+          `plugin '${pluginId}' MCP server '${serverName}' header '${name}' must be an environment reference such as \${MCP_TOKEN}; literal values are not persisted`,
+        );
       }
     }
   }
@@ -657,8 +807,14 @@ export class PluginStore {
   private assertNoCredentialValues(config: PluginStoreConfig): void {
     for (const plugin of config.plugins) {
       const credentials = pluginCredentials(plugin);
-      if (credentials === undefined) continue;
-      this.assertCredentialsSpecOnly(plugin.id, credentials, "$.credentials");
+      if (credentials !== undefined) {
+        this.assertCredentialsSpecOnly(plugin.id, credentials, "$.credentials");
+      }
+      if (isAgentPlugin(plugin)) {
+        for (const server of plugin.mcpServers ?? []) {
+          this.validateMcpHeaders(plugin.id, server.name, server.headers ?? {});
+        }
+      }
     }
   }
 
@@ -703,5 +859,6 @@ function pluginCredentials(
 ): CredentialSpec | undefined {
   if (isToolPlugin(plugin)) return plugin.credentials;
   if (isModelPlugin(plugin)) return plugin.credentials;
+  if (isAgentPlugin(plugin)) return plugin.credentials;
   return undefined;
 }

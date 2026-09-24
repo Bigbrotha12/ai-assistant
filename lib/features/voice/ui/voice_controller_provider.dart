@@ -19,6 +19,7 @@ import '../data/engine_manager_provider.dart';
 import '../data/mic_capture_service.dart';
 import '../data/screen_wake_lock.dart';
 import '../data/voice_capture_providers.dart';
+import '../data/voice_runtime_policy_provider.dart';
 import './voice_conversation_state.dart';
 import './voice_controller.dart';
 
@@ -165,7 +166,9 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     // append only when the tail already carries this exact turn's text.
     final last = trimmed.isNotEmpty ? trimmed.last : null;
     final alreadyPresent =
-        last != null && last.role == MessageRole.user && last.content == userText;
+        last != null &&
+        last.role == MessageRole.user &&
+        last.content == userText;
     if (!alreadyPresent) {
       result.add(ApiMessage(role: 'user', content: userText));
     }
@@ -183,6 +186,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
     // Managed send seam (plan P2): stable identity (the provider watches
     // nothing scope-reactive), with the staged adapters read per turn inside.
     final managedSend = ref.watch(voiceTurnSenderProvider);
+    final runtimePolicy = ref.read(voiceRuntimePolicyProvider);
     // The controller owns its per-turn cancel token (interrupt() cancels and
     // replaces it) and cancels it in dispose(); nothing to abort here.
     final controller = VoiceController(
@@ -233,19 +237,23 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
       micCapture: ref.read(micCaptureServiceProvider),
       playback: ref.read(audioPlaybackServiceProvider),
       screenWakeLock: ref.watch(screenWakeLockProvider),
+      runtimePolicy: runtimePolicy,
       sttEngine: sttEngine,
       ttsEngine: ttsEngine,
       onNetworkError: () {
         if (!ref.mounted) return;
-        ref.read(networkStatusProvider.notifier).set(NetworkStatus.disconnected);
+        ref
+            .read(networkStatusProvider.notifier)
+            .set(NetworkStatus.disconnected);
       },
       onUserMessage: (userText) {
         if (!ref.mounted) return;
         // Capture the turn's conversation id — the only per-turn hook the
-        // provider keeps: the managed service owns the row writes (plan P2
+        // provider keeps: the managed service owns the row writes (plan §3
         // single-writer), so no persistence is enqueued here.
-        _turnConversationId =
-            ref.read(activeConversationIdProvider.notifier).ensure();
+        _turnConversationId = ref
+            .read(activeConversationIdProvider.notifier)
+            .ensure();
       },
       contextBuilder: (userText) => _buildRequestMessages(userText),
     );

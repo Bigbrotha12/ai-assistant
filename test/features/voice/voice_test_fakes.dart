@@ -68,6 +68,8 @@ class FakeMicCaptureService implements MicCaptureService {
   /// Number of [start] calls — lets tests observe mic restarts (self-heal).
   int startCount = 0;
 
+  Completer<void>? stopGateForTest;
+
   @override
   bool get isRecording => _recording;
 
@@ -90,6 +92,8 @@ class FakeMicCaptureService implements MicCaptureService {
 
   @override
   Future<void> stop() async {
+    final gate = stopGateForTest;
+    if (gate != null) await gate.future;
     _recording = false;
   }
 

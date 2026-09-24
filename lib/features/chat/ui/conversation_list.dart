@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import './chat_providers.dart';
+import '../../plugins/data/ledger_client.dart';
 import '../data/database_providers.dart';
 
 /// Full-screen conversation history browser. Tapping a conversation pops back
@@ -12,7 +13,7 @@ class ConversationListScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final conversations = ref.watch(conversationsProvider);
-    final pendingIds = ref.watch(pendingConversationIdsProvider);
+    final projections = ref.watch(backgroundJobProjectionsProvider);
     final store = ref.read(chatStoreProvider);
 
     return Scaffold(
@@ -24,7 +25,8 @@ class ConversationListScreen extends ConsumerWidget {
           if (items.isEmpty) {
             return const Center(child: Text('No conversations yet'));
           }
-          final pending = pendingIds.value ?? const <String>{};
+          final pending =
+              projections.value ?? const <String, LedgerTaskProjection>{};
           return ListView.builder(
             itemCount: items.length,
             itemBuilder: (context, index) {
@@ -46,9 +48,11 @@ class ConversationListScreen extends ConsumerWidget {
                 child: ListTile(
                   title: Text(conversation.title),
                   subtitle: Text(_formatTime(conversation.updatedAt)),
-                  trailing: pending.contains(conversation.id)
-                      ? const _PendingJobIndicator()
-                      : null,
+                  trailing: pending[conversation.id] == null
+                      ? null
+                      : _PendingJobIndicator(
+                          projection: pending[conversation.id]!,
+                        ),
                   onTap: () => Navigator.pop(context, conversation.id),
                 ),
               );
@@ -93,21 +97,26 @@ class ConversationListScreen extends ConsumerWidget {
 }
 
 class _PendingJobIndicator extends StatelessWidget {
-  const _PendingJobIndicator();
+  const _PendingJobIndicator({required this.projection});
+
+  final LedgerTaskProjection projection;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final review = projection.code == LedgerTaskProgressCode.review;
     return Material(
-      color: scheme.surfaceContainerHigh,
+      color: review ? scheme.tertiaryContainer : scheme.surfaceContainerHigh,
       borderRadius: BorderRadius.circular(16),
       child: Padding(
         padding: const EdgeInsets.all(6),
         child: Icon(
-          Icons.hourglass_top,
+          review ? Icons.rate_review_outlined : Icons.hourglass_top,
           size: 18,
-          semanticLabel: 'Pending background job',
-          color: scheme.onSurfaceVariant,
+          semanticLabel: review
+              ? 'Background job awaiting review'
+              : 'Pending background job',
+          color: review ? scheme.onTertiaryContainer : scheme.onSurfaceVariant,
         ),
       ),
     );

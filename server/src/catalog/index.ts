@@ -7,7 +7,12 @@ export type { ResolvedAgentDef };
 
 export type Catalogs = {
   skills: Array<{ id: string; title: string; content: string }>;
-  mcps: Array<{ name: string; url: string; headers?: Record<string, string> }>;
+  mcps: Array<{
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+    headerRefs?: Record<string, string>;
+  }>;
   agents: Array<ResolvedAgentDef>;
 };
 

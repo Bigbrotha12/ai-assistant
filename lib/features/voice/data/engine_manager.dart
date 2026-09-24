@@ -11,6 +11,18 @@ import './model_downloader.dart';
 import './stt_engine.dart';
 import './tts_engine.dart';
 
+class VoiceModelReadiness {
+  const VoiceModelReadiness({
+    required this.sttReady,
+    required this.ttsReady,
+    required this.requiredDownloadBytes,
+  });
+
+  final bool sttReady;
+  final bool ttsReady;
+  final int? requiredDownloadBytes;
+}
+
 /// High-level status of a voice engine's model.
 enum VoiceEngineStatus {
   /// Model file has not been downloaded yet.
@@ -43,12 +55,13 @@ enum VoiceEngineStatus {
 /// change (initialization completes or a download lands), so providers can
 /// react to async registration instead of snapshotting stale state.
 class EngineManager extends ChangeNotifier {
-  EngineManager({String? modelDir})
-      : _modelDir = modelDir ?? '.voice_models';
+  EngineManager({String? modelDir, FreeStorageBytesReader? freeStorageBytes})
+    : _modelDir = modelDir ?? '.voice_models',
+      _downloader = ModelDownloader(freeStorageBytes: freeStorageBytes);
 
   final String _modelDir;
 
-  final ModelDownloader _downloader = ModelDownloader();
+  final ModelDownloader _downloader;
   final Map<String, VoiceEngineStatus> _statuses = {};
 
   /// The registered TTS engine, kept so [dispose] can release its native
@@ -179,8 +192,8 @@ class EngineManager extends ChangeNotifier {
       await _downloadArtifacts(config, dir);
       _statuses[modelId] =
           config.allTargets(dir).every((t) => File(t.path).existsSync())
-              ? VoiceEngineStatus.ready
-              : VoiceEngineStatus.failed;
+          ? VoiceEngineStatus.ready
+          : VoiceEngineStatus.failed;
     } catch (e) {
       _statuses[modelId] = VoiceEngineStatus.failed;
       if (kDebugMode) {
@@ -202,6 +215,7 @@ class EngineManager extends ChangeNotifier {
       url: config.url,
       destinationPath: dir,
       fileName: config.fileName,
+      requiredBytes: config.estimatedBytes,
     );
     for (final artifact in config.artifacts) {
       await _downloader.downloadModel(
@@ -209,6 +223,7 @@ class EngineManager extends ChangeNotifier {
         url: artifact.url,
         destinationPath: dir,
         fileName: artifact.fileName,
+        requiredBytes: config.estimatedBytes,
       );
     }
   }
@@ -232,8 +247,40 @@ class EngineManager extends ChangeNotifier {
       _statuses[modelId] ?? VoiceEngineStatus.notStarted;
 
   /// Snapshot of all model statuses.
-  Map<String, VoiceEngineStatus> get allStatuses =>
-      Map.unmodifiable(_statuses);
+  Map<String, VoiceEngineStatus> get allStatuses => Map.unmodifiable(_statuses);
+
+  VoiceModelReadiness? get modelReadiness {
+    final dir = _resolvedModelDir;
+    if (dir == null) return null;
+    final sttConfig = _modelConfig[EngineConfig.whisperTinyId];
+    final ttsConfig = _modelConfig[EngineConfig.supertonic3Id];
+    final sttReady = sttConfig != null && _targetsReady(sttConfig, dir);
+    final ttsReady = ttsConfig != null && _targetsReady(ttsConfig, dir);
+    int? requiredBytes = 0;
+    for (final config in _modelConfig.values) {
+      if (!config.downloadable) continue;
+      final missing = config
+          .allTargets(dir)
+          .where((target) => !target.existsSync())
+          .isNotEmpty;
+      if (!missing) continue;
+      final estimate = config.estimatedBytes;
+      if (estimate == null) {
+        requiredBytes = null;
+      } else if (requiredBytes != null) {
+        requiredBytes += estimate;
+      }
+    }
+    return VoiceModelReadiness(
+      sttReady: sttReady,
+      ttsReady: ttsReady,
+      requiredDownloadBytes: requiredBytes,
+    );
+  }
+
+  bool _targetsReady(_ModelConfig config, String dir) =>
+      config.downloadable &&
+      config.allTargets(dir).every((target) => target.existsSync());
 
   // ---------------------------------------------------------------------------
   // Engine access (convenience)
@@ -273,6 +320,7 @@ class EngineManager extends ChangeNotifier {
       downloaderType: 'whisper_tiny',
       url: EngineConfig.whisperTinyUrl,
       downloadable: true,
+      estimatedBytes: EngineConfig.whisperTinyEstimatedBytes,
     ),
     EngineConfig.supertonic3Id: _ModelConfig(
       fileName:
@@ -281,6 +329,7 @@ class EngineManager extends ChangeNotifier {
       downloaderType: EngineConfig.supertonic3TextEncoderId,
       url: EngineConfig.supertonic3TextEncoderUrl,
       downloadable: EngineConfig.supertonic3DownloadAvailable,
+      estimatedBytes: EngineConfig.supertonic3EstimatedBytes,
       artifacts: [
         _ArtifactConfig(
           fileName:
@@ -367,10 +416,7 @@ class EngineManager extends ChangeNotifier {
       if (config.allTargets(dir).every((t) => File(t.path).existsSync())) {
         _statuses[entry.key] = VoiceEngineStatus.ready;
       } else {
-        _statuses.putIfAbsent(
-          entry.key,
-          () => VoiceEngineStatus.notStarted,
-        );
+        _statuses.putIfAbsent(entry.key, () => VoiceEngineStatus.notStarted);
       }
     }
   }
@@ -389,11 +435,13 @@ class _ModelConfig {
     required this.downloaderType,
     required this.url,
     required this.downloadable,
+    this.estimatedBytes,
     this.artifacts = const [],
   });
   final String fileName;
   final String downloaderType;
   final String url;
+  final int? estimatedBytes;
 
   /// Secondary artifacts (additional files) that make up this model, e.g.
   /// Supertonic's six non-primary model files. Downloaded alongside the
@@ -408,9 +456,9 @@ class _ModelConfig {
   /// The absolute [File] targets for the primary file and every artifact that
   /// must all be present for the model to be [VoiceEngineStatus.ready].
   List<File> allTargets(String dir) => [
-        File('$dir/$fileName'),
-        for (final a in artifacts) File('$dir/${a.fileName}'),
-      ];
+    File('$dir/$fileName'),
+    for (final a in artifacts) File('$dir/${a.fileName}'),
+  ];
 }
 
 class _ArtifactConfig {

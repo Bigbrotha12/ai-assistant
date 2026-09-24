@@ -371,6 +371,7 @@ describe("PluginRegistry hot-reload", () => {
       JSON.stringify({
         schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
         plugins: [],
+        approvedDigests: {},
       } satisfies PluginStoreConfig),
       "utf8",
     );
@@ -398,6 +399,7 @@ describe("PluginRegistry file watch", () => {
         JSON.stringify({
           schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
           plugins: [],
+          approvedDigests: {},
         } satisfies PluginStoreConfig),
         "utf8",
       );

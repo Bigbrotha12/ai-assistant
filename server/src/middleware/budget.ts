@@ -47,11 +47,18 @@ export type ModelCallReservation =
   | { ok: true; remaining: number; resetAt: number }
   | { ok: false; code: "budget_exhausted"; retryAfterSeconds: number; resetAt: number };
 
+export const DEFAULT_MAX_TOOL_CALLS_PER_OWNER = 4;
+export const DEFAULT_MAX_TOOL_CALLS_GLOBAL = 16;
+
 export class BudgetExhaustedError extends Error {
   readonly code = "budget_exhausted";
 
-  constructor(readonly retryAfterSeconds: number, readonly resetAt: number) {
-    super("LLM call budget exhausted");
+  constructor(
+    readonly retryAfterSeconds: number,
+    readonly resetAt: number,
+    message = "LLM call budget exhausted",
+  ) {
+    super(message);
     this.name = "BudgetExhaustedError";
   }
 }
@@ -63,6 +70,9 @@ export type BudgetManager = {
   reserveModelCall(owner: string, kind?: ModelCallKind): ModelCallReservation;
   beforeModelCall(owner: string, kind?: ModelCallKind): void;
   modelCallCount(owner: string): number;
+  withToolCallBudget<T>(owner: string, run: () => Promise<T>): Promise<T>;
+  toolCallCount(owner: string): number;
+  globalToolCallCount(): number;
 };
 
 export type BudgetSetTimeout = (handler: () => void, timeout?: number) => unknown;
@@ -78,6 +88,8 @@ export type BudgetManagerOptions = {
   queueMaxPerUser?: number;
   /** Max time a parked async reservation waits for a slot (ms). Default 10_000. */
   waitMs?: number;
+  maxToolCallsPerOwner?: number;
+  maxGlobalToolCalls?: number;
   /** Test seam; defaults to the global `setTimeout`. */
   setTimeout?: BudgetSetTimeout;
   /** Test seam; defaults to the global `clearTimeout`. */
@@ -92,6 +104,7 @@ export const DEFAULT_MODEL_CALL_WINDOW_MS = 60_000;
 
 type OwnerState = {
   active: number;
+  toolActive: number;
   /** FIFO of parked async reservations awaiting a free slot. */
   parked: Array<{ slot: Slot; timer: unknown; resolve: (r: AsyncReservation) => void }>;
 };
@@ -103,6 +116,18 @@ export function createBudgetManager(opts: BudgetManagerOptions = {}): BudgetMana
   const maxConcurrentPerUser = opts.maxConcurrentPerUser ?? DEFAULT_MAX_CONCURRENT;
   const queueMaxPerUser = opts.queueMaxPerUser ?? DEFAULT_QUEUE_MAX;
   const waitMs = opts.waitMs ?? DEFAULT_WAIT_MS;
+  const maxToolCallsPerOwner =
+    opts.maxToolCallsPerOwner ?? DEFAULT_MAX_TOOL_CALLS_PER_OWNER;
+  const maxGlobalToolCalls =
+    opts.maxGlobalToolCalls ?? DEFAULT_MAX_TOOL_CALLS_GLOBAL;
+  for (const [name, value] of Object.entries({
+    maxToolCallsPerOwner,
+    maxGlobalToolCalls,
+  })) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`createBudgetManager: ${name} must be a positive safe integer`);
+    }
+  }
   const setTimeoutFn: BudgetSetTimeout =
     opts.setTimeout ?? globalThis.setTimeout.bind(globalThis);
   const clearTimeoutFn: BudgetClearTimeout =
@@ -160,18 +185,19 @@ export function createBudgetManager(opts: BudgetManagerOptions = {}): BudgetMana
   };
 
   const records = new Map<string, OwnerState>();
+  let globalToolActive = 0;
 
   const ensureState = (owner: string): OwnerState => {
     let st = records.get(owner);
     if (!st) {
-      st = { active: 0, parked: [] };
+      st = { active: 0, toolActive: 0, parked: [] };
       records.set(owner, st);
     }
     return st;
   };
 
   const maybeCleanup = (owner: string, st: OwnerState): void => {
-    if (st.active === 0 && st.parked.length === 0) records.delete(owner);
+    if (st.active === 0 && st.toolActive === 0 && st.parked.length === 0) records.delete(owner);
   };
 
   const removeParked = (st: OwnerState, entry: OwnerState["parked"][number]): void => {
@@ -243,6 +269,35 @@ export function createBudgetManager(opts: BudgetManagerOptions = {}): BudgetMana
     },
     modelCallCount(owner) {
       return currentCalls(owner)?.count ?? 0;
+    },
+    async withToolCallBudget<T>(owner: string, run: () => Promise<T>): Promise<T> {
+      if (!owner.trim()) throw new Error("Tool call budget requires an owner");
+      const st = ensureState(owner);
+      if (
+        st.toolActive >= maxToolCallsPerOwner ||
+        globalToolActive >= maxGlobalToolCalls
+      ) {
+        throw new BudgetExhaustedError(
+          1,
+          now() + 1_000,
+          "Tool call concurrency budget exhausted",
+        );
+      }
+      st.toolActive += 1;
+      globalToolActive += 1;
+      try {
+        return await run();
+      } finally {
+        st.toolActive -= 1;
+        globalToolActive -= 1;
+        maybeCleanup(owner, st);
+      }
+    },
+    toolCallCount(owner) {
+      return records.get(owner)?.toolActive ?? 0;
+    },
+    globalToolCallCount() {
+      return globalToolActive;
     },
     reserveSync(owner: string): SyncReservation {
       const st = ensureState(owner);

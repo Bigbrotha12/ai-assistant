@@ -136,7 +136,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
     if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
     const id = c.req.param("id");
     try {
-      if (store.getPlugin(id)) {
+      if (store.getPlugin(id) && !store.needsManifestReapproval(id)) {
         return c.json({ error: "plugin_already_installed" }, 409);
       }
       await store.install(id);
@@ -183,6 +183,9 @@ function pluginError(c: Context, e: unknown): Response {
         );
       case "INVALID_PLUGIN":
         return c.json({ error: "invalid_plugin" }, 400);
+      case "PIN_MISMATCH":
+        console.error("plugins: manifest pin mismatch", e);
+        return c.json({ error: "pin_mismatch" }, 409);
       default:
         console.error("plugins: unexpected store error", e);
         return c.json({ error: "internal" }, 500);
@@ -191,6 +194,9 @@ function pluginError(c: Context, e: unknown): Response {
   if (e instanceof PluginRegistryError) {
     if (e.code === "PLUGIN_NOT_FOUND") {
       return c.json({ error: "plugin_not_found" }, 404);
+    }
+    if (e.code === "PIN_MISMATCH") {
+      return c.json({ error: "pin_mismatch" }, 409);
     }
     console.error("plugins: unexpected registry error", e);
     return c.json({ error: "internal" }, 500);

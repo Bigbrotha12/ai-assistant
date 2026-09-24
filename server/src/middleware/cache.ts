@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { McpTool } from "../agents/mcp.ts";
+import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../tool_bounds.ts";
 
 /**
  * In-memory tool-result cache (Phase 4, Wave B).
@@ -83,6 +84,7 @@ export type CreateToolResultCacheOptions = {
   ttlMs?: number;
   /** LRU capacity; default 1000 entries. */
   maxEntries?: number;
+  maxValueChars?: number;
   /** Injectable monotonic clock; defaults to Date.now. */
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -134,6 +136,7 @@ export function createToolResultCache(
 ): ToolResultCache {
   const ttlMs = opts.ttlMs ?? DEFAULT_TOOL_CACHE_TTL_MS;
   const maxEntries = opts.maxEntries ?? DEFAULT_TOOL_CACHE_MAX_ENTRIES;
+  const maxValueChars = opts.maxValueChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS;
   if (!(ttlMs > 0)) {
     throw new Error(
       `createToolResultCache: ttlMs must be a positive number, got ${ttlMs}`,
@@ -142,6 +145,11 @@ export function createToolResultCache(
   if (!(maxEntries > 0)) {
     throw new Error(
       `createToolResultCache: maxEntries must be a positive number, got ${maxEntries}`,
+    );
+  }
+  if (!Number.isSafeInteger(maxValueChars) || maxValueChars <= 0) {
+    throw new Error(
+      `createToolResultCache: maxValueChars must be a positive safe integer, got ${maxValueChars}`,
     );
   }
   const now = opts.now ?? Date.now;
@@ -184,6 +192,7 @@ export function createToolResultCache(
     },
 
     set(key, result) {
+      if (result.length > maxValueChars) return;
       entries.set(internalKey(key), {
         key,
         result,

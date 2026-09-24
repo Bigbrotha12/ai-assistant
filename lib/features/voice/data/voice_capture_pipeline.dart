@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import './audio_session_manager.dart';
 import './mic_capture_service.dart';
 import './vad_processor.dart';
+import './voice_runtime_policy.dart';
 import '../ui/voice_controller.dart';
 
 /// Orchestrates mic capture → VAD → VoiceController.
@@ -21,8 +22,10 @@ class VoiceCapturePipeline {
     required this.vad,
     required this.audioSession,
     required this.voiceController,
+    this.runtimePolicy,
   }) {
     audioSession.onInterruption = _handleInterruption;
+    runtimePolicy?.addListener(_handleRuntimePolicyChanged);
   }
 
   /// Microphone capture used for voice activity detection.
@@ -37,6 +40,7 @@ class VoiceCapturePipeline {
   /// Conversation controller receiving mic audio for on-device STT and
   /// driving the text-turn flow.
   final VoiceController voiceController;
+  final VoiceRuntimePolicySource? runtimePolicy;
 
   StreamSubscription<List<int>>? _micSubscription;
   StreamSubscription<VadState>? _vadSubscription;
@@ -86,6 +90,9 @@ class VoiceCapturePipeline {
   /// TTS).
   Future<void> startRecording() async {
     if (_isDisposed || _isRecording || _startInFlight) return;
+    await runtimePolicy?.refreshHealth();
+    if (_isDisposed || _isRecording || _startInFlight) return;
+    if (!_captureAllowed) return;
     _startInFlight = true;
     _restartInFlightGeneration = null;
     final epoch = ++_lifecycleEpoch;
@@ -97,9 +104,26 @@ class VoiceCapturePipeline {
     try {
       await audioSession.requestAudioFocus();
       if (!_isLifecycleCurrent(epoch)) return;
+      if (!_captureAllowed) {
+        _isStopped = true;
+        _lifecycleEpoch++;
+        try {
+          await audioSession.abandonAudioFocus();
+        } catch (_) {}
+        return;
+      }
       await micCapture.start();
       if (!_isLifecycleCurrent(epoch)) {
         if (_isStopped) await _stopMicBestEffort();
+        return;
+      }
+      if (!_captureAllowed) {
+        _isStopped = true;
+        _lifecycleEpoch++;
+        await _stopMicBestEffort();
+        try {
+          await audioSession.abandonAudioFocus();
+        } catch (_) {}
         return;
       }
       _armMicReopenDiscard();
@@ -130,6 +154,18 @@ class VoiceCapturePipeline {
     } finally {
       _startInFlight = false;
     }
+  }
+
+  bool get _captureAllowed => runtimePolicy?.decision.allowCapture ?? true;
+
+  void _handleRuntimePolicyChanged() {
+    if (_isDisposed || _captureAllowed) return;
+    if (_isRecording || _startInFlight) unawaited(_stopForRuntimePolicy());
+  }
+
+  Future<void> _stopForRuntimePolicy() async {
+    if (_isDisposed || !_isRecording && !_startInFlight) return;
+    await stopRecording();
   }
 
   /// Subscribes to the mic stream. Shared by [startRecording], the
@@ -163,7 +199,7 @@ class VoiceCapturePipeline {
     var chunkCount = 0;
     final subscription = micCapture.audioStream.listen(
       (chunk) {
-        if (!_isMicGenerationCurrent(generation)) return;
+        if (!_captureAllowed || !_isMicGenerationCurrent(generation)) return;
         // W1.5: drop warm-up/glitch frames captured in the first
         // [micReopenDiscardWindow] after this (re)open at the pipeline
         // boundary, before they reach VAD or the flush it triggers. In
@@ -298,6 +334,7 @@ class VoiceCapturePipeline {
   }
 
   void _onMicAudio(List<int> chunk) {
+    if (_isStopped || !_isRecording || !_captureAllowed) return;
     // No capture while paused (interruption) or while the assistant's own
     // TTS is playing through the speaker — the mic would otherwise feed the
     // assistant's voice back through VAD/STT as a phantom user turn.
@@ -498,6 +535,7 @@ class VoiceCapturePipeline {
     _isRecording = false;
     _selfHealTimer?.cancel();
     _selfHealTimer = null;
+    runtimePolicy?.removeListener(_handleRuntimePolicyChanged);
     audioSession.onInterruption = null;
 
     final vadSubscription = _vadSubscription;

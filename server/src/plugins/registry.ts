@@ -2,7 +2,12 @@ import { watch } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import { isModelPlugin, isToolPlugin, isAgentPlugin } from "./types.ts";
-import type { CredentialSpec, PluginDefinition, ToolDefinition } from "./types.ts";
+import type {
+  CredentialSpec,
+  ManifestHashMismatch,
+  PluginDefinition,
+  ToolDefinition,
+} from "./types.ts";
 import { PluginStore } from "./store.ts";
 
 /**
@@ -23,17 +28,30 @@ import { PluginStore } from "./store.ts";
 export type PluginRegistryErrorCode =
   | "PLUGIN_NOT_FOUND"
   | "PLUGIN_DISABLED"
-  | "PLUGIN_REMOVED";
+  | "PLUGIN_REMOVED"
+  | "PIN_MISMATCH";
 
 export class PluginRegistryError extends Error {
   readonly code: PluginRegistryErrorCode;
+  readonly mismatch?: ManifestHashMismatch;
 
-  constructor(code: PluginRegistryErrorCode, message: string) {
+  constructor(
+    code: PluginRegistryErrorCode,
+    message: string,
+    mismatch?: ManifestHashMismatch,
+  ) {
     super(message);
     this.name = "PluginRegistryError";
     this.code = code;
+    this.mismatch = mismatch;
   }
 }
+
+export type PluginHashMismatchStatus = {
+  hashMismatch: true;
+  expected: string | null;
+  actual: string;
+};
 
 export type PluginSummary = {
   id: string;
@@ -66,7 +84,7 @@ export type PluginSummary = {
     skillCount: number;
     mcpServers?: { name: string }[];
   };
-};
+} & Partial<PluginHashMismatchStatus>;
 
 export type WatchOptions = {
   debounceMs?: number;
@@ -93,18 +111,40 @@ export class PluginRegistry {
     const installedIds = new Set(this.listInstalledPlugins().map((p) => p.id));
     return this.store
       .listAvailable()
-      .map((plugin) => summarizePlugin(plugin, installedIds.has(plugin.id)));
+      .map((plugin) =>
+        summarizePlugin(
+          plugin,
+          installedIds.has(plugin.id),
+          this.store.getManifestHashMismatch(plugin.id),
+        ),
+      );
   }
 
   /**
    * Auth-gated detail payload (`GET /v1/plugins/:id`). Full definition —
    * baseUrls include their url values here, but credentials remain spec-only.
    */
-  getPluginDetails(id: string): (PluginDefinition & { installed: boolean }) | undefined {
+  getPluginDetails(
+    id: string,
+  ): (PluginDefinition & {
+    installed: boolean;
+  } & Partial<PluginHashMismatchStatus>) | undefined {
     const installedIds = new Set(this.listInstalledPlugins().map((p) => p.id));
     const plugin = this.store.listAvailable().find((p) => p.id === id);
     if (!plugin) return undefined;
-    return { ...plugin, installed: installedIds.has(id) };
+    const detail = isAgentPlugin(plugin)
+      ? {
+          ...plugin,
+          ...(plugin.mcpServers === undefined
+            ? {}
+            : { mcpServers: plugin.mcpServers.map((server) => ({ name: server.name })) }),
+        }
+      : plugin;
+    return {
+      ...detail,
+      installed: installedIds.has(id),
+      ...hashMismatchFields(this.store.getManifestHashMismatch(id)),
+    };
   }
 
   /**
@@ -117,7 +157,17 @@ export class PluginRegistry {
    */
   requirePlugin(id: string): PluginDefinition {
     const installed = this.store.getPlugin(id);
-    if (installed) return installed;
+    if (installed) {
+      const mismatch = this.store.getManifestHashMismatch(id);
+      if (mismatch) {
+        throw new PluginRegistryError(
+          "PIN_MISMATCH",
+          `plugin '${id}' has an unapproved manifest change; reinstall it before using it`,
+          mismatch,
+        );
+      }
+      return installed;
+    }
 
     if (this.store.listAvailable().some((p) => p.id === id)) {
       throw new PluginRegistryError(
@@ -132,15 +182,15 @@ export class PluginRegistry {
   }
 
   canResolveModelPlugin(id: string): boolean {
-    return this.store.getPlugin(id)?.type === "model";
+    return this.store.getPlugin(id)?.type === "model" && !this.store.hasManifestHashMismatch(id);
   }
 
   canResolveToolPlugin(id: string): boolean {
-    return this.store.getPlugin(id)?.type === "tool";
+    return this.store.getPlugin(id)?.type === "tool" && !this.store.hasManifestHashMismatch(id);
   }
 
   canResolveAgentPlugin(id: string): boolean {
-    return this.store.getPlugin(id)?.type === "agent";
+    return this.store.getPlugin(id)?.type === "agent" && !this.store.hasManifestHashMismatch(id);
   }
 
   /** Re-read the store file (called after fs.watch fires, or by an endpoint). */
@@ -218,7 +268,22 @@ function redactEntry(entry: { id: string; label?: string }): {
   return entry.label === undefined ? { id: entry.id } : { id: entry.id, label: entry.label };
 }
 
-function summarizePlugin(plugin: PluginDefinition, installed: boolean): PluginSummary {
+function hashMismatchFields(
+  mismatch: ManifestHashMismatch | undefined,
+): Partial<PluginHashMismatchStatus> {
+  if (!mismatch) return {};
+  return {
+    hashMismatch: true,
+    expected: mismatch.expected,
+    actual: mismatch.actual,
+  };
+}
+
+function summarizePlugin(
+  plugin: PluginDefinition,
+  installed: boolean,
+  mismatch?: ManifestHashMismatch,
+): PluginSummary {
   const summary: PluginSummary = {
     id: plugin.id,
     type: plugin.type,
@@ -228,6 +293,7 @@ function summarizePlugin(plugin: PluginDefinition, installed: boolean): PluginSu
     schemaVersion: plugin.schemaVersion,
     installed,
     baseUrls: [],
+    ...hashMismatchFields(mismatch),
   };
 
   if (isToolPlugin(plugin)) {

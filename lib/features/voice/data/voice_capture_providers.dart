@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import './audio_session_manager.dart';
 import './vad_processor.dart';
 import './voice_capture_pipeline.dart';
+import './voice_runtime_policy_provider.dart';
 import '../ui/voice_controller_provider.dart';
 import '../ui/voice_lifecycle_observer.dart';
 import '../ui/voice_settings_providers.dart';
@@ -76,6 +77,7 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
       vad: ref.watch(vadProcessorProvider),
       audioSession: ref.watch(audioSessionManagerProvider),
       voiceController: ref.watch(voiceControllerProvider),
+      runtimePolicy: ref.read(voiceRuntimePolicyProvider),
     );
 
     // Apply voice-settings changes to the running VAD in place instead of
@@ -83,13 +85,10 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
     // a hold is active stops the mic mid-utterance and drops the buffered
     // audio. Fires once at startup with the loaded settings, so the first
     // frame of a session already carries the persisted values.
-    final vadSettingsSub = ref.listen(
-      voiceSettingsProvider,
-      (_, next) {
-        pipeline.vad.setSensitivity(next.value?.vadSensitivity ?? 0.5);
-        pipeline.vad.setMinSilenceSeconds(next.value?.minTurnSeconds ?? 0.5);
-      },
-    );
+    final vadSettingsSub = ref.listen(voiceSettingsProvider, (_, next) {
+      pipeline.vad.setSensitivity(next.value?.vadSensitivity ?? 0.5);
+      pipeline.vad.setMinSilenceSeconds(next.value?.minTurnSeconds ?? 0.5);
+    });
     ref.onDispose(() {
       vadSettingsSub.close();
       pipeline.dispose();
@@ -117,19 +116,15 @@ class VoiceCapturePipelineNotifier extends Notifier<VoiceCapturePipeline> {
   /// and its reply queues (persisted via onTranscript) for playback on the next
   /// foreground. The audio-safe parts of a full teardown still happen — mic,
   /// player, and focus are all released so nothing leaks while not visible.
-  Future<void> _handleBackground() => _enqueueLifecycleTransition(
-        _applyBackground,
-        'background',
-      );
+  Future<void> _handleBackground() =>
+      _enqueueLifecycleTransition(_applyBackground, 'background');
 
   /// Resumes a backgrounded session on foreground: any reply held while the
   /// app was hidden starts playing (playback re-acquires focus), and a
   /// session left paused by an OS audio interruption is resumed. The
   /// conversation itself stays connected across the background period.
-  Future<void> _handleForeground() => _enqueueLifecycleTransition(
-        _applyForeground,
-        'foreground',
-      );
+  Future<void> _handleForeground() =>
+      _enqueueLifecycleTransition(_applyForeground, 'foreground');
 
   /// Queues a lifecycle transition behind any still-running one so the last
   /// event to arrive takes effect last. Each transition is bounded so a hung

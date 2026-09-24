@@ -9,6 +9,7 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import { createAgentGraph } from "../agents/graph.ts";
 import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
+import type { TrackedExecution } from "../agents/execution.ts";
 import { jsonSchemaToZod, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import { redactForOutbound, redactMessages } from "../redact.ts";
@@ -27,13 +28,32 @@ import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import { BudgetExhaustedError } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
-import type { Ledger } from "../ledger.ts";
-import type { TaskRow, TaskStatus } from "../ledger.ts";
+import { LedgerError, projectTaskProgress } from "../ledger.ts";
+import type {
+  Ledger,
+  TaskEffectState,
+  TaskLiveProjection,
+  TaskProgress,
+  TaskRow,
+  TaskStatus,
+} from "../ledger.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
-import { isToolPlugin } from "../plugins/types.ts";
+import { isMcpHeaderReference, isToolPlugin } from "../plugins/types.ts";
 import type { ToolDefinition, ToolPluginDefinition } from "../plugins/types.ts";
-import { validatedFetch } from "../plugins/ssrf.ts";
-import type { LookupFn, Mode } from "../plugins/ssrf.ts";
+import {
+  createEgressPolicy,
+  policyFetch,
+  SsrfValidationError,
+  validateMcpHeaderName,
+} from "../plugins/ssrf.ts";
+import type { Mode } from "../plugins/ssrf.ts";
+import {
+  boundToolResult,
+  DEFAULT_TOOL_RESPONSE_MAX_BYTES,
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  readBoundedResponseText,
+  ToolResourceError,
+} from "../tool_bounds.ts";
 
 /**
  * Async job runner (stateless-gateway, step 8 — Phase C part 2 rewrite).
@@ -66,7 +86,7 @@ import type { LookupFn, Mode } from "../plugins/ssrf.ts";
  *      pluginId)`). A `credentials_expired` pin fails the job with a
  *      `credentials_expired` step — no graph invoke happens.
  *   6. Build the agent (`createAgentGraph`, NO checkpointer) with a REAL
- *      `ToolCallHandler`: the {@link ToolExecutor} (validatedFetch + pinned IPs
+ *      `ToolCallHandler`: the {@link ToolExecutor} (policyFetch + pinned IPs
  *      + credentials + trusted hosts) wrapped with tool-call replay dedupe
  *      (`hasToolResult`/`recordToolResult`, `tool_retry_forbidden` for mutating
  *      tools that cannot be proven never-run when the task is a replay).
@@ -113,6 +133,53 @@ export class JobError extends Error {
   }
 }
 
+export const TASK_CANCEL_SCHEMA_VERSION = 1 as const;
+const TASK_CANCEL_COMPLETED_ACTIONS_LIMIT = 64;
+
+export type TaskCancelStage =
+  | "cancelling"
+  | "cancelled"
+  | "already-terminal"
+  | "not-cancellable";
+
+export type TaskCancelReachedStage =
+  | "queued"
+  | "admitted"
+  | "running"
+  | "already-terminal"
+  | "stuck";
+
+export type TaskActionSummary = {
+  id: string;
+  stage: string;
+  action: string;
+  toolCallId?: string;
+  completed: true;
+};
+
+export type TaskCancelReport = {
+  schemaVersion: typeof TASK_CANCEL_SCHEMA_VERSION;
+  taskId: string;
+  stage: TaskCancelStage;
+  reachedStage: TaskCancelReachedStage;
+  taskStatus: TaskStatus;
+  cancellable: boolean;
+  terminalStatus?: Extract<
+    TaskStatus,
+    "succeeded" | "failed" | "cancelled" | "awaiting_review"
+  >;
+  effectState: TaskEffectState;
+  completedActions: TaskActionSummary[];
+  projection: TaskProgress;
+};
+
+class JobCancelledError extends Error {
+  constructor(taskId: string) {
+    super(`background task ${taskId} cancellation requested`);
+    this.name = "JobCancelledError";
+  }
+}
+
 /** A pre-validated, IP-pinned allowlist entry for a plugin (store.ts shape). */
 export type PinnedUrlEntry = { entryId: string; url: string; pinned: string[] };
 
@@ -142,7 +209,7 @@ const DEFAULT_ENDPOINT_RESOLVER: ToolEndpointResolver = (
     );
   }
   const base = entry.url.replace(/\/+$/, "");
-  return `${base}/${toolName}`;
+  return `${base}/${encodeURIComponent(toolName)}`;
 };
 
 function buildAuthHeader(
@@ -163,22 +230,60 @@ export type ToolExecutorOptions = {
   getPinnedIps: (pluginId: string) => PinnedUrlEntry[] | undefined;
   /** Endpoint resolution; defaults to first pinned base URL + `/<toolName>`. */
   resolveEndpoint?: ToolEndpointResolver;
-  /** Injectable fetch for `validatedFetch` (tests stub this; never the network). */
+  /** Injectable fetch for `policyFetch` (tests stub this; never the network). */
   fetchFn?: typeof fetch;
-  /** Injectable DNS resolver for `validatedFetch` (tests stub this). */
-  lookup?: LookupFn;
-  /** Scheme enforcement mode override for `validatedFetch`. */
+  /** Scheme enforcement mode override for `policyFetch`. */
   mode?: Mode;
   /**
-   * Admin-trusted hostnames/IPs forwarded into `validatedFetch`. The pins were
-   * computed WITH the trusted-hosts list at install/load time (a `*.local` /
-   * RFC1918 backend is allowed because the admin vouched for it); a call-time
-   * re-resolution WITHOUT the same list would reject those hosts as
-   * DNS_REBINDING. This MUST carry the plugin store's trusted hosts so an
-   * admin-trusted internal plugin keeps working.
+   * Admin-trusted hostnames/IPs used to validate the retained store pins and
+   * construct the per-call egress policy.
    */
   trustedHosts?: readonly string[];
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  maxResultChars?: number;
 };
+
+function toolEndpointPath(baseUrl: string, toolName: string): string {
+  const basePath = new URL(baseUrl).pathname.replace(/\/+$/, "");
+  return `${basePath || ""}/${encodeURIComponent(toolName)}`;
+}
+
+function toolEgressPolicy(
+  registry: PluginRegistry,
+  pluginId: string,
+  toolName: string,
+  pinned: readonly PinnedUrlEntry[],
+  trustedHosts: readonly string[] | undefined,
+  mode: Mode | undefined,
+) {
+  let plugin;
+  try {
+    plugin = registry.requirePlugin(pluginId);
+  } catch {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `tool plugin '${pluginId}' is not available for an egress-authorized call`,
+    );
+  }
+  if (!isToolPlugin(plugin) || !plugin.tools.some((tool) => tool.name === toolName)) {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `tool '${toolName}' is not declared by installed plugin '${pluginId}'`,
+    );
+  }
+  return createEgressPolicy({
+    subject: `tool:${pluginId}`,
+    destinations: pinned.map((entry) => ({
+      baseUrl: entry.url,
+      pinnedIps: entry.pinned,
+      methods: ["POST"],
+      exactPaths: [toolEndpointPath(entry.url, toolName)],
+    })),
+    trustedHosts,
+    mode,
+  });
+}
 
 /**
  * The REAL `ToolCallHandler` (exported separately so tests can exercise it
@@ -187,9 +292,9 @@ export type ToolExecutorOptions = {
  *   - resolves the plugin's pinned IPs (`getPinnedIps`) — a plugin with no
  *     pins is `plugin_unavailable` (the pins are the SSRF-validated resolve
  *     result; a job must never ad-hoc resolve a plugin URL),
- *   - calls `validatedFetch` — the ONLY sanctioned outbound path — against the
+ *   - calls `policyFetch` — the ONLY sanctioned outbound path — against the
  *     allowlisted URL with the pinned credentials (bearer header),
- *   - refuses any 3xx (validatedFetch does this; redirects are never followed),
+ *   - refuses any 3xx (policyFetch does this; redirects are never followed),
  *   - redacts the result with `redactForOutbound` before it is returned so
  *     credential-shaped material never reaches graph state.
  *
@@ -215,46 +320,77 @@ export class ToolExecutor implements ToolCallHandler {
           "plugin store or reinstall the plugin before running background jobs",
       );
     }
+    const policy = toolEgressPolicy(
+      this.opts.registry,
+      pluginId,
+      toolName,
+      pinned,
+      this.opts.trustedHosts,
+      this.opts.mode,
+    );
     const resolveEndpoint =
       this.opts.resolveEndpoint ?? DEFAULT_ENDPOINT_RESOLVER;
     const url = await resolveEndpoint(pluginId, toolName, args, pinned);
     signal?.throwIfAborted();
-    // Bound every tool call (the model and MCP paths both have explicit
-    // timeouts; undici's fetch default alone would allow ~5 min stalls). A hung
-    // plugin backend must not wedge the budget slot / job fence that long.
-    const callSignal = signal
-      ? AbortSignal.any([signal, AbortSignal.timeout(env.TOOL_CALL_TIMEOUT_MS)])
-      : AbortSignal.timeout(env.TOOL_CALL_TIMEOUT_MS);
-    const response = await validatedFetch(
-      url,
-      {
-        method: "POST",
-        signal: callSignal,
-        headers: {
-          "content-type": "application/json",
-          ...buildAuthHeader(credentials),
-        },
-        body: JSON.stringify(args ?? {}),
-      },
-      {
-        mode: this.opts.mode,
-        lookup: this.opts.lookup,
-        fetchFn: this.opts.fetchFn,
-        // Re-resolution must apply the SAME trusted-hosts policy the pins were
-        // computed under, or an admin-trusted internal plugin (e.g. `vikunja.local`
-        // behind `*.local`) would be rejected at call time (see ToolExecutorOptions).
-        trustedHosts: this.opts.trustedHosts,
-      },
-    );
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      throw new JobError(
-        "job_failed",
-        `tool '${toolName}' of plugin '${pluginId}' failed with HTTP ${response.status}`,
-      );
+    const timeoutMs = this.opts.timeoutMs ?? env.TOOL_CALL_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError("timeoutMs must be a positive safe integer");
     }
-    const text = await response.text();
-    return redactForOutbound(text);
+    const timeoutController = new AbortController();
+    const timeoutTimer = setTimeout(() => {
+      timeoutController.abort(new DOMException("tool call timed out", "TimeoutError"));
+    }, timeoutMs);
+    const timeoutSignal = timeoutController.signal;
+    const callSignal = signal
+      ? AbortSignal.any([signal, timeoutSignal])
+      : timeoutSignal;
+    try {
+      const response = await policyFetch(
+        url,
+        {
+          method: "POST",
+          signal: callSignal,
+          headers: {
+            "content-type": "application/json",
+            ...buildAuthHeader(credentials),
+          },
+          body: JSON.stringify(args ?? {}),
+        },
+        {
+          policy,
+          fetchFn: this.opts.fetchFn,
+        },
+      );
+      callSignal.throwIfAborted();
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        throw new JobError(
+          "job_failed",
+          `tool '${toolName}' of plugin '${pluginId}' failed with HTTP ${response.status}`,
+        );
+      }
+      const text = await readBoundedResponseText(
+        response,
+        this.opts.maxResponseBytes ?? DEFAULT_TOOL_RESPONSE_MAX_BYTES,
+        callSignal,
+      );
+      return boundToolResult(
+        text,
+        this.opts.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
+      );
+    } catch (error) {
+      if (!signal?.aborted && timeoutSignal.aborted) {
+        throw new ToolResourceError(
+          "tool_timeout",
+          `tool '${toolName}' of plugin '${pluginId}' exceeded ${timeoutMs}ms`,
+          timeoutMs,
+          "milliseconds",
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutTimer);
+    }
   }
 }
 
@@ -316,9 +452,143 @@ export type JobDescriptor = {
   mcpServers?: McpServerConfig[];
 };
 
+export const JOB_SPEC_SCHEMA_VERSION = 1 as const;
+
+export type PersistedJobSpec = {
+  schemaVersion: typeof JOB_SPEC_SCHEMA_VERSION;
+  clientThreadId: string;
+  toolPlugins: string[];
+  modelPluginId: string;
+  modelRequestConfig?: unknown;
+  systemPrompt?: string;
+  mcpServers?: {
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+  }[];
+};
+
+export function serializeJobSpec(
+  descriptor: Pick<
+    JobDescriptor,
+    "clientThreadId" | "toolPlugins" | "modelPluginId" | "modelRequestConfig" | "systemPrompt" | "mcpServers"
+  >,
+): string {
+  const mcpServers = descriptor.mcpServers?.map((server) => {
+    const headerRefs: Record<string, string> = { ...(server.headerRefs ?? {}) };
+    let unresolvedHeaders = false;
+    for (const [name, value] of Object.entries(server.headers ?? {})) {
+      if (isMcpHeaderReference(value)) {
+        headerRefs[name] ??= value;
+      } else if (headerRefs[name] === undefined) {
+        unresolvedHeaders = true;
+      }
+    }
+    return {
+      name: server.name,
+      url: server.url,
+      ...(Object.keys(headerRefs).length > 0 ? { headerRefs } : {}),
+      ...(unresolvedHeaders ? { unresolvedHeaders: true } : {}),
+    };
+  });
+  return JSON.stringify({
+    schemaVersion: JOB_SPEC_SCHEMA_VERSION,
+    clientThreadId: descriptor.clientThreadId,
+    toolPlugins: [...descriptor.toolPlugins],
+    modelPluginId: descriptor.modelPluginId,
+    ...(descriptor.modelRequestConfig === undefined
+      ? {}
+      : { modelRequestConfig: descriptor.modelRequestConfig }),
+    ...(descriptor.systemPrompt === undefined
+      ? {}
+      : { systemPrompt: descriptor.systemPrompt }),
+    ...(mcpServers === undefined ? {} : { mcpServers }),
+  });
+}
+
+export function parsePersistedJobSpec(
+  value: string | null | undefined,
+): PersistedJobSpec | null {
+  if (value === null || value === undefined || value.trim() === "") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (record.schemaVersion !== JOB_SPEC_SCHEMA_VERSION) return null;
+  if (typeof record.clientThreadId !== "string" || record.clientThreadId === "") return null;
+  if (!Array.isArray(record.toolPlugins) || record.toolPlugins.some((id) => typeof id !== "string")) {
+    return null;
+  }
+  if (typeof record.modelPluginId !== "string" || record.modelPluginId === "") return null;
+  if (
+    record.systemPrompt !== undefined &&
+    typeof record.systemPrompt !== "string"
+  ) return null;
+  const mcpServers: PersistedJobSpec["mcpServers"] = [];
+  if (record.mcpServers !== undefined) {
+    if (!Array.isArray(record.mcpServers)) return null;
+    for (const item of record.mcpServers) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) return null;
+      const server = item as Record<string, unknown>;
+      if (server.unresolvedHeaders === true) return null;
+      if (typeof server.name !== "string" || typeof server.url !== "string") return null;
+      const headers: Record<string, string> = {};
+      if (server.headerRefs !== undefined) {
+        if (typeof server.headerRefs !== "object" || server.headerRefs === null || Array.isArray(server.headerRefs)) {
+          return null;
+        }
+        for (const [name, reference] of Object.entries(server.headerRefs)) {
+          try {
+            validateMcpHeaderName(name);
+          } catch {
+            return null;
+          }
+          if (typeof reference !== "string" || !isMcpHeaderReference(reference)) return null;
+          const variable = reference.slice(2, -1);
+          const resolved = process.env[variable];
+          if (resolved === undefined || /[\r\n\u0000-\u001f]/.test(resolved)) return null;
+          headers[name] = resolved;
+        }
+      }
+      mcpServers.push({
+        name: server.name,
+        url: server.url,
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      });
+    }
+  }
+  return {
+    schemaVersion: JOB_SPEC_SCHEMA_VERSION,
+    clientThreadId: record.clientThreadId,
+    toolPlugins: record.toolPlugins as string[],
+    modelPluginId: record.modelPluginId,
+    ...(record.modelRequestConfig === undefined
+      ? {}
+      : { modelRequestConfig: record.modelRequestConfig }),
+    ...(record.systemPrompt === undefined
+      ? {}
+      : { systemPrompt: record.systemPrompt }),
+    ...(record.mcpServers === undefined ? {} : { mcpServers }),
+  };
+}
+
+export function serializeJobPayload(input: JobInput): string | null {
+  if (input == null) return null;
+  return JSON.stringify(
+    mapChatMessagesToStoredMessages(
+      redactMessages((input as { messages?: BaseMessage[] }).messages ?? []),
+    ),
+  );
+}
+
 export type RunJobResult =
   | { status: "succeeded"; taskId: string; threadId: string }
   | { status: "failed"; taskId: string; threadId: string; code: JobErrorCode; error: string }
+  | { status: "cancelled"; taskId: string; threadId: string }
   | { status: "in_flight"; taskId: string; threadId: string }
   | { status: "already_terminal"; taskId: string; threadId: string; terminalStatus: TaskStatus }
   | { status: "account_deleted"; taskId?: string; threadId: string; error: string };
@@ -335,7 +605,7 @@ function accountDeletedResult(
 export type StuckTaskOutcome = {
   taskId: string;
   owner: string;
-  outcome: "credentials_expired" | "repinned" | JobErrorCode;
+  outcome: "credentials_expired" | "repinned" | "cancelled" | JobErrorCode;
 };
 
 export type ResumeStuckJobsResult = {
@@ -381,7 +651,7 @@ export type JobRunnerDeps = {
   /** Override the real ToolExecutor (tests inject a real one with a stubbed fetch). */
   executor?: ToolExecutor;
   /**
-   * Admin-trusted hosts forwarded into the default executor's `validatedFetch`
+    * Admin-trusted hosts forwarded into the default executor's `policyFetch`
    * (see `ToolExecutorOptions.trustedHosts`). Wire the plugin store's
    * trusted-host list (env `PLUGINS_TRUSTED_HOSTS`) so admin-trusted internal
    * plugin backends are not rejected at call time.
@@ -409,6 +679,18 @@ export type JobRunnerDeps = {
   budget?: BudgetManager;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+};
+
+type ActiveJob = {
+  taskId: string;
+  owner: string;
+  threadId: string;
+  fenceToken: string;
+  controller: AbortController;
+  stage: "admitted" | "running";
+  activeToolCallIds: Set<string>;
+  cancelRequested: boolean;
+  cancelFromStage?: "admitted" | "running";
 };
 
 function isConflict(e: unknown): boolean {
@@ -449,6 +731,9 @@ export type BindJobToolsOptions = {
    * from the validated credentials — never from raw values in the key.
    */
   fingerprintsByPlugin?: Record<string, string>;
+  onToolStart?: (actionId: string) => void;
+  onToolEnd?: (actionId: string) => void;
+  budget?: BudgetManager;
 };
 
 /**
@@ -469,6 +754,7 @@ export type BindJobToolsOptions = {
 export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[] {
   const tools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
+  let anonymousToolSequence = 0;
   for (const plugin of opts.registry.listInstalledPlugins()) {
     if (!isToolPlugin(plugin) || !Object.hasOwn(opts.credentialsByPlugin, plugin.id)) continue;
     const credentials = opts.credentialsByPlugin[plugin.id] ?? {};
@@ -480,7 +766,15 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
         continue;
       }
       seen.add(toolDef.name);
-      tools.push(bindJobTool(opts, plugin, toolDef, credentials));
+      tools.push(
+        bindJobTool(
+          opts,
+          plugin,
+          toolDef,
+          credentials,
+          () => ++anonymousToolSequence,
+        ),
+      );
     }
   }
   return tools;
@@ -491,6 +785,7 @@ function bindJobTool(
   plugin: ToolPluginDefinition,
   toolDef: ToolDefinition,
   credentials: Record<string, string>,
+  nextAnonymousToolSequence: () => number,
 ): DynamicStructuredTool {
   return new DynamicStructuredTool({
     name: toolDef.name,
@@ -512,21 +807,34 @@ function bindJobTool(
       const signal = opts.signal && config?.signal
         ? AbortSignal.any([opts.signal, config.signal])
         : opts.signal ?? config?.signal;
-      const execute = async () => {
-        assertActive();
-        const result = await opts.handler.execute(
-          plugin.id,
-          toolDef.name,
-          input as Record<string, unknown>,
-          invocationCredentials,
-          signal,
-        );
-        assertActive();
-        return redactForOutbound(String(result));
-      };
       const toolCallId = (
         config as { toolCall?: { id?: string } } | undefined
       )?.toolCall?.id;
+      const actionId =
+        toolCallId ??
+        `tool:${plugin.id}:${toolDef.name}:${nextAnonymousToolSequence()}`;
+      const execute = async () => {
+        const invoke = async () => {
+          assertActive();
+          opts.onToolStart?.(actionId);
+          try {
+            const result = await opts.handler.execute(
+              plugin.id,
+              toolDef.name,
+              input as Record<string, unknown>,
+              invocationCredentials,
+              signal,
+            );
+            assertActive();
+            return boundToolResult(String(result));
+          } finally {
+            opts.onToolEnd?.(actionId);
+          }
+        };
+        return opts.budget
+          ? opts.budget.withToolCallBudget(opts.owner, invoke)
+          : invoke();
+      };
       if (!toolCallId) {
         if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
           throw new JobError("tool_retry_forbidden", "cannot replay a mutating tool without a stored result");
@@ -545,7 +853,7 @@ function bindJobTool(
           toolCallId,
           opts.owner,
         );
-        return redactForOutbound(step?.result ?? "");
+        return boundToolResult(step?.result ?? "");
       }
       // Phase 4, Wave B: the in-memory tool-result cache sits AFTER the ledger
       // replay dedupe (a stored step is always authoritative, never shadowed
@@ -568,7 +876,7 @@ function bindJobTool(
           argsHash: cache.argsHash(input as Record<string, unknown>),
         };
         const cached = cache.get(cacheKey);
-        if (cached !== undefined) return redactForOutbound(cached);
+        if (cached !== undefined) return boundToolResult(cached);
       }
       if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
         throw new JobError(
@@ -592,6 +900,34 @@ function bindJobTool(
   });
 }
 
+function trackMcpTools(
+  tools: readonly DynamicStructuredTool[],
+  execution: TrackedExecution,
+  onToolStart: (actionId: string) => void,
+  onToolEnd: (actionId: string) => void,
+): DynamicStructuredTool[] {
+  let sequence = 0;
+  return tools.map((tool) =>
+    new DynamicStructuredTool({
+      name: tool.name,
+      description: tool.description,
+      schema: tool.schema,
+      func: async (input, _runManager, config) => {
+        const toolCallId = (
+          config as { toolCall?: { id?: string } } | undefined
+        )?.toolCall?.id;
+        const actionId = toolCallId ?? `mcp:${tool.name}:${++sequence}`;
+        onToolStart(actionId);
+        try {
+          return await execution.track(() => tool.invoke(input, config));
+        } finally {
+          onToolEnd(actionId);
+        }
+      },
+    }),
+  );
+}
+
 export class JobRunner {
   private readonly deps: JobRunnerDeps;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -599,6 +935,7 @@ export class JobRunner {
   private readonly pinUsers = new Map<CredentialPinHandle, number>();
   private readonly controllers = new Set<AbortController>();
   private readonly controllersByOwner = new Map<string, Set<AbortController>>();
+  private readonly activeJobs = new Map<string, ActiveJob>();
 
   constructor(deps: JobRunnerDeps) {
     this.deps = deps;
@@ -650,6 +987,59 @@ export class JobRunner {
     return this.deps.ledger.getTaskByIntentKey(owner, intentKey);
   }
 
+  getTaskExecution(taskId: string, owner: string): TaskLiveProjection | undefined {
+    const active = this.activeJobs.get(taskId);
+    if (active === undefined || active.owner !== owner) return undefined;
+    return this.liveProjection(active);
+  }
+
+  cancelTask(taskId: string, owner: string): TaskCancelReport | null {
+    let task = this.deps.ledger.getTask(taskId, owner);
+    if (task === null) return null;
+
+    if (task.status === "queued") {
+      try {
+        const cancelled = this.deps.ledger.completeTask(task.id, owner, "cancelled");
+        return this.cancelReport(cancelled, "cancelled", "queued");
+      } catch (error) {
+        if (!(error instanceof LedgerError) || error.code !== "INVALID_TRANSITION") {
+          throw error;
+        }
+        task = this.deps.ledger.getTask(taskId, owner);
+        if (task === null) return null;
+        if (task.status === "queued") throw error;
+      }
+    }
+
+    if (task.status === "running") {
+      const active = this.activeJobs.get(task.id);
+      if (
+        active === undefined ||
+        active.owner !== owner ||
+        active.fenceToken !== task.fence_token
+      ) {
+        return this.cancelReport(task, "not-cancellable", "running");
+      }
+      if (!active.cancelRequested) {
+        active.cancelRequested = true;
+        active.cancelFromStage = active.stage;
+        active.controller.abort(new JobCancelledError(active.taskId));
+      }
+      return this.cancelReport(
+        task,
+        "cancelling",
+        active.cancelFromStage ?? active.stage,
+        this.liveProjection(active),
+      );
+    }
+
+    if (task.status === "stuck") {
+      return this.cancelReport(task, "not-cancellable", "stuck");
+    }
+
+    return this.cancelReport(task, "already-terminal", "already-terminal");
+  }
+
   /** GC for expired credential pins. Call periodically or rely on `sweepIntervalMs`. */
   sweepPins(): number {
     return this.deps.pins.sweep();
@@ -698,27 +1088,19 @@ export class JobRunner {
   }
 
   private async runAdmittedJob(descriptor: JobDescriptor, pinError?: unknown): Promise<RunJobResult> {
-    const { owner, intentKey, spec, clientThreadId, toolPlugins, input } = descriptor;
+    let { owner, intentKey, spec, clientThreadId, toolPlugins, input } = descriptor;
     if (isDeleting(owner)) return accountDeletedResult(clientThreadId);
     // No checkpoint thread: the raw client thread id IS the public thread
     // handle surfaced in results (and the ledger `worker` label).
-    const threadId = clientThreadId;
+    let threadId = clientThreadId;
     // Snapshot payload (ledger v5): the JSON-encoded messages the job runs on.
     // This is the ONLY durable place the snapshot can live now that the
     // checkpointer is gone; `resumeStuckJobs` reads it after a crash. Messages
     // are serialized in LangChain's stored-message format (a plain
     // `JSON.stringify(BaseMessage[])` would emit the `lc:1` constructor shape,
     // which is not re-coercible).
-    const payload =
-      input == null
-        ? null
-        : JSON.stringify(
-            mapChatMessagesToStoredMessages(
-              redactMessages(
-                (input as { messages?: BaseMessage[] }).messages ?? [],
-              ),
-            ),
-          );
+    const payload = serializeJobPayload(input);
+    const jobSpec = serializeJobSpec(descriptor);
 
     // 1. Owner-scoped idempotent admission (persists the snapshot payload on
     //    first creation).
@@ -728,9 +1110,12 @@ export class JobRunner {
       task = await getOrCreateTask(this.deps.ledger, {
         owner,
         intentKey,
-        spec,
-        payload,
-      });
+         spec,
+         worker: clientThreadId,
+         payload,
+         jobSpec,
+       });
+
     } catch (error) {
       if (error instanceof AccountDeletedError || isDeleting(owner)) {
         return accountDeletedResult(threadId);
@@ -797,17 +1182,43 @@ export class JobRunner {
     }
     if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
     const fenceToken = claimed.fence_token;
-
-    // 3b. Backfill the snapshot payload on a task admitted by a caller that
-    //     stored none (e.g. the transport's pre-run admission, or a pre-v5
-    //     row): `resumeStuckJobs` re-runs from it, so it must be durable before
-    //     the job runs. Only touches a task we actually claimed (an
-    //    in_flight/already_terminal duplicate never mutates the stored row).
     if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
-    if (payload !== null && (claimed.payload == null || claimed.payload === "")) {
-      this.deps.ledger.updateTaskPayload(claimed.id, owner, payload);
+    const storedSpec = parsePersistedJobSpec(claimed.job_spec);
+    const storedMessages = snapshotMessagesFromPayload(claimed);
+    if (storedSpec === null || storedMessages === null) {
+      return this.failJob(
+        claimed,
+        owner,
+        fenceToken,
+        threadId,
+        "job_failed",
+        storedSpec === null
+          ? "stored background job configuration is missing or invalid; the job cannot be re-run"
+          : "no stored message snapshot to resume from; the job cannot be re-run",
+      );
     }
+    owner = claimed.owner;
+    intentKey = claimed.intent_key;
+    spec = claimed.spec;
+    clientThreadId = storedSpec.clientThreadId;
+    toolPlugins = storedSpec.toolPlugins;
+    input = { messages: storedMessages };
+    descriptor = {
+      ...descriptor,
+      owner,
+      intentKey,
+      spec,
+      clientThreadId,
+      toolPlugins,
+      modelPluginId: storedSpec.modelPluginId,
+      modelRequestConfig: storedSpec.modelRequestConfig,
+      systemPrompt: storedSpec.systemPrompt,
+      mcpServers: storedSpec.mcpServers,
+      input,
+    };
+    threadId = clientThreadId;
     if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
+
 
     // 4. Timer heartbeat covers the WHOLE job (pin fetch → graph invoke →
     //    tool execution); started INSIDE the try so a misconfigured interval
@@ -815,8 +1226,19 @@ export class JobRunner {
     //    of orphaning the task as `running` forever. Stopped in the finally.
     let heartbeat: { stop(): void } | undefined;
     const controller = new AbortController();
+    const activeJob: ActiveJob = {
+      taskId: claimed.id,
+      owner,
+      threadId,
+      fenceToken,
+      controller,
+      stage: "admitted",
+      activeToolCallIds: new Set(),
+      cancelRequested: false,
+    };
     this.controllers.add(controller);
     this.registerController(owner, controller);
+    this.activeJobs.set(claimed.id, activeJob);
     const signal = descriptor.signal
       ? AbortSignal.any([descriptor.signal, controller.signal])
       : controller.signal;
@@ -875,6 +1297,7 @@ export class JobRunner {
       const beforeModelCall = (messages: unknown) => {
         void messages;
         assertDispatch();
+        if (!activeJob.cancelRequested) activeJob.stage = "running";
         this.deps.budget?.beforeModelCall(owner, "async");
       };
       const model = await this.resolveModel(descriptor, {
@@ -899,7 +1322,15 @@ export class JobRunner {
         assertActive,
         signal,
         fingerprintsByPlugin,
+        onToolStart: (actionId) => {
+          if (!activeJob.cancelRequested) activeJob.stage = "running";
+          activeJob.activeToolCallIds.add(actionId);
+        },
+        onToolEnd: (actionId) => {
+          activeJob.activeToolCallIds.delete(actionId);
+        },
         toolCache: this.deps.toolCache,
+        budget: this.deps.budget,
         ledger: this.deps.ledger,
         taskId: claimed.id,
         owner,
@@ -907,12 +1338,25 @@ export class JobRunner {
         allowMutatingRetry: !replaying,
       });
       const mcpBinding = descriptor.mcpServers
-        ? await bindMcpServers(descriptor.mcpServers, {
-            signal,
-            trustedHosts: env.MCP_TRUSTED_HOSTS,
-          })
+         ? await bindMcpServers(descriptor.mcpServers, {
+             owner,
+             requestId: claimed.id,
+             signal,
+             trustedHosts: env.MCP_TRUSTED_HOSTS,
+           })
+
         : undefined;
-      const mcpTools = mcpBinding?.tools ?? [];
+      const mcpTools = trackMcpTools(
+        mcpBinding?.tools ?? [],
+        execution,
+        (actionId) => {
+          if (!activeJob.cancelRequested) activeJob.stage = "running";
+          activeJob.activeToolCallIds.add(actionId);
+        },
+        (actionId) => {
+          activeJob.activeToolCallIds.delete(actionId);
+        },
+      );
       const allTools = mergePluginAndMcpTools(tools, mcpTools, "[jobs]");
       const graph = createAgentGraph({
         model,
@@ -963,7 +1407,24 @@ export class JobRunner {
             );
           }
         }
-        this.safeComplete(claimed.id, owner, fenceToken, "succeeded");
+        const completion = this.deps.ledger.completeTaskWithFence(
+          claimed.id,
+          owner,
+          "succeeded",
+          fenceToken,
+        );
+        if (!completion.transitioned) {
+          const current = this.deps.ledger.getTask(claimed.id, owner);
+          if (current && current.status !== "running") {
+            return {
+              status: "already_terminal",
+              taskId: claimed.id,
+              threadId,
+              terminalStatus: current.status,
+            };
+          }
+          return { status: "in_flight", taskId: claimed.id, threadId };
+        }
         const summary = JSON.stringify({
           status: "succeeded",
           messages: Array.isArray(invokeResult?.messages) ? invokeResult.messages.length : 0,
@@ -983,6 +1444,9 @@ export class JobRunner {
       if (isDeleting(owner) || e instanceof AccountDeletedError) {
         return accountDeletedResult(threadId, claimed.id);
       }
+      if (activeJob.cancelRequested) {
+        return this.finishCancellation(activeJob);
+      }
       const code = jobErrorCodeOf(e);
       return this.failJob(claimed, owner, fenceToken, threadId, code, errorMessageOf(e));
     } finally {
@@ -990,6 +1454,9 @@ export class JobRunner {
       controller.abort();
       this.controllers.delete(controller);
       this.unregisterController(owner, controller);
+      if (this.activeJobs.get(activeJob.taskId) === activeJob) {
+        this.activeJobs.delete(activeJob.taskId);
+      }
     }
   }
 
@@ -1013,13 +1480,27 @@ export class JobRunner {
    * scheduler pass to defer to anymore).
    */
   async resumeStuckJobs(): Promise<ResumeStuckJobsResult> {
-    const stuck = this.deps.ledger
+    const recoverable = this.deps.ledger
       .listTasks()
-      .filter((task) => task.status === "stuck");
+      .filter((task) => task.status === "queued" || task.status === "stuck");
     const outcomes: StuckTaskOutcome[] = [];
-    for (const task of stuck) {
+    for (const task of recoverable) {
       if (isDeleting(task.owner)) {
         outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
+        continue;
+      }
+      const storedSpec = parsePersistedJobSpec(task.job_spec);
+      const messages = snapshotMessagesFromPayload(task);
+      if (storedSpec === null || messages === null) {
+        outcomes.push(
+          await this.failStuck(
+            task,
+            "job_failed",
+            storedSpec === null
+              ? "stored background job configuration is missing or invalid; the job cannot be re-run"
+              : "no stored message snapshot to resume from (ledger payload missing or invalid); the job cannot be re-run",
+          ),
+        );
         continue;
       }
       try {
@@ -1031,87 +1512,68 @@ export class JobRunner {
           outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
           continue;
         }
-        if (reestablished !== null && reestablished !== undefined) {
-          for (const [pluginId, credentials] of Object.entries(reestablished)) {
-            if (isDeleting(task.owner)) {
-              break;
-            }
-            this.deps.pins.pin(task.owner, pluginId, credentials);
-          }
-          if (isDeleting(task.owner)) {
-            this.deps.pins.releaseOwner(task.owner);
-            outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
-            continue;
-          }
-          if (this.deps.buildModel) {
-            // Pins restored AND a model seam is wired: identify the model
-            // plugin among the restored pins (the registry distinguishes model
-            // from tool plugins). A task whose restored pins carry NO model
-            // plugin cannot be resumed — the honest restart-loss story is to
-            // fail it `plugin_unavailable` (M2), NOT to replay it with an empty
-            // model-plugin id.
-            const modelPluginId = this.findModelPluginId(reestablished);
-            if (modelPluginId === null) {
-              outcomes.push(await this.failStuck(task, "plugin_unavailable"));
-              continue;
-            }
-            // Re-run the task from the STORED SNAPSHOT (H3). The task is still
-            // `stuck` here, so runJob's admission treats it as a replay — it
-            // resumes it under a fresh fence and binds tools with
-            // `allowMutatingRetry: false`, so a mutating tool with no stored
-            // result fails `tool_retry_forbidden` instead of re-executing a
-            // possibly-applied side effect. The snapshot is re-coerced from
-            // JSON back into LangChain messages — never `graph.getState`.
-            const messages = snapshotMessagesFromPayload(task);
-            if (messages === null) {
-              outcomes.push(
-                await this.failStuck(
-                  task,
-                  "job_failed",
-                  "no stored message snapshot to resume from (ledger payload missing or invalid); " +
-                    "the job cannot be re-run",
-                ),
-              );
-              continue;
-            }
-            const replay = await this.runJob({
-              owner: task.owner,
-              intentKey: task.intent_key,
-              spec: task.spec,
-              // M2: resume on the ORIGINAL worker label the transport stored at
-              // admission — never `intent_key`.
-              clientThreadId: task.worker ?? task.intent_key,
-              toolPlugins: Object.keys(reestablished).filter(
-                (pluginId) => pluginId !== modelPluginId,
-              ),
-              modelPluginId,
-              input: { messages },
-            });
-            outcomes.push({
-              taskId: task.id,
-              owner: task.owner,
-              outcome:
-                replay.status === "account_deleted"
-                  ? "account_deleted"
-                  : replay.status === "failed"
-                    ? replay.code
-                    : "repinned",
-            });
-          } else {
-            // No model seam: the job cannot be re-run, and there is no
-            // checkpoint scheduler pass to defer to anymore. Fail it honestly
-            // rather than leaving a phantom `running` task.
-            outcomes.push(
-              await this.failStuck(
-                task,
-                "plugin_unavailable",
-                "cannot resume a background job without a buildModel seam",
-              ),
-            );
-          }
-        } else {
+        if (reestablished === null || reestablished === undefined) {
           outcomes.push(await this.failStuck(task, "credentials_expired"));
+          continue;
         }
+        for (const [pluginId, credentials] of Object.entries(reestablished)) {
+          if (isDeleting(task.owner)) break;
+          this.deps.pins.pin(task.owner, pluginId, credentials);
+        }
+        if (isDeleting(task.owner)) {
+          this.deps.pins.releaseOwner(task.owner);
+          outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
+          continue;
+        }
+        if (!this.deps.buildModel) {
+          outcomes.push(
+            await this.failStuck(
+              task,
+              "plugin_unavailable",
+              "cannot resume a background job without a buildModel seam",
+            ),
+          );
+          continue;
+        }
+        const modelPlugin = (() => {
+          try {
+            return this.deps.registry.requirePlugin(storedSpec.modelPluginId);
+          } catch {
+            return null;
+          }
+        })();
+        if (
+          modelPlugin === null ||
+          modelPlugin.type !== "model" ||
+          reestablished[storedSpec.modelPluginId] === undefined
+        ) {
+          outcomes.push(await this.failStuck(task, "plugin_unavailable"));
+          continue;
+        }
+        const replay = await this.runJob({
+          owner: task.owner,
+          intentKey: task.intent_key,
+          spec: task.spec,
+          clientThreadId: task.worker ?? storedSpec.clientThreadId,
+          toolPlugins: storedSpec.toolPlugins,
+          modelPluginId: storedSpec.modelPluginId,
+          modelRequestConfig: storedSpec.modelRequestConfig,
+          systemPrompt: storedSpec.systemPrompt,
+          mcpServers: storedSpec.mcpServers,
+          input: { messages },
+        });
+        outcomes.push({
+          taskId: task.id,
+          owner: task.owner,
+          outcome:
+            replay.status === "account_deleted"
+              ? "account_deleted"
+              : replay.status === "failed"
+                ? replay.code
+                : replay.status === "cancelled"
+                  ? "cancelled"
+                  : "repinned",
+        });
       } catch (e) {
         if (isDeleting(task.owner) || e instanceof AccountDeletedError) {
           this.deps.pins.releaseOwner(task.owner);
@@ -1132,12 +1594,59 @@ export class JobRunner {
       controller.abort(new JobError("task_conflict", "job runner disposed"));
     }
     this.controllersByOwner.clear();
+    this.activeJobs.clear();
     if (this.sweepTimer) {
       const clearInterval =
         this.deps.clearInterval ?? globalThis.clearInterval.bind(globalThis);
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
+  }
+
+  private liveProjection(active: ActiveJob): TaskLiveProjection {
+    const stage: TaskLiveProjection["stage"] = active.cancelRequested
+      ? "cancelling"
+      : active.activeToolCallIds.size > 0
+        ? "running_tool"
+        : active.stage === "admitted"
+          ? "admitted"
+          : "running_model";
+    return {
+      stage,
+      activeToolCallIds: [...active.activeToolCallIds],
+    };
+  }
+
+  private cancelReport(
+    task: TaskRow,
+    stage: TaskCancelStage,
+    reachedStage: TaskCancelReachedStage,
+    live?: TaskLiveProjection,
+  ): TaskCancelReport {
+    const steps = this.deps.ledger.listSteps(task.id, task.owner);
+    const projection = projectTaskProgress(task, steps, live);
+    return {
+      schemaVersion: TASK_CANCEL_SCHEMA_VERSION,
+      taskId: task.id,
+      stage,
+      reachedStage,
+      taskStatus: task.status,
+      cancellable: projection.canCancel,
+      ...(projection.terminalStatus === undefined
+        ? {}
+        : { terminalStatus: projection.terminalStatus }),
+      effectState: projection.effectState,
+      completedActions: steps.slice(-TASK_CANCEL_COMPLETED_ACTIONS_LIMIT).map((step) => ({
+        id: step.id,
+        stage: step.stage,
+        action: step.action,
+        ...(step.tool_call_id === null
+          ? {}
+          : { toolCallId: step.tool_call_id }),
+        completed: true as const,
+      })),
+      projection,
+    };
   }
 
   /**
@@ -1151,28 +1660,6 @@ export class JobRunner {
       getPinnedIps: this.deps.getPinnedIps ?? (() => undefined),
       trustedHosts: this.deps.trustedHosts,
     });
-  }
-
-  /**
-   * The model plugin id among a restored pin set, or null when the set carries
-   * no installed model plugin. `resumeStuckJobs` uses this to re-run a stuck
-   * task through `runJob` — an empty/missing model plugin id must fail
-   * `plugin_unavailable`, never replay onto a mis-identified model (M2).
-   */
-  private findModelPluginId(
-    restored: Record<string, Record<string, string>>,
-  ): string | null {
-    for (const pluginId of Object.keys(restored)) {
-      let plugin;
-      try {
-        plugin = this.deps.registry.requirePlugin(pluginId);
-      } catch {
-        continue; // not installed anymore — cannot be the model plugin
-      }
-      if (isToolPlugin(plugin)) continue;
-      if (plugin.type === "model") return pluginId;
-    }
-    return null;
   }
 
   private async resolveModel(
@@ -1205,18 +1692,38 @@ export class JobRunner {
     );
   }
 
-  /** Completes a task only if we still hold its fence (never clobber a successor). */
-  private safeComplete(
-    taskId: string,
-    owner: string,
-    fenceToken: string,
-    to: "succeeded" | "failed" | "cancelled" | "awaiting_review",
-  ): void {
-    const current = this.deps.ledger.getTask(taskId, owner);
-    if (!current || current.status !== "running" || current.fence_token !== fenceToken) {
-      throw new JobError("task_conflict", "background job cannot complete without its running task fence");
+  private async finishCancellation(active: ActiveJob): Promise<RunJobResult> {
+    let transitioned = false;
+    try {
+      transitioned = this.deps.ledger.completeTaskWithFence(
+        active.taskId,
+        active.owner,
+        "cancelled",
+        active.fenceToken,
+      ).transitioned;
+    } catch (error) {
+      if (!(error instanceof LedgerError) || error.code !== "FENCE_CONFLICT") {
+        throw error;
+      }
     }
-    this.deps.ledger.completeTask(taskId, owner, to);
+    if (!transitioned) {
+      const current = this.deps.ledger.getTask(active.taskId, active.owner);
+      if (current?.status === "succeeded" || current?.status === "failed" || current?.status === "cancelled" || current?.status === "awaiting_review") {
+        return {
+          status: "already_terminal",
+          taskId: active.taskId,
+          threadId: active.threadId,
+          terminalStatus: current.status,
+        };
+      }
+      return { status: "in_flight", taskId: active.taskId, threadId: active.threadId };
+    }
+    await this.notify(active.owner, active.taskId, "cancelled");
+    return {
+      status: "cancelled",
+      taskId: active.taskId,
+      threadId: active.threadId,
+    };
   }
 
   /** Appends a redacted error step + fails the task; superseded workers no-op. */
@@ -1229,6 +1736,7 @@ export class JobRunner {
     message: string,
   ): RunJobResult & { status: "failed" } {
     const redacted = redactForOutbound(message);
+    let transitioned = false;
     try {
       const current = this.deps.ledger.getTask(claimed.id, owner);
       if (current?.status === "running" && current.fence_token === fenceToken) {
@@ -1238,13 +1746,18 @@ export class JobRunner {
           { stage: "error", action: `error:${code}`, result: redacted },
           fenceToken,
         );
-        this.deps.ledger.completeTask(claimed.id, owner, "failed");
+        transitioned = this.deps.ledger.completeTaskWithFence(
+          claimed.id,
+          owner,
+          "failed",
+          fenceToken,
+        ).transitioned;
       }
     } catch (err) {
       // Best-effort: another pass already moved the task; never throw out.
       console.warn(`[jobs] failed to record failure for task ${claimed.id}:`, err);
     }
-    void this.notify(owner, claimed.id, `failed: ${code}`);
+    if (transitioned) void this.notify(owner, claimed.id, `failed: ${code}`);
     return { status: "failed", taskId: claimed.id, threadId, code, error: redacted };
   }
 
@@ -1257,8 +1770,11 @@ export class JobRunner {
     if (isDeleting(task.owner)) {
       return { taskId: task.id, owner: task.owner, outcome: "account_deleted" };
     }
+    let transitioned = false;
     try {
-      const resumed = this.deps.ledger.resumeTask(task.id, task.owner);
+      const claimed = task.status === "queued"
+        ? this.deps.ledger.claimTask(task.id, task.owner)
+        : this.deps.ledger.resumeTask(task.id, task.owner);
       if (isDeleting(task.owner)) {
         return { taskId: task.id, owner: task.owner, outcome: "account_deleted" };
       }
@@ -1272,17 +1788,24 @@ export class JobRunner {
             reason ?? `orphaned background job cannot resume after restart: ${code}`,
           ),
         },
-        resumed.fence_token,
+        claimed.fence_token,
       );
       if (isDeleting(task.owner)) {
         return { taskId: task.id, owner: task.owner, outcome: "account_deleted" };
       }
-      this.deps.ledger.completeTask(task.id, task.owner, "failed");
+      transitioned = this.deps.ledger.completeTaskWithFence(
+        task.id,
+        task.owner,
+        "failed",
+        claimed.fence_token,
+      ).transitioned;
     } catch (err) {
       // Best-effort: another pass already handled this task.
       console.warn(`[jobs] failed to fail stuck task ${task.id}:`, err);
     }
-    await this.notify(task.owner, task.id, `failed: ${code} (restart loss)`);
+    if (transitioned) {
+      await this.notify(task.owner, task.id, `failed: ${code} (restart loss)`);
+    }
     return { taskId: task.id, owner: task.owner, outcome: code };
   }
 

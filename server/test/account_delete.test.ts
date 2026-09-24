@@ -80,12 +80,12 @@ function seedOwnerTasks(
   const queued = create("q");
 
   const running = create("r");
-  ledger.claimTask(running.id, owner);
+  const runningClaim = ledger.claimTask(running.id, owner);
   ledger.appendStep(running.id, owner, {
     stage: "s",
     action: "A",
     result: "r",
-  });
+  }, runningClaim.fence_token);
 
   const stuck = create("st");
   ledger.claimTask(stuck.id, owner);
@@ -93,12 +93,12 @@ function seedOwnerTasks(
   assert.equal(ledger.markStuckIfHeartbeatStale(stuck.id)?.status, "stuck");
 
   const awaitingReview = create("ar");
-  ledger.claimTask(awaitingReview.id, owner);
-  ledger.completeTask(awaitingReview.id, owner, "awaiting_review");
+  const reviewClaim = ledger.claimTask(awaitingReview.id, owner);
+  ledger.completeTask(awaitingReview.id, owner, "awaiting_review", reviewClaim.fence_token);
 
   const succeeded = create("ok");
-  ledger.claimTask(succeeded.id, owner);
-  ledger.completeTask(succeeded.id, owner, "succeeded");
+  const succeededClaim = ledger.claimTask(succeeded.id, owner);
+  ledger.completeTask(succeeded.id, owner, "succeeded", succeededClaim.fence_token);
 
   return {
     queued: queued.id,

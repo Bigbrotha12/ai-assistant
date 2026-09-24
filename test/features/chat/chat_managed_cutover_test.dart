@@ -726,6 +726,71 @@ void main() {
       expect(state.messages, hasLength(2));
     });
 
+    test(
+      'a detached job survives notifier disposal and reconciles on return',
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient();
+        final clock = FakeScheduler();
+        final ledgerAdapter = FakeAdapter((request) {
+          if (request.uri.path.startsWith('/ledger/tasks/by-key/')) {
+            final byKey = Uri.decodeComponent(request.uri.pathSegments.last);
+            return jsonResponse({
+              ...backgroundTaskJson(
+                status: 'succeeded',
+                messageId: byKey,
+                taskId: 'task-1',
+              ),
+              'steps': [
+                {
+                  'stage': 'reply',
+                  'action': 'assistant_message',
+                  'result': 'detached reply',
+                },
+              ],
+            });
+          }
+          throw StateError('unexpected ledger path ${request.uri.path}');
+        });
+        final poller = testPoller(scope, ledgerAdapter, clock);
+        addTearDown(poller.dispose);
+        final fake = FakeManagedChatAdapter(
+          store: store,
+          script: client,
+          poller: poller,
+        );
+        final wired = _container(store: store, client: client, adapter: fake);
+        final container = wired.container;
+        final subscription = container.listen<AsyncValue<ConversationState>>(
+          conversationProvider('c1'),
+          (_, _) {},
+        );
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
+        await notifier.submitBackgroundJob('Hi');
+        expect(
+          container.read(conversationProvider('c1')).value!.hasPendingJob,
+          isTrue,
+        );
+
+        subscription.close();
+        await Future<void>.delayed(Duration.zero);
+        poller.setForeground(true);
+        await clock.advance(Duration.zero);
+        await waitFor(() async {
+          final stored = await store.loadConversation('c1');
+          return stored?.messages.last.content == 'detached reply';
+        });
+
+        final returned = await container.read(
+          conversationProvider('c1').future,
+        );
+        expect(returned.messages.last.content, 'detached reply');
+        expect(returned.hasPendingJob, isFalse);
+        expect(fake.backgroundSubmits, hasLength(1));
+      },
+    );
+
     test('a terminal account_deleted poll error clears the chip and triggers '
         'the terminal handler', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
@@ -777,7 +842,7 @@ void main() {
     });
 
     test('retryBackgroundJob replays the pending job; cancelBackgroundJob '
-        'clears the chip and the pending row', () async {
+        'uses the ledger controller before clearing the chip', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient();
       final clock = FakeScheduler();
@@ -826,7 +891,8 @@ void main() {
 
       // Cancel clears the pending row and drops the chip.
       await notifier.cancelBackgroundJob();
-      expect(fake.abandons, hasLength(1));
+      expect(fake.abandons, isEmpty);
+      expect(fake.backgroundCancels, ['c1']);
       final state = container.read(conversationProvider('c1')).value!;
       expect(state.hasPendingJob, isFalse);
       expect(state.jobError, isNull);
@@ -891,7 +957,7 @@ void main() {
       expect(state.hasPendingJob, isTrue);
       expect(
         state.error,
-        'A background job is still running — wait for it to finish.',
+        'A background job is still pending — wait for it to finish.',
       );
       expect(
         state.messages.where((m) => m.content == 'interrupt text'),

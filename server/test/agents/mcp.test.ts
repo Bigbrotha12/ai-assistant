@@ -4,15 +4,22 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import {
   bindMcpServers,
   defaultSseClientFactory,
+  getMcpCircuitState,
   getMcpToolListCache,
+  McpResourceError,
+  DEFAULT_MCP_BOUNDARY_LIMITS,
   jsonSchemaToZod,
   mcpToolListCacheKey,
   McpError,
+  resetMcpRuntimeState,
   resetMcpToolListCache,
   setMcpToolListCache,
   type McpServerConfig,
   type McpClientFactory,
+  type McpClientLike,
+  type McpCallResult,
   type McpTool,
+  type McpBoundaryLimits,
 } from "../../src/agents/mcp.ts";
 import {
   createMcpToolListCache,
@@ -83,8 +90,14 @@ describe("mcp", () => {
   // The tool-list cache is a module-level singleton: several tests below
   // reuse `https://mcp.example.com` with different tool lists, so each test
   // must start from a cold cache (and leave no sweep timer behind).
-  beforeEach(() => resetMcpToolListCache());
-  afterEach(() => resetMcpToolListCache());
+  beforeEach(() => {
+    resetMcpRuntimeState();
+    resetMcpToolListCache();
+  });
+  afterEach(() => {
+    resetMcpRuntimeState();
+    resetMcpToolListCache();
+  });
 
   test("McpError sets name and code", () => {
     const err = new McpError("test message", "MY_CODE");
@@ -231,6 +244,93 @@ describe("mcp", () => {
     await binding.dispose();
   });
 
+  test("tools/list rejects item, byte, string, and schema-depth limits with typed errors", async () => {
+    const baseFactory = (tools: McpTool[]): McpClientFactory => async () => ({
+      listTools: async () => ({ tools }),
+      callTool: async () => ({ content: [] }),
+      close: async () => {},
+    });
+    const cases: Array<{
+      name: string;
+      tools: McpTool[];
+      bounds: Partial<McpBoundaryLimits>;
+      code: string;
+      unit: string;
+    }> = [
+      {
+        name: "items",
+        tools: [{ name: "one" }, { name: "two" }],
+        bounds: { maxToolCount: 1 },
+        code: "mcp_tool_list_item_limit",
+        unit: "items",
+      },
+      {
+        name: "bytes",
+        tools: [{ name: "one", description: "a".repeat(100) }],
+        bounds: { maxToolListBytes: 32 },
+        code: "mcp_tool_list_byte_limit",
+        unit: "bytes",
+      },
+      {
+        name: "strings",
+        tools: [{ name: "one", description: "too-long" }],
+        bounds: { maxToolStringChars: 3 },
+        code: "mcp_tool_string_limit",
+        unit: "characters",
+      },
+      {
+        name: "schema depth",
+        tools: [{
+          name: "deep",
+          inputSchema: {
+            type: "object",
+            properties: {
+              outer: {
+                type: "object",
+                properties: { inner: { type: "string" } },
+              },
+            },
+          },
+        }],
+        bounds: { maxSchemaDepth: 2 },
+        code: "mcp_tool_schema_depth_limit",
+        unit: "depth",
+      },
+    ];
+    for (const testCase of cases) {
+      await assert.rejects(
+        bindMcpServers(
+          [{ name: `limits-${testCase.name}`, url: `https://${testCase.name}.example.com` }],
+          { clientFactory: baseFactory(testCase.tools), bounds: testCase.bounds },
+        ),
+        (error: unknown) =>
+          error instanceof McpResourceError &&
+          error.code === testCase.code &&
+          error.unit === testCase.unit,
+      );
+    }
+  });
+
+  test("tools/call content is bounded before graph return and telemetry", async () => {
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "large", description: "large" }] }),
+      callTool: async () => ({ content: [{ type: "text", text: "x".repeat(10_000) }] }),
+      close: async () => {},
+    });
+    const binding = await bindMcpServers(
+      [{ name: "large-call", url: "https://large-call.example.com" }],
+      {
+        clientFactory: factory,
+        bounds: { ...DEFAULT_MCP_BOUNDARY_LIMITS, maxCallResultChars: 64 },
+      },
+    );
+    const result = await binding.tools[0]!.func({});
+    assert.equal(typeof result, "string");
+    assert.ok((result as string).length <= 64);
+    assert.match(result as string, /\[tool result truncated\]$/);
+    await binding.dispose();
+  });
+
   test("mcp tool func calls tools/call and returns text content", async () => {
     const callLog: CallRecord[] = [];
     const factory = makeFactory(
@@ -335,6 +435,28 @@ describe("mcp", () => {
     assert.deepEqual(closed.sort(), ["a", "b"]);
   });
 
+  test("dispose bounds a client close that never resolves and invokes force-close once", async () => {
+    let forceCloseCalls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "tool", description: "tool" }] }),
+      callTool: async () => ({ content: [] }),
+      close: () => new Promise<void>(() => undefined),
+      forceClose: () => {
+        forceCloseCalls += 1;
+      },
+    });
+    const binding = await bindMcpServers(
+      [{ name: "stuck-close", url: "https://stuck-close.example.com" }],
+      { clientFactory: factory, closeTimeoutMs: 5 },
+    );
+    const first = binding.dispose();
+    const second = binding.dispose();
+    assert.equal(first, second);
+    await first;
+    assert.equal(forceCloseCalls, 1);
+    await binding.dispose();
+    assert.equal(forceCloseCalls, 1);
+  });
   test("jsonSchemaToZod infers object when type is omitted but properties present", () => {
     const schema = jsonSchemaToZod({
       properties: { a: { type: "string" }, b: { type: "number" } },
@@ -760,5 +882,225 @@ describe("mcp", () => {
     await b2.dispose();
     assert.equal(factoryCalls, 1, "dispose without invocation opens nothing");
     assert.equal(closes, 1, "nothing to close → close not called");
+  });
+
+  test("MCP connection cap rejects excess per-owner connections without opening another client", async () => {
+    let connects = 0;
+    let closes = 0;
+    const factory: McpClientFactory = async () => {
+      connects++;
+      return {
+        listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {
+          closes++;
+        },
+      };
+    };
+    const cfg: McpServerConfig = { name: "capped", url: "https://capped.example.com" };
+    const limits = {
+      maxConnectionsPerServer: 4,
+      maxConnectionsPerOwner: 1,
+      maxInFlightCallsPerServer: 4,
+      maxInFlightCallsPerOwner: 4,
+    };
+    const first = await bindMcpServers([cfg], {
+      clientFactory: factory,
+      owner: "owner-a",
+      limits,
+    });
+    const second = await bindMcpServers([cfg], {
+      clientFactory: factory,
+      owner: "owner-a",
+      limits,
+    });
+    await assert.rejects(
+      Promise.resolve(second.tools[0]!.func({})),
+      (err: unknown) => err instanceof McpError && err.code === "MCP_CONCURRENCY_LIMIT",
+    );
+    assert.equal(connects, 1, "the owner cap rejects before factory/connect");
+    await first.dispose();
+    await second.dispose();
+    assert.equal(closes, 1, "the one admitted client closes exactly once");
+  });
+
+  test("MCP server-wide connection cap rejects excess sessions across owners", async () => {
+    let connects = 0;
+    const factory: McpClientFactory = async () => {
+      connects++;
+      return {
+        listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {},
+      };
+    };
+    const cfg: McpServerConfig = { name: "server-cap", url: "https://server-cap.example.com" };
+    const limits = {
+      maxConnectionsPerServer: 2,
+      maxConnectionsPerOwner: 2,
+      maxInFlightCallsPerServer: 4,
+      maxInFlightCallsPerOwner: 4,
+    };
+    const first = await bindMcpServers([cfg], { clientFactory: factory, owner: "a", limits });
+    const second = await bindMcpServers([cfg], { clientFactory: factory, owner: "b", limits });
+    const third = await bindMcpServers([cfg], { clientFactory: factory, owner: "c", limits });
+    assert.equal(await second.tools[0]!.func({}), "");
+    await assert.rejects(
+      Promise.resolve(third.tools[0]!.func({})),
+      (err: unknown) => err instanceof McpError && err.code === "MCP_CONCURRENCY_LIMIT",
+    );
+    assert.equal(connects, 2, "the third server session is rejected before connect");
+    await first.dispose();
+    await second.dispose();
+    await third.dispose();
+  });
+
+  test("MCP in-flight cap rejects a concurrent call and releases the slot after completion", async () => {
+    const pending = deferred<McpCallResult>();
+    let calls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+      callTool: async () => {
+        calls++;
+        return pending.promise;
+      },
+      close: async () => {},
+    });
+    const cfg: McpServerConfig = { name: "inflight", url: "https://inflight.example.com" };
+    const limits = {
+      maxConnectionsPerServer: 2,
+      maxConnectionsPerOwner: 2,
+      maxInFlightCallsPerServer: 1,
+      maxInFlightCallsPerOwner: 1,
+    };
+    const first = await bindMcpServers([cfg], { clientFactory: factory, limits });
+    const second = await bindMcpServers([cfg], { clientFactory: factory, limits });
+    const firstCall = first.tools[0]!.func({});
+    await nextTurn();
+    await assert.rejects(
+      Promise.resolve(second.tools[0]!.func({})),
+      (err: unknown) => err instanceof McpError && err.code === "MCP_CONCURRENCY_LIMIT",
+    );
+    assert.equal(calls, 1);
+    pending.resolve({ content: [{ type: "text", text: "done" }] });
+    assert.equal(await firstCall, "done");
+    await first.dispose();
+    await second.dispose();
+  });
+
+  test("MCP circuit opens after consecutive failures, short-circuits, half-opens, and closes on probe success", async () => {
+    let now = 1_000;
+    let connects = 0;
+    let calls = 0;
+    let closes = 0;
+    let fail = true;
+    const factory: McpClientFactory = async () => {
+      connects++;
+      return {
+        listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+        callTool: async () => {
+          calls++;
+          if (fail) throw new Error("server unavailable");
+          return { content: [{ type: "text", text: "recovered" }] };
+        },
+        close: async () => {
+          closes++;
+        },
+      };
+    };
+    const cfg: McpServerConfig = { name: "circuit", url: "https://circuit.example.com" };
+    const limits = {
+      circuitFailureThreshold: 2,
+      circuitFailureWindowMs: 100,
+      circuitCooldownMs: 10,
+      now: () => now,
+    };
+    const binding = await bindMcpServers([cfg], { clientFactory: factory, limits });
+    await assert.rejects(Promise.resolve(binding.tools[0]!.func({})), /server unavailable/);
+    await assert.rejects(Promise.resolve(binding.tools[0]!.func({})), /server unavailable/);
+    assert.equal(getMcpCircuitState(cfg).state, "open");
+    const callsBeforeShortCircuit = calls;
+    await assert.rejects(
+      Promise.resolve(binding.tools[0]!.func({})),
+      (err: unknown) => err instanceof McpError && err.code === "MCP_CIRCUIT_OPEN",
+    );
+    assert.equal(calls, callsBeforeShortCircuit, "open circuit does not invoke the server");
+
+    now += limits.circuitCooldownMs;
+    fail = false;
+    assert.equal(await binding.tools[0]!.func({}), "recovered");
+    assert.equal(getMcpCircuitState(cfg).state, "closed");
+    assert.equal(connects, 3, "half-open probe creates one fresh connection");
+    await binding.dispose();
+    await binding.dispose();
+    assert.equal(closes, 3, "circuit-open and binding disposal close each client once");
+  });
+
+  test("MCP failure window resets consecutive failures before the threshold", async () => {
+    let now = 0;
+    let fail = true;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+      callTool: async () => {
+        if (fail) throw new Error("temporary");
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+      close: async () => {},
+    });
+    const cfg: McpServerConfig = { name: "window", url: "https://window.example.com" };
+    const limits = {
+      circuitFailureThreshold: 2,
+      circuitFailureWindowMs: 10,
+      circuitCooldownMs: 10,
+      now: () => now,
+    };
+    const binding = await bindMcpServers([cfg], { clientFactory: factory, limits });
+    await assert.rejects(Promise.resolve(binding.tools[0]!.func({})), /temporary/);
+    now = 11;
+    await assert.rejects(Promise.resolve(binding.tools[0]!.func({})), /temporary/);
+    assert.equal(getMcpCircuitState(cfg).state, "closed");
+    fail = false;
+    assert.equal(await binding.tools[0]!.func({}), "ok");
+    await binding.dispose();
+  });
+
+  test("MCP connect, list, and invoke operations all enforce the configured timeout", async () => {
+    const connectPending = deferred<McpClientLike>();
+    const listPending = deferred<{ tools: McpTool[] }>();
+    const invokePending = deferred<McpCallResult>();
+    let phase = "connect";
+    const factory: McpClientFactory = async () => {
+      if (phase === "connect") return connectPending.promise;
+      return {
+        listTools: async () => {
+          if (phase === "list") return listPending.promise;
+          return { tools: [{ name: "tool", description: "t" }] };
+        },
+        callTool: async () => invokePending.promise,
+        close: async () => {},
+      };
+    };
+    const connectCfg: McpServerConfig = { name: "connect-timeout", url: "https://connect-timeout.example.com" };
+    const connectBinding = await bindMcpServers([connectCfg], { clientFactory: factory, timeoutMs: 5 });
+    assert.equal(connectBinding.tools.length, 0, "connect timeout fails the bind safely");
+    await connectBinding.dispose();
+    connectPending.reject(new Error("late connect"));
+
+    phase = "list";
+    const listCfg: McpServerConfig = { name: "list-timeout", url: "https://list-timeout.example.com" };
+    const listBinding = await bindMcpServers([listCfg], { clientFactory: factory, timeoutMs: 5 });
+    assert.equal(listBinding.tools.length, 0);
+    await listBinding.dispose();
+    listPending.reject(new Error("late list"));
+
+    phase = "invoke";
+    const invokeCfg: McpServerConfig = { name: "invoke-timeout", url: "https://invoke-timeout.example.com" };
+    const invokeBinding = await bindMcpServers([invokeCfg], { clientFactory: factory, timeoutMs: 5 });
+    await assert.rejects(
+      Promise.resolve(invokeBinding.tools[0]!.func({})),
+      (err: unknown) => err instanceof McpError && err.code === "MCP_TIMEOUT",
+    );
+    await invokeBinding.dispose();
+    invokePending.reject(new Error("late invoke"));
   });
 });

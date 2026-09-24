@@ -7,9 +7,10 @@ import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
 import { createHealthRoutes } from "./health.ts";
 import { inferenceRoutes, requireApiKey } from "./api_key.ts";
+import { createSentinelRoutes } from "./sentinel/routes.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
-import { ledgerRoutes, ledger } from "./ledger.routes.ts";
+import { createLedgerRoutes, ledger } from "./ledger.routes.ts";
 import { createNtfyNotificationHook } from "./notify/hook.ts";
 import { createNotifyRoutes } from "./notify/routes.ts";
 import { NotifyStore } from "./notify/store.ts";
@@ -86,7 +87,19 @@ app.use("/api/auth/delete-user", (c, next) => {
 });
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 app.route("/v1", inferenceRoutes);
-app.route("/ledger", ledgerRoutes);
+app.route(
+  "/v1",
+  createSentinelRoutes({
+    ledger,
+    verifyKey: requireApiKey,
+    policyMode: env.SENTINEL_POLICY_MODE,
+    maxBodyBytes: env.SENTINEL_MAX_BODY_BYTES,
+    rateLimiter: createPerOwnerRateLimiter({
+      ratePerMinute: env.SENTINEL_RATE_LIMIT,
+      burst: env.SENTINEL_RATE_BURST,
+    }),
+  }),
+);
 
 // Password-reset completion page — the emailed link targets `GET
 // /reset-password?token=…`, not better-auth's /api/auth callback redirect
@@ -245,6 +258,8 @@ try {
   jobPins = undefined;
   console.warn("jobs: JobRunner unavailable; background jobs disabled:", err);
 }
+
+app.route("/ledger", createLedgerRoutes(ledger, { jobRunner }));
 
 // Phase 3, Wave C1/C2: `POST /v1/chat/completions` is the LangChain transport
 // (`src/transport/chat.ts`) — model built from the MODEL plugin + per-request

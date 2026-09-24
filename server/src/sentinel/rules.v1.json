@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "version": "sentinel-rules.v1.0.0",
+  "rules": [
+    {
+      "id": "self_harm.crisis_language",
+      "category": "self_harm",
+      "severity": "high",
+      "match": "phrase",
+      "patterns": ["kill myself", "commit suicide", "end my life", "self harm"],
+      "context": {
+        "excludes": ["do not kill myself", "do not want to kill myself", "help a suicidal friend", "suicide prevention"]
+      }
+    },
+    {
+      "id": "violence.threat_language",
+      "category": "violence",
+      "severity": "high",
+      "match": "phrase",
+      "patterns": ["kill you", "kill someone", "shoot up", "hurt someone"],
+      "context": {
+        "excludes": ["do not kill someone", "dont kill someone"]
+      }
+    },
+    {
+      "id": "illegal.weapon_or_fraud",
+      "category": "illegal",
+      "severity": "high",
+      "match": "phrase",
+      "patterns": ["make a bomb", "build a bomb", "credit card fraud", "launder money", "buy illegal drugs"]
+    },
+    {
+      "id": "pii.exfiltration",
+      "category": "pii",
+      "severity": "high",
+      "match": "phrase",
+      "patterns": ["steal social security number", "steal a social security number", "find someone's home address", "exfiltrate personal data"]
+    },
+    {
+      "id": "child_safety.sexual_content",
+      "category": "child_safety",
+      "severity": "high",
+      "match": "phrase",
+      "patterns": ["child sexual abuse", "sexual content involving a child", "csam"]
+    },
+    {
+      "id": "sexual_content.explicit",
+      "category": "sexual_content",
+      "severity": "medium",
+      "match": "phrase",
+      "patterns": ["explicit sexual content", "send nude photos"]
+    },
+    {
+      "id": "medical_guardrail.unsafe_advice",
+      "category": "medical_guardrail",
+      "severity": "medium",
+      "match": "phrase",
+      "patterns": ["diagnose my illness", "prescribe me medication"],
+      "context": {
+        "excludes": ["safe medical advice"]
+      }
+    },
+    {
+      "id": "jailbreak_attempt.instruction_override",
+      "category": "jailbreak_attempt",
+      "severity": "high",
+      "match": "phrase",
+      "patterns": [
+        "ignore all previous instructions",
+        "ignore prior instructions",
+        "reveal your system prompt",
+        "disable your safety rules",
+        "developer mode"
+      ],
+      "context": {
+        "excludes": ["do not ignore all previous instructions", "never ignore all previous instructions"]
+      }
+    }
+  ]
+}

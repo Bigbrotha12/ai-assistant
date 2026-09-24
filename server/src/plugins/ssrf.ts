@@ -56,7 +56,8 @@ export type SsrfValidationErrorCode =
   | "DISALLOWED_HOST"
   | "DNS_RESOLUTION_FAILED"
   | "DNS_REBINDING"
-  | "REDIRECT_REFUSED";
+  | "REDIRECT_REFUSED"
+  | "EGRESS_DENIED";
 
 export class SsrfValidationError extends Error {
   readonly code: SsrfValidationErrorCode;
@@ -358,6 +359,205 @@ export function validateStaticUrl(url: string, opts: UrlValidateOptions = {}): U
   return parsed;
 }
 
+export type EgressPathRule = {
+  readonly kind: "exact" | "prefix";
+  readonly path: string;
+};
+
+export type EgressDestinationPolicy = {
+  readonly scheme: "http:" | "https:";
+  readonly hostname: string;
+  readonly port: number;
+  readonly methods: readonly string[];
+  readonly paths: readonly EgressPathRule[];
+  readonly pinnedIps: readonly string[];
+  readonly resolvePins?: (hostname: string) => Promise<readonly string[]>;
+};
+
+export type EgressPolicy = {
+  readonly subject: string;
+  readonly mode: Mode;
+  readonly trustedHosts: readonly string[];
+  readonly redirect: "manual";
+  readonly destinations: readonly EgressDestinationPolicy[];
+};
+
+export type EgressPolicyDestinationInput = {
+  baseUrl: string;
+  pinnedIps: readonly string[];
+  resolvePins?: (hostname: string) => Promise<readonly string[]>;
+  methods: readonly string[];
+  exactPaths?: readonly string[];
+  pathPrefixes?: readonly string[];
+};
+
+export type CreateEgressPolicyInput = {
+  subject: string;
+  destinations: readonly EgressPolicyDestinationInput[];
+  mode?: Mode;
+  trustedHosts?: readonly string[];
+};
+
+function normalizedPolicyPath(path: string): string {
+  if (!path.startsWith("/")) {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `egress path '${path}' must start with '/'`,
+    );
+  }
+  if (path === "/") return path;
+  return path.replace(/\/+$/, "") || "/";
+}
+
+function effectivePort(parsed: URL): number {
+  return Number(
+    parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+  );
+}
+
+function sameOrigin(left: URL, right: EgressDestinationPolicy): boolean {
+  return (
+    left.protocol === right.scheme &&
+    normalizeHostname(left.hostname) === right.hostname &&
+    effectivePort(left) === right.port
+  );
+}
+
+function pathAllowed(path: string, rules: readonly EgressPathRule[]): boolean {
+  return rules.some((rule) => {
+    if (rule.kind === "exact") return path === rule.path;
+    return rule.path === "/" || path === rule.path || path.startsWith(`${rule.path}/`);
+  });
+}
+
+export function createEgressPolicy(input: CreateEgressPolicyInput): EgressPolicy {
+  const subject = input.subject.trim();
+  if (subject === "" || input.destinations.length === 0) {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      "egress policy requires a subject and at least one destination",
+    );
+  }
+  const mode = input.mode ?? NODE_ENV;
+  const trustedHosts = [...(input.trustedHosts ?? [])];
+  const destinations = input.destinations.map((destination) => {
+    const parsed = validateStaticUrl(destination.baseUrl, { mode, trustedHosts });
+    if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
+      throw new SsrfValidationError(
+        "EGRESS_DENIED",
+        `egress destination for '${subject}' may not contain credentials, query parameters, or fragments`,
+      );
+    }
+    const methods = [...new Set(destination.methods.map((method) => method.toUpperCase()))];
+    if (
+      methods.length === 0 ||
+      methods.some((method) => !/^[A-Z]+$/.test(method))
+    ) {
+      throw new SsrfValidationError(
+        "EGRESS_DENIED",
+        `egress destination for '${subject}' has no valid HTTP method policy`,
+      );
+    }
+    const paths = [
+      ...(destination.exactPaths ?? []).map((path) => ({
+        kind: "exact" as const,
+        path: normalizedPolicyPath(path),
+      })),
+      ...(destination.pathPrefixes ?? []).map((path) => ({
+        kind: "prefix" as const,
+        path: normalizedPolicyPath(path),
+      })),
+    ];
+    if (paths.length === 0) {
+      throw new SsrfValidationError(
+        "EGRESS_DENIED",
+        `egress destination for '${subject}' has no path policy`,
+      );
+    }
+    const hostname = normalizeHostname(parsed.hostname);
+    const hostTrusted = isTrustedHost(hostname, trustedHosts);
+    const pinnedIps = [...new Set(destination.pinnedIps.map((ip) => normalizeHostname(ip)))];
+    if (
+      pinnedIps.some(
+        (ip) => isIP(ip) === 0 || (!hostTrusted && !isIpAllowed(ip)),
+      ) ||
+      (pinnedIps.length === 0 && !destination.resolvePins)
+    ) {
+      throw new SsrfValidationError(
+        "EGRESS_DENIED",
+        `egress destination for '${subject}' has no valid retained address pins`,
+      );
+    }
+    return {
+      scheme: parsed.protocol === "https:" ? "https:" : "http:",
+      hostname,
+      port: effectivePort(parsed),
+      methods,
+      paths,
+      pinnedIps,
+      resolvePins: destination.resolvePins,
+    } satisfies EgressDestinationPolicy;
+  });
+  return Object.freeze({
+    subject,
+    mode,
+    trustedHosts: Object.freeze(trustedHosts),
+    redirect: "manual",
+    destinations: Object.freeze(destinations.map((destination) => Object.freeze({
+      ...destination,
+      methods: Object.freeze([...destination.methods]),
+      paths: Object.freeze(destination.paths.map((path) => Object.freeze({ ...path }))),
+      pinnedIps: Object.freeze([...destination.pinnedIps]),
+    }))),
+  });
+}
+
+export async function authorizeEgressRequest(
+  policy: EgressPolicy,
+  urlValue: string,
+  methodValue = "GET",
+): Promise<{ parsed: URL; pinnedIps: readonly string[] }> {
+  const parsed = validateStaticUrl(urlValue, {
+    mode: policy.mode,
+    trustedHosts: policy.trustedHosts,
+  });
+  const method = methodValue.toUpperCase();
+  if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `egress request for '${policy.subject}' may not contain credentials, query parameters, or fragments`,
+    );
+  }
+  const destination = policy.destinations.find(
+    (candidate) =>
+      sameOrigin(parsed, candidate) &&
+      candidate.methods.includes(method) &&
+      pathAllowed(parsed.pathname, candidate.paths),
+  );
+  if (!destination) {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `egress request for '${policy.subject}' is not allowed by policy`,
+    );
+  }
+  const pinnedIps = destination.pinnedIps.length > 0
+    ? [...destination.pinnedIps]
+    : [...new Set(await destination.resolvePins!(destination.hostname))];
+  const hostTrusted = isTrustedHost(destination.hostname, policy.trustedHosts);
+  if (
+    pinnedIps.length === 0 ||
+    pinnedIps.some(
+      (ip) => isIP(ip) === 0 || (!hostTrusted && !isIpAllowed(ip)),
+    )
+  ) {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `egress policy for '${policy.subject}' resolved to no valid address pins`,
+    );
+  }
+  return { parsed, pinnedIps };
+}
+
 export type LookupFn = (
   hostname: string,
   options: { all: true; verbatim: true },
@@ -592,25 +792,13 @@ export function buildPinnedAgent(
   });
 }
 
-export async function validatedFetch(
+async function fetchWithPinnedAddresses(
   url: string,
-  init: RequestInit = {},
-  opts: ValidatedFetchOptions = {},
+  init: RequestInit,
+  opts: ValidatedFetchOptions,
+  parsed: URL,
+  pinned: readonly string[],
 ): Promise<Response> {
-  const mode = opts.mode ?? NODE_ENV;
-  const allowHttp = opts.allowHttp ?? mode !== "production";
-
-  const parsed = validateStaticUrl(url, {
-    mode,
-    allowHttp,
-    trustedHosts: opts.trustedHosts,
-    httpAllowedHosts: opts.httpAllowedHosts,
-  });
-  const pinned = await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
-    trustedHosts: opts.trustedHosts,
-    lookup: opts.lookup,
-  });
-
   const hostname = normalizeHostname(parsed.hostname);
   const agent = buildPinnedAgent(hostname, parsed, pinned);
   try {
@@ -631,4 +819,51 @@ export async function validatedFetch(
     await agent.destroy().catch(() => {});
     throw error;
   }
+}
+
+export async function validatedFetch(
+  url: string,
+  init: RequestInit = {},
+  opts: ValidatedFetchOptions = {},
+): Promise<Response> {
+  const mode = opts.mode ?? NODE_ENV;
+  const allowHttp = opts.allowHttp ?? mode !== "production";
+  const parsed = validateStaticUrl(url, {
+    mode,
+    allowHttp,
+    trustedHosts: opts.trustedHosts,
+    httpAllowedHosts: opts.httpAllowedHosts,
+  });
+  const pinned = await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
+    trustedHosts: opts.trustedHosts,
+    lookup: opts.lookup,
+  });
+  return fetchWithPinnedAddresses(url, init, opts, parsed, pinned);
+}
+
+export type PolicyFetchOptions = {
+  policy: EgressPolicy;
+  fetchFn?: typeof fetch;
+};
+
+export async function policyFetch(
+  url: string,
+  init: RequestInit = {},
+  opts: PolicyFetchOptions,
+): Promise<Response> {
+  const method = init.method ?? "GET";
+  const authorized = await authorizeEgressRequest(opts.policy, url, method);
+  if (opts.policy.redirect !== "manual") {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `egress policy for '${opts.policy.subject}' must refuse redirects`,
+    );
+  }
+  return fetchWithPinnedAddresses(
+    url,
+    init,
+    opts,
+    authorized.parsed,
+    authorized.pinnedIps,
+  );
 }

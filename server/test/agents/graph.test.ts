@@ -28,6 +28,7 @@ import {
   type PrepareMessages,
 } from "../../src/agents/graph.ts";
 import { jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
+import { TOOL_RESULT_TRUNCATION_MARKER } from "../../src/tool_bounds.ts";
 
 /**
  * Scripted fake chat model: returns a preset sequence of AIMessages (some with
@@ -127,6 +128,31 @@ describe("agent graph — supervisor loop", () => {
     assert.equal(String(messages[3].content), "Here are your tasks.");
     assert.equal(result.toolRounds, 1);
     assert.deepEqual(result.toolResults, ['{"ok":true,"projectId":"p1"}']);
+  });
+
+  test("redacts and truncates tool content before it enters graph state", async () => {
+    const secret = "skAbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("list_tasks", { projectId: "p1" }),
+        new AIMessage("done"),
+      ],
+    });
+    const oversized = new DynamicStructuredTool({
+      name: "list_tasks",
+      description: "oversized result",
+      schema: z.object({ projectId: z.string() }),
+      func: async () => `${secret} ${"x".repeat(100_000)}`,
+    });
+    const graph = createAgentGraph({ model, tools: [oversized] });
+    const result = await graph.invoke({ messages: [new HumanMessage("go")] });
+    const toolMessage = result.messages.find((message) => message instanceof ToolMessage);
+    assert.ok(toolMessage);
+    const content = String(toolMessage.content);
+    assert.ok(content.length <= 65_536);
+    assert.ok(content.endsWith(TOOL_RESULT_TRUNCATION_MARKER));
+    assert.ok(!content.includes(secret));
+    assert.ok(result.toolResults.every((entry) => entry.length <= 65_536));
   });
 
   test("streamEvents (v2) yields on_chat_model_stream and on_chain_end", async () => {

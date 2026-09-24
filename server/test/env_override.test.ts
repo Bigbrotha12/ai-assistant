@@ -76,6 +76,13 @@ describe("immutable-image env overrides (env schema)", () => {
     assert.equal(env.AGENT_SPEC_MAX_TOOLS, 150);
   });
 
+  test("Sentinel policy defaults to advisory and supports the blocking flip", () => {
+    assert.equal(parse().SENTINEL_POLICY_MODE, "advisory");
+    assert.equal(parse({ SENTINEL_POLICY_MODE: "blocking" }).SENTINEL_POLICY_MODE, "blocking");
+    assert.equal(parse().SENTINEL_MAX_BODY_BYTES, 65_536);
+    assert.equal(parse({ SENTINEL_MAX_BODY_BYTES: "1024" }).SENTINEL_MAX_BODY_BYTES, 1_024);
+  });
+
   test("LEDGER_RETENTION_MS / LEDGER_SWEEP_INTERVAL_MS default to 24h / 1h and are overridable", () => {
     assert.equal(parse().LEDGER_RETENTION_MS, 86_400_000);
     assert.equal(parse().LEDGER_SWEEP_INTERVAL_MS, 3_600_000);

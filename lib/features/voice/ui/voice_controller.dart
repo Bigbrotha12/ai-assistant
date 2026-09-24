@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:dio/dio.dart';
 
 import 'package:flutter/foundation.dart';
@@ -9,6 +10,7 @@ import '../../chat/data/sse.dart' show stripStructuredTokens;
 import '../../chat/data/status_tracker.dart';
 import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_http.dart';
+import '../../sentinel/sentinel.dart';
 import './voice_conversation_state.dart';
 import '../data/audio_playback_service.dart';
 import '../data/mic_capture_service.dart';
@@ -19,6 +21,7 @@ import '../data/speech_text_filter.dart';
 import '../data/speech_text_normalizer.dart';
 import '../data/stt_engine.dart';
 import '../data/tts_engine.dart';
+import '../data/voice_runtime_policy.dart';
 
 /// Monotonic clock shared by the debug-only speak-queue diagnostics, so
 /// per-chunk timings are independent of wall-clock adjustments.
@@ -29,14 +32,14 @@ final Stopwatch _diagStopwatch = Stopwatch()..start();
 /// plays as-is.
 class _SpeakItem {
   _SpeakItem.forText(String this.text)
-      : pcm = null,
-        result = Completer<List<int>>(),
-        enqueuedAtMs = _diagStopwatch.elapsedMilliseconds;
+    : pcm = null,
+      result = Completer<List<int>>(),
+      enqueuedAtMs = _diagStopwatch.elapsedMilliseconds;
 
   _SpeakItem.forPcm(List<int> this.pcm)
-      : text = null,
-        result = null,
-        enqueuedAtMs = _diagStopwatch.elapsedMilliseconds;
+    : text = null,
+      result = null,
+      enqueuedAtMs = _diagStopwatch.elapsedMilliseconds;
 
   /// Text to synthesise (null for PCM items).
   final String? text;
@@ -110,27 +113,33 @@ final class VoiceController {
     this.sttEngine,
     this.ttsEngine,
     this.screenWakeLock,
+    this.runtimePolicy,
     this.onTranscript,
     this.onDeviceTranscript,
     this.onUserMessage,
     this.onError,
     this.onNetworkError,
+    SentinelInputGate? sentinelGate,
     this.contextBuilder,
     this.systemPrompt,
     Duration? echoGateDuration,
     Duration? synthesisTimeout,
   }) : _echoGateDuration =
            echoGateDuration ?? const Duration(milliseconds: 300),
-       _synthesisTimeout = synthesisTimeout ?? const Duration(seconds: 60) {
+       _synthesisTimeout = synthesisTimeout ?? const Duration(seconds: 60),
+       sentinelGate = sentinelGate ?? SentinelInputGate() {
     // Mic frames → local buffer for on-device STT. The capture pipeline is
     // the single error reporter for mic streams (it routes into
     // [reportError]); this listener only logs so a broadcast error can never
     // be unhandled — and is never double-reported.
+
     _micSubscription = micCapture.audioStream.listen(
       _onMicAudio,
       onError: (Object e) {
         if (kDebugMode) {
-          debugPrint('VoiceController: mic stream error (reported by pipeline): $e');
+          debugPrint(
+            'VoiceController: mic stream error (reported by pipeline): $e',
+          );
         }
       },
     );
@@ -139,6 +148,7 @@ final class VoiceController {
     _isPlayingSubscription = playback.isPlaying.listen(_onIsPlayingChanged);
     // Playback failures → conversation state (never silent).
     _playbackErrorSubscription = playback.errors.listen(_reportError);
+    runtimePolicy?.addListener(_onRuntimePolicyChanged);
   }
 
   /// The managed LLM send seam used to produce assistant replies (plan P2):
@@ -162,6 +172,8 @@ final class VoiceController {
   /// Keeps the screen awake for the duration of a connected conversation.
   /// Null (or a no-op) leaves the OS idle timer untouched.
   final ScreenWakeLock? screenWakeLock;
+
+  final VoiceRuntimePolicySource? runtimePolicy;
 
   /// Optional on-device STT engine (Whisper). When provided, mic audio is
   /// buffered during recording and transcribed locally on [flushTranscriptionBuffer].
@@ -195,6 +207,8 @@ final class VoiceController {
   /// does not need network status notifications.
   final void Function()? onNetworkError;
 
+  final SentinelInputGate sentinelGate;
+
   /// Builds the full request message list (history + new user message) for a
   /// turn. When set, [sendText] uses its result instead of a bare user
   /// message.
@@ -213,6 +227,8 @@ final class VoiceController {
   /// Bounded by [micBufferCapSamples]: when an append would exceed the cap the
   /// oldest samples are dropped (keep-tail — see [_onMicAudio]).
   final List<int> _micAudioBuffer = [];
+  var _micGeneration = 0;
+  int? _activeMicGeneration = 0;
 
   /// Upper bound on [_micAudioBuffer]: 3 minutes @ 16 kHz mono —
   /// 16,000 samples/s × 180 s = 2,880,000 samples. The 16-bitness of PCM is
@@ -289,6 +305,7 @@ final class VoiceController {
   /// start a fresh drain for the new epoch instead of appending the next
   /// turn's sentences to the stale one (which would drop them on wake).
   int? _drainEpoch;
+  int _speechEpoch = 0;
 
   /// Bound on a single sentence's synthesis. Without it, one hung
   /// synthesis (dead isolate, stalled backend) would wedge the drain, the
@@ -348,7 +365,9 @@ final class VoiceController {
   /// Ends the current conversation session and deactivates the mic.
   Future<void> endConversation() async {
     if (kDebugMode) {
-      debugPrint('Controller: endConversation (recording=${_state.isRecording})');
+      debugPrint(
+        'Controller: endConversation (recording=${_state.isRecording})',
+      );
     }
     // Invalidate any queued or in-flight turn: nothing may transcribe, hit
     // the network, or start playback after the session is gone.
@@ -380,7 +399,14 @@ final class VoiceController {
     // Drop per-turn fields so a later restarted session cannot re-emit the
     // previous session's utterance/reply as phantom bubbles.
     clearTurnFields();
-    _update(_state.copyWith(isConnected: false, isAiSpeaking: false, isSpeaking: false, status: null));
+    _update(
+      _state.copyWith(
+        isConnected: false,
+        isAiSpeaking: false,
+        isSpeaking: false,
+        status: null,
+      ),
+    );
     // Conversation over: let the screen fall asleep again.
     await _setWakeLock(false);
   }
@@ -457,15 +483,56 @@ final class VoiceController {
   /// swallowed: keeping the screen on is best-effort and a platform failure
   /// must never crash a lifecycle or teardown path.
   Future<void> _setWakeLock(bool enabled) {
-    final action =
-        enabled ? screenWakeLock?.enable() : screenWakeLock?.disable();
+    final action = enabled
+        ? screenWakeLock?.enable()
+        : screenWakeLock?.disable();
     if (action == null) return Future<void>.value();
-    final next = _wakeLockTail.then(
-      (_) => action.timeout(_wakeLockOpTimeout),
-    );
+    final next = _wakeLockTail.then((_) => action.timeout(_wakeLockOpTimeout));
     final safe = next.catchError((Object _) {});
     _wakeLockTail = safe;
     return safe;
+  }
+
+  VoiceRuntimeDecision get runtimeDecision =>
+      runtimePolicy?.decision ?? VoiceRuntimeDecision.ready;
+
+  bool get _captureAllowed => runtimeDecision.allowCapture;
+
+  bool get _ttsAllowed => runtimeDecision.allowTts;
+
+  void _onRuntimePolicyChanged() {
+    if (_disposed) return;
+    final decision = runtimeDecision;
+    if (!decision.allowCapture) {
+      _invalidateMicCaptureGeneration();
+      _clearMicBuffer();
+      if (_state.isRecording || micCapture.isRecording) {
+        unawaited(_stopCaptureForPolicy());
+      }
+    }
+    if (!decision.allowTts) {
+      _speechEpoch++;
+      _dropPendingSpeakItems();
+      if (_state.isAiSpeaking || _state.isSpeaking) {
+        _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
+        unawaited(_stopPlaybackForPolicy());
+      }
+    }
+  }
+
+  Future<void> _stopCaptureForPolicy() async {
+    try {
+      await micCapture.stop();
+    } catch (_) {
+    } finally {
+      if (_state.isRecording) _update(_state.copyWith(isRecording: false));
+    }
+  }
+
+  Future<void> _stopPlaybackForPolicy() async {
+    try {
+      await playback.stop().timeout(const Duration(seconds: 1));
+    } catch (_) {}
   }
 
   /// Starts capturing microphone audio for on-device STT. No-op when already
@@ -475,13 +542,27 @@ final class VoiceController {
       _reportError(StateError('Start the conversation before speaking'));
       return;
     }
+    await runtimePolicy?.refreshHealth();
+    if (!_captureAllowed) {
+      _clearMicBuffer();
+      return;
+    }
     if (_state.isRecording) return;
+    final generation = _beginMicCaptureGeneration();
     try {
       // Stale audio (e.g. a released hold before speech) must never leak
       // into the next utterance's transcription.
       _clearMicBuffer();
       // 16 kHz mono matches the buffer format for the on-device STT engine.
       await micCapture.start(sampleRate: kPlaybackSampleRate);
+      if (!_captureAllowed || generation != _micGeneration) {
+        try {
+          await micCapture.stop();
+        } catch (_) {}
+        _clearMicBuffer();
+        return;
+      }
+      _activateMicCaptureGeneration(generation);
       _update(_state.copyWith(isRecording: true, error: null));
     } catch (e) {
       _reportError(e);
@@ -490,7 +571,10 @@ final class VoiceController {
 
   /// Stops capturing microphone audio.
   Future<void> stopRecording() async {
-    if (!_state.isRecording) return;
+    final wasRecording = _state.isRecording;
+    _invalidateMicCaptureGeneration();
+    _clearMicBuffer();
+    if (!wasRecording) return;
     if (kDebugMode) {
       debugPrint('Controller: stopRecording');
     }
@@ -499,7 +583,7 @@ final class VoiceController {
     } catch (e) {
       _reportError(e);
     } finally {
-      _update(_state.copyWith(isRecording: false));
+      if (_state.isRecording) _update(_state.copyWith(isRecording: false));
     }
   }
 
@@ -516,6 +600,10 @@ final class VoiceController {
   /// the turn itself (STT → LLM → TTS) is serialised onto [_turnTail] so two
   /// flushes can never run concurrently.
   Future<void> flushTranscriptionBuffer() async {
+    if (!_captureAllowed) {
+      _clearMicBuffer();
+      return;
+    }
     final engine = sttEngine;
     final buffer = List<int>.from(_micAudioBuffer);
     _clearMicBuffer();
@@ -532,9 +620,7 @@ final class VoiceController {
     // buffer was already consumed above, so nothing accumulates and nothing
     // becomes a concurrent turn.
     if (_pendingTurns >= 1) {
-      _update(
-        _state.copyWith(notice: 'Dropped — one utterance at a time.'),
-      );
+      _update(_state.copyWith(notice: 'Dropped — one utterance at a time.'));
       if (kDebugMode) {
         debugPrint('VoiceController: flush dropped (a turn is already queued)');
       }
@@ -570,15 +656,19 @@ final class VoiceController {
       }
       return;
     }
+    if (!_captureAllowed) return;
     if (kDebugMode) {
       debugPrint('VoiceController: turn start (epoch $epoch)');
     }
+    final policy = runtimePolicy;
+    policy?.recordLoadStarted();
     try {
       // Bounded: one hung transcription must cost one utterance, never the
       // turn tail (an unbounded await here would wedge every future flush).
       final raw = await engine
           .transcribe(buffer, sampleRate: kPlaybackSampleRate)
           .timeout(const Duration(minutes: 2));
+      policy?.recordSttInferenceSuccess();
       if (kDebugMode) {
         debugPrint('VoiceController: turn transcribed');
       }
@@ -606,11 +696,13 @@ final class VoiceController {
         // transcript listener appends onDeviceTranscript (user) and lastReply
         // (assistant) from each state, so a stale lastReply here would be
         // appended again right after the new user bubble.
-        _update(_state.copyWith(
-          onDeviceTranscript: transcript,
-          lastTranscript: null,
-          lastReply: null,
-        ));
+        _update(
+          _state.copyWith(
+            onDeviceTranscript: transcript,
+            lastTranscript: null,
+            lastReply: null,
+          ),
+        );
         // The turn's audio is fully serialised inside sendText: it returns
         // only after the speak queue has drained and the last playback
         // finished (_waitQueueDrained). No extra playback wait here — it was
@@ -621,12 +713,15 @@ final class VoiceController {
         await sendText(transcript);
       }
     } on TimeoutException {
-      // Abnormally long playback; never wedge the turn queue on it.
+      policy?.recordSttInferenceFailure();
     } catch (e) {
+      policy?.recordSttInferenceFailure();
       if (kDebugMode) {
         debugPrint('VoiceController: STT failed: $e');
       }
       _reportError(e);
+    } finally {
+      policy?.recordLoadFinished();
     }
     if (kDebugMode) {
       debugPrint('VoiceController: turn done (epoch $epoch)');
@@ -663,8 +758,9 @@ final class VoiceController {
     if (trimmed.isEmpty) return;
     // A turn queued ahead of a teardown must not hit the network.
     if (!_state.isConnected) return;
+    await runtimePolicy?.refreshHealth();
     if (kDebugMode) {
-      debugPrint('VoiceController: sendText "${_debugTruncate(trimmed)}"');
+      debugPrint('VoiceController: sendText (${trimmed.length} chars)');
     }
     // The user's utterance surfaces in the UI transcript for this turn. Voice
     // turns already set it in flushTranscriptionBuffer (the UI dedupes the
@@ -679,11 +775,13 @@ final class VoiceController {
     // (assistant) from each state, so a stale lastReply carried here would be
     // appended again right after the new user bubble — the reported "last LLM
     // message duplicated after my new message".
-    _update(_state.copyWith(
-      onDeviceTranscript: trimmed,
-      lastTranscript: null,
-      lastReply: null,
-    ));
+    _update(
+      _state.copyWith(
+        onDeviceTranscript: trimmed,
+        lastTranscript: null,
+        lastReply: null,
+      ),
+    );
     onDeviceTranscript?.call(trimmed);
     onUserMessage?.call(trimmed);
     // Wait out any abandon cleanup from a previous barge-in/end so this
@@ -698,7 +796,7 @@ final class VoiceController {
     final epoch = _turnEpoch;
     // Sentence-buffered streaming only applies when this turn may speak and
     // an on-device TTS engine is configured.
-    final speak = speakReply && ttsEngine != null;
+    final speak = speakReply && ttsEngine != null && _ttsAllowed;
     _turnStartedAt = DateTime.now();
     try {
       // A stale notice from a dropped utterance is consumed here: this turn
@@ -711,8 +809,16 @@ final class VoiceController {
           onDeviceTranscript: null,
         ),
       );
+      SentinelAdvisory? advisory;
+      try {
+        advisory = sentinelGate.advisory(trimmed);
+      } catch (_) {}
+      if (advisory != null) {
+        _update(_state.copyWith(notice: sentinelAdvisoryMessage));
+      }
       final builder = contextBuilder;
-      final messages = builder != null
+       final messages = builder != null
+
           ? await builder(trimmed)
           : [ApiMessage(role: 'user', content: trimmed)];
       final buffer = StringBuffer();
@@ -784,9 +890,10 @@ final class VoiceController {
             // args fragment.
             if (reportedToolIndices.contains(index)) return;
             reportedToolIndices.add(index);
-            tracker.onToolCall(accName, buf.toString());
-          },
-        );
+             tracker.onToolCall(accName, buf.toString());
+           },
+         );
+
       } finally {
         tracker.cancel();
         _turnInFlight = false;
@@ -850,8 +957,7 @@ final class VoiceController {
       // branch: production senders throw PluginClientException('cancelled')
       // here — the fakes still script the legacy wire shape.)
       if (e is ChatNetworkError && e.message == 'cancelled' ||
-          e is PluginClientException &&
-              e.code == ManagedErrorCodes.cancelled ||
+          e is PluginClientException && e.code == ManagedErrorCodes.cancelled ||
           e is PluginClientException &&
               e.code == ManagedErrorCodes.conversationInFlight) {
         // Drop any partial reply accumulated before the cancellation landed.
@@ -873,6 +979,10 @@ final class VoiceController {
   /// next turn gets a fresh drain instead of being appended to the stale
   /// one — the stale drain would drop the new sentences when it woke.
   void _enqueue(_SpeakItem item) {
+    if (!_ttsAllowed) {
+      item.result?.complete(const []);
+      return;
+    }
     _speakQueue.add(item);
     // While backgrounded the drain is suspended by design (the reply is held
     // for the next foreground, see exitBackground); starting one here would
@@ -897,11 +1007,13 @@ final class VoiceController {
   /// empty (code blocks, stage directions) are skipped, matching the old
   /// whole-reply behaviour.
   void _enqueueText(String raw) {
+    if (!_ttsAllowed) return;
     // Filter stage tags first, then normalise the remnants for speech (€5 →
     // "5 euros", e.g. → "for example", emoji dropped). The transcript keeps
     // the raw text; only the spoken audio is rewritten.
-    final speakable =
-        SpeechTextNormalizer.normalizeForSpeech(SpeechTextFilter.stripNonSpeechTags(raw)).trim();
+    final speakable = SpeechTextNormalizer.normalizeForSpeech(
+      SpeechTextFilter.stripNonSpeechTags(raw),
+    ).trim();
     if (speakable.isEmpty) {
       if (kDebugMode) {
         debugPrint('VoiceController: sentence skipped (nothing speakable)');
@@ -950,21 +1062,19 @@ final class VoiceController {
     _SpeakItem item,
     String text,
   ) async {
+    await runtimePolicy?.refreshHealth();
     final synthStartedAt = DateTime.now();
+    final engine = ttsEngine;
+    if (!_ttsAllowed || engine == null) {
+      return const _SentenceSynthesis(null, 0, true);
+    }
+    final policy = runtimePolicy;
+    policy?.recordLoadStarted();
     try {
-      final engine = ttsEngine;
-      if (engine == null) {
-        throw StateError('No on-device TTS engine configured');
-      }
-      // Bounded: one hung synthesis must cost one sentence, never the whole
-      // loop (an unbounded await here would wedge the drain, the turn tail,
-      // and every future flush until the app restarts).
       final synthesized = await engine
           .synthesize(text, sampleRate: kPlaybackSampleRate)
           .timeout(_synthesisTimeout);
-      // Supertonic bakes leading/trailing silence into every chunk (~0.5-0.7s
-      // per edge). Trim it (keeping a small natural margin) so consecutive
-      // chunks flow without the model's dead air between them.
+      policy?.recordTtsInferenceSuccess();
       final trimmed = trimPcm16Silence(synthesized);
       final synthMs = DateTime.now().difference(synthStartedAt).inMilliseconds;
       if (kDebugMode) {
@@ -976,6 +1086,7 @@ final class VoiceController {
       }
       return _SentenceSynthesis(trimmed, synthMs, false);
     } on TimeoutException {
+      policy?.recordTtsInferenceFailure();
       if (kDebugMode) {
         debugPrint('VoiceController: sentence TTS timed out');
       }
@@ -984,11 +1095,14 @@ final class VoiceController {
       );
       return const _SentenceSynthesis(null, 0, true);
     } catch (e) {
+      policy?.recordTtsInferenceFailure();
       if (kDebugMode) {
         debugPrint('VoiceController: sentence TTS failed: $e');
       }
       _reportError(e);
       return const _SentenceSynthesis(null, 0, true);
+    } finally {
+      policy?.recordLoadFinished();
     }
   }
 
@@ -1014,6 +1128,7 @@ final class VoiceController {
     // resumption must still drop what was just enqueued, not inherit the
     // post-interrupt epoch and play it.
     final epoch = _turnEpoch;
+    final speechEpoch = _speechEpoch;
     // Suspend once before any work so [_enqueue]'s `_drainFuture` assignment
     // always observes a still-pending drain: a drain that completed
     // synchronously (e.g. a queue of skippable items) would otherwise leave
@@ -1041,6 +1156,13 @@ final class VoiceController {
         // items synchronously; anything here belongs to a newer turn and is
         // the newer drain's business.
         if (epoch != _turnEpoch) break;
+        if (speechEpoch != _speechEpoch || !_ttsAllowed) {
+          _dropPendingSpeakItems();
+          if (_state.isAiSpeaking || _state.isSpeaking) {
+            _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
+          }
+          break;
+        }
         // The app is backgrounded: suspend WITHOUT consuming the queue. No
         // playback may start on a hidden surface, and the sentences accumulate
         // for [exitBackground], which restarts the drain and speaks them on
@@ -1113,6 +1235,12 @@ final class VoiceController {
           prefetchedItem = null;
           prefetchedPcm = null;
         }
+        if (speechEpoch != _speechEpoch || !_ttsAllowed) {
+          item.result?.complete(const []);
+          _dropPendingSpeakItems();
+          _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
+          break;
+        }
         // The app backgrounded while this sentence was being synthesised:
         // the loop-top break above cannot cover this window, and playback
         // would re-acquire audio focus on a hidden surface. Requeue the
@@ -1151,7 +1279,8 @@ final class VoiceController {
         final playStartedAtMs = _diagStopwatch.elapsedMilliseconds;
         if (kDebugMode) {
           final envelope = analyzePcm16Envelope(pcm);
-          final llmGapMs = _lastPlaybackEndedAtMs == null ||
+          final llmGapMs =
+              _lastPlaybackEndedAtMs == null ||
                   item.enqueuedAtMs < _lastPlaybackEndedAtMs!
               ? 0
               : item.enqueuedAtMs - _lastPlaybackEndedAtMs!;
@@ -1167,6 +1296,13 @@ final class VoiceController {
             'peak=${envelope.peak.toStringAsFixed(2)} '
             'rms=${envelope.rmsDb.toStringAsFixed(1)}dB',
           );
+        }
+        await runtimePolicy?.refreshHealth();
+        if (speechEpoch != _speechEpoch || !_ttsAllowed) {
+          item.result?.complete(const []);
+          _dropPendingSpeakItems();
+          _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
+          break;
         }
         // Subscribe BEFORE playAudio: a fast-finished utterance emits its
         // isPlaying false before a later subscription would attach.
@@ -1185,12 +1321,22 @@ final class VoiceController {
           item.result?.complete(const []);
           continue;
         }
+        if (speechEpoch != _speechEpoch || !_ttsAllowed) {
+          item.result?.complete(const []);
+          _dropPendingSpeakItems();
+          _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false));
+          unawaited(_stopPlaybackForPolicy());
+          break;
+        }
         // Pipeline: start the next sentence's synthesis NOW, while this chunk
         // is still playing, so it is ready the moment this playback ends. The
         // engine serialises in its own worker isolate, so at most one
         // synthesis is ever in flight; this one overlaps playback instead of
         // following it.
-        if (epoch == _turnEpoch && _speakQueue.isNotEmpty) {
+        if (epoch == _turnEpoch &&
+            speechEpoch == _speechEpoch &&
+            _ttsAllowed &&
+            _speakQueue.isNotEmpty) {
           final next = _speakQueue.first;
           if (next.text != null) {
             final prepared = await _synthesizeSentence(next, next.text!);
@@ -1247,7 +1393,9 @@ final class VoiceController {
         // An interrupt mid-playback stops the player: the utterance was
         // cancelled, not played — report it as such (the generation counter
         // in the service makes the stop authoritative).
-        if (epoch != _turnEpoch) {
+        if (epoch != _turnEpoch ||
+            speechEpoch != _speechEpoch ||
+            !_ttsAllowed) {
           item.result?.complete(const []);
           break;
         }
@@ -1369,7 +1517,14 @@ final class VoiceController {
     // Stale audio from the interrupted utterance must never leak into the
     // next one's transcription.
     _clearMicBuffer();
-    _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false, notice: null, status: null));
+    _update(
+      _state.copyWith(
+        isAiSpeaking: false,
+        isSpeaking: false,
+        notice: null,
+        status: null,
+      ),
+    );
     try {
       // Bounded: one hung stop must never wedge the mic gates shut for a
       // barge-in hold.
@@ -1393,6 +1548,8 @@ final class VoiceController {
   ///
   /// Throws [StateError] if no [ttsEngine] is configured.
   Future<List<int>> synthesizeOnDevice(String text) async {
+    await runtimePolicy?.refreshHealth();
+    if (!_ttsAllowed) return const [];
     final engine = ttsEngine;
     if (engine == null) {
       throw StateError('No on-device TTS engine configured');
@@ -1446,7 +1603,9 @@ final class VoiceController {
     // playback-end event, and it must already see isPaused at its loop top —
     // otherwise it would start the next sentence in the race window before
     // the paused flag lands.
-    _update(_state.copyWith(isPaused: true, isAiSpeaking: false, isSpeaking: false));
+    _update(
+      _state.copyWith(isPaused: true, isAiSpeaking: false, isSpeaking: false),
+    );
     try {
       await playback.stop();
     } catch (_) {
@@ -1489,6 +1648,12 @@ final class VoiceController {
   // ---- wiring -----------------------------------------------------------
 
   void _onMicAudio(List<int> chunk) {
+    if (_disposed ||
+        !_captureAllowed ||
+        _activeMicGeneration == null ||
+        _activeMicGeneration != _micGeneration) {
+      return;
+    }
     // Echo gate: while the assistant is speaking — and for a short tail
     // after it stops (speaker decay + room echo) — mic chunks must not enter
     // the STT buffer, or the assistant transcribes its own voice into a
@@ -1524,6 +1689,21 @@ final class VoiceController {
     if (_state.micBufferTruncated) {
       _update(_state.copyWith(micBufferTruncated: false));
     }
+  }
+
+  int _beginMicCaptureGeneration() {
+    _micGeneration++;
+    _activeMicGeneration = null;
+    return _micGeneration;
+  }
+
+  void _activateMicCaptureGeneration(int generation) {
+    if (generation == _micGeneration) _activeMicGeneration = generation;
+  }
+
+  void _invalidateMicCaptureGeneration() {
+    _micGeneration++;
+    _activeMicGeneration = null;
   }
 
   void _onIsPlayingChanged(bool playing) {
@@ -1590,6 +1770,7 @@ final class VoiceController {
   Future<void> dispose() async {
     // Invalidate queued turns — nothing may run against a disposed controller.
     _disposed = true;
+    runtimePolicy?.removeListener(_onRuntimePolicyChanged);
     _turnEpoch++;
     // Complete any queued result completers so no [synthesizeOnDevice]
     // caller hangs on a controller that can never speak again.

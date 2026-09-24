@@ -13,6 +13,7 @@ export type McpEntry = {
   name: string;
   url: string;
   headers?: Record<string, string>;
+  headerRefs?: Record<string, string>;
 };
 
 const envVarRe = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
@@ -75,7 +76,7 @@ export async function loadMcpCatalog(filePath: string): Promise<McpEntry[]> {
     throw new Error(`Invalid MCP catalog at ${filePath}:\n${details}`);
   }
 
-  const entries = result.data;
+  const entries: McpEntry[] = result.data;
 
   const seen = new Set<string>();
   for (const entry of entries) {
@@ -94,10 +95,14 @@ export async function loadMcpCatalog(filePath: string): Promise<McpEntry[]> {
     });
 
     if (entry.headers) {
+      const headerRefs: Record<string, string> = {};
       for (const headerName of Object.keys(entry.headers)) {
         validateMcpHeaderName(headerName);
-        entry.headers[headerName] = resolveHeaderValue(entry.headers[headerName]!);
+        const reference = entry.headers[headerName]!;
+        headerRefs[headerName] = reference;
+        entry.headers[headerName] = resolveHeaderValue(reference);
       }
+      entry.headerRefs = headerRefs;
     }
   }
 

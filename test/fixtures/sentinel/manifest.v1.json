@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "suiteVersion": "2026-09-24.1-seed",
+  "datasetStatus": "seed",
+  "minimumCases": {
+    "benignPerLaunchLanguage": 1,
+    "positivePerCategory": 1,
+    "adversarialParaphrasePerCategory": 0
+  },
+  "thresholds": {
+    "l1": {
+      "testDecisionAccuracy": 1.0
+    }
+  },
+  "expectedHashes": {
+    "rulesSha256": "4224479b9642d075820f0ebe4a955f6494bc68a19f7d467222bf14fec20816d2",
+    "casesSha256": "4a5fcaf3a5849e224c1a20130545dadbcea56b54712c727a4374b918858b7e69"
+  }
+}

@@ -7,6 +7,39 @@ import 'package:path_provider/path_provider.dart';
 
 import './engine_config.dart';
 
+typedef FreeStorageBytesReader = Future<int?> Function();
+
+class InsufficientStorageException implements Exception {
+  const InsufficientStorageException({
+    required this.requiredBytes,
+    required this.availableBytes,
+  });
+
+  final int requiredBytes;
+  final int? availableBytes;
+
+  @override
+  String toString() =>
+      'InsufficientStorageException: '
+      '$requiredBytes bytes required, '
+      '${availableBytes == null ? 'unknown' : '$availableBytes'} bytes available';
+}
+
+class ModelDownloadLimitException implements Exception {
+  const ModelDownloadLimitException({
+    required this.maxBytes,
+    required this.observedBytes,
+  });
+
+  final int maxBytes;
+  final int observedBytes;
+
+  @override
+  String toString() =>
+      'ModelDownloadLimitException: maximum $maxBytes bytes exceeded '
+      '(observed $observedBytes bytes)';
+}
+
 /// Progress report for a model download.
 class ModelDownloadProgress {
   const ModelDownloadProgress({required this.percent, required this.status});
@@ -53,11 +86,44 @@ class NotStarted extends ModelDownloadState {}
 /// Models are stored in a `.voice_models/` subdirectory of the
 /// application documents directory.
 class ModelDownloader {
-  ModelDownloader({Dio? dio})
-    : _dio = dio ?? Dio(),
-      _modelDirectory = _loadModelDirectory();
+  ModelDownloader({
+    Dio? dio,
+    FreeStorageBytesReader? freeStorageBytes,
+    int requiredBytesTolerance = EngineConfig.modelDownloadSizeToleranceBytes,
+    int hardMaxBytes = EngineConfig.modelDownloadHardCapBytes,
+  }) : this._(
+         dio ?? Dio(),
+         freeStorageBytes,
+         requiredBytesTolerance,
+         hardMaxBytes,
+       );
+
+  ModelDownloader._(
+    this._dio,
+    this._freeStorageBytes,
+    this._requiredBytesTolerance,
+    this._hardMaxBytes,
+  ) : _modelDirectory = _loadModelDirectory() {
+    if (_requiredBytesTolerance < 0) {
+      throw ArgumentError.value(
+        _requiredBytesTolerance,
+        'requiredBytesTolerance',
+        'must be non-negative',
+      );
+    }
+    if (_hardMaxBytes < 0) {
+      throw ArgumentError.value(
+        _hardMaxBytes,
+        'hardMaxBytes',
+        'must be non-negative',
+      );
+    }
+  }
 
   final Dio _dio;
+  final FreeStorageBytesReader? _freeStorageBytes;
+  final int _requiredBytesTolerance;
+  final int _hardMaxBytes;
   final Future<Directory> _modelDirectory;
 
   static Future<Directory> _loadModelDirectory() async {
@@ -90,73 +156,117 @@ class ModelDownloader {
     required String url,
     String? destinationPath,
     String? fileName,
+    int? requiredBytes,
   }) async {
     final dir = destinationPath ?? (await _modelDirectory).path;
-    final resolvedPath =
-        fileName != null ? '$dir/$fileName' : '$dir/ggml$modelType.bin';
+    final resolvedPath = fileName != null
+        ? '$dir/$fileName'
+        : '$dir/ggml$modelType.bin';
 
     _states[modelType] = Downloading();
-    await _doDownload(modelType, url, resolvedPath);
+    await _doDownload(modelType, url, resolvedPath, requiredBytes);
   }
 
   Future<void> _doDownload(
     String modelType,
     String url,
     String resolvedPath,
+    int? requiredBytes,
   ) async {
     try {
+      await _preflight(requiredBytes);
       final dir = File(resolvedPath).parent;
       await dir.create(recursive: true);
-
-      int? expectedTotal;
-      final response = await _dio.get<List<int>>(
-        url,
-        options: Options(
-          responseType: ResponseType.bytes,
-          followRedirects: true,
-          maxRedirects: 5,
-        ),
-        onReceiveProgress: (received, total) {
-          if (total > 0) expectedTotal = total;
-          final progress = total > 0 ? received / total : 0.0;
-          _progressController.add(
-            ModelDownloadProgress(percent: progress, status: 'downloading'),
-          );
-          _states[modelType] = Downloading(
-            receivedBytes: received,
-            totalBytes: total,
-            progress: progress,
-          );
-        },
-      );
-
-      final bytes = response.data;
-      if (bytes == null) {
-        throw Exception('download returned no data');
-      }
-      if (bytes.isEmpty) {
-        throw Exception('download returned an empty file');
-      }
-      final expected = expectedTotal;
-      if (expected != null && bytes.length != expected) {
-        throw Exception(
-          'download size mismatch: expected $expected bytes, '
-          'got ${bytes.length}',
-        );
-      }
-
-      // Write to a temp file in the same directory as the final model so a
-      // partial or interrupted download can never be mistaken for the real
-      // file. Only once the temp file is fully written and validated is it
-      // atomically renamed into place.
+      final maxBytes = _maxBytesFor(requiredBytes);
       final tempPath = '$resolvedPath.part';
       final tempFile = File(tempPath);
+      ResponseBody? responseBody;
+      RandomAccessFile? output;
+      var received = 0;
+      int? expectedTotal;
+
       try {
-        await tempFile.writeAsBytes(bytes, flush: true);
+        final response = await _dio.get<ResponseBody>(
+          url,
+          options: Options(
+            responseType: ResponseType.stream,
+            followRedirects: true,
+            maxRedirects: 5,
+          ),
+          onReceiveProgress: (count, total) {
+            if (total > 0) expectedTotal = total;
+            final progress = total > 0 ? count / total : 0.0;
+            _progressController.add(
+              ModelDownloadProgress(percent: progress, status: 'downloading'),
+            );
+            _states[modelType] = Downloading(
+              receivedBytes: count,
+              totalBytes: total,
+              progress: progress,
+            );
+          },
+        );
+        final body = response.data;
+        if (body == null) throw Exception('download returned no data');
+        responseBody = body;
+        final contentLength = body.contentLength;
+        if (contentLength > maxBytes) {
+          throw ModelDownloadLimitException(
+            maxBytes: maxBytes,
+            observedBytes: contentLength,
+          );
+        }
+        if (contentLength > 0) expectedTotal = contentLength;
+        final fileOutput = await tempFile.open(mode: FileMode.write);
+        output = fileOutput;
+        await for (final chunk in body.stream) {
+          final nextReceived = received + chunk.length;
+          if (nextReceived > maxBytes) {
+            throw ModelDownloadLimitException(
+              maxBytes: maxBytes,
+              observedBytes: nextReceived,
+            );
+          }
+          await fileOutput.writeFrom(chunk);
+          received = nextReceived;
+        }
+        await fileOutput.flush();
+        await fileOutput.close();
+        output = null;
+
+        if (received == 0) throw Exception('download returned an empty file');
+        final actualLength = await tempFile.length();
+        if (actualLength > maxBytes) {
+          throw ModelDownloadLimitException(
+            maxBytes: maxBytes,
+            observedBytes: actualLength,
+          );
+        }
+        if (actualLength != received) {
+          throw Exception(
+            'download size mismatch: expected $received bytes, '
+            'got $actualLength',
+          );
+        }
+        final expected = expectedTotal;
+        if (expected != null && expected > 0 && expected != received) {
+          throw Exception(
+            'download size mismatch: expected $expected bytes, '
+            'got $received',
+          );
+        }
         await tempFile.rename(resolvedPath);
-      } catch (_) {
-        await _deleteIfExists(tempFile);
-        rethrow;
+      } finally {
+        if (responseBody != null) {
+          try {
+            (responseBody as dynamic).close();
+          } catch (_) {}
+        }
+        if (output != null) {
+          try {
+            await output.close();
+          } catch (_) {}
+        }
       }
 
       _states[modelType] = Ready();
@@ -168,12 +278,50 @@ class ModelDownloader {
         debugPrint('Model "$modelType" downloaded to $resolvedPath');
       }
     } catch (e) {
+      await _deleteIfExists(File('$resolvedPath.part'));
       final error = e.toString();
       _states[modelType] = Failed(error: error);
       _progressController.add(
         ModelDownloadProgress(percent: 0.0, status: 'error: $error'),
       );
       rethrow;
+    }
+  }
+
+  int _maxBytesFor(int? requiredBytes) {
+    if (requiredBytes == null) return _hardMaxBytes;
+    if (requiredBytes >= _hardMaxBytes) return _hardMaxBytes;
+    final remaining = _hardMaxBytes - requiredBytes;
+    return requiredBytes +
+        (remaining < _requiredBytesTolerance
+            ? remaining
+            : _requiredBytesTolerance);
+  }
+
+  Future<void> _preflight(int? requiredBytes) async {
+    final artifactBytes = requiredBytes ?? 0;
+    if (artifactBytes < 0) {
+      throw InsufficientStorageException(
+        requiredBytes: artifactBytes,
+        availableBytes: null,
+      );
+    }
+    final required =
+        artifactBytes + EngineConfig.modelDownloadSafetyMarginBytes;
+    final reader = _freeStorageBytes;
+    if (reader == null) return;
+    int? available;
+    try {
+      available = await reader();
+    } catch (_) {
+      return;
+    }
+    if (available == null) return;
+    if (available < 0 || available < required) {
+      throw InsufficientStorageException(
+        requiredBytes: required,
+        availableBytes: available,
+      );
     }
   }
 

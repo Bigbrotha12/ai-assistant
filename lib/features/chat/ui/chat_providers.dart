@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show File;
 import 'dart:typed_data' show Uint8List;
 
@@ -31,6 +32,7 @@ import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_catalog_providers.dart';
 import '../../plugins/data/plugin_credentials_providers.dart';
 import '../../plugins/data/plugin_http.dart';
+import '../../sentinel/sentinel.dart';
 
 export 'active_conversation_provider.dart';
 
@@ -68,15 +70,16 @@ class ConversationState {
   /// generic message.
   final bool authRequired;
 
-  /// True while this conversation owns a background job (plan P3): a pending
-  /// ledger-polled submission is running and its reply has not been appended
-  /// yet. Drives the pending-job chip + Retry/Cancel affordances. Cleared when
-  /// the poll observes a terminal status (or the job is cancelled).
-  final bool hasPendingJob;
+  final LedgerTaskProjection? backgroundJobProjection;
 
-  /// Human-readable error for the last terminal background job when it failed
-  /// (`succeeded` clears it). Drives the chip's "Retry job" affordance.
-  final String? jobError;
+  bool get hasPendingJob =>
+      backgroundJobProjection?.keepsPendingMarker ?? false;
+
+  String? get jobError => backgroundJobProjection?.isFailure == true
+      ? 'Background job failed'
+      : null;
+
+  final String? sentinelNotice;
 
   const ConversationState({
     required this.messages,
@@ -88,8 +91,8 @@ class ConversationState {
     this.isDbReady = false,
     this.attachmentUploads = const {},
     this.authRequired = false,
-    this.hasPendingJob = false,
-    this.jobError,
+    this.backgroundJobProjection,
+    this.sentinelNotice,
   });
 
   ConversationState copyWith({
@@ -102,8 +105,8 @@ class ConversationState {
     Object? attachmentUploads = _sentinel,
     bool? isDbReady,
     Object? authRequired = _sentinel,
-    bool? hasPendingJob,
-    Object? jobError = _sentinel,
+    Object? backgroundJobProjection = _sentinel,
+    Object? sentinelNotice = _sentinel,
   }) {
     return ConversationState(
       messages: messages ?? this.messages,
@@ -123,10 +126,12 @@ class ConversationState {
       authRequired: identical(authRequired, _sentinel)
           ? this.authRequired
           : authRequired as bool,
-      hasPendingJob: hasPendingJob ?? this.hasPendingJob,
-      jobError: identical(jobError, _sentinel)
-          ? this.jobError
-          : jobError as String?,
+      backgroundJobProjection: identical(backgroundJobProjection, _sentinel)
+          ? this.backgroundJobProjection
+          : backgroundJobProjection as LedgerTaskProjection?,
+      sentinelNotice: identical(sentinelNotice, _sentinel)
+          ? this.sentinelNotice
+          : sentinelNotice as String?,
     );
   }
 }
@@ -232,14 +237,13 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // rebuilt after navigation while a background job is still pending (the
     // poller + its handle survive in the account-scoped adapter). Best-effort:
     // no scope / no background pending row yields null and the chip stays off.
-    var restoredJob = false;
+    ManagedBackgroundWatch? restoredWatch;
     try {
-      final handle = await ref
+      restoredWatch = await ref
           .read(managedChatAdapterProvider)
           .rewatchPendingBackground(conversationId);
-      if (handle != null && ref.mounted) {
-        restoredJob = true;
-        _watchBackgroundHandle(handle);
+      if (restoredWatch != null && ref.mounted) {
+        _watchBackgroundHandle(restoredWatch.handle);
       }
     } catch (_) {
       // Scope not ready or the row is not a background envelope — no chip.
@@ -248,7 +252,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     return ConversationState(
       messages: conversation?.messages ?? const [],
       isDbReady: true,
-      hasPendingJob: restoredJob,
+      backgroundJobProjection: restoredWatch?.projection,
     );
   }
 
@@ -320,6 +324,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         error: null,
         failedMessageId: null,
         authRequired: false,
+        sentinelNotice: null,
       ),
     );
 
@@ -768,9 +773,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   /// Submits [text] as a background job (plan §3/P3): the service POSTs a
   /// self-contained snapshot and returns a [LedgerPollHandle] whose terminal
   /// observation appends the reply. The conversation is marked with a
-  /// pending-job chip ([ConversationState.hasPendingJob]) that is cleared when
-  /// the poll observes a terminal status. The in-memory user row is written by
-  /// the service during admission (exactly one writer).
+  /// projected pending-job chip ([ConversationState.hasPendingJob]); completed
+  /// and failed work clears it, while review remains visible as terminal. The
+  /// in-memory user row is written by the service during admission.
   Future<void> submitBackgroundJob(String text) async {
     final current = state.value;
     if (current == null || current.isStreaming || current.hasPendingJob) {
@@ -794,8 +799,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         error: null,
         failedMessageId: null,
         authRequired: false,
-        hasPendingJob: true,
-        jobError: null,
+        backgroundJobProjection: LedgerTaskProjection.queued(),
       ),
     );
 
@@ -806,7 +810,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         state.value!.copyWith(
           isStreaming: false,
           pendingUserMessageId: null,
-          hasPendingJob: false,
+          backgroundJobProjection: null,
         ),
       );
       return;
@@ -844,7 +848,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
             cur.copyWith(
               isStreaming: false,
               pendingUserMessageId: null,
-              hasPendingJob: false,
+              backgroundJobProjection: null,
               messages: [
                 for (final m in cur.messages)
                   if (m.id != userMsg.id) m,
@@ -880,7 +884,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       if (!ref.mounted) return;
       if (e.code == ManagedErrorCodes.noPendingTurn) {
         // The retry identity is gone — drop the chip and offer a fresh send.
-        _setState(state.value!.copyWith(hasPendingJob: false, jobError: null));
+        _setState(state.value!.copyWith(backgroundJobProjection: null));
         return;
       }
       await _onBackgroundError(e);
@@ -890,21 +894,30 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     }
   }
 
-  /// Cancels the conversation's pending background job (plan §3 chip
-  /// affordance): [ManagedChatAdapter.abandonTurn] clears the pending row and
-  /// cancels the dispatch so the next submit is never blocked. Best-effort —
-  /// a failed clear surfaces `pending_turn_exists` on the next submit.
+  /// Cancels the conversation's pending background job through the ledger
+  /// controller before touching the local pending envelope.
   Future<void> cancelBackgroundJob() async {
     final current = state.value;
     if (current == null || !current.hasPendingJob) return;
     try {
-      await ref.read(managedChatAdapterProvider).abandonTurn(conversationId);
-    } catch (_) {
-      // Best-effort — the next submit surfaces pending_turn_exists if the
-      // clear genuinely failed (or the scope is unavailable).
+      final result = await ref
+          .read(managedChatAdapterProvider)
+          .cancelBackground(conversationId);
+      if (!ref.mounted) return;
+      _setState(
+        state.value!.copyWith(
+          backgroundJobProjection:
+              result.projection.terminalStatus == LedgerTaskStatus.cancelled
+              ? null
+              : result.projection,
+        ),
+      );
+      final watch = result.watch;
+      if (watch != null) _watchBackgroundHandle(watch);
+    } catch (error) {
+      if (error is Error) rethrow;
+      await _onBackgroundError(error);
     }
-    if (!ref.mounted) return;
-    _setState(state.value!.copyWith(hasPendingJob: false, jobError: null));
   }
 
   Future<void> _handleAccountDeleted(Object error) async {
@@ -915,8 +928,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         current.copyWith(
           isStreaming: false,
           pendingUserMessageId: null,
-          hasPendingJob: false,
-          jobError: null,
+          backgroundJobProjection: null,
           error: accountDeletedNotice,
           failedMessageId: null,
           authRequired: false,
@@ -943,24 +955,25 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               await _handleAccountDeleted(result.error!);
               return;
             }
-            final terminal =
-                result.end == LedgerPollEnd.observed &&
-                (result.task?.status.isTerminal ?? false);
-            if (!terminal) {
-              // Exhausted/errored poll: the job is still pending (the marker is kept
-              // for an explicit retry) — keep the chip.
+            if (result.end == LedgerPollEnd.expired) {
+              _setState(
+                state.value!.copyWith(
+                  backgroundJobProjection:
+                      result.projection ?? LedgerTaskProjection.expired(),
+                  error: 'Background job status is no longer available.',
+                ),
+              );
               return;
             }
+            if (result.end != LedgerPollEnd.observed || result.task == null) {
+              return;
+            }
+            final projection = result.task!.projection;
             await _reloadFromStore();
             if (!ref.mounted) return;
-            final failed =
-                result.task?.status == LedgerTaskStatus.failed ||
-                result.task?.status == LedgerTaskStatus.cancelled;
             _setState(
               state.value!.copyWith(
-                hasPendingJob: false,
-                jobError: failed ? 'Background job failed' : null,
-                // A "wait for the job" banner is stale the moment the job is terminal.
+                backgroundJobProjection: projection,
                 error: null,
               ),
             );
@@ -1026,12 +1039,12 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       cur.copyWith(
         isStreaming: false,
         pendingUserMessageId: null,
-        hasPendingJob: keepChip,
-        // A neutral phrase (e.g. `cancelled`) is never shown as a banner.
+        backgroundJobProjection: authRequired || message.isEmpty
+            ? (keepChip ? LedgerTaskProjection.queued() : null)
+            : keepChip
+            ? LedgerTaskProjection.queued()
+            : LedgerTaskProjection.failed(),
         error: authRequired || message.isEmpty ? null : message,
-        jobError: authRequired || message.isEmpty
-            ? null
-            : 'Background job failed',
         authRequired: authRequired,
         messages: dropOptimistic && optimisticUserId != null
             ? [
@@ -1133,6 +1146,14 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               // sessionId omitted: the service resolves the mapped session itself
               // (first turn seeds; later turns resume/delta/compact).
               onContent: (text) => _onContent(assistant.id, text),
+              onAdvisory: (_) {
+                if (!ref.mounted) return;
+                final current = state.value;
+                if (current == null) return;
+                _setState(
+                  current.copyWith(sentinelNotice: sentinelAdvisoryMessage),
+                );
+              },
             );
     } catch (e) {
       // Fatal errors (StateError etc.) propagate so callers like the
@@ -1308,6 +1329,12 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(current.copyWith(authRequired: false));
   }
 
+  void dismissSentinelNotice() {
+    final current = state.value;
+    if (current == null || current.sentinelNotice == null) return;
+    _setState(current.copyWith(sentinelNotice: null));
+  }
+
   Future<void> _onError(
     Object error,
     String assistantId,
@@ -1412,11 +1439,13 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
                       cur.messages[i],
                 ],
                 isStreaming: false,
-                error: 'A background job is still running — wait for it to finish.',
+                error: 'A background job is still pending — wait for it to finish.',
                 pendingUserMessageId: null,
                 failedMessageId: null,
                 authRequired: false,
-                hasPendingJob: true,
+                backgroundJobProjection:
+                    cur.backgroundJobProjection ??
+                    LedgerTaskProjection.queued(),
               ),
             );
           }
@@ -1545,20 +1574,32 @@ final conversationsProvider = StreamProvider.autoDispose<List<Conversation>>(
 );
 
 /// Conversation ids in the active account scope that currently own a
-/// pending-turn row — drives the conversation list's pending-job indicator
-/// (open-gaps P2). Live via the repository's drift watch, so a job submitted
-/// or cleared while the list stays mounted under the open chat refreshes the
-/// set in place. Pre-ready plugin access yields an empty set rather than
-/// `pluginAccountScopeProvider`'s re-auth throw (same gate as
-/// [chatStoreProvider]).
-final pendingConversationIdsProvider = StreamProvider.autoDispose<Set<String>>((
-  ref,
-) {
-  if (ref.watch(pluginAccessProvider) != PluginAccess.ready) {
-    return Stream.value(const <String>{});
-  }
-  final scope = ref.watch(pluginAccountScopeProvider);
-  return ref
-      .watch(managedConversationRepositoryProvider)
-      .pendingConversationIds(scope);
-});
+/// background pending row, with the deterministic projection persisted by the
+/// managed service.
+final backgroundJobProjectionsProvider =
+    StreamProvider.autoDispose<Map<String, LedgerTaskProjection>>((ref) {
+      if (ref.watch(pluginAccessProvider) != PluginAccess.ready) {
+        return Stream.value(const <String, LedgerTaskProjection>{});
+      }
+      final scope = ref.watch(pluginAccountScopeProvider);
+      return ref
+          .watch(managedConversationRepositoryProvider)
+          .watchPendingRows(scope)
+          .map((rows) {
+            final projections = <String, LedgerTaskProjection>{};
+            for (final row in rows) {
+              try {
+                final envelope = jsonDecode(row.envelope);
+                if (envelope is! Map<String, dynamic> ||
+                    envelope['background'] != true) {
+                  continue;
+                }
+                final rawProjection = envelope['projection'];
+                projections[row.conversationId] = rawProjection == null
+                    ? LedgerTaskProjection.queued()
+                    : LedgerTaskProjection.fromJson(rawProjection);
+              } catch (_) {}
+            }
+            return projections;
+          });
+    });

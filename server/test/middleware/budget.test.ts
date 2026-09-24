@@ -300,4 +300,45 @@ describe("createBudgetManager", () => {
     release2();
     assert.equal(budget.activeCount("user-1"), 0);
   });
+
+  it("rejects tool calls above per-owner and global in-flight caps without queueing", async () => {
+    const budget = createBudgetManager({
+      maxToolCallsPerOwner: 2,
+      maxGlobalToolCalls: 3,
+      now: () => 1_000,
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls = [
+      budget.withToolCallBudget("owner-a", async () => gate),
+      budget.withToolCallBudget("owner-a", async () => gate),
+      budget.withToolCallBudget("owner-b", async () => gate),
+    ];
+    assert.equal(budget.toolCallCount("owner-a"), 2);
+    assert.equal(budget.toolCallCount("owner-b"), 1);
+    assert.equal(budget.globalToolCallCount(), 3);
+    await assert.rejects(
+      budget.withToolCallBudget("owner-c", async () => undefined),
+      (error: unknown) =>
+        error instanceof BudgetExhaustedError &&
+        error.code === "budget_exhausted" &&
+        /Tool call concurrency/.test(error.message),
+    );
+    release();
+    await Promise.all(calls);
+    assert.equal(budget.toolCallCount("owner-a"), 0);
+    assert.equal(budget.globalToolCallCount(), 0);
+    assert.equal(await budget.withToolCallBudget("owner-c", async () => "ok"), "ok");
+  });
+
+  it("rejects invalid tool concurrency limits", () => {
+    assert.throws(
+      () => createBudgetManager({ maxToolCallsPerOwner: 0 }),
+      /maxToolCallsPerOwner/,
+    );
+    assert.throws(
+      () => createBudgetManager({ maxGlobalToolCalls: -1 }),
+      /maxGlobalToolCalls/,
+    );
+  });
 });

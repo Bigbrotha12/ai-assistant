@@ -24,7 +24,7 @@ import type { ChatResult } from "@langchain/core/outputs";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
-import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
+import { createEgressPolicy, SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolCallHandler } from "../../src/agents/orchestrator.ts";
 import type {
@@ -513,9 +513,7 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
   test("happy path: admits a task, pins model + tool credentials, delegates runJob with the right descriptor + snapshot input", async (t) => {
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
-    const fake = makeFakeJobRunner([
-      { status: "succeeded", taskId: "task-1", threadId: "thread-1" },
-    ]);
+    const fake = makeBlockingJobRunner();
     const { app } = await makeApp(t, {
       pins,
       ledger,
@@ -535,12 +533,14 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
         },
       }),
     );
-    assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), {
-      status: "succeeded",
-      taskId: "task-1",
-      threadId: "thread-1",
-    });
+    assert.equal(res.status, 202);
+    const body = await res.json() as {
+      status: string;
+      taskId: string;
+      threadId: string;
+    };
+    assert.equal(body.status, "accepted");
+    assert.equal(body.threadId, "thread-1");
 
     assert.equal(fake.calls.length, 1, "runJob delegated exactly once");
     const d = fake.calls[0]!;
@@ -567,8 +567,18 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     // The task was admitted owner-scoped by (owner, messageId).
     const admitted = ledger.getTaskByIntentKey("test-user", "msg-1");
     assert.ok(admitted, "task admitted by (owner, messageId)");
+    assert.equal(body.taskId, admitted!.id);
     assert.equal(admitted!.spec, "list my tasks");
     assert.equal(ledger.getTaskByIntentKey("other-user", "msg-1"), null);
+    fake.releaseAll();
+    await waitFor(() => {
+      try {
+        pins.get("test-user", "openrouter");
+        return false;
+      } catch {
+        return true;
+      }
+    });
   });
 
   test("a background request without thread_id runs on a thread keyed by its messageId", async (t) => {
@@ -581,22 +591,16 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       jobRunner: fake as unknown as JobRunner,
     });
     const res = await postChat(app, chatBody({ background: true, messageId: "msg-no-thread" }));
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 202);
     await res.json();
     assert.equal(fake.calls[0]!.clientThreadId, "msg-no-thread");
   });
 
-  test("idempotent retry: the same messageId admits ONE task; the second delegate returns already_terminal", async (t) => {
+  test("idempotent retry: the same messageId admits one task and a terminal resubmit is already_completed", async (t) => {
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([
       { status: "succeeded", taskId: "task-1", threadId: "thr-1" },
-      {
-        status: "already_terminal",
-        taskId: "task-1",
-        threadId: "thr-1",
-        terminalStatus: "succeeded",
-      },
     ]);
     const { app } = await makeApp(t, {
       pins,
@@ -605,39 +609,50 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     });
 
     const res1 = await postChat(app, chatBody({ background: true, messageId: "msg-same" }));
-    assert.equal(res1.status, 200);
+    assert.equal(res1.status, 202);
+    const first = await res1.json() as { taskId: string };
+    const task = ledger.getTaskByIntentKey("test-user", "msg-same")!;
+    const claimed = ledger.claimTask(task.id, "test-user");
+    ledger.completeTask(task.id, "test-user", "succeeded", claimed.fence_token);
 
     const res2 = await postChat(app, chatBody({ background: true, messageId: "msg-same" }));
     assert.equal(res2.status, 200);
     assert.deepEqual(await res2.json(), {
-      status: "succeeded",
-      taskId: "task-1",
+      status: "already_completed",
+      terminalStatus: "succeeded",
+      taskId: first.taskId,
       threadId: "msg-same",
     });
 
-    assert.equal(fake.calls.length, 2);
+    assert.equal(fake.calls.length, 1);
     assert.equal(fake.calls[0]!.intentKey, "msg-same");
-    assert.equal(fake.calls[1]!.intentKey, "msg-same");
     const tasks = ledger.listTasks("test-user").filter((task) => task.intent_key === "msg-same");
     assert.equal(tasks.length, 1, "one task row per (owner, messageId)");
   });
 
-  test("a duplicate while the first job runs maps to 202 { status: accepted }", async (t) => {
-    const fake = makeFakeJobRunner([
-      { status: "in_flight", taskId: "task-1", threadId: "thr-1" },
-    ]);
+  test("a duplicate while the first job runs is rejected without a second delegate", async (t) => {
+    const ledger = makeLedger();
+    const task = ledger.createTask({
+      owner: "test-user",
+      intentKey: "msg-running",
+      spec: "running",
+      worker: "msg-running",
+    });
+    ledger.claimTask(task.id, "test-user");
+    const fake = makeFakeJobRunner([]);
     const { app } = await makeApp(t, {
       pins: new CredentialPinStore(),
-      ledger: makeLedger(),
+      ledger,
       jobRunner: fake as unknown as JobRunner,
     });
     const res = await postChat(app, chatBody({ background: true, messageId: "msg-running" }));
-    assert.equal(res.status, 202);
+    assert.equal(res.status, 409);
     assert.deepEqual(await res.json(), {
-      status: "accepted",
-      taskId: "task-1",
+      error: "conversation_in_flight",
+      taskId: task.id,
       threadId: "msg-running",
     });
+    assert.equal(fake.calls.length, 0);
   });
 
   test("M1: a background duplicate (in_flight) releases the transport's model + tool pins (the runner never claimed them)", async (t) => {
@@ -676,7 +691,7 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     );
   });
 
-  test("M1: an already_terminal re-submit also releases the transport's pins", async (t) => {
+  test("a detached non-claimed completion releases the transport pins", async (t) => {
     const pins = new CredentialPinStore();
     const ledger = makeLedger();
     const fake = makeFakeJobRunner([
@@ -704,12 +719,10 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
         },
       }),
     );
-    assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), {
-      status: "succeeded",
-      taskId: "task-1",
-      threadId: "msg-term",
-    });
+    assert.equal(res.status, 202);
+    const body = await res.json() as { status: string; threadId: string };
+    assert.equal(body.status, "accepted");
+    assert.equal(body.threadId, "msg-term");
     assert.throws(
       () => pins.get("test-user", "openrouter"),
       (e: unknown) => (e as { code?: string }).code === "pin_not_found",
@@ -826,28 +839,32 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
     }
   });
 
-  test("runJob failed: JobErrorCode -> HTTP mapping", async (t) => {
-    const cases: Array<{ code: JobErrorCode; status: number }> = [
-      { code: "credentials_expired", status: 401 },
-      { code: "task_conflict", status: 409 },
-      { code: "tool_retry_forbidden", status: 409 },
-      { code: "plugin_unavailable", status: 502 },
-      { code: "job_failed", status: 500 },
-      { code: "budget_exhausted", status: 429 },
-      { code: "context_length_exceeded", status: 400 },
+  test("detached runJob failures are reconciled from the ledger, not the admission response", async (t) => {
+    const cases: JobErrorCode[] = [
+      "credentials_expired",
+      "task_conflict",
+      "tool_retry_forbidden",
+      "plugin_unavailable",
+      "job_failed",
+      "budget_exhausted",
+      "context_length_exceeded",
     ];
-    for (const { code, status } of cases) {
+    for (const code of cases) {
+      const pins = new CredentialPinStore();
       const fake = makeFakeJobRunner([
         { status: "failed", taskId: "t", threadId: "thr", code, error: `boom-${code}` },
       ]);
       const { app } = await makeApp(t, {
-        pins: new CredentialPinStore(),
+        pins,
         ledger: makeLedger(),
         jobRunner: fake as unknown as JobRunner,
       });
       const res = await postChat(app, chatBody({ background: true, messageId: `msg-${code}` }));
-      assert.equal(res.status, status, `${code} -> HTTP ${status}`);
-      assert.deepEqual(await res.json(), { error: code, message: `boom-${code}` });
+      assert.equal(res.status, 202);
+      const body = await res.json() as { status: string };
+      assert.equal(body.status, "accepted");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.throws(() => pins.get("test-user", "openrouter"));
     }
   });
 
@@ -1456,21 +1473,30 @@ describe("transport/model.ts — model construction + SSRF fetch seam", () => {
     );
   });
 
-  test("validated-fetch adapter rejects a private-range endpoint via injected lookup (DNS_REBINDING)", async () => {
-    const lookup: LookupFn = async (hostname) =>
-      hostname === "evil.internal"
-        ? [{ address: "10.0.0.5", family: 4 }]
-        : [];
+  test("validated-fetch adapter denies a host outside the model policy before fetch", async () => {
+    let fetched = false;
     const adapter = createValidatedFetchAdapter({
-      lookup,
-      mode: "test",
-      fetchFn: async () => new Response("{}", { status: 200 }),
+      policy: createEgressPolicy({
+        subject: "model:openrouter",
+        mode: "test",
+        destinations: [{
+          baseUrl: "https://openrouter.ai/api/v1",
+          pinnedIps: ["1.1.1.1"],
+          methods: ["POST"],
+          pathPrefixes: ["/api/v1"],
+        }],
+      }),
+      fetchFn: async () => {
+        fetched = true;
+        return new Response("{}", { status: 200 });
+      },
     });
     await assert.rejects(
-      adapter("https://evil.internal/api/chat", {}),
+      adapter("https://evil.internal/api/chat", { method: "POST" }),
       (err: unknown) =>
-        err instanceof SsrfValidationError && err.code === "DNS_REBINDING",
+        err instanceof SsrfValidationError && err.code === "EGRESS_DENIED",
     );
+    assert.equal(fetched, false);
   });
 
   test("validated-fetch adapter forwards a public endpoint to the injected fetchFn with redirect: manual", async () => {
@@ -1482,8 +1508,16 @@ describe("transport/model.ts — model construction + SSRF fetch seam", () => {
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
     const adapter = createValidatedFetchAdapter({
-      lookup: fakeLookup(),
-      mode: "test",
+      policy: createEgressPolicy({
+        subject: "model:openrouter",
+        mode: "test",
+        destinations: [{
+          baseUrl: "https://openrouter.ai/api/v1",
+          pinnedIps: ["1.1.1.1"],
+          methods: ["POST"],
+          pathPrefixes: ["/api/v1"],
+        }],
+      }),
       fetchFn,
     });
     const res = await adapter("https://openrouter.ai/api/v1/chat/completions", {
@@ -1494,16 +1528,22 @@ describe("transport/model.ts — model construction + SSRF fetch seam", () => {
     assert.equal(seenInit?.redirect, "manual", "validatedFetch forces redirect: manual");
   });
 
-  test("admin-trusted internal hosts are NOT rejected (trustedHosts honored)", async () => {
-    const lookup: LookupFn = async (hostname) =>
-      hostname === "vikunja.local" ? [{ address: "192.168.1.10", family: 4 }] : [];
+  test("admin-trusted internal model destinations retain their validated private pin", async () => {
     const adapter = createValidatedFetchAdapter({
-      lookup,
-      mode: "test",
-      trustedHosts: ["*.local"],
+      policy: createEgressPolicy({
+        subject: "model:vikunja",
+        mode: "test",
+        trustedHosts: ["*.local"],
+        destinations: [{
+          baseUrl: "https://vikunja.local",
+          pinnedIps: ["192.168.1.10"],
+          methods: ["POST"],
+          pathPrefixes: ["/"],
+        }],
+      }),
       fetchFn: async () => new Response("{}", { status: 200 }),
     });
-    const res = await adapter("https://vikunja.local/api/chat", {});
+    const res = await adapter("https://vikunja.local/api/chat", { method: "POST" });
     assert.equal(res.status, 200);
   });
 });
@@ -1816,16 +1856,16 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
       fake.releaseAll();
       await waitFor(() => fake.calls.length === 2);
       const res1 = await p1;
-      assert.equal(res1.status, 200);
+      assert.equal(res1.status, 202);
 
       // Release msg-2 → completes.
       fake.releaseAll();
       const res2 = await p2;
-      assert.equal(res2.status, 200);
+      assert.equal(res2.status, 202);
       await waitFor(() => budget.activeCount("test-user") === 0);
     });
 
-    test("M1 in_flight duplicate releases the budget reservation", async (t) => {
+    test("detached non-claimed results release the budget reservation", async (t) => {
       const pins = new CredentialPinStore();
       const ledger = makeLedger();
       const budget = createBudgetManager({ maxConcurrentPerUser: 2 });
@@ -1869,19 +1909,24 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
         ),
       ]);
       assert.equal(res1.status, 202);
-      assert.deepEqual(await res1.json(), {
-        status: "accepted",
-        taskId: "task-1",
-        threadId: "thread-1",
-      });
+      const body1 = await res1.json() as {
+        status: string;
+        taskId: string;
+        threadId: string;
+      };
+      assert.equal(body1.status, "accepted");
+      assert.equal(body1.threadId, "thread-1");
       assert.equal(res2.status, 202);
-      assert.deepEqual(await res2.json(), {
-        status: "accepted",
-        taskId: "task-2",
-        threadId: "thread-2",
-      });
-
-      // Both reservations released despite the in_flight duplicate status.
+      const body2 = await res2.json() as {
+        status: string;
+        taskId: string;
+        threadId: string;
+      };
+      assert.equal(body2.status, "accepted");
+      assert.equal(body2.threadId, "thread-2");
+      assert.notEqual(body1.taskId, body2.taskId);
+      assert.equal(ledger.getTask(body1.taskId, "test-user")?.intent_key, "msg-1");
+      assert.equal(ledger.getTask(body2.taskId, "test-user")?.intent_key, "msg-2");
       assert.equal(budget.activeCount("test-user"), 0);
     });
   });
@@ -2274,12 +2319,15 @@ describe("POST /v1/chat/completions — agent resolution (Wave 1, Step 4)", () =
       thread_id: "thread-agent",
       credentials: { openrouter: { apiKey: "sk-test" }, vikunja: { apiKey: "tok-123" } },
     }));
-    assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), {
-      status: "succeeded",
-      taskId: "task-agent",
-      threadId: "thread-agent",
-    });
+    assert.equal(res.status, 202);
+    const body = await res.json() as {
+      status: string;
+      taskId: string;
+      threadId: string;
+    };
+    assert.equal(body.status, "accepted");
+    assert.equal(body.threadId, "thread-agent");
+    assert.equal(ledger.getTask(body.taskId, "test-user")?.intent_key, "msg-agent");
     assert.equal(runner.calls.length, 1, "background: runner called once");
     const d = runner.calls[0]!;
     assert.equal(d.modelPluginId, "openrouter", "background: model plugin unchanged");

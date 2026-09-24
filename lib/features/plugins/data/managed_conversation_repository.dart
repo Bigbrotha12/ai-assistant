@@ -154,10 +154,15 @@ class ManagedConversationRepository {
   /// Every pending-turn row for [scope] across all conversations. Used by the
   /// foreground re-watch (plan P3) to enumerate still-pending background jobs.
   Future<List<ManagedPendingTurnRow>> pendingRows(AuthAccountScope scope) =>
-      (db.select(db.managedPendingTurns)..where(
-            (t) => t.scopeKey.equals(scope.storageId),
-          ))
-          .get();
+      (db.select(
+        db.managedPendingTurns,
+      )..where((t) => t.scopeKey.equals(scope.storageId))).get();
+
+  Stream<List<ManagedPendingTurnRow>> watchPendingRows(
+    AuthAccountScope scope,
+  ) => (db.select(
+    db.managedPendingTurns,
+  )..where((t) => t.scopeKey.equals(scope.storageId))).watch();
 
   /// Live set view of [pendingRows]: the conversation ids in [scope] that
   /// currently own a pending-turn row, for the conversation list's
@@ -165,9 +170,8 @@ class ManagedConversationRepository {
   /// every `managed_pending_turns` write, so a job starting or finishing while
   /// the list stays mounted under the open chat refreshes in place.
   Stream<Set<String>> pendingConversationIds(AuthAccountScope scope) =>
-      (db.select(db.managedPendingTurns)..where(
-            (t) => t.scopeKey.equals(scope.storageId),
-          ))
+      (db.select(db.managedPendingTurns)
+            ..where((t) => t.scopeKey.equals(scope.storageId)))
           .watch()
           .map((rows) => rows.map((row) => row.conversationId).toSet());
 
@@ -199,9 +203,10 @@ class ManagedConversationRepository {
     String id, {
     String? messageId,
   }) {
-    final query = db.delete(db.managedPendingTurns)..where(
-      (t) => t.conversationId.equals(id) & t.scopeKey.equals(scope.storageId),
-    );
+    final query = db.delete(db.managedPendingTurns)
+      ..where(
+        (t) => t.conversationId.equals(id) & t.scopeKey.equals(scope.storageId),
+      );
     if (messageId != null) {
       query.where((t) => t.messageId.equals(messageId));
     }

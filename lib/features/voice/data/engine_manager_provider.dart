@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import './device_health_provider.dart';
 import './engine_config.dart';
 import './engine_manager.dart';
 import './engine_registry.dart';
@@ -12,7 +13,16 @@ import '../ui/voice_settings_providers.dart';
 
 /// Singleton [EngineManager] instance.
 final engineManagerProvider = Provider<EngineManager>((ref) {
-  final manager = EngineManager();
+  final healthSource = ref.watch(deviceHealthSourceProvider);
+  final manager = EngineManager(
+    freeStorageBytes: () async {
+      try {
+        return (await healthSource.read()).freeStorageBytes;
+      } catch (_) {
+        return null;
+      }
+    },
+  );
   ref.onDispose(manager.dispose);
   // Trigger lazy initialisation (creates model directory, registers engines).
   // The future is memoised on the manager (`initialize()` is idempotent), so
@@ -89,8 +99,9 @@ class VoiceEngineStatusNotifier
 }
 
 /// Progress events for the currently-active model download (if any).
-final modelDownloadProgressProvider =
-    StreamProvider<ModelDownloadProgress?>((ref) {
+final modelDownloadProgressProvider = StreamProvider<ModelDownloadProgress?>((
+  ref,
+) {
   final manager = ref.watch(engineManagerProvider);
   return manager.downloadProgress;
 });

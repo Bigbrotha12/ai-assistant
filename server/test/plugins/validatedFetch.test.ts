@@ -5,10 +5,16 @@ import tls from "node:tls";
 import type { LookupFunction } from "node:net";
 import { Agent } from "undici";
 import {
+  createEgressPolicy,
+  policyFetch,
   SsrfValidationError,
   validatedFetch,
 } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
+import { createValidatedFetchAdapter } from "../../src/transport/model.ts";
+import { ToolExecutor } from "../../src/jobs/runner.ts";
+import type { PluginRegistry } from "../../src/plugins/registry.ts";
+import type { ToolPluginDefinition } from "../../src/plugins/types.ts";
 
 /**
  * The one sanctioned outbound-call assembly point (Fix 1): validate → resolve →
@@ -407,4 +413,133 @@ describe("validatedFetch", () => {
     );
     assert.equal(spy.callCount, 0);
   });
+});
+
+describe("policyFetch", () => {
+  test("retains the install/load pin when DNS changes after policy construction", async (t) => {
+    const policy = createEgressPolicy({
+      subject: "tool:vikunja",
+      mode: "test",
+      destinations: [{
+        baseUrl: "https://vikunja.example.com",
+        pinnedIps: ["1.1.1.1"],
+        methods: ["POST"],
+        exactPaths: ["/list_tasks"],
+      }],
+    });
+    const stopped = new Error("fake connector complete");
+    let currentDnsAnswer = "1.1.1.1";
+    t.mock.method(tls, "connect", (options: tls.ConnectionOptions & { lookup: LookupFunction }) => {
+      options.lookup("vikunja.example.com", { all: true }, (error, addresses) => {
+        assert.equal(error, null);
+        assert.deepEqual(addresses, [{ address: "1.1.1.1", family: 4 }]);
+      });
+      throw stopped;
+    });
+    await policyFetch(
+      "https://vikunja.example.com/list_tasks",
+      { method: "POST" },
+      {
+        policy,
+        fetchFn: async (_url, init) => {
+          currentDnsAnswer = "169.254.169.254";
+          const dispatcher = (init as RequestInit & { dispatcher: Agent }).dispatcher;
+          await assert.rejects(dispatcher.request({
+            origin: "https://vikunja.example.com",
+            path: "/list_tasks",
+            method: "POST",
+          }), stopped);
+          return new Response("ok");
+        },
+      },
+    );
+    assert.equal(currentDnsAnswer, "169.254.169.254");
+  });
+
+  test("refuses redirects under an explicit egress policy", async () => {
+    const policy = createEgressPolicy({
+      subject: "tool:vikunja",
+      mode: "test",
+      destinations: [{
+        baseUrl: "https://vikunja.example.com",
+        pinnedIps: ["1.1.1.1"],
+        methods: ["POST"],
+        exactPaths: ["/list_tasks"],
+      }],
+    });
+    await assert.rejects(
+      policyFetch(
+        "https://vikunja.example.com/list_tasks",
+        { method: "POST" },
+        {
+          policy,
+          fetchFn: async () => new Response(null, {
+            status: 307,
+            headers: { location: "https://evil.example/steal" },
+          }),
+        },
+      ),
+      (error: unknown) =>
+        error instanceof SsrfValidationError && error.code === "REDIRECT_REFUSED",
+    );
+  });
+
+  const toolPlugin: ToolPluginDefinition = {
+    id: "vikunja",
+    version: "1.0.0",
+    schemaVersion: 1,
+    type: "tool",
+    name: "Vikunja",
+    description: "Tasks",
+    tools: [{
+      name: "list_tasks",
+      description: "List tasks",
+      readOnly: true,
+      inputSchema: { type: "object" },
+    }],
+    baseUrls: [{ id: "vikunja", url: "https://vikunja.example.com" }],
+  };
+
+  for (const callSite of ["model", "tool"] as const) {
+    test(`${callSite} outbound path enforces its explicit allowlist`, async () => {
+      let fetched = false;
+      const fetchFn = (async () => {
+        fetched = true;
+        return new Response("not allowed");
+      }) as typeof fetch;
+      const call = callSite === "model"
+        ? createValidatedFetchAdapter({
+            policy: createEgressPolicy({
+              subject: "model:openrouter",
+              mode: "test",
+              destinations: [{
+                baseUrl: "https://openrouter.ai/api/v1",
+                pinnedIps: ["1.1.1.1"],
+                methods: ["POST"],
+                pathPrefixes: ["/api/v1"],
+              }],
+            }),
+            fetchFn,
+          })("https://evil.example/api/v1/chat/completions", { method: "POST" })
+        : new ToolExecutor({
+            registry: {
+              requirePlugin: () => toolPlugin,
+            } as unknown as PluginRegistry,
+            getPinnedIps: () => [{
+              entryId: "vikunja",
+              url: "https://vikunja.example.com",
+              pinned: ["1.1.1.1"],
+            }],
+            resolveEndpoint: () => "https://evil.example/list_tasks",
+            mode: "test",
+            fetchFn,
+          }).execute("vikunja", "list_tasks", {});
+      await assert.rejects(
+        call,
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "EGRESS_DENIED",
+      );
+      assert.equal(fetched, false);
+    });
+  }
 });

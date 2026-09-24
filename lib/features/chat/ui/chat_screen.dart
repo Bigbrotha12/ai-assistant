@@ -12,6 +12,7 @@ import '../../attachments/ui/attachment_picker.dart';
 import '../../attachments/data/file_model.dart';
 import '../../auth/ui/auth_flow.dart';
 import '../../settings/ui/settings_screen.dart';
+import '../../plugins/data/ledger_client.dart';
 import '../../voice/ui/voice_screen.dart';
 import './chat_providers.dart';
 import './conversation_list.dart';
@@ -124,20 +125,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     setState(() {
       _attachments.clear();
       _uploadStatus.value =
-          ref.read(conversationProvider(_conversationId)).value
-                  ?.attachmentUploads ??
-              const {};
+          ref
+              .read(conversationProvider(_conversationId))
+              .value
+              ?.attachmentUploads ??
+          const {};
     });
   }
 
   /// True when a user message starting with [text] exists in the persisted
   /// conversation, i.e. the send actually landed in the store.
   Future<bool> _isUserMessagePersisted(String text) async {
-    final conversation =
-        await ref.read(chatStoreProvider).loadConversation(_conversationId);
+    final conversation = await ref
+        .read(chatStoreProvider)
+        .loadConversation(_conversationId);
     if (conversation == null) return false;
-    return conversation.messages.any((m) =>
-        m.role == MessageRole.user && m.content.startsWith(text));
+    return conversation.messages.any(
+      (m) => m.role == MessageRole.user && m.content.startsWith(text),
+    );
   }
 
   /// Submits the current input as a BACKGROUND job (plan P3): the service
@@ -168,9 +173,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   /// this screen so toggling modes never stacks surfaces (Voice→Text→Voice
   /// would otherwise grow the back stack unboundedly).
   void _openVoice() {
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const VoiceScreen()),
-    );
+    Navigator.of(
+      context,
+    ).pushReplacement(MaterialPageRoute(builder: (_) => const VoiceScreen()));
   }
 
   @override
@@ -192,6 +197,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final error = state?.error;
     final authRequired = state?.authRequired ?? false;
     final hasPendingJob = state?.hasPendingJob ?? false;
+    final sentinelNotice = state?.sentinelNotice;
 
     // Mirror the conversation's live upload progress into the picker's
     // notifier so AttachmentRow overlays update as jobs progress / complete /
@@ -224,8 +230,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // The background action is a text-only submit: unavailable while a job is
     // already pending (the chip owns that conversation), while streaming, or
     // when files are selected (the background path carries no attachments).
-    final canSendBackground =
-        canSend && !hasPendingJob && _attachments.isEmpty;
+    final canSendBackground = canSend && !hasPendingJob && _attachments.isEmpty;
 
     return Scaffold(
       appBar: AppBar(
@@ -256,9 +261,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   .read(conversationProvider(_conversationId).notifier)
                   .dismissAuthRequired(),
             ),
+          if (sentinelNotice != null)
+            _SentinelAdvisoryBanner(
+              message: sentinelNotice,
+              onDismiss: () => ref
+                  .read(conversationProvider(_conversationId).notifier)
+                  .dismissSentinelNotice(),
+            ),
           if (hasPendingJob)
             _PendingJobBar(
-              jobError: state?.jobError,
+              projection:
+                  state?.backgroundJobProjection ??
+                  LedgerTaskProjection.running(),
               onRetry: () => ref
                   .read(conversationProvider(_conversationId).notifier)
                   .retryBackgroundJob(),
@@ -287,9 +301,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             onSend: _send,
             onSendBackground: _sendBackground,
             canSendBackground: canSendBackground,
-            onStop: () => ref
-                .read(conversationProvider(_conversationId).notifier)
-                .stop(),
+            onStop: () =>
+                ref.read(conversationProvider(_conversationId).notifier).stop(),
             onChanged: () => setState(() {}),
             attachmentRow: showAttachmentRow
                 ? AttachmentRow(
@@ -309,8 +322,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             child: SafeArea(
               top: false,
               child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 6,
+                ),
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
@@ -345,6 +360,44 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 }
 
+class _SentinelAdvisoryBanner extends StatelessWidget {
+  const _SentinelAdvisoryBanner({
+    required this.message,
+    required this.onDismiss,
+  });
+
+  final String message;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        child: Row(
+          children: [
+            Icon(Icons.info_outline, color: scheme.onSecondaryContainer),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: TextStyle(color: scheme.onSecondaryContainer),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Dismiss advisory',
+              onPressed: onDismiss,
+              icon: Icon(Icons.close, color: scheme.onSecondaryContainer),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// Non-blocking inline banner shown when the backend is not yet configured.
 class _ConfigureBanner extends ConsumerWidget {
   @override
@@ -358,13 +411,11 @@ class _ConfigureBanner extends ConsumerWidget {
           children: [
             Icon(Icons.settings_outlined, color: scheme.onErrorContainer),
             const SizedBox(width: 12),
-            const Expanded(
-              child: Text('Backend not configured'),
-            ),
+            const Expanded(child: Text('Backend not configured')),
             TextButton(
-              onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const SettingsScreen()),
-              ),
+              onPressed: () => Navigator.of(
+                context,
+              ).push(MaterialPageRoute(builder: (_) => const SettingsScreen())),
               child: Text(
                 'Configure Backend',
                 style: TextStyle(color: scheme.onErrorContainer),
@@ -377,45 +428,65 @@ class _ConfigureBanner extends ConsumerWidget {
   }
 }
 
-/// Inline pending-job bar (plan P3): shown while this conversation owns a
-/// background job. [jobError] switches the label to the failed state with the
-/// Retry affordance; Cancel clears the pending row via the notifier.
+/// Inline pending-job bar: shown while a projected task still owns the
+/// conversation marker. Projection—not transport timing—selects queued,
+/// running, cancelling, review, failure, and retry/cancel affordances.
 class _PendingJobBar extends StatelessWidget {
   const _PendingJobBar({
-    required this.jobError,
+    required this.projection,
     required this.onRetry,
     required this.onCancel,
   });
 
-  final String? jobError;
+  final LedgerTaskProjection projection;
   final VoidCallback onRetry;
   final VoidCallback onCancel;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final failed = jobError != null;
+    final failed = projection.isFailure;
+    final review = projection.code == LedgerTaskProgressCode.review;
+    final cancelling = projection.cancellationPending;
+    final label = failed
+        ? 'Background job failed'
+        : review
+        ? 'Background job needs review'
+        : cancelling
+        ? 'Cancelling background job…'
+        : projection.code == LedgerTaskProgressCode.queued
+        ? 'Queued background job…'
+        : 'Running background job…';
     return Material(
-      color: failed ? scheme.errorContainer : scheme.surfaceContainerHigh,
+      color: failed
+          ? scheme.errorContainer
+          : review
+          ? scheme.tertiaryContainer
+          : scheme.surfaceContainerHigh,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
         child: Row(
           children: [
             Icon(
-              failed ? Icons.error_outline : Icons.hourglass_top,
+              failed
+                  ? Icons.error_outline
+                  : review
+                  ? Icons.rate_review_outlined
+                  : Icons.hourglass_top,
               size: 18,
-              color: failed ? scheme.onErrorContainer : scheme.onSurfaceVariant,
+              color: failed
+                  ? scheme.onErrorContainer
+                  : review
+                  ? scheme.onTertiaryContainer
+                  : scheme.onSurfaceVariant,
             ),
             const SizedBox(width: 8),
             Expanded(
-              child: Text(
-                failed ? 'Background job failed' : 'Running background job…',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
+              child: Text(label, style: Theme.of(context).textTheme.bodySmall),
             ),
-            if (failed)
+            if (failed || projection.canRetry)
               TextButton(onPressed: onRetry, child: const Text('Retry job'))
-            else
+            else if (projection.canCancel && !cancelling)
               TextButton(onPressed: onCancel, child: const Text('Cancel')),
           ],
         ),
@@ -457,7 +528,9 @@ class _InputBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final tier = Theme.of(context).extension<TierTheme>() ?? const TierTheme(premium: false);
+    final tier =
+        Theme.of(context).extension<TierTheme>() ??
+        const TierTheme(premium: false);
     return Material(
       color: scheme.surface,
       // Hairline divider instead of a cast shadow; premium upgrades it to a
@@ -490,9 +563,7 @@ class _InputBar extends StatelessWidget {
                       maxLines: 5,
                       onChanged: (_) => onChanged(),
                       textInputAction: TextInputAction.newline,
-                      decoration: const InputDecoration(
-                        hintText: 'Message…',
-                      ),
+                      decoration: const InputDecoration(hintText: 'Message…'),
                     ),
                   ),
                   const SizedBox(width: 8),

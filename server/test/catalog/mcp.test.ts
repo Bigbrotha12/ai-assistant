@@ -129,6 +129,7 @@ describe("loadMcpCatalog", () => {
       );
       const entries = await loadMcpCatalog(filePath);
       assert.equal(entries[0]!.headers!.Authorization, "sk-secret-token");
+      assert.deepEqual(entries[0]!.headerRefs, { Authorization: "${MCP_TEST_TOKEN}" });
     });
   });
 

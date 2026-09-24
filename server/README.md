@@ -77,6 +77,12 @@ the ledger needs migrating.
 | `MODEL_CALL_TIMEOUT_MS` | no | `60000` | Outbound model-call timeout in milliseconds. |
 | `TOOL_CALL_TIMEOUT_MS` | no | `60000` | Outbound plugin-tool-call timeout in milliseconds. |
 | `MCP_CALL_TIMEOUT_MS` | no | `15000` | Per-call MCP JSON-RPC timeout in milliseconds. |
+| `SENTINEL_POLICY_MODE` | no | `advisory` | Sentinel disposition: `advisory` records findings without blocking; `blocking` is an explicit policy flip. |
+| `SENTINEL_MAX_BODY_BYTES` | no | `65536` | Maximum Sentinel input body size in bytes. |
+| `SENTINEL_RATE_LIMIT` | no | `60` | Sentinel sustained requests per minute, per owner. |
+| `SENTINEL_RATE_BURST` | no | `20` | Sentinel burst ceiling per owner. |
+| `AUDIT_TELEMETRY_ENABLED` | no | `true` | Enables structured plugin/MCP audit telemetry; set `false`, `0`, `no`, or `off` to disable. |
+| `AUDIT_TELEMETRY_LEVEL` | no | `info` | Audit telemetry log level: `error`, `warn`, `info`, or `debug`. |
 | `MAX_REQUEST_BODY_BYTES` | no | `10000000` | Maximum body size for non-establish chat requests. |
 | `MAX_ESTABLISH_BODY_BYTES` | no | `25000000` | Maximum body size for session-establish requests. |
 | `LEDGER_DB_PATH` | no | `./data/ledger.db` | **Dedicated** SQLite file for the task ledger (§ Task ledger below). |
@@ -248,8 +254,14 @@ the auth admin surface (user/session/apikey).
 - **Owner binding**: `createTask` sets `owner` (the API-key user id, via
   `requireApiKey`); `appendStep`/`heartbeat`/`resumeTask` re-validate ownership
   and reject non-owners (`FORBIDDEN`).
-- `intentKey` is stored raw with a **`(owner, intent_key)` unique constraint**
-  (migration v4, with dedupe + golden tests); canonicalization was dropped.
+ - `intentKey` is stored raw with a **`(owner, intent_key)` unique constraint**
+   (migration v4, with dedupe + golden tests); canonicalization was dropped.
+ - Background admission persists the redacted message snapshot and the
+   non-secret execution spec (`job_spec`) with the task. Startup reconciliation
+   handles both `queued` and `stuck` rows from that durable state; public
+   ledger responses never expose either internal field. A terminal `failed`
+   task is not retryable; only `stuck` tasks expose `canRetry`.
+
 
 Endpoints (all require `Authorization: Bearer <api-key>`; owner is the key's
 user id):
@@ -263,7 +275,7 @@ user id):
 | `POST /ledger/tasks/:id/steps`  | Append a step + chain record (task must be `running`).         |
 | `POST /ledger/tasks/:id/heartbeat` | Renew the lease (owner must hold it).                       |
 | `POST /ledger/tasks/:id/resume` | Resume a `stuck`/`awaiting_review` task (owner only).          |
-| `POST /ledger/tasks/:id/complete` | Set a terminal status (`succeeded|failed|cancelled|awaiting_review`). |
+| `POST /ledger/tasks/:id/complete` | Set a terminal status (`succeeded|failed|cancelled`); `awaiting_review` is internal-only and is rejected. |
 
 **Tests.** `npm test` runs the suite with Node's built-in runner via `tsx`
 (`tsx --test test/**/*.test.ts`). It covers lifecycle transitions,
@@ -279,15 +291,19 @@ introduces a plugin system foundation under `server/src/plugins/`:
 - `types.ts` — zod-validated `PluginDefinition` (tool + model) + store schema.
 - `ssrf.ts` — SSRF allowlist validation (scheme, private/loopback/metadata
   ranges, DNS-rebinding defense, `redirect: "manual"`).
-- `store.ts` — `PluginStore`: persists which **tool-plugin manifests** are
-  installed as JSON (`PLUGINS_STORE_PATH`). Missing file → empty store written
-  with `schemaVersion` (fail-fast on mismatch). `install`/`uninstall` operate
-  **on manifests only** — builtins ship in the build, are always available and
-  can never be uninstalled (no disabling toggle in Phase 1). Every allowlisted
-  baseUrl is SSRF-validated on install; admin-trusted internal hosts are
-  listed in `PLUGINS_TRUSTED_HOSTS`. Saves are atomic (temp file + rename) at
-  `0600`, and credentials are persisted spec-only (label/required flags) —
-  credential **values** are never written.
+ - `store.ts` — `PluginStore`: persists which **tool-plugin manifests** are
+   installed as JSON (`PLUGINS_STORE_PATH`). Missing file → empty store written
+   with `schemaVersion` (fail-fast on unsupported versions). A version-1 store
+   is migrated on load to version 2, but its existing entries deliberately have
+   no approved digest and remain blocked until the manifest is reinstalled and
+   re-approved; migration never treats an old approval as current. `install`/`uninstall`
+   operate **on manifests only** — builtins ship in the build, are always available and
+   can never be uninstalled (no disabling toggle in Phase 1). Every allowlisted
+   baseUrl is SSRF-validated on install; admin-trusted internal hosts are
+   listed in `PLUGINS_TRUSTED_HOSTS`. Saves are atomic (temp file + rename) at
+   `0600`, and credentials are persisted spec-only (label/required flags) —
+   credential **values** are never written.
+
 - `registry.ts` — `PluginRegistry` (lifecycle view): redacted public list
   (`baseUrls` id+label only; model `endpoint` omitted) vs. auth-gated details
   (full URLs), `requirePlugin` with actionable `PLUGIN_NOT_FOUND`/

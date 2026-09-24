@@ -2,15 +2,16 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { TestContext } from "node:test";
 import type { LookupAddress } from "node:dns";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { PluginStore } from "../../src/plugins/store.ts";
+import { computeManifestDigest } from "../../src/plugins/digest.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { createPluginRoutes } from "../../src/plugins/routes.ts";
 import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
-import type { ModelPluginDefinition, ToolPluginDefinition } from "../../src/plugins/types.ts";
+import type { AgentPluginDefinition, ModelPluginDefinition, ToolPluginDefinition } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 
 function openRouterBuiltin(): ModelPluginDefinition {
@@ -151,6 +152,7 @@ async function makeEnv(
 async function makeApp(
   t: TestContext,
   verifyKey?: VerifyApiKeyFn,
+  limiter?: (key: string) => boolean,
 ): Promise<{
   app: Hono;
   store: PluginStore;
@@ -166,6 +168,7 @@ async function makeApp(
       registry,
       store,
       verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
+      limiter,
     }),
   );
   return { app, store, registry, storePath };
@@ -237,6 +240,52 @@ describe("plugin routes — details endpoint", () => {
     assert.equal(vikunja.tools[0].name, "list_tasks");
   });
 
+  test("agent plugin details omit MCP header values", async (t) => {
+    const dir = await makeTempDir(t);
+    const agent: AgentPluginDefinition = {
+      id: "private-agent",
+      version: "1.0.0",
+      schemaVersion: 1,
+      type: "agent",
+      name: "Private Agent",
+      description: "agent",
+      systemPrompt: "system",
+      mcpServers: [{
+        name: "private-mcp",
+        url: "https://mcp.example.com",
+        headers: { "X-Api-Key": "secret-value" },
+      }],
+    };
+    const store = new PluginStore({
+      storePath: join(dir, "plugins.json"),
+      trustedHosts: [],
+      builtinPlugins: [openRouterBuiltin(), agent],
+      manifests: [],
+      lookup: fakeLookup(),
+    });
+    await store.load();
+    const registry = new PluginRegistry(store);
+    const app = new Hono();
+    app.route(
+      "/v1",
+      createPluginRoutes({
+        registry,
+        store,
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
+      }),
+    );
+
+    const response = await app.request("/v1/plugins/private-agent", { headers: auth });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.includes("secret-value"), false);
+    assert.equal(text.includes("X-Api-Key"), false);
+    assert.deepEqual(
+      (JSON.parse(text) as { mcpServers: unknown }).mcpServers,
+      [{ name: "private-mcp" }],
+    );
+  });
+
   test("unknown id → 404 plugin_not_found", async (t) => {
     const { app } = await makeApp(t);
     const res = await app.request("/v1/plugins/ghost", { headers: auth });
@@ -265,6 +314,16 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     });
     assert.equal(reinstall.status, 409);
     assert.deepEqual(await json(reinstall), { error: "plugin_already_installed" });
+  });
+
+  test("installing a builtin remains 409 plugin_already_installed", async (t) => {
+    const { app } = await makeApp(t, undefined, () => true);
+    const res = await app.request("/v1/plugins/openrouter/install", {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(res.status, 409);
+    assert.deepEqual(await json(res), { error: "plugin_already_installed" });
   });
 
   test("unknown manifest id → 404 plugin_not_found", async (t) => {
@@ -368,6 +427,78 @@ describe("plugin routes — reload", () => {
     });
     assert.equal(res.status, 500);
     assert.deepEqual(await json(res), { error: "invalid_config" });
+  });
+});
+
+describe("plugin routes — manifest pin mismatch", () => {
+  test("reload exposes expected/actual in list and detail, then reinstall clears it", async (t) => {
+    const { app, store, storePath } = await makeApp(t, undefined, () => true);
+    const install = await app.request("/v1/plugins/vikunja/install", {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(install.status, 200);
+
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as {
+      approvedDigests: Record<string, string>;
+      plugins: ToolPluginDefinition[];
+    };
+    const expected = persisted.approvedDigests.vikunja;
+    const changed = structuredClone(persisted.plugins[0]!);
+    changed.tools[0]!.inputSchema.required = ["changedId"];
+    const actual = computeManifestDigest(changed);
+    await writeFile(
+      storePath,
+      JSON.stringify({ ...persisted, plugins: [changed] }),
+      "utf8",
+    );
+
+    const reload = await app.request("/v1/plugins/reload", {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(reload.status, 409);
+    assert.deepEqual(await json(reload), { error: "pin_mismatch" });
+
+    const list = (await (await app.request("/v1/plugins", { headers: auth })).json()) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    const vikunja = list.plugins.find((plugin) => plugin.id === "vikunja")!;
+    assert.equal(vikunja.installed, true);
+    assert.equal(vikunja.hashMismatch, true);
+    assert.equal(vikunja.expected, expected);
+    assert.equal(vikunja.actual, actual);
+    assert.equal("approvedDigests" in vikunja, false);
+    assert.equal(JSON.stringify(list).includes("https://"), false);
+
+    const detail = (await (
+      await app.request("/v1/plugins/vikunja", { headers: auth })
+    ).json()) as Record<string, unknown>;
+    assert.equal(detail.hashMismatch, true);
+    assert.equal(detail.expected, expected);
+    assert.equal(detail.actual, actual);
+
+    const reinstall = await app.request("/v1/plugins/vikunja/install", {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(reinstall.status, 200);
+    assert.equal(store.getManifestHashMismatch("vikunja"), undefined);
+
+    const afterReinstall = JSON.parse(await readFile(storePath, "utf8")) as {
+      approvedDigests: Record<string, string>;
+    };
+    assert.equal(afterReinstall.approvedDigests.vikunja, expected);
+
+    const uninstall = await app.request("/v1/plugins/vikunja/uninstall", {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(uninstall.status, 200);
+    const afterUninstall = JSON.parse(await readFile(storePath, "utf8")) as {
+      approvedDigests: Record<string, string>;
+    };
+    assert.equal(afterUninstall.approvedDigests.vikunja, undefined);
   });
 });
 

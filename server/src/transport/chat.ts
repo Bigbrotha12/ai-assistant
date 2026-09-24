@@ -22,16 +22,15 @@ import { isRecord } from "../util.ts";
 import { createAgentGraph } from "../agents/graph.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
 import type {
-  JobErrorCode,
   JobToolHandler,
   JobRunner,
-  RunJobResult,
 } from "../jobs/runner.ts";
 import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
+import { serializeJobPayload, serializeJobSpec } from "../jobs/runner.ts";
 import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
-import { redactForOutbound, redactBaseMessage } from "../redact.ts";
+import { redactBaseMessage } from "../redact.ts";
 import {
   credentialFingerprint,
   extractCredentialsFromBody,
@@ -63,6 +62,7 @@ import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
 import type { SessionStore, SessionMissingReason } from "../sessions/store.ts";
+import { boundToolResult } from "../tool_bounds.ts";
 import type { AppendDeltaResult, ReestablishResult } from "../sessions/store.ts";
 
 /**
@@ -110,9 +110,9 @@ const customAgentSpecSchema = z.object({
  *   - SYNCHRONOUS (default): runs the supervisor graph and streams the result
  *     through the SSE adapter (`transport/openai.ts`) as `text/event-stream`.
  *   - ASYNCHRONOUS (`body.background === true`, Wave C2): admits an idempotent
- *     background task, pins the request's credentials, delegates to the
- *     `JobRunner`, and returns a JSON accepted/terminal response. The client
- *     polls `GET /ledger/tasks/by-key/:messageId` for the job's status.
+ *     background task, pins the request's credentials, starts a detached
+ *     `JobRunner`, and immediately returns `202 Accepted`. The client polls
+ *     `GET /ledger/tasks/by-key/:messageId` for status and terminal output.
  *
  * FLOW (sync, per request):
  *   1. gateway auth (`verifyKey` via `keyGateResponse`) -> 401 / 403
@@ -159,19 +159,18 @@ const customAgentSpecSchema = z.object({
  *      `{ error: "background_unavailable" }` when the async path is not wired;
  *   3. requires an idempotency key in `body.messageId` (see IDEMPOTENCY) ->
  *      400 invalid_request when missing;
- *   4. builds the SNAPSHOT — the request's `messages` converted to LangChain
- *      messages (same as the stateless sync path) — and ships it to the runner
- *      as `input: { messages: snapshot }`. The job runs on this snapshot, never
- *      a live session/checkpoint; the runner persists it as the ledger payload
- *      for crash-resume (ledger v5);
+ *   4. builds the immutable request SNAPSHOT — the request's `messages`
+ *      converted to LangChain messages — for detached execution without a live
+ *      session or checkpoint;
  *   5. validates + PINS the model-plugin credential and every installed
  *      tool-plugin credential in `body.credentials` -> 400 invalid_credentials
  *      on failure, BEFORE any task is admitted;
- *   6. `getOrCreateTask(ledger, { owner, intentKey: messageId, spec })` —
- *      owner-scoped idempotent admission;
- *   7. `jobRunner.runJob({...})` with the pinned credentials (the runner's
- *      `buildModel` seam resolves the model pin) and the snapshot input;
- *   8. maps the `RunJobResult` to HTTP (see JOB ERROR MAPPING).
+ *   6. reserves the background budget and calls owner-scoped
+ *      `getOrCreateTask(ledger, { owner, intentKey: messageId, spec })`;
+ *   7. starts `jobRunner.runJob({...})` without awaiting it; the pinned handles
+ *      remain alive until the detached completion callback;
+ *   8. returns `202 { status: "accepted", taskId, threadId }` immediately.
+ *      Post-admission failures settle in the ledger and are observed by polling.
  *
  * IDEMPOTENCY: the client generates `body.messageId` ONCE per send and reuses
  * it across retries. The ledger's v4 unique (owner, intent_key) index maps
@@ -180,13 +179,10 @@ const customAgentSpecSchema = z.object({
  * (`GET /ledger/tasks/by-key/:messageId`) is the client's poll-after-drop
  * surface; this transport reuses it and does NOT duplicate the logic.
  *
- * JOB ERROR MAPPING (Wave C2; `JobErrorCode` -> HTTP):
- *   credentials_expired  -> 401 { error: "credentials_expired", message }
- *   task_conflict        -> 409 { error: "task_conflict", message }
- *   tool_retry_forbidden -> 409 { error: "tool_retry_forbidden", message }
- *   plugin_unavailable   -> 502 { error: "plugin_unavailable", message }
- *   job_failed           -> 500 { error: "job_failed", message }
- * The `message` is the runner's already-redacted error text.
+ * BACKGROUND RESULT HANDLING: the admission response is not coupled to model
+ * or tool execution. A successful completion releases pins and starts exact-
+ * replay warmups. A detached failure is recorded by the runner and reconciled
+ * through the ledger; it does not mutate the already-sent HTTP response.
  *
  * ERROR MAPPING (pre-stream; flat `{"error": <code>}` for consistency with the
  * sibling plugin/checkpoint surfaces — the wire-spec §5.1 categories are noted):
@@ -554,7 +550,12 @@ type ResolvedChat = {
     systemPrompt: string;
     toolGrants?: { pluginId: string; required: boolean }[];
     inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
-    mcpServers?: { name: string; url: string; headers?: Record<string, string> }[];
+    mcpServers?: {
+      name: string;
+      url: string;
+      headers?: Record<string, string>;
+      headerRefs?: Record<string, string>;
+    }[];
   };
 };
 
@@ -773,11 +774,21 @@ export function resolveChatRequest(
       }
 
       // Resolve MCP servers: names → url/headers from catalog
-      const resolvedMcp: { name: string; url: string; headers?: Record<string, string> }[] = [];
+      const resolvedMcp: {
+        name: string;
+        url: string;
+        headers?: Record<string, string>;
+        headerRefs?: Record<string, string>;
+      }[] = [];
       for (const mcpRef of spec.mcpServers ?? []) {
         const entry = catalogs.mcps.find(m => m.name === mcpRef.name);
         if (entry) {
-          resolvedMcp.push({ name: entry.name, url: entry.url, headers: entry.headers });
+          resolvedMcp.push({
+            name: entry.name,
+            url: entry.url,
+            headers: entry.headers,
+            headerRefs: entry.headerRefs,
+          });
         } else {
           logger.warn(`[chat] custom agent: MCP server '${mcpRef.name}' not found in catalog; skipping`);
         }
@@ -1021,6 +1032,7 @@ async function handleSyncStream(
     owner,
     cache: opts.toolCache,
     handler: toolHandler,
+    budget,
   });
   const execution = createStreamExecution(c.req.raw.signal);
   trackModelExecution(model, execution);
@@ -1041,10 +1053,16 @@ async function handleSyncStream(
     },
   }, resolved.value.enabledPlugins);
   const mcpBinding = resolved.value.agentOverride?.mcpServers
-    ? await bindMcpServers(resolved.value.agentOverride.mcpServers, {
+      ? await bindMcpServers(resolved.value.agentOverride.mcpServers, {
+        owner,
+        requestId:
+          typeof body["messageId"] === "string"
+            ? body["messageId"]
+            : c.req.header("x-request-id"),
         signal: execution.signal,
         trustedHosts: env.MCP_TRUSTED_HOSTS,
       })
+
     : undefined;
   // The MCP binding owns live SSE connections + pinned Agents until the stream
   // takes ownership (buildStreamResponse) or this function exits. Every early
@@ -1352,6 +1370,7 @@ async function handleManagedSessionStream(
       owner,
       cache: opts.toolCache,
       handler: toolHandler,
+      budget,
     });
     const execution = createStreamExecution(c.req.raw.signal);
     trackModelExecution(model, execution);
@@ -1373,6 +1392,9 @@ async function handleManagedSessionStream(
     }, resolved.enabledPlugins);
     const mcpBinding = resolved.agentOverride?.mcpServers
       ? await bindMcpServers(resolved.agentOverride.mcpServers, {
+          owner,
+          requestId:
+            resolved.managedMessageId ?? c.req.header("x-request-id"),
           signal: execution.signal,
           trustedHosts: env.MCP_TRUSTED_HOSTS,
         })
@@ -1630,21 +1652,33 @@ function withToolResultCache(opts: {
   owner: string;
   cache?: ToolResultCache;
   handler: JobToolHandler;
+  budget: BudgetManager;
 }): JobToolHandler {
-  const { registry, owner, cache, handler } = opts;
-  const directRedacted = async (
+  const { registry, owner, cache, handler, budget } = opts;
+  const invokeTool = async (
     pluginId: string,
     toolName: string,
     args: Record<string, unknown>,
     credentials?: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<string> => {
-    return redactForOutbound(
+    return boundToolResult(
       String(await handler.execute(pluginId, toolName, args, credentials, signal)),
     );
   };
+  const executeBounded = (
+    pluginId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    credentials?: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<string> =>
+    budget.withToolCallBudget(
+      owner,
+      () => invokeTool(pluginId, toolName, args, credentials, signal),
+    );
   if (!cache) {
-    return { execute: directRedacted };
+    return { execute: executeBounded };
   }
 
   type ToolCallMeta = { readOnly: boolean; version: string };
@@ -1670,7 +1704,8 @@ function withToolResultCache(opts: {
         }
         resolved.set(lookup, meta);
       }
-      const direct = () => directRedacted(pluginId, toolName, args, credentials, signal);
+      const direct = () =>
+        executeBounded(pluginId, toolName, args, credentials, signal);
       if (meta === null || !canRetryTool({ readOnly: meta.readOnly })) {
         return direct();
       }
@@ -1683,7 +1718,7 @@ function withToolResultCache(opts: {
         argsHash: cache.argsHash(args),
       };
       const hit = cache.get(key);
-      if (hit !== undefined) return redactForOutbound(hit);
+      if (hit !== undefined) return boundToolResult(hit);
       const result = await direct();
       signal?.throwIfAborted();
       if (isDeleting(owner)) throw new AccountDeletedError(owner);
@@ -1779,12 +1814,11 @@ async function handleBackground(
     if (duplicate) return managedDuplicateResponse(c, duplicate);
   }
 
-  // The job's SNAPSHOT: the request's `messages` converted to LangChain the
-  // same way the stateless sync path does. The job runs on THIS snapshot
-  // (never a live session/checkpoint); the runner persists it as the ledger
-  // payload for crash-resume and `resumeStuckJobs` re-runs from it.
+  // The job's immutable snapshot: the request's `messages` converted exactly
+  // as the stateless sync path does. Detached execution never reads a live
+  // session or checkpoint; ledger payload retention lets startup recovery
+  // re-admit interrupted work through the same idempotent runner boundary.
   const snapshot = toLangChainMessages(rawMessages);
-
   // Validate + pin tool credentials first (atomic: all-or-nothing), then the
   // model credential. Any validation failure -> 400 before admission, and no
   // pin is left behind. `enabled_plugins` (when present) limits BOTH the
@@ -1817,11 +1851,26 @@ async function handleBackground(
     return accountDeletedResponse(c);
   }
 
+  const durablePayload = serializeJobPayload({ messages: snapshot });
+  const modelRequestConfig = {
+    owner,
+    requestModel,
+    requestParameters,
+  } satisfies JobModelRequestConfig;
+  const durableJobSpec = serializeJobSpec({
+    clientThreadId: clientThread,
+    toolPlugins,
+    modelPluginId,
+    modelRequestConfig,
+    systemPrompt: resolved.value.agentOverride?.systemPrompt,
+    mcpServers: resolved.value.agentOverride?.mcpServers,
+  });
+
   // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
   // so a queue-full 503 leaves no phantom task row. A queued admission parks
   // in the owner's bounded FIFO queue and waits (up to the budget's waitMs)
-  // for a free slot; the pool is shared with sync streams. Releasing after
-  // `runJob` returns (ANY result) mirrors the M1 pin-release pattern: a
+  // for a free slot; the pool is shared with sync streams. Releasing when the
+  // detached `runJob` promise settles mirrors the M1 pin-release pattern: a
   // non-claimed duplicate (in_flight / already_terminal) must not hold a
   // reservation either.
   const reservation = await budget.reserveAsync(owner);
@@ -1849,8 +1898,11 @@ async function handleBackground(
       // M2: persist the RAW client thread id so a restart-loss replay
       // (`resumeStuckJobs`) resumes under the same worker label instead of
       // re-deriving one from the intent key.
-      worker: clientThread,
-    });
+       worker: clientThread,
+       payload: durablePayload,
+       jobSpec: durableJobSpec,
+     });
+
   } catch (err) {
     if (err instanceof AccountDeletedError || isDeleting(owner)) {
       releasePins();
@@ -1868,62 +1920,42 @@ async function handleBackground(
     return accountDeletedResponse(c);
   }
 
-  let result: RunJobResult;
-  if (isDeleting(owner)) {
-    reservation.release();
-    releasePins();
-    return accountDeletedResponse(c);
-  }
-  try {
-    result = await jobRunner.runJob({
+  const completion = jobRunner.runJob({
+    owner,
+    intentKey: messageId,
+    spec: task.spec,
+    clientThreadId: clientThread,
+    toolPlugins,
+    modelPluginId,
+    modelRequestConfig: {
       owner,
-      intentKey: messageId,
-      spec: task.spec,
-      clientThreadId: clientThread,
-      toolPlugins,
-      modelPluginId,
-      modelRequestConfig: {
-        owner,
-        requestModel,
-        requestParameters,
-      } satisfies JobModelRequestConfig,
-      systemPrompt: resolved.value.agentOverride?.systemPrompt,
-      mcpServers: resolved.value.agentOverride?.mcpServers,
-      pinHandles,
-      input: { messages: snapshot },
-    });
-  } catch (err) {
-    if (err instanceof AccountDeletedError || isDeleting(owner)) {
+      requestModel,
+      requestParameters,
+    } satisfies JobModelRequestConfig,
+    systemPrompt: resolved.value.agentOverride?.systemPrompt,
+    mcpServers: resolved.value.agentOverride?.mcpServers,
+    pinHandles,
+    input: { messages: snapshot },
+  });
+  void completion.then(
+    (result) => {
       releasePins();
       reservation.release();
-      return accountDeletedResponse(c);
-    }
-    console.error("chat: background runJob threw", err);
-    // The runner releases pins in its own finally for the claimed path; a
-    // throw before claim (ledger edge) leaves them — release here as a safety
-    // net so an unexpected throw never leaks pins until the next sweep.
-    releasePins();
-    reservation.release();
-    return c.json({ error: "internal" }, 500);
-  }
+      if (result.status === "succeeded") {
+        scheduleWarmups(opts, owner, resolved.value.toolCredentialsByPlugin);
+      }
+    },
+    (error: unknown) => {
+      releasePins();
+      reservation.release();
+      console.error("chat: detached background runJob threw", error);
+    },
+  );
 
-  if (isDeleting(owner)) {
-    releasePins();
-    reservation.release();
-    return accountDeletedResponse(c);
-  }
-
-  if (
-    result.status === "in_flight" ||
-    result.status === "already_terminal" ||
-    result.status === "account_deleted"
-  ) releasePins();
-  reservation.release();
-  if (result.status === "succeeded") {
-    scheduleWarmups(opts, owner, resolved.value.toolCredentialsByPlugin);
-  }
-
-  return mapRunJobResult(c, result, clientThread);
+  return c.json(
+    { status: "accepted", taskId: task.id, threadId: clientThread },
+    202,
+  );
 }
 
 /**
@@ -2011,62 +2043,6 @@ function pinToolPlugins(
     return { ok: false, response: accountDeletedResponse(c) };
   }
   return { ok: true, toolPlugins: selected, pinHandles };
-}
-
-/** `JobErrorCode` -> HTTP status for a failed background job. */
-const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 400 | 401 | 403 | 409 | 429 | 502 | 500> = {
-  account_deleted: 403,
-  budget_exhausted: 429,
-  context_length_exceeded: 400,
-  credentials_expired: 401,
-  task_conflict: 409,
-  tool_retry_forbidden: 409,
-  plugin_unavailable: 502,
-  job_failed: 500,
-};
-
-/**
- * Map a `RunJobResult` to the async HTTP response:
- *   - `in_flight` (a concurrent duplicate is running) -> 202 accepted;
- *   - `succeeded` -> 200 { status: "succeeded" };
- *   - `already_terminal` -> 200 { status: <terminalStatus> };
- *   - `failed` -> the JobErrorCode HTTP status with the redacted message.
- *
- * `publicThreadId` is the RAW client thread handle (`clientThreadId ?? messageId`)
- * — the value the client must echo back as `thread_id`. The runner's
- * `result.threadId` is now the same raw client label (there is no checkpoint
- * thread to hash it into anymore); it is kept for the result type's shape, and
- * this mapping uses the caller-provided public label directly.
- */
-function mapRunJobResult(c: Context, result: RunJobResult, publicThreadId: string): Response {
-  switch (result.status) {
-    case "in_flight":
-      return c.json(
-        { status: "accepted", taskId: result.taskId, threadId: publicThreadId },
-        202,
-      );
-    case "succeeded":
-      return c.json(
-        { status: "succeeded", taskId: result.taskId, threadId: publicThreadId },
-        200,
-      );
-    case "already_terminal":
-      return c.json(
-        {
-          status: result.terminalStatus,
-          taskId: result.taskId,
-          threadId: publicThreadId,
-        },
-        200,
-      );
-    case "failed":
-      return c.json(
-        { error: result.code, message: result.error },
-        JOB_ERROR_HTTP_STATUS[result.code],
-      );
-    case "account_deleted":
-      return c.json({ error: "account_deleted", message: result.error }, 403);
-  }
 }
 
 /** True when the client's LAST message on a session turn is a `user` message.

@@ -14,7 +14,12 @@ const skillsCatalog: SkillEntry[] = [
 ];
 
 const mcpCatalog: McpEntry[] = [
-  { name: "filesystem", url: "https://filesystem.example.com", headers: { Authorization: "${TOKEN}" } },
+  {
+    name: "filesystem",
+    url: "https://filesystem.example.com",
+    headers: { Authorization: "resolved-token" },
+    headerRefs: { Authorization: "${TOKEN}" },
+  },
 ];
 
 const VALID_TEMPLATE = {
@@ -59,6 +64,8 @@ describe("loadAgentsCatalog", () => {
       assert.equal(entry.mcpServers.length, 1);
       assert.equal(entry.mcpServers[0]!.name, "filesystem");
       assert.equal(entry.mcpServers[0]!.url, "https://filesystem.example.com");
+      assert.deepEqual(entry.mcpServers[0]!.headerRefs, { Authorization: "${TOKEN}" });
+
       assert.equal(entry.tools!.length, 1);
       assert.equal(entry.tools![0]!.pluginId, "mealie");
       assert.equal(entry.tools![0]!.required, true);

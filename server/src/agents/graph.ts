@@ -10,6 +10,7 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { Annotation, END, Overwrite, START, StateGraph } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { SUPERVISOR_PROMPT } from "./prompts.ts";
+import { boundToolResultContent } from "../tool_bounds.ts";
 
 export const MAX_TOOL_ROUNDS = 5;
 
@@ -105,11 +106,13 @@ export function createAgentGraph({
     config.signal?.throwIfAborted();
     const result = await toolNode.invoke(state, config);
     const toolMessages = result.messages as BaseMessage[];
-    const outputs = toolMessages
+    const boundedToolMessages = toolMessages
       .filter((message): message is ToolMessage => message instanceof ToolMessage)
-      .map((message) => typeof message.content === "string"
-        ? message.content
-        : JSON.stringify(message.content));
+      .map((message) => {
+        message.content = boundToolResultContent(message.content);
+        return message;
+      });
+    const outputs = boundedToolMessages.map((message) => String(message.content));
     return {
       messages: toolMessages,
       toolRounds: 1,

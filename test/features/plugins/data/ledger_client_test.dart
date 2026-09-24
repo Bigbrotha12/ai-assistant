@@ -33,6 +33,41 @@ Map<String, dynamic> taskJson({
   'last_heartbeat_ts': 2,
 };
 
+Map<String, dynamic> cancelReportJson({
+  String taskId = 'task',
+  String stage = 'already-terminal',
+  String reachedStage = 'already-terminal',
+  String taskStatus = 'awaiting_review',
+  String? terminalStatus = 'awaiting_review',
+}) => {
+  'schemaVersion': 1,
+  'taskId': taskId,
+  'stage': stage,
+  'reachedStage': reachedStage,
+  'taskStatus': taskStatus,
+  'cancellable': false,
+  'terminalStatus': ?terminalStatus,
+  'effectState': 'completed_steps_only',
+  'completedActions': [
+    {
+      'id': 'step-1',
+      'stage': 'sentinel',
+      'action': 'sentinel:flag',
+      'completed': true,
+    },
+  ],
+  'projection': {
+    'schemaVersion': 1,
+    'code': 'review',
+    'lastActionId': 'step-1',
+    'canCancel': false,
+    'canRetry': false,
+    'cancellationPending': false,
+    'effectState': 'completed_steps_only',
+    'terminalStatus': 'awaiting_review',
+  },
+};
+
 ResponseBody jsonResponse(
   Object? value, {
   int status = 200,
@@ -308,63 +343,110 @@ void main() {
     }
   });
 
+  test(
+    'cancelTask posts no caller-selected state and parses the versioned report',
+    () async {
+      final adapter = FakeAdapter((_) => jsonResponse(cancelReportJson()));
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = LedgerClient(dio: dio, scope: credentials.accountScope!);
+
+      final report = await client.cancelTask('task', gatewayKey: 'gateway-key');
+
+      expect(adapter.requests.single.method, 'POST');
+      expect(adapter.requests.single.uri.path, '/ledger/tasks/task/cancel');
+      expect(adapter.requests.single.data, isNull);
+      expect(
+        adapter.requests.single.headers['Authorization'],
+        'Bearer gateway-key',
+      );
+      expect(report.stage, LedgerTaskCancelStage.alreadyTerminal);
+      expect(report.reachedStage, LedgerTaskCancelReachedStage.alreadyTerminal);
+      expect(report.taskStatus, LedgerTaskStatus.awaitingReview);
+      expect(report.terminalStatus, LedgerTaskStatus.awaitingReview);
+      expect(report.cancellable, isFalse);
+      expect(report.completedActions.single.action, 'sentinel:flag');
+      expect(report.projection.code, LedgerTaskProgressCode.review);
+    },
+  );
+
+  test('cancelTask rejects an internally inconsistent report', () async {
+    final payload = cancelReportJson();
+    (payload['projection']! as Map<String, dynamic>)['canCancel'] = true;
+    final adapter = FakeAdapter((_) => jsonResponse(payload));
+    final dio = Dio()..httpClientAdapter = adapter;
+    addTearDown(dio.close);
+    final client = LedgerClient(dio: dio, scope: credentials.accountScope!);
+
+    await expectLater(
+      client.cancelTask('task', gatewayKey: 'gateway-key'),
+      throwsA(
+        isA<PluginClientException>().having(
+          (error) => error.code,
+          'code',
+          'invalid_response',
+        ),
+      ),
+    );
+  });
+
   test('steps parsing: reply extraction + missing steps tolerated', () {
-  final withSteps = LedgerTask.fromJson({
-    ...taskJson(status: 'succeeded'),
-    'steps': [
-      {
-        'id': 's1',
-        'task_id': 'task',
-        'seq': 1,
-        'stage': 'tool',
-        'action': 'tool:list_tasks',
-        'result': '{"ok":true}',
-        'ts': 1,
-        'tool_call_id': 'call_1',
-      },
-      {
-        'id': 's2',
-        'task_id': 'task',
-        'seq': 2,
-        'stage': 'reply',
-        'action': 'assistant_message',
-        'result': 'the assistant reply',
-        'ts': 2,
-        'tool_call_id': null,
-      },
-    ],
+    final withSteps = LedgerTask.fromJson({
+      ...taskJson(status: 'succeeded'),
+      'steps': [
+        {
+          'id': 's1',
+          'task_id': 'task',
+          'seq': 1,
+          'stage': 'tool',
+          'action': 'tool:list_tasks',
+          'result': '{"ok":true}',
+          'ts': 1,
+          'tool_call_id': 'call_1',
+        },
+        {
+          'id': 's2',
+          'task_id': 'task',
+          'seq': 2,
+          'stage': 'reply',
+          'action': 'assistant_message',
+          'result': 'the assistant reply',
+          'ts': 2,
+          'tool_call_id': null,
+        },
+      ],
+    });
+    expect(withSteps.steps, hasLength(2));
+    expect(withSteps.steps.first.stage, 'tool');
+    expect(withSteps.steps.first.toolCallId, 'call_1');
+    expect(withSteps.steps.last.action, 'assistant_message');
+    expect(withSteps.reply, 'the assistant reply');
+
+    // The status-by-messageId endpoint carries no steps key — tolerated.
+    final withoutSteps = LedgerTask.fromJson(taskJson(status: 'succeeded'));
+    expect(withoutSteps.steps, isEmpty);
+    expect(withoutSteps.reply, isNull);
+
+    // A reply step without a string result yields a null reply.
+    final nullResult = LedgerTask.fromJson({
+      ...taskJson(status: 'succeeded'),
+      'steps': [
+        {'stage': 'reply', 'action': 'assistant_message', 'result': null},
+      ],
+    });
+    expect(nullResult.reply, isNull);
+
+    // A reply step with a non-string result yields a null reply.
+    final nonString = LedgerTask.fromJson({
+      ...taskJson(status: 'succeeded'),
+      'steps': [
+        {'stage': 'reply', 'action': 'assistant_message', 'result': 42},
+      ],
+    });
+    expect(nonString.reply, isNull);
   });
-  expect(withSteps.steps, hasLength(2));
-  expect(withSteps.steps.first.stage, 'tool');
-  expect(withSteps.steps.first.toolCallId, 'call_1');
-  expect(withSteps.steps.last.action, 'assistant_message');
-  expect(withSteps.reply, 'the assistant reply');
 
-  // The status-by-messageId endpoint carries no steps key — tolerated.
-  final withoutSteps = LedgerTask.fromJson(taskJson(status: 'succeeded'));
-  expect(withoutSteps.steps, isEmpty);
-  expect(withoutSteps.reply, isNull);
-
-  // A reply step without a string result yields a null reply.
-  final nullResult = LedgerTask.fromJson({
-    ...taskJson(status: 'succeeded'),
-    'steps': [
-      {'stage': 'reply', 'action': 'assistant_message', 'result': null},
-    ],
-  });
-  expect(nullResult.reply, isNull);
-
-  // A reply step with a non-string result yields a null reply.
-  final nonString = LedgerTask.fromJson({
-    ...taskJson(status: 'succeeded'),
-    'steps': [
-      {'stage': 'reply', 'action': 'assistant_message', 'result': 42},
-    ],
-  });
-  expect(nonString.reply, isNull);
-});
-
-test(
+  test(
     'all server statuses stay distinct; review and stuck are not terminal',
     () {
       final statuses = {
@@ -388,6 +470,181 @@ test(
       expect(LedgerTaskStatus.unknown.isTerminal, isFalse);
     },
   );
+
+  test('deterministic projection preserves every existing status and error behavior', () {
+    const cases =
+        <
+          ({
+            String status,
+            List<Map<String, dynamic>> steps,
+            LedgerTaskProgressCode code,
+            bool pending,
+            bool terminal,
+            bool canCancel,
+            bool canRetry,
+            LedgerTaskStatus? terminalStatus,
+            String? errorCode,
+            LedgerTaskEffectState effectState,
+          })
+        >[
+          (
+            status: 'queued',
+            steps: [],
+            code: LedgerTaskProgressCode.queued,
+            pending: true,
+            terminal: false,
+            canCancel: true,
+            canRetry: false,
+            terminalStatus: null,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.noneKnown,
+          ),
+          (
+            status: 'running',
+            steps: [],
+            code: LedgerTaskProgressCode.runningModel,
+            pending: true,
+            terminal: false,
+            canCancel: true,
+            canRetry: false,
+            terminalStatus: null,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.noneKnown,
+          ),
+          (
+            status: 'running',
+            steps: [
+              {'stage': 'tool', 'action': 'tool:list', 'result': '{}'},
+            ],
+            code: LedgerTaskProgressCode.runningModel,
+            pending: true,
+            terminal: false,
+            canCancel: true,
+            canRetry: false,
+            terminalStatus: null,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.completedStepsOnly,
+          ),
+          (
+            status: 'running',
+            steps: [
+              {'stage': 'error', 'action': 'error:job_failed', 'result': 'x'},
+            ],
+            code: LedgerTaskProgressCode.runningModel,
+            pending: true,
+            terminal: false,
+            canCancel: true,
+            canRetry: false,
+            terminalStatus: null,
+            errorCode: 'job_failed',
+            effectState: LedgerTaskEffectState.completedStepsOnly,
+          ),
+          (
+            status: 'stuck',
+            steps: [
+              {'stage': 'tool', 'action': 'tool:list', 'result': '{}'},
+            ],
+            code: LedgerTaskProgressCode.queued,
+            pending: true,
+            terminal: false,
+            canCancel: false,
+            canRetry: true,
+            terminalStatus: null,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.unknown,
+          ),
+          (
+            status: 'succeeded',
+            steps: [
+              {'stage': 'reply', 'action': 'assistant_message', 'result': 'ok'},
+            ],
+            code: LedgerTaskProgressCode.done,
+            pending: false,
+            terminal: true,
+            canCancel: false,
+            canRetry: false,
+            terminalStatus: LedgerTaskStatus.succeeded,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.completedStepsOnly,
+          ),
+          (
+            status: 'failed',
+            steps: [
+              {
+                'stage': 'error',
+                'action': 'error:credentials_expired',
+                'result': 'x',
+              },
+            ],
+            code: LedgerTaskProgressCode.done,
+            pending: false,
+            terminal: true,
+            canCancel: false,
+            canRetry: true,
+            terminalStatus: LedgerTaskStatus.failed,
+            errorCode: 'credentials_expired',
+            effectState: LedgerTaskEffectState.completedStepsOnly,
+          ),
+          (
+            status: 'cancelled',
+            steps: [],
+            code: LedgerTaskProgressCode.done,
+            pending: false,
+            terminal: true,
+            canCancel: false,
+            canRetry: false,
+            terminalStatus: LedgerTaskStatus.cancelled,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.noneKnown,
+          ),
+          (
+            status: 'awaiting_review',
+            steps: [
+              {'stage': 'sentinel', 'action': 'sentinel:flag', 'result': '{}'},
+            ],
+            code: LedgerTaskProgressCode.review,
+            pending: true,
+            terminal: true,
+            canCancel: false,
+            canRetry: false,
+            terminalStatus: LedgerTaskStatus.awaitingReview,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.completedStepsOnly,
+          ),
+          (
+            status: 'future_status',
+            steps: [],
+            code: LedgerTaskProgressCode.expired,
+            pending: false,
+            terminal: true,
+            canCancel: false,
+            canRetry: false,
+            terminalStatus: null,
+            errorCode: null,
+            effectState: LedgerTaskEffectState.unknown,
+          ),
+        ];
+
+    for (final item in cases) {
+      final task = LedgerTask.fromJson({
+        ...taskJson(status: item.status),
+        'steps': item.steps,
+      });
+      final projection = task.projection;
+      expect(projection.code, item.code, reason: item.status);
+      expect(projection.keepsPendingMarker, item.pending, reason: item.status);
+      expect(projection.isTerminal, item.terminal, reason: item.status);
+      expect(projection.canCancel, item.canCancel, reason: item.status);
+      expect(projection.canRetry, item.canRetry, reason: item.status);
+      expect(
+        projection.terminalStatus,
+        item.terminalStatus,
+        reason: item.status,
+      );
+      expect(projection.errorCode, item.errorCode, reason: item.status);
+      expect(projection.effectState, item.effectState, reason: item.status);
+    }
+  });
 
   test('invalid shapes, owner and lookup mismatches fail safely', () async {
     for (final body in [
@@ -416,24 +673,22 @@ test(
     }
   });
 
-  test(
-    '404 stays unknown and retries, backoff caps and exhausts without replay',
-    () async {
-      final rig = Rig(
-        (_) => jsonResponse({'error': 'not_found'}, status: 404),
-        maxAttempts: 5,
-      );
-      final handle = rig.poller.watch(const LedgerLookup.byMessageId('msg'));
-      rig.poller.setForeground(true);
-      await rig.clock.advance(const Duration(seconds: 20));
-      expect(rig.times, [0, 1, 3, 6, 9]);
-      final result = await handle.done;
-      expect(result.end, LedgerPollEnd.exhausted);
-      expect(result.task, isNull);
-      expect(result.error?.code, 'not_found');
-      expect(rig.adapter.requests.every((r) => r.method == 'GET'), isTrue);
-    },
-  );
+  test('404 projects an expired task immediately without retry', () async {
+    final rig = Rig(
+      (_) => jsonResponse({'error': 'not_found'}, status: 404),
+      maxAttempts: 5,
+    );
+    final handle = rig.poller.watch(const LedgerLookup.byMessageId('msg'));
+    rig.poller.setForeground(true);
+    await rig.clock.advance(Duration.zero);
+    final result = await handle.done;
+    expect(result.end, LedgerPollEnd.expired);
+    expect(result.task, isNull);
+    expect(result.projection?.code, LedgerTaskProgressCode.expired);
+    expect(result.error?.code, 'not_found');
+    expect(rig.times, [0]);
+    expect(rig.adapter.requests.every((r) => r.method == 'GET'), isTrue);
+  });
 
   test(
     '413 request_too_large is retryable (backoff then exhausts, no replay)',

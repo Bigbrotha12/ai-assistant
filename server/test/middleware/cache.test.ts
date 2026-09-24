@@ -84,6 +84,14 @@ describe("createToolResultCache", () => {
     assert.equal(cache.size, 0);
   });
 
+  test("oversized values are not admitted to the cache", (t) => {
+    const cache = createToolResultCache({ maxValueChars: 32, now: () => 1_000_000 });
+    t.after(() => cache.dispose());
+    cache.set(baseKey(), "x".repeat(33));
+    assert.equal(cache.size, 0);
+    assert.equal(cache.get(baseKey()), undefined);
+  });
+
   test("argsHash is deterministic and independent of object key order", (t) => {
     const cache = createToolResultCache({ now: () => 1_000_000 });
     t.after(() => cache.dispose());
@@ -226,6 +234,10 @@ describe("createToolResultCache", () => {
     assert.throws(
       () => createToolResultCache({ ttlMs: -1, setInterval, clearInterval }),
       /ttlMs/,
+    );
+    assert.throws(
+      () => createToolResultCache({ maxValueChars: 0, setInterval, clearInterval }),
+      /maxValueChars/,
     );
   });
 

@@ -4,26 +4,30 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/ui/conversation_list.dart';
 
 import '../../fakes.dart';
 
 Conversation conversation(String id, String title) => Conversation(
-      id: id,
-      title: title,
-      createdAt: DateTime(2024),
-      updatedAt: DateTime(2024),
-      messages: const [
-        Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-      ],
-    );
+  id: id,
+  title: title,
+  createdAt: DateTime(2024),
+  updatedAt: DateTime(2024),
+  messages: const [Message(id: 'm1', role: MessageRole.user, content: 'hi')],
+);
 
-Widget listApp({required FakeChatStore store, Set<String> pending = const {}}) {
+Widget listApp({
+  required FakeChatStore store,
+  Map<String, LedgerTaskProjection> projections = const {},
+}) {
   return ProviderScope(
     overrides: [
       chatStoreProvider.overrideWithValue(store),
-      pendingConversationIdsProvider.overrideWithValue(AsyncData(pending)),
+      backgroundJobProjectionsProvider.overrideWithValue(
+        AsyncData(projections),
+      ),
     ],
     child: const MaterialApp(home: ConversationListScreen()),
   );
@@ -31,34 +35,72 @@ Widget listApp({required FakeChatStore store, Set<String> pending = const {}}) {
 
 void main() {
   testWidgets(
-      'a conversation with a pending job shows the hourglass indicator and '
-      'conversations without one do not', (tester) async {
-    final store = FakeChatStore(initial: [
-      conversation('c1', 'Pending one'),
-      conversation('c2', 'Idle one'),
-    ]);
-    await tester.pumpWidget(listApp(store: store, pending: const {'c1'}));
+    'a conversation with a pending job shows the hourglass indicator and '
+    'conversations without one do not',
+    (tester) async {
+      final store = FakeChatStore(
+        initial: [
+          conversation('c1', 'Pending one'),
+          conversation('c2', 'Idle one'),
+        ],
+      );
+      await tester.pumpWidget(
+        listApp(
+          store: store,
+          projections: {'c1': LedgerTaskProjection.queued()},
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byIcon(Icons.hourglass_top), findsOneWidget);
+      final pendingRow = tester.widget<ListTile>(
+        find.ancestor(
+          of: find.text('Pending one'),
+          matching: find.byType(ListTile),
+        ),
+      );
+      expect(pendingRow.trailing, isNotNull);
+      final idleRow = tester.widget<ListTile>(
+        find.ancestor(
+          of: find.text('Idle one'),
+          matching: find.byType(ListTile),
+        ),
+      );
+      expect(idleRow.trailing, isNull);
+    },
+  );
+
+  testWidgets('review projection uses a distinct conversation-list chip', (
+    tester,
+  ) async {
+    final store = FakeChatStore(initial: [conversation('c1', 'Review one')]);
+    await tester.pumpWidget(
+      listApp(
+        store: store,
+        projections: {
+          'c1': const LedgerTaskProjection(
+            code: LedgerTaskProgressCode.review,
+            canCancel: false,
+            canRetry: false,
+            effectState: LedgerTaskEffectState.completedStepsOnly,
+            terminalStatus: LedgerTaskStatus.awaitingReview,
+          ),
+        },
+      ),
+    );
     await tester.pumpAndSettle();
 
-    expect(find.byIcon(Icons.hourglass_top), findsOneWidget);
-    final pendingRow = tester.widget<ListTile>(
-      find.ancestor(
-        of: find.text('Pending one'),
-        matching: find.byType(ListTile),
-      ),
+    expect(find.byIcon(Icons.rate_review_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.hourglass_top), findsNothing);
+    expect(
+      tester.widget<Icon>(find.byIcon(Icons.rate_review_outlined)).semanticLabel,
+      'Background job awaiting review',
     );
-    expect(pendingRow.trailing, isNotNull);
-    final idleRow = tester.widget<ListTile>(
-      find.ancestor(
-        of: find.text('Idle one'),
-        matching: find.byType(ListTile),
-      ),
-    );
-    expect(idleRow.trailing, isNull);
   });
 
-  testWidgets('no indicator is shown when the pending set is empty',
-      (tester) async {
+  testWidgets('no indicator is shown when the pending set is empty', (
+    tester,
+  ) async {
     final store = FakeChatStore(initial: [conversation('c1', 'Only one')]);
     await tester.pumpWidget(listApp(store: store));
     await tester.pumpAndSettle();
@@ -74,8 +116,10 @@ void main() {
       ProviderScope(
         overrides: [
           chatStoreProvider.overrideWithValue(store),
-          pendingConversationIdsProvider.overrideWithValue(
-            const AsyncData<Set<String>>({'c1'}),
+          backgroundJobProjectionsProvider.overrideWithValue(
+            AsyncData<Map<String, LedgerTaskProjection>>({
+              'c1': LedgerTaskProjection.queued(),
+            }),
           ),
         ],
         child: MaterialApp(

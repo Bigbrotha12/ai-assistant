@@ -26,6 +26,8 @@ import '../data/engine_errors.dart';
 import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/voice_capture_providers.dart';
+import '../data/voice_runtime_policy.dart';
+import '../data/voice_runtime_policy_provider.dart';
 import './voice_controller_provider.dart';
 
 /// Voice-first home screen: a single large hold-to-talk [SpeakButton], a
@@ -88,6 +90,8 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   Future<void> _holdStart() async {
     if (kDebugMode) debugPrint('UI: _holdStart');
     if (_micBusy) return;
+    if (!ref.read(voiceRuntimeDecisionProvider).allowCapture) return;
+
     final pipeline = ref.read(voiceCapturePipelineProvider);
     if (pipeline.isRecording) {
       await _holdEnd();
@@ -254,6 +258,7 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       }
     });
     final state = ref.watch(voiceConversationStateProvider);
+    final runtimeDecision = ref.watch(voiceRuntimeDecisionProvider);
 
     final accountDeleted =
         state.error != null && isAccountDeletedError(state.error);
@@ -308,7 +313,14 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            if (!configured) const _ConfigureBanner() else _FallbackBanner(),
+            if (!configured)
+              const _ConfigureBanner()
+            else
+              _FallbackBanner(
+                decision: runtimeDecision,
+                onContinueInText: _openChat,
+              ),
+
             if (error != null)
               authRequired
                   ? Flexible(
@@ -385,7 +397,9 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                                 ),
                                 const SizedBox(height: 10),
                                 _PhaseLabel(
-                                  phase: recording
+                                  phase: !runtimeDecision.allowCapture
+                                      ? 'Text'
+                                      : recording
                                       ? 'Listening'
                                       : state.isGenerating
                                       ? 'Working'
@@ -428,7 +442,8 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                             recording: recording,
                             aiSpeaking: state.isAiSpeaking,
                             generating: state.isGenerating,
-                            busy: _micBusy,
+                            busy: _micBusy || !runtimeDecision.allowCapture,
+
                             onHoldStart: _holdStart,
                             onHoldEnd: _holdEnd,
                           ),
@@ -772,11 +787,14 @@ class _ConfigureBanner extends ConsumerWidget {
   }
 }
 
-/// Non-blocking banner describing partial model availability: shown when an
-/// on-device engine is missing/failed but its server-side counterpart can
-/// still service the conversation.
 class _FallbackBanner extends ConsumerWidget {
-  const _FallbackBanner();
+  const _FallbackBanner({
+    required this.decision,
+    required this.onContinueInText,
+  });
+
+  final VoiceRuntimeDecision decision;
+  final Future<void> Function() onContinueInText;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -785,40 +803,55 @@ class _FallbackBanner extends ConsumerWidget {
       statuses[EngineConfig.whisperTinyId] ?? VoiceEngineStatus.notStarted,
       statuses[EngineConfig.supertonic3Id] ?? VoiceEngineStatus.notStarted,
     );
-    // Engines surfaced as `unavailable` are intentionally off (e.g. TTS is
-    // gated until its model/tokenizer lands) — they should neither show a
-    // download prompt nor trigger the fallback banner.
+    final policyMessage = decision.notice;
     final sttAvailable = stt != VoiceEngineStatus.unavailable;
     final ttsAvailable = tts != VoiceEngineStatus.unavailable;
     final sttReady = stt == VoiceEngineStatus.ready;
     final ttsReady = tts == VoiceEngineStatus.ready;
 
     final String message;
-    if (sttAvailable && !sttReady) {
+    final bool showPolicy = policyMessage != null;
+    if (showPolicy) {
+      message = policyMessage;
+    } else if (sttAvailable && !sttReady) {
       message = ttsAvailable && !ttsReady
-          ? 'On-device voice models not downloaded — download them below.'
-          : 'Local speech-to-text unavailable — using server transcription.';
+          ? 'On-device voice models are not downloaded. Download them below or continue in text.'
+          : 'On-device speech recognition is unavailable. Download the model below or continue in text.';
     } else if (ttsAvailable && !ttsReady) {
-      message = 'Local text-to-speech unavailable — using server voice.';
+      message = 'On-device voice replies are unavailable. Replies remain available as text.';
     } else {
       return const SizedBox.shrink();
     }
 
     final scheme = Theme.of(context).colorScheme;
+    final blocked = decision.level == VoiceRuntimeLevel.blocked;
+    final background = blocked
+        ? scheme.errorContainer
+        : scheme.surfaceContainerHighest;
+    final foreground = blocked
+        ? scheme.onErrorContainer
+        : scheme.onSurfaceVariant;
     return Material(
-      color: scheme.surfaceContainerHighest,
+      color: background,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         child: Row(
           children: [
-            Icon(Icons.info_outline, color: scheme.onSurfaceVariant),
+            Icon(
+              blocked ? Icons.warning_amber_outlined : Icons.info_outline,
+              color: foreground,
+            ),
             const SizedBox(width: 12),
             Expanded(
-              child: Text(
-                message,
-                style: TextStyle(color: scheme.onSurfaceVariant),
-              ),
+              child: Text(message, style: TextStyle(color: foreground)),
             ),
+            if (blocked)
+              TextButton(
+                key: const Key('voice-policy-text-fallback'),
+                style: TextButton.styleFrom(foregroundColor: foreground),
+                onPressed: () => unawaited(onContinueInText()),
+                child: const Text('Continue in text'),
+              ),
           ],
         ),
       ),

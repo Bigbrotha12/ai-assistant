@@ -38,22 +38,386 @@ enum LedgerTaskStatus {
   bool get shouldPoll => this == queued || this == running;
 }
 
+const taskProjectionSchemaVersion = 1;
+const taskCancelSchemaVersion = 1;
+
+enum LedgerTaskProgressCode {
+  queued,
+  runningModel,
+  runningTool,
+  review,
+  done,
+  expired,
+}
+
+enum LedgerTaskEffectState { noneKnown, completedStepsOnly, unknown }
+
+enum LedgerTaskCancelStage {
+  cancelling,
+  cancelled,
+  alreadyTerminal,
+  notCancellable,
+}
+
+enum LedgerTaskCancelReachedStage {
+  queued,
+  admitted,
+  running,
+  alreadyTerminal,
+  stuck,
+}
+
+LedgerTaskProgressCode _progressCode(Object? value) => switch (value) {
+  'queued' => LedgerTaskProgressCode.queued,
+  'running_model' => LedgerTaskProgressCode.runningModel,
+  'running_tool' => LedgerTaskProgressCode.runningTool,
+  'review' => LedgerTaskProgressCode.review,
+  'done' => LedgerTaskProgressCode.done,
+  'expired' => LedgerTaskProgressCode.expired,
+  _ => throw const PluginProtocolException(),
+};
+
+LedgerTaskEffectState _effectState(Object? value) => switch (value) {
+  'none_known' => LedgerTaskEffectState.noneKnown,
+  'completed_steps_only' => LedgerTaskEffectState.completedStepsOnly,
+  'unknown' => LedgerTaskEffectState.unknown,
+  _ => throw const PluginProtocolException(),
+};
+
+LedgerTaskCancelStage _cancelStage(Object? value) => switch (value) {
+  'cancelling' => LedgerTaskCancelStage.cancelling,
+  'cancelled' => LedgerTaskCancelStage.cancelled,
+  'already-terminal' => LedgerTaskCancelStage.alreadyTerminal,
+  'not-cancellable' => LedgerTaskCancelStage.notCancellable,
+  _ => throw const PluginProtocolException(),
+};
+
+LedgerTaskCancelReachedStage _cancelReachedStage(Object? value) =>
+    switch (value) {
+      'queued' => LedgerTaskCancelReachedStage.queued,
+      'admitted' => LedgerTaskCancelReachedStage.admitted,
+      'running' => LedgerTaskCancelReachedStage.running,
+      'already-terminal' => LedgerTaskCancelReachedStage.alreadyTerminal,
+      'stuck' => LedgerTaskCancelReachedStage.stuck,
+      _ => throw const PluginProtocolException(),
+    };
+
+LedgerTaskStatus _taskStatus(Object? value) => switch (value) {
+  'queued' => LedgerTaskStatus.queued,
+  'running' => LedgerTaskStatus.running,
+  'stuck' => LedgerTaskStatus.stuck,
+  'succeeded' => LedgerTaskStatus.succeeded,
+  'failed' => LedgerTaskStatus.failed,
+  'cancelled' => LedgerTaskStatus.cancelled,
+  'awaiting_review' => LedgerTaskStatus.awaitingReview,
+  _ => LedgerTaskStatus.unknown,
+};
+
+LedgerTaskStatus? _optionalTerminalStatus(Object? value) {
+  if (value == null) return null;
+  if (value is! String || !terminalTaskStatuses.contains(value)) {
+    throw const PluginProtocolException();
+  }
+  return _taskStatus(value);
+}
+
+class LedgerTaskProjection {
+  const LedgerTaskProjection({
+    required this.code,
+    required this.canCancel,
+    required this.canRetry,
+    required this.effectState,
+    this.cancellationPending = false,
+    this.lastActionId,
+    this.terminalStatus,
+    this.errorCode,
+  });
+
+  factory LedgerTaskProjection.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    if (json['schemaVersion'] != taskProjectionSchemaVersion) {
+      throw const PluginProtocolException();
+    }
+    final rawLastActionId = json['lastActionId'];
+    final rawErrorCode = json['errorCode'];
+    if (rawLastActionId != null && rawLastActionId is! String) {
+      throw const PluginProtocolException();
+    }
+    if (rawErrorCode != null && rawErrorCode is! String) {
+      throw const PluginProtocolException();
+    }
+    final rawCancellationPending = json['cancellationPending'];
+    if (rawCancellationPending != null && rawCancellationPending is! bool) {
+      throw const PluginProtocolException();
+    }
+    return LedgerTaskProjection(
+      code: _progressCode(json['code']),
+      canCancel: switch (json['canCancel']) {
+        final bool value => value,
+        _ => throw const PluginProtocolException(),
+      },
+      canRetry: switch (json['canRetry']) {
+        final bool value => value,
+        _ => throw const PluginProtocolException(),
+      },
+      effectState: _effectState(json['effectState']),
+      cancellationPending: rawCancellationPending as bool? ?? false,
+      lastActionId: rawLastActionId as String?,
+      terminalStatus: _optionalTerminalStatus(json['terminalStatus']),
+      errorCode: rawErrorCode as String?,
+    );
+  }
+
+  factory LedgerTaskProjection.queued() => const LedgerTaskProjection(
+    code: LedgerTaskProgressCode.queued,
+    canCancel: true,
+    canRetry: false,
+    effectState: LedgerTaskEffectState.noneKnown,
+  );
+
+  factory LedgerTaskProjection.running() => const LedgerTaskProjection(
+    code: LedgerTaskProgressCode.runningModel,
+    canCancel: true,
+    canRetry: false,
+    effectState: LedgerTaskEffectState.noneKnown,
+  );
+
+  factory LedgerTaskProjection.expired() => const LedgerTaskProjection(
+    code: LedgerTaskProgressCode.expired,
+    canCancel: false,
+    canRetry: false,
+    effectState: LedgerTaskEffectState.unknown,
+  );
+
+  factory LedgerTaskProjection.failed() => const LedgerTaskProjection(
+    code: LedgerTaskProgressCode.done,
+    canCancel: false,
+    canRetry: true,
+    effectState: LedgerTaskEffectState.unknown,
+    terminalStatus: LedgerTaskStatus.failed,
+  );
+
+  final LedgerTaskProgressCode code;
+  final String? lastActionId;
+  final bool canCancel;
+  final bool canRetry;
+  final bool cancellationPending;
+  final LedgerTaskEffectState effectState;
+  final LedgerTaskStatus? terminalStatus;
+  final String? errorCode;
+
+  bool get keepsPendingMarker =>
+      code == LedgerTaskProgressCode.queued ||
+      code == LedgerTaskProgressCode.runningModel ||
+      code == LedgerTaskProgressCode.runningTool ||
+      code == LedgerTaskProgressCode.review;
+
+  bool get isTerminal =>
+      code == LedgerTaskProgressCode.review ||
+      code == LedgerTaskProgressCode.done ||
+      code == LedgerTaskProgressCode.expired;
+
+  bool get isFailure =>
+      code == LedgerTaskProgressCode.expired ||
+      (code == LedgerTaskProgressCode.done &&
+          (terminalStatus == LedgerTaskStatus.failed ||
+              terminalStatus == LedgerTaskStatus.cancelled));
+
+  Map<String, dynamic> toJson() => {
+    'schemaVersion': taskProjectionSchemaVersion,
+    'code': switch (code) {
+      LedgerTaskProgressCode.queued => 'queued',
+      LedgerTaskProgressCode.runningModel => 'running_model',
+      LedgerTaskProgressCode.runningTool => 'running_tool',
+      LedgerTaskProgressCode.review => 'review',
+      LedgerTaskProgressCode.done => 'done',
+      LedgerTaskProgressCode.expired => 'expired',
+    },
+    if (lastActionId != null) 'lastActionId': lastActionId,
+    'canCancel': canCancel,
+    'canRetry': canRetry,
+    'cancellationPending': cancellationPending,
+    'effectState': switch (effectState) {
+      LedgerTaskEffectState.noneKnown => 'none_known',
+      LedgerTaskEffectState.completedStepsOnly => 'completed_steps_only',
+      LedgerTaskEffectState.unknown => 'unknown',
+    },
+    if (terminalStatus != null) 'terminalStatus': _statusWire(terminalStatus!),
+    if (errorCode != null) 'errorCode': errorCode,
+  };
+}
+
+class LedgerCompletedAction {
+  const LedgerCompletedAction({
+    required this.id,
+    required this.stage,
+    required this.action,
+    this.toolCallId,
+  });
+
+  factory LedgerCompletedAction.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    if (json['completed'] != true) throw const PluginProtocolException();
+    final rawToolCallId = json['toolCallId'];
+    if (rawToolCallId != null && rawToolCallId is! String) {
+      throw const PluginProtocolException();
+    }
+    return LedgerCompletedAction(
+      id: _publicId(json['id']),
+      stage: _metadataText(json['stage']),
+      action: _metadataText(json['action']),
+      toolCallId: rawToolCallId == null ? null : _publicId(rawToolCallId),
+    );
+  }
+
+  final String id;
+  final String stage;
+  final String action;
+  final String? toolCallId;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'stage': stage,
+    'action': action,
+    if (toolCallId != null) 'toolCallId': toolCallId,
+    'completed': true,
+  };
+}
+
+class LedgerTaskCancelReport {
+  const LedgerTaskCancelReport({
+    required this.taskId,
+    required this.stage,
+    required this.reachedStage,
+    required this.taskStatus,
+    required this.cancellable,
+    required this.effectState,
+    required this.completedActions,
+    required this.projection,
+    this.terminalStatus,
+  });
+
+  factory LedgerTaskCancelReport.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    if (json['schemaVersion'] != taskCancelSchemaVersion) {
+      throw const PluginProtocolException();
+    }
+    final rawActions = json['completedActions'];
+    if (rawActions is! List || rawActions.length > 64) {
+      throw const PluginProtocolException();
+    }
+    final projection = LedgerTaskProjection.fromJson(json['projection']);
+    final effectState = _effectState(json['effectState']);
+    final stage = _cancelStage(json['stage']);
+    final reachedStage = _cancelReachedStage(json['reachedStage']);
+    final taskStatus = _taskStatus(json['taskStatus']);
+    final cancellable = switch (json['cancellable']) {
+      final bool value => value,
+      _ => throw const PluginProtocolException(),
+    };
+    final terminalStatus = _optionalTerminalStatus(json['terminalStatus']);
+    if (taskStatus == LedgerTaskStatus.unknown ||
+        effectState != projection.effectState ||
+        cancellable != projection.canCancel ||
+        (stage == LedgerTaskCancelStage.cancelling) !=
+            projection.cancellationPending ||
+        (stage == LedgerTaskCancelStage.alreadyTerminal) !=
+            (reachedStage == LedgerTaskCancelReachedStage.alreadyTerminal) ||
+        (stage == LedgerTaskCancelStage.cancelled &&
+            (taskStatus != LedgerTaskStatus.cancelled ||
+                terminalStatus != LedgerTaskStatus.cancelled ||
+                projection.terminalStatus != LedgerTaskStatus.cancelled)) ||
+        (stage == LedgerTaskCancelStage.cancelling &&
+            (taskStatus != LedgerTaskStatus.running ||
+                terminalStatus != null)) ||
+        (stage == LedgerTaskCancelStage.alreadyTerminal &&
+            (!projection.isTerminal ||
+                terminalStatus == null ||
+                terminalStatus != projection.terminalStatus)) ||
+        (stage == LedgerTaskCancelStage.notCancellable &&
+            (projection.canCancel ||
+                projection.cancellationPending ||
+                projection.terminalStatus != null))) {
+      throw const PluginProtocolException();
+    }
+    return LedgerTaskCancelReport(
+      taskId: _publicId(json['taskId']),
+      stage: stage,
+      reachedStage: reachedStage,
+      taskStatus: taskStatus,
+      cancellable: cancellable,
+      terminalStatus: terminalStatus,
+      effectState: effectState,
+      completedActions: List.unmodifiable(
+        rawActions.map(LedgerCompletedAction.fromJson),
+      ),
+      projection: projection,
+    );
+  }
+
+  final String taskId;
+  final LedgerTaskCancelStage stage;
+  final LedgerTaskCancelReachedStage reachedStage;
+  final LedgerTaskStatus taskStatus;
+  final bool cancellable;
+  final LedgerTaskStatus? terminalStatus;
+  final LedgerTaskEffectState effectState;
+  final List<LedgerCompletedAction> completedActions;
+  final LedgerTaskProjection projection;
+
+  Map<String, dynamic> toJson() => {
+    'schemaVersion': taskCancelSchemaVersion,
+    'taskId': taskId,
+    'stage': switch (stage) {
+      LedgerTaskCancelStage.cancelling => 'cancelling',
+      LedgerTaskCancelStage.cancelled => 'cancelled',
+      LedgerTaskCancelStage.alreadyTerminal => 'already-terminal',
+      LedgerTaskCancelStage.notCancellable => 'not-cancellable',
+    },
+    'reachedStage': switch (reachedStage) {
+      LedgerTaskCancelReachedStage.queued => 'queued',
+      LedgerTaskCancelReachedStage.admitted => 'admitted',
+      LedgerTaskCancelReachedStage.running => 'running',
+      LedgerTaskCancelReachedStage.alreadyTerminal => 'already-terminal',
+      LedgerTaskCancelReachedStage.stuck => 'stuck',
+    },
+    'taskStatus': _statusWire(taskStatus),
+    'cancellable': cancellable,
+    if (terminalStatus != null) 'terminalStatus': _statusWire(terminalStatus!),
+    'effectState': switch (effectState) {
+      LedgerTaskEffectState.noneKnown => 'none_known',
+      LedgerTaskEffectState.completedStepsOnly => 'completed_steps_only',
+      LedgerTaskEffectState.unknown => 'unknown',
+    },
+    'completedActions': completedActions
+        .map((action) => action.toJson())
+        .toList(growable: false),
+    'projection': projection.toJson(),
+  };
+}
+
+String _statusWire(LedgerTaskStatus status) => switch (status) {
+  LedgerTaskStatus.queued => 'queued',
+  LedgerTaskStatus.running => 'running',
+  LedgerTaskStatus.stuck => 'stuck',
+  LedgerTaskStatus.succeeded => 'succeeded',
+  LedgerTaskStatus.failed => 'failed',
+  LedgerTaskStatus.cancelled => 'cancelled',
+  LedgerTaskStatus.awaitingReview => 'awaiting_review',
+  LedgerTaskStatus.unknown => 'unknown',
+};
+
 class LedgerTask {
   LedgerTask.fromJson(Object? value) {
     final json = pluginJsonObject(value);
     id = _publicId(json['id']);
     messageId = _publicId(json['intent_key']);
     final rawStatus = pluginJsonString(json['status']);
-    status = switch (rawStatus) {
-      'queued' => LedgerTaskStatus.queued,
-      'running' => LedgerTaskStatus.running,
-      'stuck' => LedgerTaskStatus.stuck,
-      'succeeded' => LedgerTaskStatus.succeeded,
-      'failed' => LedgerTaskStatus.failed,
-      'cancelled' => LedgerTaskStatus.cancelled,
-      'awaiting_review' => LedgerTaskStatus.awaitingReview,
-      _ => LedgerTaskStatus.unknown,
-    };
+    status = _taskStatus(rawStatus);
+    final rawProjection = json['projection'];
+    serverProjection = rawProjection == null
+        ? null
+        : LedgerTaskProjection.fromJson(rawProjection);
     createdTs = _timestamp(json['created_ts']);
     updatedTs = _timestamp(json['updated_ts']);
     lastHeartbeatTs = _timestamp(json['last_heartbeat_ts']);
@@ -78,6 +442,10 @@ class LedgerTask {
   late final int updatedTs;
   late final int lastHeartbeatTs;
   late final List<LedgerStep> steps;
+  late final LedgerTaskProjection? serverProjection;
+
+  LedgerTaskProjection get projection =>
+      serverProjection ?? projectLedgerTask(this);
 
   /// The transient `reply` step's result (the background job's final assistant
   /// message), or null when the task carries none. Only the full-task endpoint
@@ -117,6 +485,76 @@ class LedgerStep {
   late final String? toolCallId;
 }
 
+LedgerTaskProjection projectLedgerTask(LedgerTask task) {
+  String? errorCode;
+  for (final step in task.steps.reversed) {
+    if (step.stage == 'error' && step.action.startsWith('error:')) {
+      errorCode = step.action.substring('error:'.length);
+      break;
+    }
+  }
+  return switch (task.status) {
+    LedgerTaskStatus.queued => LedgerTaskProjection.queued(),
+    LedgerTaskStatus.running => LedgerTaskProjection(
+      code: LedgerTaskProgressCode.runningModel,
+      canCancel: true,
+      canRetry: false,
+      effectState: task.steps.isEmpty
+          ? LedgerTaskEffectState.noneKnown
+          : LedgerTaskEffectState.completedStepsOnly,
+      errorCode: errorCode,
+    ),
+    LedgerTaskStatus.stuck => LedgerTaskProjection(
+      code: LedgerTaskProgressCode.queued,
+      canCancel: false,
+      canRetry: true,
+      effectState: LedgerTaskEffectState.unknown,
+      errorCode: errorCode,
+    ),
+    LedgerTaskStatus.succeeded => LedgerTaskProjection(
+      code: LedgerTaskProgressCode.done,
+      canCancel: false,
+      canRetry: false,
+      effectState: task.steps.isEmpty
+          ? LedgerTaskEffectState.noneKnown
+          : LedgerTaskEffectState.completedStepsOnly,
+      terminalStatus: LedgerTaskStatus.succeeded,
+      errorCode: errorCode,
+    ),
+    LedgerTaskStatus.failed => LedgerTaskProjection(
+      code: LedgerTaskProgressCode.done,
+      canCancel: false,
+      canRetry: true,
+      effectState: task.steps.isEmpty
+          ? LedgerTaskEffectState.noneKnown
+          : LedgerTaskEffectState.completedStepsOnly,
+      terminalStatus: LedgerTaskStatus.failed,
+      errorCode: errorCode,
+    ),
+    LedgerTaskStatus.cancelled => LedgerTaskProjection(
+      code: LedgerTaskProgressCode.done,
+      canCancel: false,
+      canRetry: false,
+      effectState: task.steps.isEmpty
+          ? LedgerTaskEffectState.noneKnown
+          : LedgerTaskEffectState.completedStepsOnly,
+      terminalStatus: LedgerTaskStatus.cancelled,
+      errorCode: errorCode,
+    ),
+    LedgerTaskStatus.awaitingReview => LedgerTaskProjection(
+      code: LedgerTaskProgressCode.review,
+      canCancel: false,
+      canRetry: false,
+      effectState: task.steps.isEmpty
+          ? LedgerTaskEffectState.noneKnown
+          : LedgerTaskEffectState.completedStepsOnly,
+      terminalStatus: LedgerTaskStatus.awaitingReview,
+      errorCode: errorCode,
+    ),
+    LedgerTaskStatus.unknown => LedgerTaskProjection.expired(),
+  };
+}
+
 String _publicId(Object? value) {
   final id = pluginJsonString(value);
   if (id.length > 1024 ||
@@ -126,6 +564,14 @@ String _publicId(Object? value) {
     throw const PluginProtocolException();
   }
   return id;
+}
+
+String _metadataText(Object? value) {
+  final text = pluginJsonString(value);
+  if (text.length > 256 || text.contains(RegExp(r'[\x00-\x1f\x7f]'))) {
+    throw const PluginProtocolException();
+  }
+  return text;
 }
 
 int _timestamp(Object? value) {
@@ -158,6 +604,25 @@ class LedgerClient {
     required String gatewayKey,
     CancelToken? cancelToken,
   }) => _get(LedgerLookup.byTaskId(id), gatewayKey, cancelToken);
+
+  Future<LedgerTaskCancelReport> cancelTask(
+    String id, {
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  }) => _http.run(cancelToken, (token) async {
+    final safeId = _publicId(id);
+    final response = await _http.send(
+      path: '/ledger/tasks/${Uri.encodeComponent(safeId)}/cancel',
+      gatewayKey: gatewayKey,
+      cancelToken: token,
+      method: 'POST',
+    );
+    final report = LedgerTaskCancelReport.fromJson(
+      await _http.readJson(response.data),
+    );
+    if (report.taskId != safeId) throw const PluginProtocolException();
+    return report;
+  });
 
   Future<LedgerTask> _get(
     LedgerLookup lookup,
@@ -220,13 +685,14 @@ class TimerLedgerScheduler implements LedgerScheduler {
       Timer(delay, callback).cancel;
 }
 
-enum LedgerPollEnd { observed, exhausted, error, cancelled }
+enum LedgerPollEnd { observed, expired, exhausted, error, cancelled }
 
 class LedgerPollResult {
-  const LedgerPollResult(this.end, {this.task, this.error});
+  const LedgerPollResult(this.end, {this.task, this.projection, this.error});
 
   final LedgerPollEnd end;
   final LedgerTask? task;
+  final LedgerTaskProjection? projection;
   final PluginClientException? error;
 }
 
@@ -247,6 +713,7 @@ class LedgerPollHandle {
   int _attempts = 0;
   Duration _notBefore = Duration.zero;
   LedgerTask? _task;
+  LedgerTaskProjection? _projection;
   PluginClientException? _error;
 
   Future<LedgerPollResult> get done => _completion.future;
@@ -272,7 +739,14 @@ class LedgerPollHandle {
     _suspend();
     if (!_completion.isCompleted) {
       _completionGeneration = _generation;
-      _completion.complete(LedgerPollResult(end, task: _task, error: _error));
+      _completion.complete(
+        LedgerPollResult(
+          end,
+          task: _task,
+          projection: _projection,
+          error: _error,
+        ),
+      );
     }
   }
 
@@ -324,6 +798,7 @@ class LedgerPollHandle {
             );
       if (!_valid(generation)) return;
       _task = task;
+      _projection = task.projection;
       _error = null;
       _onUpdate?.call(task);
       if (!_valid(generation)) return;
@@ -334,6 +809,11 @@ class LedgerPollHandle {
     } on PluginClientException catch (error) {
       if (!_valid(generation)) return;
       _error = error;
+      if (error.statusCode == 404) {
+        _projection = LedgerTaskProjection.expired();
+        _finish(LedgerPollEnd.expired);
+        return;
+      }
       retryAfter = error.retryAfter;
       if (!_retryable(error)) {
         _finish(LedgerPollEnd.error);
@@ -361,8 +841,7 @@ class LedgerPollHandle {
   bool _retryable(PluginClientException error) {
     final status = error.statusCode;
     if (status != null) {
-      return status == 404 ||
-          status == 408 ||
+      return status == 408 ||
           status == 413 ||
           status == 429 ||
           status >= 500 && status <= 599;

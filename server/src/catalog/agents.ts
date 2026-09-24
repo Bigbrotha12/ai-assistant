@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { glob } from "node:fs/promises";
 import { join } from "node:path";
-import { templateAgentDefinitionSchema } from "../plugins/types.ts";
+import { isMcpHeaderReference, templateAgentDefinitionSchema } from "../plugins/types.ts";
 import type { AgentPluginDefinition, PluginDefinition, ResolvedAgentDef } from "../plugins/types.ts";
 import type { SkillEntry } from "./skills.ts";
 import type { McpEntry } from "./mcp.ts";
@@ -80,7 +80,17 @@ export async function loadAgentsCatalog(
           `Agent template '${template.id}' (${fullPath}) references unknown MCP server name '${ref.name}'`,
         );
       }
-      resolvedMcp.push({ name: mcp.name, url: mcp.url, headers: mcp.headers });
+      const headerRefs = mcp.headerRefs ?? Object.fromEntries(
+        Object.entries(mcp.headers ?? {}).filter(([, value]) =>
+          isMcpHeaderReference(value),
+        ),
+      );
+      resolvedMcp.push({
+        name: mcp.name,
+        url: mcp.url,
+        headers: mcp.headers,
+        ...(Object.keys(headerRefs).length > 0 ? { headerRefs } : {}),
+      });
     }
 
     entries.push({
@@ -118,7 +128,12 @@ export function migrateInstalledAgents(
       description: agent.description,
       systemPrompt: agent.systemPrompt,
       skills: (agent.skills ?? []).map(s => ({ id: s.id, title: s.title, content: s.content })),
-      mcpServers: (agent.mcpServers ?? []).map(s => ({ name: s.name, url: s.url, headers: s.headers })),
+      mcpServers: (agent.mcpServers ?? []).map(s => ({
+        name: s.name,
+        url: s.url,
+        headers: s.headers,
+        ...(s.headers === undefined ? {} : { headerRefs: { ...s.headers } }),
+      })),
       tools: agent.tools?.map(t => ({ pluginId: t.pluginId, required: t.required })),
       modelRef: agent.modelRef,
       inference: agent.inference,

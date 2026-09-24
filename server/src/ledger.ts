@@ -99,6 +99,12 @@ export type TaskRow = {
    * through routes that never store a payload.
    */
   payload?: string | null;
+  job_spec?: string | null;
+};
+
+export type TaskCompletionResult = {
+  task: TaskRow;
+  transitioned: boolean;
 };
 
 export type StepRow = {
@@ -112,6 +118,123 @@ export type StepRow = {
   /** Tool-call id (v4) for replay dedupe; null for non-tool steps. */
   tool_call_id: string | null;
 };
+
+export const TASK_PROJECTION_SCHEMA_VERSION = 1 as const;
+
+export type TaskProgressCode =
+  | "queued"
+  | "running_model"
+  | "running_tool"
+  | "review"
+  | "done"
+  | "expired";
+
+export type TaskEffectState =
+  | "none_known"
+  | "completed_steps_only"
+  | "unknown";
+
+export type TaskLiveStage =
+  | "admitted"
+  | "running_model"
+  | "running_tool"
+  | "cancelling";
+
+export type TaskLiveProjection = {
+  stage: TaskLiveStage;
+  activeToolCallIds: readonly string[];
+};
+
+export type TaskProgress = {
+  schemaVersion: typeof TASK_PROJECTION_SCHEMA_VERSION;
+  code: TaskProgressCode;
+  lastActionId?: string;
+  canCancel: boolean;
+  canRetry: boolean;
+  cancellationPending: boolean;
+  effectState: TaskEffectState;
+  terminalStatus?: Extract<
+    TaskStatus,
+    "succeeded" | "failed" | "cancelled" | "awaiting_review"
+  >;
+  errorCode?: string;
+};
+
+export function projectTaskProgress(
+  task: TaskRow | null,
+  steps: readonly StepRow[] = [],
+  live?: TaskLiveProjection,
+): TaskProgress {
+  if (task === null) {
+    return {
+      schemaVersion: TASK_PROJECTION_SCHEMA_VERSION,
+      code: "expired",
+      canCancel: false,
+      canRetry: false,
+      cancellationPending: false,
+      effectState: "unknown",
+    };
+  }
+
+  const ordered = [...steps].sort((left, right) => left.seq - right.seq);
+  const lastAction = ordered.at(-1);
+  let errorCode: string | undefined;
+  for (let index = ordered.length - 1; index >= 0; index--) {
+    const step = ordered[index]!;
+    if (step.stage === "error" && step.action.startsWith("error:")) {
+      errorCode = step.action.slice("error:".length);
+      break;
+    }
+  }
+
+  const terminalStatus = TERMINAL_TASK_STATUSES.includes(task.status)
+    ? (task.status as Extract<
+        TaskStatus,
+        "succeeded" | "failed" | "cancelled" | "awaiting_review"
+      >)
+    : undefined;
+  const liveToolUncertain =
+    live !== undefined &&
+    live.activeToolCallIds.length > 0 &&
+    (live.stage === "running_tool" || live.stage === "cancelling");
+
+  let code: TaskProgressCode;
+  if (task.status === "awaiting_review") {
+    code = "review";
+  } else if (terminalStatus !== undefined) {
+    code = "done";
+  } else if (task.status === "queued" || task.status === "stuck") {
+    code = "queued";
+  } else if (
+    live?.stage === "running_tool" ||
+    (live?.stage === "cancelling" && live.activeToolCallIds.length > 0)
+  ) {
+    code = "running_tool";
+  } else {
+    code = "running_model";
+  }
+
+  return {
+    schemaVersion: TASK_PROJECTION_SCHEMA_VERSION,
+    code,
+    ...(lastAction === undefined ? {} : { lastActionId: lastAction.id }),
+    canCancel:
+      task.status === "queued" ||
+      (task.status === "running" &&
+        live !== undefined &&
+        live.stage !== "cancelling"),
+    canRetry: task.status === "stuck",
+    cancellationPending: live?.stage === "cancelling",
+    effectState:
+      task.status === "stuck" || liveToolUncertain
+        ? "unknown"
+        : ordered.length === 0
+          ? "none_known"
+          : "completed_steps_only",
+    ...(terminalStatus === undefined ? {} : { terminalStatus }),
+    ...(errorCode === undefined ? {} : { errorCode }),
+  };
+}
 
 export type ChainRow = {
   seq: number;
@@ -342,6 +465,11 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
         ON ledger_task(status, updated_ts);
     `);
   },
+  (db) => {
+    db.exec(`
+      ALTER TABLE ledger_task ADD COLUMN job_spec TEXT;
+    `);
+  },
 ];
 
 export const CURRENT_LEDGER_VERSION = LEDGER_MIGRATIONS.length;
@@ -393,6 +521,7 @@ export interface CreateTaskInput {
    *  routes never set it. Transient — purged with the task by the retention
    *  sweep. */
   payload?: string | null;
+  jobSpec?: string | null;
 }
 
 export interface AppendStepInput {
@@ -470,9 +599,9 @@ export class Ledger {
       .prepare(
         `INSERT INTO ledger_task
           (id, owner, intent_key, spec, worker, status, created_ts, updated_ts,
-           last_heartbeat_ts, payload)
+           last_heartbeat_ts, payload, job_spec)
          VALUES (@id, @owner, @intentKey, @spec, @worker, 'queued', @ts, @ts,
-                 @ts, @payload)`,
+                 @ts, @payload, @jobSpec)`,
       )
       .run({
         id,
@@ -480,8 +609,10 @@ export class Ledger {
         intentKey: input.intentKey,
         spec,
         worker,
-        payload: input.payload ?? null,
-        ts,
+         payload: input.payload ?? null,
+         jobSpec: input.jobSpec ?? null,
+         ts,
+
       });
     const row = this.getTask(id);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${id} not found`);
@@ -498,7 +629,7 @@ export class Ledger {
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                 updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token, payload
+                fence_token, payload, job_spec
          FROM ledger_task WHERE id = ?`,
       )
       .get(id) as TaskRow | undefined;
@@ -518,7 +649,7 @@ export class Ledger {
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                 updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token, payload
+                fence_token, payload, job_spec
          FROM ledger_task WHERE owner = ? AND intent_key = ?`,
       )
       .get(owner, intentKey) as TaskRow | undefined;
@@ -559,7 +690,7 @@ export class Ledger {
         .prepare(
           `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                   updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                  fence_token, payload
+                  fence_token, payload, job_spec
            FROM ledger_task WHERE owner = ? ORDER BY created_ts`,
         )
         .all(owner) as TaskRow[];
@@ -568,7 +699,7 @@ export class Ledger {
       .prepare(
         `SELECT id, owner, intent_key, spec, worker, status, created_ts,
                 updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token, payload
+                fence_token, payload, job_spec
          FROM ledger_task ORDER BY created_ts`,
       )
       .all() as TaskRow[];
@@ -673,17 +804,23 @@ export class Ledger {
     this.requireStatus(task, ["queued"]);
     const now = this.now();
     const fence = randomUUID();
-    this.db
+    const result = this.db
       .prepare(
         `UPDATE ledger_task
          SET status = 'running', worker = COALESCE(worker, @owner),
              lease_owner = @owner, lease_expires_at = @expires,
              fence_token = @fence,
              updated_ts = @now, last_heartbeat_ts = @now
-         WHERE id = @id`,
+         WHERE id = @id AND owner = @owner AND status = 'queued'`,
       )
       .run({ id: taskId, owner, expires: now + this.leaseExpiryMs, fence, now });
-    const row = this.getTask(taskId);
+    if (result.changes === 0) {
+      throw new LedgerError(
+        "INVALID_TRANSITION",
+        `task ${taskId} could not transition queued -> running`,
+      );
+    }
+    const row = this.getTask(taskId, owner);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     return row;
   }
@@ -1086,13 +1223,13 @@ export class Ledger {
     return row;
   }
 
-  /** Moves a `running` (or otherwise claimable) task to a terminal state. */
-  completeTask(
+  /** Moves a task to a terminal state with a fence-protected compare-and-set. */
+  completeTaskWithFence(
     taskId: string,
     owner: string,
     to: Exclude<TaskStatus, "queued" | "running" | "stuck">,
     fenceToken?: string,
-  ): TaskRow {
+  ): TaskCompletionResult {
     if (
       to !== "succeeded" &&
       to !== "failed" &&
@@ -1104,11 +1241,70 @@ export class Ledger {
     const task = this.getTask(taskId);
     if (!task) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
     this.requireOwnership(task, owner);
-    this.requireFence(task, fenceToken);
-    this.setStatus(taskId, task.status, to);
-    const row = this.getTask(taskId);
+    if (task.status === to) {
+      return { task, transitioned: false };
+    }
+    assertTransition(task.status, to);
+    if (task.status === "running") {
+      if (fenceToken === undefined || task.fence_token !== fenceToken) {
+        throw new LedgerError(
+          "FENCE_CONFLICT",
+          `caller's fence token does not match task ${taskId} (superseded worker)`,
+        );
+      }
+      const result = this.db
+        .prepare(
+          `UPDATE ledger_task SET status = ?, updated_ts = ?
+           WHERE id = ? AND owner = ? AND status = 'running' AND fence_token = ?`,
+        )
+        .run(to, this.now(), taskId, owner, fenceToken);
+      if (result.changes === 0) {
+        return this.resolveCompletionRace(taskId, owner, to, true);
+      }
+    } else {
+      const result = this.db
+        .prepare(
+          `UPDATE ledger_task SET status = ?, updated_ts = ?
+           WHERE id = ? AND owner = ? AND status = ?`,
+        )
+        .run(to, this.now(), taskId, owner, task.status);
+      if (result.changes === 0) {
+        return this.resolveCompletionRace(taskId, owner, to, false);
+      }
+    }
+    const row = this.getTask(taskId, owner);
     if (!row) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
-    return row;
+    return { task: row, transitioned: true };
+  }
+
+  private resolveCompletionRace(
+    taskId: string,
+    owner: string,
+    to: Exclude<TaskStatus, "queued" | "running" | "stuck">,
+    wasRunning: boolean,
+  ): TaskCompletionResult {
+    const current = this.getTask(taskId, owner);
+    if (!current) throw new LedgerError("TASK_NOT_FOUND", `task ${taskId} not found`);
+    if (current.status === to) return { task: current, transitioned: false };
+    if (wasRunning && current.status === "running") {
+      throw new LedgerError(
+        "FENCE_CONFLICT",
+        `caller's fence token does not match task ${taskId} (superseded worker)`,
+      );
+    }
+    throw new LedgerError(
+      "INVALID_TRANSITION",
+      `task ${taskId} could not transition to ${to} (currently ${current.status})`,
+    );
+  }
+
+  completeTask(
+    taskId: string,
+    owner: string,
+    to: Exclude<TaskStatus, "queued" | "running" | "stuck">,
+    fenceToken?: string,
+  ): TaskRow {
+    return this.completeTaskWithFence(taskId, owner, to, fenceToken).task;
   }
 
   /**

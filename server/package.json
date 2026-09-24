@@ -13,6 +13,8 @@
     "typecheck": "tsc --noEmit",
     "migrate": "auth migrate && npm run migrate:ledger",
     "migrate:ledger": "tsx src/migrate-ledger.ts",
+    "sentinel:eval": "tsx src/sentinel/eval-cli.ts",
+    "eval:sentinel": "tsx src/sentinel/eval-cli.ts",
     "test": "tsx --test test/*.test.ts test/**/*.test.ts"
   },
   "dependencies": {

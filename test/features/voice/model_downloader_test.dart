@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:ai_assistant/features/voice/data/engine_config.dart';
 import 'package:ai_assistant/features/voice/data/model_downloader.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
@@ -17,25 +18,34 @@ import 'package:flutter_test/flutter_test.dart';
 class FakeModelDownloaderAdapter implements HttpClientAdapter {
   FakeModelDownloaderAdapter({
     this.bytes = const [],
+    List<List<int>>? chunks,
     this.error,
     this.reportedTotal,
     this.gate,
-  });
+    this.includeContentLength = true,
+  }) : chunks = chunks ?? <List<int>>[bytes];
 
   List<int> bytes;
+  final List<List<int>> chunks;
 
   /// When set, `fetch` throws a [DioException] before producing a body.
   Object? error;
 
   /// Total reported via the response `Content-Length` header (which Dio
   /// surfaces through `onReceiveProgress`). When non-null it overrides
-  /// [bytes].length so tests can simulate a body that is shorter than the
-  /// server's advertised Content-Length.
+  /// the streamed payload size so tests can simulate a body that is shorter
+  /// than the server's advertised Content-Length.
   int? reportedTotal;
 
   /// When set, `fetch` pauses here until the test completes it, so the
   /// mid-download state can be observed.
   Completer<void>? gate;
+
+  /// Whether the response includes a `Content-Length` header.
+  bool includeContentLength;
+
+  /// Whether the response body was closed by the downloader.
+  bool closed = false;
 
   /// The [RequestOptions] of every `fetch` call, in order.
   final List<RequestOptions> requests = [];
@@ -55,11 +65,17 @@ class FakeModelDownloaderAdapter implements HttpClientAdapter {
     if (err != null) {
       throw DioException(requestOptions: options, error: err);
     }
-    final total = reportedTotal ?? bytes.length;
-    return ResponseBody.fromBytes(
-      Uint8List.fromList(bytes),
+    final total = reportedTotal ??
+        chunks.fold<int>(0, (sum, chunk) => sum + chunk.length);
+    final headers = <String, List<String>>{};
+    if (includeContentLength) {
+      headers[Headers.contentLengthHeader] = ['$total'];
+    }
+    return ResponseBody(
+      Stream.fromIterable(chunks.map(Uint8List.fromList)),
       200,
-      headers: {Headers.contentLengthHeader: ['$total']},
+      headers: headers,
+      onClose: () => closed = true,
     );
   }
 
@@ -89,9 +105,9 @@ void main() {
     // path_provider; serve it from a temp dir so no platform channel is hit.
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
-      _pathProviderChannel,
-      (call) async => tempDir.path,
-    );
+          _pathProviderChannel,
+          (call) async => tempDir.path,
+        );
   });
 
   tearDown(() {
@@ -105,17 +121,31 @@ void main() {
   Dio dioWith(FakeModelDownloaderAdapter adapter) =>
       Dio()..httpClientAdapter = adapter;
 
-  ModelDownloader newDownloader(FakeModelDownloaderAdapter adapter) {
-    final downloader = ModelDownloader(dio: dioWith(adapter));
+  ModelDownloader newDownloader(
+    FakeModelDownloaderAdapter adapter, {
+    FreeStorageBytesReader? freeStorageBytes,
+    int requiredBytesTolerance = EngineConfig.modelDownloadSizeToleranceBytes,
+    int hardMaxBytes = EngineConfig.modelDownloadHardCapBytes,
+  }) {
+    final downloader = ModelDownloader(
+      dio: dioWith(adapter),
+      freeStorageBytes: freeStorageBytes,
+      requiredBytesTolerance: requiredBytesTolerance,
+      hardMaxBytes: hardMaxBytes,
+    );
     addTearDown(downloader.dispose);
     return downloader;
   }
 
-  Future<void> download(ModelDownloader downloader) => downloader.downloadModel(
-        modelType: _modelType,
-        url: _modelUrl,
-        destinationPath: tempDir.path,
-      );
+  Future<void> download(
+    ModelDownloader downloader, {
+    int? requiredBytes,
+  }) => downloader.downloadModel(
+    modelType: _modelType,
+    url: _modelUrl,
+    destinationPath: tempDir.path,
+    requiredBytes: requiredBytes,
+  );
 
   group('ModelDownloader atomic download', () {
     test('successful download writes final bytes and reaches Ready', () async {
@@ -140,6 +170,24 @@ void main() {
       expect(progress.last.percent, 1.0);
     });
 
+    test('insufficient storage fails before the network request', () async {
+      final adapter = FakeModelDownloaderAdapter(bytes: [1, 2, 3]);
+      final downloader = newDownloader(
+        adapter,
+        freeStorageBytes: () async => 10,
+      );
+
+      await expectLater(
+        download(downloader),
+        throwsA(isA<InsufficientStorageException>()),
+      );
+
+      expect(adapter.requests, isEmpty);
+      expect(downloader.getState(_modelType), isA<Failed>());
+      expect(File(modelPath).existsSync(), isFalse);
+      expect(File(partPath).existsSync(), isFalse);
+    });
+
     test('state is Downloading while the request is in flight', () async {
       final gate = Completer<void>();
       final downloader = newDownloader(
@@ -157,19 +205,68 @@ void main() {
       expect(downloader.getState(_modelType), isA<Ready>());
     });
 
-    test('empty body throws, leaves no final or temp file, not Ready',
-        () async {
-      final downloader = newDownloader(FakeModelDownloaderAdapter());
+    test(
+      'empty body throws, leaves no final or temp file, not Ready',
+      () async {
+        final downloader = newDownloader(FakeModelDownloaderAdapter());
+
+        await expectLater(download(downloader), throwsA(isA<Exception>()));
+
+        final state = downloader.getState(_modelType);
+        expect(state, isA<Failed>());
+        expect((state as Failed).error, contains('empty file'));
+        expect(downloader.getState(_modelType), isNot(isA<Ready>()));
+        expect(File(modelPath).existsSync(), isFalse);
+        expect(File(partPath).existsSync(), isFalse);
+      },
+    );
+
+    test('oversized streamed response aborts mid-stream and cleans up', () async {
+      final adapter = FakeModelDownloaderAdapter(
+        chunks: [
+          [1, 2],
+          [3, 4],
+          [5, 6],
+        ],
+        reportedTotal: 4,
+      );
+      final downloader = newDownloader(
+        adapter,
+        requiredBytesTolerance: 1,
+        hardMaxBytes: 5,
+      );
+
+      await expectLater(
+        download(downloader, requiredBytes: 4),
+        throwsA(isA<ModelDownloadLimitException>()),
+      );
+
+      expect(adapter.closed, isTrue);
+      expect(downloader.getState(_modelType), isA<Failed>());
+      expect(File(modelPath).existsSync(), isFalse);
+      expect(File(partPath).existsSync(), isFalse);
+    });
+
+    test('chunked response without content length is capped', () async {
+      final adapter = FakeModelDownloaderAdapter(
+        chunks: [
+          [1, 2, 3],
+          [4, 5, 6],
+        ],
+        includeContentLength: false,
+      );
+      final downloader = newDownloader(
+        adapter,
+        hardMaxBytes: 5,
+      );
 
       await expectLater(
         download(downloader),
-        throwsA(isA<Exception>()),
+        throwsA(isA<ModelDownloadLimitException>()),
       );
 
-      final state = downloader.getState(_modelType);
-      expect(state, isA<Failed>());
-      expect((state as Failed).error, contains('empty file'));
-      expect(downloader.getState(_modelType), isNot(isA<Ready>()));
+      expect(adapter.closed, isTrue);
+      expect(downloader.getState(_modelType), isA<Failed>());
       expect(File(modelPath).existsSync(), isFalse);
       expect(File(partPath).existsSync(), isFalse);
     });
@@ -179,10 +276,7 @@ void main() {
         FakeModelDownloaderAdapter(bytes: [1, 2, 3, 4], reportedTotal: 10),
       );
 
-      await expectLater(
-        download(downloader),
-        throwsA(isA<Exception>()),
-      );
+      await expectLater(download(downloader), throwsA(isA<Exception>()));
 
       final state = downloader.getState(_modelType);
       expect(state, isA<Failed>());
@@ -199,10 +293,7 @@ void main() {
         ),
       );
 
-      await expectLater(
-        download(downloader),
-        throwsA(isA<DioException>()),
-      );
+      await expectLater(download(downloader), throwsA(isA<DioException>()));
 
       final state = downloader.getState(_modelType);
       expect(state, isA<Failed>());
@@ -212,27 +303,29 @@ void main() {
       expect(File(partPath).existsSync(), isFalse);
     });
 
-    test('rename failure deletes the partial temp file and propagates',
-        () async {
-      // Occupying the final path with a directory forces the atomic rename to
-      // fail, exercising the partial-file cleanup branch.
-      Directory(modelPath).createSync(recursive: true);
-      final downloader = newDownloader(
-        FakeModelDownloaderAdapter(bytes: [1, 2, 3]),
-      );
+    test(
+      'rename failure deletes the partial temp file and propagates',
+      () async {
+        // Occupying the final path with a directory forces the atomic rename to
+        // fail, exercising the partial-file cleanup branch.
+        Directory(modelPath).createSync(recursive: true);
+        final downloader = newDownloader(
+          FakeModelDownloaderAdapter(bytes: [1, 2, 3]),
+        );
 
-      await expectLater(
-        download(downloader),
-        throwsA(isA<FileSystemException>()),
-      );
+        await expectLater(
+          download(downloader),
+          throwsA(isA<FileSystemException>()),
+        );
 
-      expect(downloader.getState(_modelType), isA<Failed>());
-      expect(downloader.getState(_modelType), isNot(isA<Ready>()));
-      // The partial temp file must be gone and the final path untouched.
-      expect(File(partPath).existsSync(), isFalse);
-      expect(Directory(modelPath).existsSync(), isTrue);
-      expect(File(modelPath).existsSync(), isFalse);
-    });
+        expect(downloader.getState(_modelType), isA<Failed>());
+        expect(downloader.getState(_modelType), isNot(isA<Ready>()));
+        // The partial temp file must be gone and the final path untouched.
+        expect(File(partPath).existsSync(), isFalse);
+        expect(Directory(modelPath).existsSync(), isTrue);
+        expect(File(modelPath).existsSync(), isFalse);
+      },
+    );
   });
 
   group('ModelDownloader state defaults', () {
@@ -249,18 +342,20 @@ void main() {
       expect(downloader.getState('unknown_model'), isA<NotStarted>());
     });
 
-    test('existing final file is atomically replaced by a fresh download',
-        () async {
-      File(modelPath).writeAsBytesSync([9, 9, 9]);
-      final downloader = newDownloader(
-        FakeModelDownloaderAdapter(bytes: [4, 5, 6]),
-      );
+    test(
+      'existing final file is atomically replaced by a fresh download',
+      () async {
+        File(modelPath).writeAsBytesSync([9, 9, 9]);
+        final downloader = newDownloader(
+          FakeModelDownloaderAdapter(bytes: [4, 5, 6]),
+        );
 
-      await download(downloader);
+        await download(downloader);
 
-      expect(downloader.getState(_modelType), isA<Ready>());
-      expect(File(modelPath).readAsBytesSync(), [4, 5, 6]);
-      expect(File(partPath).existsSync(), isFalse);
-    });
+        expect(downloader.getState(_modelType), isA<Ready>());
+        expect(File(modelPath).readAsBytesSync(), [4, 5, 6]);
+        expect(File(partPath).existsSync(), isFalse);
+      },
+    );
   });
 }

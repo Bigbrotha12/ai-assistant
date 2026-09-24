@@ -12,6 +12,7 @@ import '../../chat/data/context_trimmer.dart';
 import '../../chat/data/message_model.dart';
 import '../../chat/ui/chat_lifecycle_observer.dart';
 import '../../chat/ui/chat_providers.dart' show contextTrimmerProvider;
+import '../../sentinel/sentinel.dart';
 import 'langchain_client.dart';
 import 'ledger_client.dart';
 import 'managed_conversation_repository.dart';
@@ -260,12 +261,11 @@ class ManagedChatAdapter {
 
   /// Re-arms a fresh ledger watch for [conversationId]'s still-pending
   /// BACKGROUND job (the original handle's deadline may have expired while
-  /// suspended). Returns the new handle, or null when no pending background
-  /// envelope exists. A bare per-turn service is used — the watch needs no
-  /// model/plugin selection (the job already ran server-side); a selection
-  /// gap degrades the terminal credential resolver to `null` (fail-open,
-  /// marker retained for an explicit retry).
-  Future<LedgerPollHandle?> rewatchPendingBackground(
+  /// suspended). Returns the new watch and persisted projection, or null when
+  /// no pending background envelope exists. A bare per-turn service is used —
+  /// the watch needs no model/plugin selection (the job already ran
+  /// server-side); a selection gap degrades the terminal credential resolver.
+  Future<ManagedBackgroundWatch?> rewatchPendingBackground(
     String conversationId,
   ) async {
     try {
@@ -292,10 +292,10 @@ class ManagedChatAdapter {
     for (final row in rows) {
       if (row.reconcileOnly) continue;
       try {
-        final handle = await service.rewatchPendingBackground(
+        final watch = await service.rewatchPendingBackground(
           row.conversationId,
         );
-        if (handle != null) rewound.add(row.conversationId);
+        if (watch != null) rewound.add(row.conversationId);
       } on PluginClientException {
         // Scope cancelled / malformed envelope — skip, the next resume retries.
       }
@@ -351,6 +351,7 @@ class ManagedChatAdapter {
     required String userText,
     String? sessionId,
     void Function(String delta)? onContent,
+    void Function(SentinelAdvisory advisory)? onAdvisory,
   }) async {
     final service = await buildService();
     return service.sendTurn(
@@ -359,6 +360,7 @@ class ManagedChatAdapter {
       userText: userText,
       sessionId: sessionId,
       onContent: onContent,
+      onAdvisory: onAdvisory,
     );
   }
 
@@ -440,6 +442,18 @@ class ManagedChatAdapter {
       history: history,
       userText: userText,
     );
+  }
+
+  Future<ManagedBackgroundCancelResult> cancelBackground(
+    String conversationId,
+  ) async {
+    ManagedConversationService service;
+    try {
+      service = await buildService();
+    } on PluginClientException {
+      service = _bareService();
+    }
+    return service.cancelBackground(conversationId);
   }
 
   Future<List<Message>> reconcileFromServer(String conversationId) async {

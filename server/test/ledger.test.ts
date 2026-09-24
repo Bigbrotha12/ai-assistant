@@ -36,6 +36,17 @@ function makeLedger(
   return { db, ledger };
 }
 
+function completeRunning(
+  ledger: Ledger,
+  taskId: string,
+  owner: string,
+  to: "succeeded" | "failed" | "cancelled" | "awaiting_review",
+): TaskRow {
+  const task = ledger.getTask(taskId, owner);
+  assert.ok(task, "task must exist before completion");
+  return ledger.completeTask(taskId, owner, to, task.fence_token);
+}
+
 /**
  * A deterministic stand-in for the global timers: `setInterval` registers a
  * callback that the test drives explicitly via `fireAll()`, so timer-driven
@@ -90,7 +101,7 @@ describe("task lifecycle: create -> append -> transitions", () => {
     });
     assert.equal(s2.step.seq, 2);
 
-    const done = ledger.completeTask(task.id, "user-1", "succeeded");
+    const done = completeRunning(ledger, task.id, "user-1", "succeeded");
     assert.equal(done.status, "succeeded");
 
     const steps = ledger.listSteps(task.id);
@@ -105,7 +116,7 @@ describe("task lifecycle: create -> append -> transitions", () => {
     const { ledger } = makeLedger();
     const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
     ledger.claimTask(task.id, "o");
-    const failed = ledger.completeTask(task.id, "o", "failed");
+    const failed = completeRunning(ledger, task.id, "o", "failed");
     assert.equal(failed.status, "failed");
   });
 
@@ -113,7 +124,7 @@ describe("task lifecycle: create -> append -> transitions", () => {
     const { ledger } = makeLedger();
     const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
     ledger.claimTask(task.id, "o");
-    ledger.completeTask(task.id, "o", "succeeded");
+    completeRunning(ledger, task.id, "o", "succeeded");
     assert.throws(
       () =>
         ledger.appendStep(task.id, "o", {
@@ -542,17 +553,31 @@ describe("fence token (superseded-worker fencing)", () => {
     assert.equal(ok.step.seq, 1);
   });
 
-  test("appendStep without a fence token still works (backwards compatible)", () => {
-    const { ledger } = makeLedger();
-    const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
-    ledger.claimTask(task.id, "o");
-    const out = ledger.appendStep(task.id, "o", {
-      stage: "s",
-      action: "A",
-      result: null,
-    });
-    assert.equal(out.step.seq, 1);
+  test("completion requires the current fence and does not let a stale worker settle a task", () => {
+    let now = 1_000_000;
+    const { ledger } = makeLedger({ stuck: 1000, lease: 5000, now: () => now });
+    const task = ledger.createTask({ owner: "user-1", intentKey: "fence-complete", spec: "s" });
+    const first = ledger.claimTask(task.id, "user-1");
+    now += 2000;
+    ledger.markStuckIfHeartbeatStale(task.id);
+    now += 1;
+    const second = ledger.resumeTask(task.id, "user-1");
+
+    assert.throws(
+      () => ledger.completeTaskWithFence(task.id, "user-1", "succeeded", first.fence_token),
+      (error: unknown) => error instanceof LedgerError && error.code === "FENCE_CONFLICT",
+    );
+    assert.equal(ledger.getTask(task.id)?.status, "running");
+    assert.equal(ledger.listSteps(task.id).length, 0);
+
+    const completed = ledger.completeTaskWithFence(task.id, "user-1", "succeeded", second.fence_token);
+    assert.equal(completed.transitioned, true);
+    assert.equal(completed.task.status, "succeeded");
+    const repeated = ledger.completeTaskWithFence(task.id, "user-1", "succeeded", second.fence_token);
+    assert.equal(repeated.transitioned, false);
+    assert.equal(repeated.task.status, "succeeded");
   });
+
 });
 
 describe("timer-driven heartbeat", () => {
@@ -724,7 +749,7 @@ describe("startup orphan reconciliation", () => {
     const queued = ledger.createTask({ owner: "o", intentKey: "q", spec: "s" });
     const done = ledger.createTask({ owner: "o", intentKey: "d", spec: "s" });
     ledger.claimTask(done.id, "o");
-    ledger.completeTask(done.id, "o", "succeeded");
+    completeRunning(ledger, done.id, "o", "succeeded");
     now += 2000; // everything stale by now, but none of these are running
 
     const res = ledger.reconcileOrphans();
@@ -792,7 +817,7 @@ describe("terminal-task retention purge (D6)", () => {
   ): TaskRow => {
     const task = ledger.createTask({ owner, intentKey, spec: "s" });
     ledger.claimTask(task.id, owner);
-    return ledger.completeTask(task.id, owner, to);
+    return completeRunning(ledger, task.id, owner, to);
   };
 
   test("a terminal task older than retention is purged along with its steps and chain", () => {
@@ -807,7 +832,7 @@ describe("terminal-task retention purge (D6)", () => {
     ledger.claimTask(task.id, "o");
     ledger.appendStep(task.id, "o", { stage: "s", action: "A", result: "r1" });
     ledger.appendStep(task.id, "o", { stage: "s", action: "B", result: "r2" });
-    ledger.completeTask(task.id, "o", "succeeded");
+    completeRunning(ledger, task.id, "o", "succeeded");
     now += 86_400_000 + 1;
 
     assert.equal(ledger.purgeTerminalTasks(), 1);
@@ -908,7 +933,7 @@ describe("terminal-task retention purge (D6)", () => {
     const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
     ledger.claimTask(task.id, "o");
     ledger.appendStep(task.id, "o", { stage: "s", action: "A", result: "r" });
-    ledger.completeTask(task.id, "o", "succeeded");
+    completeRunning(ledger, task.id, "o", "succeeded");
     now += 2000;
     assert.equal(ledger.purgeTerminalTasks(), 1);
 
@@ -960,7 +985,7 @@ describe("retention sweep timer (D6)", () => {
 
     const task = ledger.createTask({ owner: "o", intentKey: "k", spec: "s" });
     ledger.claimTask(task.id, "o");
-    ledger.completeTask(task.id, "o", "succeeded");
+    completeRunning(ledger, task.id, "o", "succeeded");
     now += 2000; // terminal + past retention
 
     scheduler.fireAll();
@@ -1089,7 +1114,7 @@ describe("snapshot payload (v5)", () => {
       payload: JSON.stringify([{ role: "user", content: "transient" }]),
     });
     ledger.claimTask(task.id, "o");
-    ledger.completeTask(task.id, "o", "succeeded");
+    completeRunning(ledger, task.id, "o", "succeeded");
     now += 2000;
     assert.equal(ledger.purgeTerminalTasks(), 1);
     assert.equal(ledger.getTask(task.id), null, "the task (and its payload) is purged");
@@ -1158,9 +1183,10 @@ describe("snapshot payload (v5)", () => {
     migrateLedger(db); // upgrades v1 -> current (incl. the v5 payload column)
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const row = db
-      .prepare("SELECT id, payload FROM ledger_task WHERE id = 't1'")
-      .get() as { id: string; payload: string | null };
+      .prepare("SELECT id, payload, job_spec FROM ledger_task WHERE id = 't1'")
+      .get() as { id: string; payload: string | null; job_spec: string | null };
     assert.equal(row.payload, null, "existing rows get a NULL payload");
+    assert.equal(row.job_spec, null, "existing rows get a NULL job spec");
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get("idx_tasks_status_updated") as { name: string } | undefined;
@@ -1172,6 +1198,7 @@ describe("snapshot payload (v5)", () => {
       .all()
       .map((r) => (r as { name: string }).name);
     assert.ok(cols.includes("payload"), "fresh DB must have the payload column");
+    assert.ok(cols.includes("job_spec"), "fresh DB must have the job spec column");
   });
 });
 
@@ -1180,7 +1207,7 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
-    assert.equal(CURRENT_LEDGER_VERSION, 6);
+    assert.equal(CURRENT_LEDGER_VERSION, 7);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -1196,22 +1223,26 @@ describe("migration", () => {
     assert.deepEqual(tables, ["ledger_chain", "ledger_step", "ledger_task"]);
   });
 
-  test("v6 migration adds the retention index when upgrading from v5", () => {
+  test("v7 migration adds the durable job-spec column when upgrading from v6", () => {
     const db = new Database(":memory:");
     migrateLedger(db);
-    db.exec("DROP INDEX idx_tasks_status_updated");
-    db.pragma("user_version = 5");
-    assert.equal(db.pragma("user_version", { simple: true }), 5);
+     db.exec("DROP INDEX idx_tasks_status_updated");
+     db.exec("ALTER TABLE ledger_task DROP COLUMN job_spec");
+     db.pragma("user_version = 6");
+     assert.equal(db.pragma("user_version", { simple: true }), 6);
+
 
     migrateLedger(db);
 
-    assert.equal(db.pragma("user_version", { simple: true }), 6);
+    assert.equal(db.pragma("user_version", { simple: true }), 7);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
-    const retentionIndex = db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
-      .get("idx_tasks_status_updated") as { name: string } | undefined;
-    assert.equal(retentionIndex?.name, "idx_tasks_status_updated");
-  });
+     const columns = db
+       .prepare("PRAGMA table_info(ledger_task)")
+       .all()
+       .map((row) => (row as { name: string }).name);
+     assert.ok(columns.includes("job_spec"));
+   });
+
 
   test("migration is idempotent and preserves data on re-run", () => {
     const db = new Database(":memory:");

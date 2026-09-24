@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { Hono } from "hono";
 import { Ledger, migrateLedger } from "../src/ledger.ts";
 import { createLedgerRoutes } from "../src/ledger.routes.ts";
+import type { JobRunner, TaskCancelReport } from "../src/jobs/runner.ts";
 import type { VerifyApiKeyFn } from "../src/plugins/routes.ts";
 import { clearDeleting, markDeleting } from "../src/account_deletion.ts";
 
@@ -13,7 +14,10 @@ import { clearDeleting, markDeleting } from "../src/account_deletion.ts";
  * exercise the full HTTP surface without better-auth's DB — mirroring the
  * plugin routes' `verifyKey` seam.
  */
-function makeApp(verifyKey?: VerifyApiKeyFn): {
+function makeApp(
+  verifyKey?: VerifyApiKeyFn,
+  jobRunner?: JobRunner,
+): {
   app: Hono;
   db: Database.Database;
   ledger: Ledger;
@@ -26,6 +30,7 @@ function makeApp(verifyKey?: VerifyApiKeyFn): {
     "/ledger",
     createLedgerRoutes(ledger, {
       verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "user-1" })),
+      jobRunner,
     }),
   );
   return { app, db, ledger };
@@ -297,6 +302,48 @@ describe("ledger routes — fence enforcement on running tasks (M8)", () => {
     assert.equal(ok.status, 201, "with the fence token the step appends");
   });
 
+  test("completion requires the fence, rejects stale fences, and repeats idempotently", async () => {
+    const { app, db, ledger } = makeApp();
+    const created = await createTask(app, "fence-complete");
+    const firstFence = await claimTask(app, created.id);
+    db.prepare("UPDATE ledger_task SET last_heartbeat_ts = 0 WHERE id = ?").run(created.id);
+    ledger.markStuckIfHeartbeatStale(created.id);
+    const secondFence = (ledger.resumeTask(created.id, "user-1")).fence_token;
+
+    const missing = await app.request(`/ledger/tasks/${created.id}/complete`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ status: "succeeded" }),
+    });
+    assert.equal(missing.status, 403);
+    assert.deepEqual(await missing.json(), { error: "fence_conflict" });
+
+    const stale = await app.request(`/ledger/tasks/${created.id}/complete`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ status: "succeeded", fenceToken: firstFence }),
+    });
+    assert.equal(stale.status, 403);
+    assert.deepEqual(await stale.json(), { error: "fence_conflict" });
+    const running = (await (await app.request(`/ledger/tasks/${created.id}`, { headers: auth })).json()) as { status: string };
+    assert.equal(running.status, "running");
+
+    const completed = await app.request(`/ledger/tasks/${created.id}/complete`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ status: "succeeded", fenceToken: secondFence }),
+    });
+    assert.equal(completed.status, 200);
+    assert.equal(((await completed.json()) as { status: string }).status, "succeeded");
+
+    const repeated = await app.request(`/ledger/tasks/${created.id}/complete`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ status: "succeeded", fenceToken: secondFence }),
+    });
+    assert.equal(repeated.status, 200);
+    assert.equal(((await repeated.json()) as { status: string }).status, "succeeded");
+  });
   test("a non-running task (queued/terminal) is not fence-gated", async () => {
     const { app } = makeApp();
     const created = await createTask(app, "fence-queued");
@@ -310,5 +357,156 @@ describe("ledger routes — fence enforcement on running tasks (M8)", () => {
       body: JSON.stringify({}),
     });
     assert.equal(res.status, 409, "queued heartbeat is a transition error, not a fence conflict");
+  });
+});
+
+describe("ledger task projection and cancellation route", () => {
+  test("task reads carry a versioned bounded projection without raw step results", async () => {
+    const { app, ledger } = makeApp();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "projected", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    ledger.appendStep(
+      task.id,
+      "user-1",
+      { stage: "tool", action: "tool:list", result: "private-result" },
+      claimed.fence_token,
+    );
+    const response = await app.request(`/ledger/tasks/${task.id}`, { headers: auth });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      projection: Record<string, unknown>;
+      steps: Array<Record<string, unknown>>;
+    };
+    assert.equal(body.projection["schemaVersion"], 1);
+    assert.equal(body.projection["code"], "running_model");
+    assert.equal(body.projection["canCancel"], false);
+    assert.equal(body.projection["effectState"], "completed_steps_only");
+    assert.equal("result" in body.projection, false);
+    assert.equal(body.steps[0]?.["result"], "private-result");
+
+    const byKey = await app.request(
+      "/ledger/tasks/by-key/projected",
+      { headers: auth },
+    );
+    assert.equal(byKey.status, 200);
+    const byKeyBody = await byKey.json() as Record<string, unknown>;
+    assert.equal("steps" in byKeyBody, false);
+    assert.equal(
+      (byKeyBody["projection"] as Record<string, unknown>)["effectState"],
+      "completed_steps_only",
+    );
+  });
+
+  test("a failed task is terminal and is not advertised as retryable", async () => {
+    const { app, ledger } = makeApp();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "failed", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    ledger.completeTask(task.id, "user-1", "failed", claimed.fence_token);
+
+    const response = await app.request(`/ledger/tasks/${task.id}`, {
+      headers: auth,
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      status: string;
+      projection: { terminalStatus?: string; canRetry?: boolean };
+    };
+    assert.equal(body.status, "failed");
+    assert.equal(body.projection.terminalStatus, "failed");
+    assert.equal(body.projection.canRetry, false);
+  });
+
+  test("cancel reports awaiting_review as terminal and not cancellable", async () => {
+    const { ledger } = makeApp();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "review", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    ledger.appendStep(
+      task.id,
+      "user-1",
+      { stage: "sentinel", action: "sentinel:flag", result: "{}" },
+      claimed.fence_token,
+    );
+    ledger.completeTask(task.id, "user-1", "awaiting_review", claimed.fence_token);
+    const report: TaskCancelReport = {
+      schemaVersion: 1,
+      taskId: task.id,
+      stage: "already-terminal",
+      reachedStage: "already-terminal",
+      taskStatus: "awaiting_review",
+      cancellable: false,
+      terminalStatus: "awaiting_review",
+      effectState: "completed_steps_only",
+      completedActions: [{
+        id: "step-1",
+        stage: "sentinel",
+        action: "sentinel:flag",
+        completed: true,
+      }],
+      projection: {
+        schemaVersion: 1,
+        code: "review",
+        lastActionId: "step-1",
+        canCancel: false,
+        canRetry: false,
+        cancellationPending: false,
+        effectState: "completed_steps_only",
+        terminalStatus: "awaiting_review",
+      },
+    };
+    const runner = {
+      cancelTask: (id: string, owner: string) =>
+        owner === "user-1" && id === task.id ? report : null,
+      getTaskExecution: () => undefined,
+    } as unknown as JobRunner;
+    const { app } = makeApp(undefined, runner);
+
+    const response = await app.request(`/ledger/tasks/${task.id}/cancel`, {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), report);
+    assert.equal(ledger.getTask(task.id, "user-1")?.status, "awaiting_review");
+  });
+
+  test("cancel is owner-scoped, tombstone-aware, and unavailable without a controller", async () => {
+    const { ledger } = makeApp();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "owned", spec: "s" });
+    const runner = {
+      cancelTask: (_id: string, owner: string) =>
+        owner === "user-1" ? null : null,
+      getTaskExecution: () => undefined,
+    } as unknown as JobRunner;
+
+    const intruder = makeApp(
+      async () => ({ ok: true as const, owner: "intruder" }),
+      runner,
+    );
+    const denied = await intruder.app.request(`/ledger/tasks/${task.id}/cancel`, {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(denied.status, 404);
+    assert.deepEqual(await denied.json(), { error: "not_found" });
+
+    const unavailable = await makeApp().app.request(`/ledger/tasks/${task.id}/cancel`, {
+      method: "POST",
+      headers: auth,
+    });
+    assert.equal(unavailable.status, 503);
+    assert.deepEqual(await unavailable.json(), { error: "background_unavailable" });
+
+    markDeleting("user-1");
+    try {
+      const tombstoned = await makeApp(undefined, runner).app.request(
+        `/ledger/tasks/${task.id}/cancel`,
+        { method: "POST", headers: auth },
+      );
+      assert.equal(tombstoned.status, 403);
+      assert.deepEqual(await tombstoned.json(), { error: "account_deleted" });
+    } finally {
+      clearDeleting("user-1");
+    }
+    assert.equal(ledger.getTask(task.id, "user-1")?.status, "queued");
   });
 });

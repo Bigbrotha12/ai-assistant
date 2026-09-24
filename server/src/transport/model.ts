@@ -6,8 +6,14 @@ import { PluginRegistryError } from "../plugins/registry.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import type { PluginStore } from "../plugins/store.ts";
 import { isModelPlugin } from "../plugins/types.ts";
-import { validatedFetch } from "../plugins/ssrf.ts";
-import type { LookupFn, Mode } from "../plugins/ssrf.ts";
+import type { ModelPluginDefinition } from "../plugins/types.ts";
+import {
+  createEgressPolicy,
+  policyFetch,
+  resolveAndValidateHost,
+  SsrfValidationError,
+} from "../plugins/ssrf.ts";
+import type { EgressPolicy, LookupFn, Mode } from "../plugins/ssrf.ts";
 
 /**
  * Model construction (Phase 3, Wave C1).
@@ -21,10 +27,10 @@ import type { LookupFn, Mode } from "../plugins/ssrf.ts";
  *
  * SSRF BOUNDARY (the one hard rule): ChatOpenAI's underlying OpenAI SDK client
  * MUST NOT use the global fetch. The SDK's `ClientOptions` accepts a custom
- * `fetch`, and {@link buildModel} wires a `validatedFetch` adapter
+ * `fetch`, and {@link buildModel} wires a `policyFetch` adapter
  * (plugins/ssrf.ts — the ONLY sanctioned outbound path) into
- * `configuration.fetch`, so every provider call re-validates scheme + literal
- * IP ranges + resolves and validates EVERY A/AAAA record before connecting,
+ * `configuration.fetch`, so every provider call enforces the manifest-derived
+ * origin/method/path policy and connects only through validated retained pins,
  * with `redirect: "manual"`. An admin-trusted internal endpoint (e.g.
  * `vikunja.local` behind `*.local`) keeps working because the handler's
  * `PLUGINS_TRUSTED_HOSTS` list is forwarded into the adapter. If the SDK ever
@@ -39,7 +45,7 @@ import type { LookupFn, Mode } from "../plugins/ssrf.ts";
  * verbatim (no `/v1` mangling; the OpenRouter builtin endpoint already carries
  * it). The custom `fetch` is invoked with the fully-resolved request URL (e.g.
  * `https://openrouter.ai/api/v1/chat/completions`), which is exactly the URL
- * `validatedFetch` must see.
+ * `policyFetch` must see.
  *
  * CREDENTIALS: ChatOpenAI requires a non-empty apiKey to construct its OpenAI
  * client, and the gateway must NEVER fall back to the server host's
@@ -86,22 +92,78 @@ export type BuildModelInput = {
    * explicit model fields always win over both.
    */
   requestParameters?: Record<string, unknown>;
-  /** Admin-trusted hosts forwarded into `validatedFetch` (bypass RANGE checks,
+  /** Admin-trusted hosts forwarded into the egress policy (bypass RANGE checks,
    *  never scheme enforcement). Must match the store's trusted-host policy. */
   trustedHosts?: readonly string[];
-  /** Scheme-enforcement mode override for `validatedFetch`. */
+  /** Scheme-enforcement mode override for the egress policy. */
   mode?: Mode;
-  /** Injectable DNS resolver for `validatedFetch` (tests). */
+  /** Injectable DNS resolver for a missing retained model pin (tests). */
   lookup?: LookupFn;
-  /** Injectable fetch for `validatedFetch` (tests). */
+  /** Injectable fetch for `policyFetch` (tests). */
   fetchFn?: typeof fetch;
 };
+
+type ModelPinnedEntry = { entryId: string; url: string; pinned: string[] };
+
+function canonicalEndpoint(value: string): string {
+  return new URL(value).href;
+}
+
+function modelEgressPolicy(
+  plugin: ModelPluginDefinition,
+  selectedBaseUrl: string,
+  pinnedEntries: ModelPinnedEntry[] | undefined,
+  trustedHosts: readonly string[] | undefined,
+  mode: Mode | undefined,
+  lookup: LookupFn | undefined,
+): EgressPolicy {
+  const declared = [
+    plugin.inference.endpoint,
+    ...(plugin.baseUrls ?? []).map((entry) => entry.url),
+  ];
+  if (!declared.some((url) => canonicalEndpoint(url) === canonicalEndpoint(selectedBaseUrl))) {
+    throw new SsrfValidationError(
+      "EGRESS_DENIED",
+      `model plugin '${plugin.id}' selected a base URL outside its manifest policy`,
+    );
+  }
+  const resolvedFallbacks = new Map<string, Promise<readonly string[]>>();
+  return createEgressPolicy({
+    subject: `model:${plugin.id}`,
+    destinations: declared.map((baseUrl) => {
+      const retained = pinnedEntries?.find(
+        (entry) => canonicalEndpoint(entry.url) === canonicalEndpoint(baseUrl),
+      );
+      return {
+        baseUrl,
+        pinnedIps: retained?.pinned ?? [],
+        resolvePins: retained
+          ? undefined
+          : (hostname) => {
+              let pending = resolvedFallbacks.get(hostname);
+              if (!pending) {
+                pending = resolveAndValidateHost(hostname, {
+                  trustedHosts,
+                  lookup,
+                });
+                resolvedFallbacks.set(hostname, pending);
+              }
+              return pending;
+            },
+        methods: ["POST"],
+        pathPrefixes: [new URL(baseUrl).pathname],
+      };
+    }),
+    trustedHosts,
+    mode,
+  });
+}
 
 /**
  * Build the chat model for one request. `pluginStore` is accepted for the
  * stable seam (Wave C2's background jobs); `buildModel` resolves the plugin
  * definition through the registry and routes all outbound traffic through
- * `validatedFetch`.
+ * `policyFetch`.
  */
 export function buildModel(input: BuildModelInput): BaseChatModel {
   let plugin;
@@ -151,10 +213,15 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
     maxRetries: 0,
     baseURL,
     fetch: createValidatedFetchAdapter({
-      trustedHosts: input.trustedHosts,
-      lookup: input.lookup,
+      policy: modelEgressPolicy(
+        plugin,
+        baseURL,
+        input.pluginStore.getPinnedIps(input.modelPluginId),
+        input.trustedHosts,
+        input.mode,
+        input.lookup,
+      ),
       fetchFn: input.fetchFn,
-      mode: input.mode,
     }),
   };
 
@@ -175,35 +242,31 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
 }
 
 export type ValidatedFetchAdapterOptions = {
-  trustedHosts?: readonly string[];
-  lookup?: LookupFn;
+  policy: EgressPolicy;
   fetchFn?: typeof fetch;
-  mode?: Mode;
 };
 
 /**
  * The custom `fetch` handed to the OpenAI SDK via `configuration.fetch`.
- * Routes EVERY provider call through `validatedFetch` — the only sanctioned
- * outbound path — with the plugin's trusted hosts and any injected
- * lookup/fetchFn/mode. Exported so the SSRF contract can be unit-tested
+ * Routes EVERY provider call through `policyFetch` — the only sanctioned
+ * outbound path — with the manifest-derived egress policy and any injected
+ * fetchFn. Exported so the SSRF contract can be unit-tested
  * without constructing a real `ChatOpenAI`.
  */
 export function createValidatedFetchAdapter(
-  opts: ValidatedFetchAdapterOptions = {},
+  opts: ValidatedFetchAdapterOptions,
 ): typeof fetch {
   return (url, init) =>
-    validatedFetch(resolveFetchUrl(url), init, {
-      trustedHosts: opts.trustedHosts,
-      lookup: opts.lookup,
+    policyFetch(resolveFetchUrl(url), init, {
+      policy: opts.policy,
       fetchFn: opts.fetchFn,
-      mode: opts.mode,
     });
 }
 
 /**
  * The OpenAI SDK calls the custom fetch with a string URL (verified against
  * 1.5.13), but tolerate `URL`/`Request` objects so a future SDK revision or a
- * direct test cannot slip a `[object Request]` into `validatedFetch`.
+ * direct test cannot slip a `[object Request]` into `policyFetch`.
  */
 function resolveFetchUrl(url: string | URL | Request): string {
   if (typeof url === "string") return url;

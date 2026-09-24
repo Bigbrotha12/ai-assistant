@@ -6,6 +6,8 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PluginStore, PluginStoreError } from "../../src/plugins/store.ts";
+import { computeManifestDigest } from "../../src/plugins/digest.ts";
+import { PluginRegistry, PluginRegistryError } from "../../src/plugins/registry.ts";
 import {
   CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
   PluginSchemaError,
@@ -13,6 +15,7 @@ import {
 import type {
   AgentPluginDefinition,
   ModelPluginDefinition,
+  PluginDefinition,
   PluginStoreConfig,
   ToolPluginDefinition,
 } from "../../src/plugins/types.ts";
@@ -79,6 +82,16 @@ function mealieManifest(): ToolPluginDefinition {
       },
     ],
     baseUrls: [{ id: "mealie-api", url: "https://mealie.example.com" }],
+  };
+}
+
+function persistedConfig(plugins: PluginDefinition[]): PluginStoreConfig {
+  return {
+    schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
+    plugins,
+    approvedDigests: Object.fromEntries(
+      plugins.map((plugin) => [plugin.id, computeManifestDigest(plugin)]),
+    ),
   };
 }
 
@@ -201,15 +214,45 @@ describe("PluginStore init", () => {
     );
   });
 
+  test("v1 stores migrate to v2 but remain unapproved until reinstall", async (t) => {
+    const dir = await makeTempDir(t);
+    const storePath = join(dir, "plugins.json");
+    const manifest = vikunjaManifest();
+    await writeFile(
+      storePath,
+      JSON.stringify({ schemaVersion: 1, plugins: [manifest] }),
+      "utf8",
+    );
+    const store = new PluginStore({
+      storePath,
+      trustedHosts: [],
+      builtinPlugins: [openRouterBuiltin()],
+      manifests: [manifest],
+      lookup: fakeLookup(),
+    });
+
+    await store.load();
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.equal(persisted.schemaVersion, CURRENT_PLUGIN_STORE_SCHEMA_VERSION);
+    assert.deepEqual(persisted.approvedDigests, {});
+    assert.equal(store.needsManifestReapproval("vikunja"), true);
+    assert.throws(
+      () => new PluginRegistry(store).requirePlugin("vikunja"),
+      (error: unknown) =>
+        error instanceof PluginRegistryError && error.code === "PIN_MISMATCH",
+    );
+
+    await store.install("vikunja");
+    const approved = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.equal(approved.approvedDigests?.vikunja, computeManifestDigest(manifest));
+  });
+
   test("a pre-existing valid store is honored", async (t) => {
     const dir = await makeTempDir(t);
     const storePath = join(dir, "plugins.json");
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [vikunjaManifest()],
-      }),
+      JSON.stringify(persistedConfig([vikunjaManifest()])),
       "utf8",
     );
     const store = new PluginStore({
@@ -237,6 +280,201 @@ describe("PluginStore init", () => {
         }),
       (e: unknown) => e instanceof PluginStoreError && e.code === "CONFIG",
     );
+  });
+});
+
+describe("PluginStore manifest digest pinning", () => {
+  test("digest is stable across key order and changes for security-relevant fields", () => {
+    const manifest = vikunjaManifest({
+      credentials: { apiKey: { label: "Personal access token", required: true } },
+      tools: [
+        {
+          name: "list_tasks",
+          description: "List tasks from a project",
+          readOnly: true,
+          inputSchema: {
+            type: "object",
+            properties: { projectId: { type: "string" } },
+            required: ["projectId"],
+          },
+        },
+      ],
+    });
+    const reordered = {
+      baseUrls: manifest.baseUrls,
+      tools: [
+        {
+          inputSchema: {
+            type: "object",
+            required: ["projectId"],
+            properties: { projectId: { type: "string" } },
+          },
+          readOnly: true,
+          description: manifest.tools[0]!.description,
+          name: manifest.tools[0]!.name,
+        },
+      ],
+      credentials: manifest.credentials,
+      description: manifest.description,
+      name: manifest.name,
+      type: manifest.type,
+      schemaVersion: manifest.schemaVersion,
+      version: manifest.version,
+      id: manifest.id,
+    } satisfies ToolPluginDefinition;
+
+    const digest = computeManifestDigest(manifest);
+    assert.match(digest, /^sha256:v1:[0-9a-f]{64}$/);
+    assert.equal(computeManifestDigest(reordered), digest);
+    const compact = JSON.stringify(reordered);
+    const pretty = JSON.stringify(JSON.parse(compact), null, 4);
+    assert.equal(computeManifestDigest(JSON.parse(compact)), computeManifestDigest(JSON.parse(pretty)));
+
+    const changedUrl = structuredClone(manifest);
+    changedUrl.baseUrls[0]!.url = "https://other.example.com";
+    assert.notEqual(computeManifestDigest(changedUrl), digest);
+
+    const changedSchema = structuredClone(manifest);
+    changedSchema.tools[0]!.inputSchema.required = ["otherId"];
+    assert.notEqual(computeManifestDigest(changedSchema), digest);
+
+    const changedReadOnly = structuredClone(manifest);
+    changedReadOnly.tools[0]!.readOnly = false;
+    assert.notEqual(computeManifestDigest(changedReadOnly), digest);
+
+    const changedCredentialSpec = structuredClone(manifest);
+    changedCredentialSpec.credentials!.apiKey.required = false;
+    assert.notEqual(computeManifestDigest(changedCredentialSpec), digest);
+
+    const withCredentialValue = structuredClone(manifest) as ToolPluginDefinition & {
+      credentials: { apiKey: Record<string, unknown> };
+    };
+    withCredentialValue.credentials.apiKey.value = "sk-not-persisted";
+    assert.equal(computeManifestDigest(withCredentialValue), digest);
+  });
+
+  test("install persists the approved digest alongside the definition", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir);
+    await store.install("vikunja");
+
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    const definition = persisted.plugins.find((plugin) => plugin.id === "vikunja")!;
+    const expected = computeManifestDigest(definition);
+    assert.equal(persisted.approvedDigests?.vikunja, expected);
+    assert.equal(store.getApprovedManifestDigest("vikunja"), expected);
+  });
+
+  test("reload reports a pin mismatch, blocks resolution, and reinstall clears it", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir);
+    await store.install("vikunja");
+
+    const original = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    const expected = original.approvedDigests!.vikunja;
+    const changed = structuredClone(original.plugins[0]!) as ToolPluginDefinition;
+    changed.tools[0]!.inputSchema.required = ["changedId"];
+    const actual = computeManifestDigest(changed);
+    await writeFile(
+      storePath,
+      JSON.stringify({ ...original, plugins: [changed] }),
+      "utf8",
+    );
+
+    await assert.rejects(
+      store.reload(),
+      (error: unknown) =>
+        error instanceof PluginStoreError &&
+        error.code === "PIN_MISMATCH" &&
+        error.mismatches?.[0]?.expected === expected &&
+        error.mismatches?.[0]?.actual === actual,
+    );
+    assert.deepEqual(store.getManifestHashMismatch("vikunja"), {
+      pluginId: "vikunja",
+      expected,
+      actual,
+    });
+    assert.equal(store.getPinnedIps("vikunja")?.[0]?.url, "https://vikunja.example.com");
+
+    const registry = new PluginRegistry(store);
+    assert.equal(registry.canResolveToolPlugin("vikunja"), false);
+    assert.throws(
+      () => registry.requirePlugin("vikunja"),
+      (error: unknown) => error instanceof PluginRegistryError && error.code === "PIN_MISMATCH",
+    );
+
+    await store.install("vikunja");
+    assert.equal(store.getManifestHashMismatch("vikunja"), undefined);
+    assert.equal(store.getApprovedManifestDigest("vikunja"), expected);
+    const afterReinstall = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.equal(afterReinstall.approvedDigests?.vikunja, expected);
+    await store.reload();
+    assert.equal(store.getManifestHashMismatch("vikunja"), undefined);
+  });
+
+  test("a fresh load surfaces a changed persisted definition as PIN_MISMATCH", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir);
+    await store.install("vikunja");
+    const original = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    const changed = structuredClone(original.plugins[0]!) as ToolPluginDefinition;
+    changed.baseUrls[0]!.url = "https://other.example.com";
+    await writeFile(
+      storePath,
+      JSON.stringify({ ...original, plugins: [changed] }),
+      "utf8",
+    );
+
+    const fresh = new PluginStore({
+      storePath,
+      trustedHosts: [],
+      builtinPlugins: [openRouterBuiltin()],
+      manifests: [vikunjaManifest()],
+      lookup: fakeLookup(),
+    });
+    await assert.rejects(
+      fresh.load(),
+      (error: unknown) =>
+        error instanceof PluginStoreError &&
+        error.code === "PIN_MISMATCH" &&
+        error.mismatches?.[0]?.pluginId === "vikunja",
+    );
+  });
+
+  test("a store with no digest map is also fail-closed", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir);
+    await store.install("vikunja");
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    await writeFile(
+      storePath,
+      JSON.stringify({
+        schemaVersion: persisted.schemaVersion,
+        plugins: persisted.plugins,
+      }),
+      "utf8",
+    );
+
+    await assert.rejects(
+      store.reload(),
+      (error: unknown) =>
+        error instanceof PluginStoreError &&
+        error.code === "PIN_MISMATCH" &&
+        error.mismatches?.[0]?.expected === null,
+    );
+    assert.equal(store.getPlugin("vikunja")?.id, "vikunja");
+  });
+
+  test("uninstall removes the persisted digest pin", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir);
+    await store.install("vikunja");
+    await store.uninstall("vikunja");
+
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.equal(persisted.approvedDigests?.vikunja, undefined);
+    assert.equal(store.getManifestHashMismatch("vikunja"), undefined);
+    assert.deepEqual(store.listInstallableManifests().map((plugin) => plugin.id), ["vikunja", "mealie"]);
   });
 });
 
@@ -467,10 +705,9 @@ describe("PluginStore mutation serialization", () => {
     await store.install("mealie");
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [{ ...mealieManifest(), version: "2.0.0" }],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(
+        persistedConfig([{ ...mealieManifest(), version: "2.0.0" }]),
+      ),
       "utf8",
     );
 
@@ -686,10 +923,11 @@ describe("PluginStore SSRF re-validation on load (Fix 6)", () => {
     const storePath = join(dir, "plugins.json");
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [vikunjaManifest({ baseUrls: [{ id: "private", url: "http://10.0.0.5" }] })],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(
+        persistedConfig([
+          vikunjaManifest({ baseUrls: [{ id: "private", url: "http://10.0.0.5" }] }),
+        ]),
+      ),
       "utf8",
     );
     const store = new PluginStore({
@@ -724,10 +962,7 @@ describe("PluginStore SSRF re-validation on load (Fix 6)", () => {
     };
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [model],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(persistedConfig([model])),
       "utf8",
     );
     const store = new PluginStore({
@@ -749,10 +984,11 @@ describe("PluginStore SSRF re-validation on load (Fix 6)", () => {
     const writeStore = () =>
       writeFile(
         storePath,
-        JSON.stringify({
-          schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-          plugins: [vikunjaManifest({ baseUrls: [{ id: "vikunja", url: "https://vikunja.local" }] })],
-        } satisfies PluginStoreConfig),
+        JSON.stringify(
+          persistedConfig([
+            vikunjaManifest({ baseUrls: [{ id: "vikunja", url: "https://vikunja.local" }] }),
+          ]),
+        ),
         "utf8",
       );
 
@@ -797,10 +1033,11 @@ describe("PluginStore SSRF re-validation on load (Fix 6)", () => {
     // — instead simulate a bad hand-edit: replace the plugin with a private URL.
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [vikunjaManifest({ baseUrls: [{ id: "private", url: "http://10.0.0.5" }] })],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(
+        persistedConfig([
+          vikunjaManifest({ baseUrls: [{ id: "private", url: "http://10.0.0.5" }] }),
+        ]),
+      ),
       "utf8",
     );
     await assert.rejects(
@@ -893,12 +1130,13 @@ describe("PluginStore MCP server SSRF validation", () => {
     // Hand-edit the store with a bad MCP URL
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [agentManifest({
-          mcpServers: [{ name: "mcp-private", url: "http://10.0.0.5" }],
-        })],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(
+        persistedConfig([
+          agentManifest({
+            mcpServers: [{ name: "mcp-private", url: "http://10.0.0.5" }],
+          }),
+        ]),
+      ),
       "utf8",
     );
     await assert.rejects(
@@ -932,10 +1170,25 @@ describe("PluginStore MCP header validation", () => {
   test("valid header name 'X-Api-Key' is allowed", async (t) => {
     const dir = await makeTempDir(t);
     const { store } = await makeStore(dir, {
-      manifests: [headerManifest({ "X-Api-Key": "test123" })],
+      manifests: [headerManifest({ "X-Api-Key": "${MCP_TEST_TOKEN}" })],
     });
     await store.install("custom-agent");
     assert.ok(store.getPlugin("custom-agent"));
+  });
+
+  test("literal header values are rejected and never persisted", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir, {
+      manifests: [headerManifest({ "X-Api-Key": "secret-value" })],
+    });
+    await assert.rejects(
+      store.install("custom-agent"),
+      (error: unknown) =>
+        error instanceof PluginStoreError && error.code === "CREDENTIAL_VALUES_FORBIDDEN",
+    );
+    assert.equal(store.getPlugin("custom-agent"), undefined);
+    const raw = await readFile(storePath, "utf8");
+    assert.equal(raw.includes("secret-value"), false);
   });
 
   test("header name with colon 'Bad:Header' is rejected", async (t) => {
@@ -993,10 +1246,12 @@ describe("PluginStore duplicate-id rejection at load (Fix 10)", () => {
     const storePath = join(dir, "plugins.json");
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [vikunjaManifest(), vikunjaManifest({ version: "9.9.9" })],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(
+        persistedConfig([
+          vikunjaManifest(),
+          vikunjaManifest({ version: "9.9.9" }),
+        ]),
+      ),
       "utf8",
     );
     const store = new PluginStore({
@@ -1018,10 +1273,7 @@ describe("PluginStore duplicate-id rejection at load (Fix 10)", () => {
     const storePath = join(dir, "plugins.json");
     await writeFile(
       storePath,
-      JSON.stringify({
-        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
-        plugins: [openRouterBuiltin()],
-      } satisfies PluginStoreConfig),
+      JSON.stringify(persistedConfig([openRouterBuiltin()])),
       "utf8",
     );
     const store = new PluginStore({
@@ -1105,6 +1357,7 @@ describe("PluginStore persistence", () => {
     storeAny.config = {
       schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
       plugins: [poisoned],
+      approvedDigests: {},
     };
     await assert.rejects(
       storeAny.save(),
@@ -1148,6 +1401,7 @@ describe("PluginStore assertNoCredentialValues hardening (Fix 9)", () => {
     storeAny.config = {
       schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
       plugins: [poisoned],
+      approvedDigests: {},
     };
     return store;
   }

@@ -24,6 +24,8 @@ import {
   ToolExecutor,
   bindJobTools,
   createJobRunner,
+  parsePersistedJobSpec,
+  serializeJobSpec,
 } from "../../src/jobs/runner.ts";
 import type { JobRunner } from "../../src/jobs/runner.ts";
 import type { CredentialPinHandle } from "../../src/credentials/pins.ts";
@@ -45,8 +47,15 @@ import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolPluginDefinition, ModelPluginDefinition } from "../../src/plugins/types.ts";
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolCacheKey } from "../../src/middleware/cache.ts";
-import { createBudgetManager } from "../../src/middleware/budget.ts";
+import {
+  BudgetExhaustedError,
+  createBudgetManager,
+} from "../../src/middleware/budget.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
+import {
+  TOOL_RESULT_TRUNCATION_MARKER,
+  ToolResourceError,
+} from "../../src/tool_bounds.ts";
 
 /**
  * Wave C1 job-runner tests (stateless-gateway step 8). Everything is
@@ -297,6 +306,17 @@ function descriptor(
   };
 }
 
+function storedJobSpec(
+  overrides: Partial<Parameters<typeof serializeJobSpec>[0]> = {},
+): string {
+  return serializeJobSpec({
+    clientThreadId: "thr-stored",
+    toolPlugins: ["vikunja"],
+    modelPluginId: "openrouter",
+    ...overrides,
+  });
+}
+
 /** The ledger v5 payload format: JSON-encoded stored messages. */
 function storedPayload(messages: BaseMessage[]): string {
   return JSON.stringify(mapChatMessagesToStoredMessages(messages));
@@ -384,12 +404,76 @@ describe("JobRunner.runJob", () => {
     );
   });
 
-  test("step 9: a succeeded job stores a redacted `reply` step for the assembled assistant reply", async (t) => {
+  test("durable MCP specs keep only environment references, not resolved header values", () => {
+    const previous = process.env.MCP_TEST_TOKEN;
+    process.env.MCP_TEST_TOKEN = "resolved-secret";
+    try {
+      const serialized = serializeJobSpec({
+        clientThreadId: "thread-mcp",
+        toolPlugins: [],
+        modelPluginId: "openrouter",
+        mcpServers: [{
+          name: "filesystem",
+          url: "https://filesystem.example.com",
+          headers: { Authorization: "resolved-secret" },
+          headerRefs: { Authorization: "${MCP_TEST_TOKEN}" },
+        }],
+      });
+      assert.equal(serialized.includes("resolved-secret"), false);
+      const parsed = parsePersistedJobSpec(serialized);
+      assert.equal(parsed?.mcpServers?.[0]?.headers?.Authorization, "resolved-secret");
+    } finally {
+      if (previous === undefined) delete process.env.MCP_TEST_TOKEN;
+      else process.env.MCP_TEST_TOKEN = previous;
+    }
+  });
+
+  test("a duplicate claim uses the stored job spec instead of the duplicate request config", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = makeLedger();
     const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tool" });
+    pins.pin("user-1", "openrouter", { apiKey: "model" });
+    ledger.createTask({
+      owner: "user-1",
+      intentKey: "duplicate-config",
+      spec: "original",
+      jobSpec: storedJobSpec({ modelRequestConfig: { requestModel: "original-model" } }),
+      payload: storedPayload([new HumanMessage("original snapshot")]),
+    });
+    let seenConfig: unknown;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (_modelId, config) => {
+          seenConfig = config;
+          return new ScriptedChatModel({ responses: [new AIMessage("done")] });
+        },
+      }),
+    );
+
+    const result = await runner.runJob(
+      descriptor({
+        intentKey: "duplicate-config",
+        modelRequestConfig: { requestModel: "different-model" },
+        input: { messages: [new HumanMessage("different snapshot")] },
+      }),
+    );
+    assert.equal(result.status, "succeeded");
+    assert.equal(
+      (seenConfig as { requestModel?: string } | undefined)?.requestModel,
+      "original-model",
+    );
+    assert.ok(ledger.getTask(result.taskId)?.payload?.includes("original snapshot"));
+    assert.equal(ledger.getTask(result.taskId)?.payload?.includes("different snapshot"), false);
+  });
+
+  test("step 9: a succeeded job stores a redacted `reply` step for the assembled assistant reply", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = await makeLedger();
+    const pins = new CredentialPinStore();
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
     const randomPart = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+
     const replyText = [
       `here are your tasks: sk${randomPart}`,
       `sk-${randomPart}`,
@@ -773,6 +857,8 @@ describe("JobRunner.runJob", () => {
       owner: "user-1",
       intentKey: "wedged",
       spec: "{}",
+      jobSpec: storedJobSpec(),
+      payload: storedPayload([new HumanMessage("list my tasks")]),
     });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000); // heartbeat stale past the stuck timeout
@@ -862,7 +948,13 @@ describe("JobRunner.runJob", () => {
     // A stuck task at admission IS a replay (H3) — no explicit `isReplay` flag
     // needed. Stage the crash: claim a task, let its heartbeat go stale, and
     // reconcile it to `stuck`, then run the same intentKey through the runner.
-    const staged = ledger.createTask({ owner: "user-1", intentKey: "mut-replay", spec: "{}" });
+    const staged = ledger.createTask({
+      owner: "user-1",
+      intentKey: "mut-replay",
+      spec: "{}",
+      jobSpec: storedJobSpec(),
+      payload: storedPayload([new HumanMessage("list my tasks")]),
+    });
     ledger.claimTask(staged.id, "user-1");
     clock.advance(20_000);
     ledger.reconcileOrphans();
@@ -923,7 +1015,13 @@ describe("JobRunner.runJob", () => {
     // pre-run `getOrCreateTask`) is backfilled once the runner claims it.
     // (The first runJob released the tool pin in its finally, so re-pin.)
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
-    const preAdmitted = ledger.createTask({ owner: "user-1", intentKey: "payload-2", spec: "{}" });
+    const preAdmitted = ledger.createTask({
+      owner: "user-1",
+      intentKey: "payload-2",
+      spec: "{}",
+      jobSpec: storedJobSpec(),
+      payload: storedPayload([new HumanMessage("snapshot message")]),
+    });
     const resumed = await runner.runJob(
       descriptor({ intentKey: "payload-2", input }),
     );
@@ -975,7 +1073,9 @@ describe("JobRunner.runJob", () => {
     assert.ok(payload.includes("ordinary snapshot text"));
     assert.ok(payload.includes("snapshot-1"));
     assert.ok(payload.includes("call-snapshot"));
-    assert.ok(graphMessages?.some((message) => message.content === inputMessage.content));
+    assert.ok(graphMessages?.some((message) =>
+      JSON.stringify(message.content).includes("ordinary snapshot text"),
+    ));
   });
 
   test("Wave C2: the buildModel seam resolves the PINNED model credential by owner and builds the model", async (t) => {
@@ -1153,8 +1253,10 @@ describe("JobRunner deletion admission and owner abort", () => {
       markDeleting("resume-deleted");
       const resumed = await runner.resumeStuckJobs();
       assert.deepEqual(resumed.outcomes, [
+        { taskId: queued.id, owner: "claim-deleted", outcome: "account_deleted" },
         { taskId: stuck.id, owner: "resume-deleted", outcome: "account_deleted" },
       ]);
+
       assert.equal(ledger.getTask(stuck.id, "resume-deleted")?.status, "stuck");
       assert.equal(modelCalls, 0);
       assert.equal(credentialSourceCalls, 0);
@@ -1451,7 +1553,13 @@ describe("JobRunner.runJob — credential pin lifecycle (phase 4 review)", () =>
     pins.pin("user-1", "vikunja", { apiKey: "tok" });
     pins.pin("user-1", "openrouter", { apiKey: "sk-model" });
 
-    const task = ledger.createTask({ owner: "user-1", intentKey: "fence-1", spec: "{}" });
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "fence-1",
+      spec: "{}",
+      jobSpec: storedJobSpec({ clientThreadId: "thr-fence" }),
+      payload: storedPayload([new HumanMessage("list my tasks")]),
+    });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000);
     ledger.reconcileOrphans();
@@ -1643,6 +1751,8 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       owner: "user-1",
       intentKey: "orphan",
       spec: "{}",
+      jobSpec: storedJobSpec(),
+      payload: storedPayload([new HumanMessage("snapshot")]),
     });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000); // heartbeat stale past the stuck timeout
@@ -1674,6 +1784,75 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     assert.equal(notifications[0]?.taskId, task.id);
   });
 
+  test("queued admission is reconciled at startup from its durable spec and snapshot", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "queued-after-admission",
+      spec: "queued snapshot",
+      worker: "queued-thread",
+      jobSpec: storedJobSpec({
+        clientThreadId: "queued-thread",
+        modelRequestConfig: { requestModel: "original-model" },
+      }),
+      payload: storedPayload([new HumanMessage("queued snapshot")]),
+    });
+    const seen: BaseMessage[][] = [];
+    let seenConfig: unknown;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (_modelId, config) => {
+          seenConfig = config;
+          return new ScriptedChatModel({
+            responses: [new AIMessage("recovered")],
+            onGenerateMessages: (messages) => seen.push(messages),
+          });
+        },
+        credentialSource: () => ({
+          openrouter: { apiKey: "model" },
+          vikunja: { apiKey: "tool" },
+        }),
+      }),
+    );
+
+    const result = await runner.resumeStuckJobs();
+    assert.equal(result.processed, 1);
+    assert.equal(result.outcomes[0]?.outcome, "repinned");
+    assert.equal(ledger.getTask(task.id)?.status, "succeeded");
+    assert.deepEqual(
+      (seenConfig as { requestModel?: string } | undefined)?.requestModel,
+      "original-model",
+    );
+    assert.ok(seen[0]?.some((message) => String(message.content) === "queued snapshot"));
+  });
+
+  test("a queued row without a durable spec fails instead of fabricating a job", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = await makeLedger();
+    const pins = new CredentialPinStore();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "queued-unresolvable",
+      spec: "unresolvable",
+      payload: storedPayload([new HumanMessage("must not run")]),
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("wrong")] }),
+        credentialSource: () => ({ openrouter: { apiKey: "model" } }),
+      }),
+    );
+
+    const result = await runner.resumeStuckJobs();
+    assert.equal(result.outcomes[0]?.outcome, "job_failed");
+    assert.equal(ledger.getTask(task.id)?.status, "failed");
+    assert.ok(
+      ledger.listSteps(task.id).some((step) => step.action === "error:job_failed"),
+    );
+  });
+
   test("with a credentialSource that re-establishes pins and a buildModel seam, a stuck task resumes from its STORED payload (model re-invoked with the snapshot messages)", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger, clock } = makeLedger();
@@ -1684,6 +1863,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       intentKey: "orphan-2",
       spec: "{}",
       worker: "original-client-thread",
+      jobSpec: storedJobSpec({ clientThreadId: "original-client-thread" }),
       payload: storedPayload(snapshot),
     });
     ledger.claimTask(task.id, "user-1");
@@ -1726,6 +1906,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       intentKey: "orphan-replay",
       spec: "{}",
       worker: "original-client-thread",
+      jobSpec: storedJobSpec({ clientThreadId: "original-client-thread" }),
       payload: storedPayload([new HumanMessage("snapshot turn")]),
     });
     ledger.claimTask(task.id, "user-1");
@@ -1768,6 +1949,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       owner: "user-1",
       intentKey: "orphan-nomodel",
       spec: "{}",
+      jobSpec: storedJobSpec(),
       payload: storedPayload([new HumanMessage("snapshot")]),
     });
     ledger.claimTask(task.id, "user-1");
@@ -1797,7 +1979,12 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     const { registry } = await makeRegistry(t);
     const { ledger, clock } = makeLedger();
     const pins = new CredentialPinStore();
-    const task = ledger.createTask({ owner: "user-1", intentKey: "orphan-nopayload", spec: "{}" });
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "orphan-nopayload",
+      spec: "{}",
+      jobSpec: storedJobSpec(),
+    });
     ledger.claimTask(task.id, "user-1");
     clock.advance(20_000);
     ledger.reconcileOrphans();
@@ -1841,6 +2028,7 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
       owner: "user-1",
       intentKey: "dedupe-resume",
       spec: "{}",
+      jobSpec: storedJobSpec(),
       payload: storedPayload([new HumanMessage("snapshot")]),
     });
     const claimed = ledger.claimTask(task.id, "user-1");
@@ -1955,6 +2143,103 @@ describe("bindJobTools replay/retry rules", () => {
     assert.equal(result, '{"already":"applied"}');
     assert.equal(calls.length, 0);
   });
+
+  test("redacted truncation is identical in graph output, cache, and ledger", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = await makeLedger();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "bounded", spec: "{}" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    const toolCache = createToolResultCache();
+    t.after(() => toolCache.dispose());
+    const secret = "skAbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const tools = bindJobTools({
+      registry,
+      handler: { execute: async () => `${secret} ${"x".repeat(100_000)}` },
+      credentialsByPlugin: { vikunja: { apiKey: "tok" } },
+      ledger,
+      taskId: task.id,
+      owner: "user-1",
+      fenceToken: claimed.fence_token,
+      allowMutatingRetry: true,
+      toolCache,
+    });
+    const input = { projectId: "p1" };
+    const result = String(await tools.find((tool) => tool.name === "list_tasks")!.func(
+      input,
+      undefined,
+      { toolCall: { id: "call_bounded" } } as never,
+    ));
+    assert.ok(result.length <= 65_536);
+    assert.ok(result.endsWith(TOOL_RESULT_TRUNCATION_MARKER));
+    assert.ok(!result.includes(secret));
+    const key: ToolCacheKey = {
+      owner: "user-1",
+      pluginId: "vikunja",
+      pluginVersion: "1.4.0",
+      credentialFingerprint: credentialFingerprint({ apiKey: "tok" }),
+      tool: "list_tasks",
+      argsHash: toolCache.argsHash(input),
+    };
+    assert.equal(toolCache.get(key), result);
+    assert.equal(
+      ledger.listSteps(task.id).find((step) => step.action === "tool:list_tasks")?.result,
+      result,
+    );
+  });
+
+  test("tool concurrency rejects immediately above the per-owner cap", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = await makeLedger();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "bounded-concurrency", spec: "{}" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    const budget = createBudgetManager({
+      maxToolCallsPerOwner: 1,
+      maxGlobalToolCalls: 2,
+    });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const isEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const tools = bindJobTools({
+      registry,
+      handler: {
+        execute: async () => {
+          entered();
+          await gate;
+          return '{"ok":true}';
+        },
+      },
+      credentialsByPlugin: { vikunja: { apiKey: "tok" } },
+      ledger,
+      taskId: task.id,
+      owner: "user-1",
+      fenceToken: claimed.fence_token,
+      allowMutatingRetry: true,
+      budget,
+    });
+    const tool = tools.find((candidate) => candidate.name === "list_tasks")!;
+    const first = tool.func(
+      { projectId: "p1" },
+      undefined,
+      { toolCall: { id: "call_concurrent_1" } } as never,
+    );
+    await isEntered;
+    await assert.rejects(
+      (async () => {
+        await tool.func(
+          { projectId: "p2" },
+          undefined,
+          { toolCall: { id: "call_concurrent_2" } } as never,
+        );
+      })(),
+      (error: unknown) =>
+        error instanceof BudgetExhaustedError && error.code === "budget_exhausted",
+    );
+    release();
+    assert.equal(await first, '{"ok":true}');
+    assert.equal(budget.toolCallCount("user-1"), 0);
+    assert.equal(budget.globalToolCallCount(), 0);
+  });
 });
 
 describe("ToolExecutor (real validatedFetch path)", () => {
@@ -1976,7 +2261,6 @@ describe("ToolExecutor (real validatedFetch path)", () => {
         registry,
         getPinnedIps: () => [{ entryId: "vikunja-api", url: "https://vikunja.example.com", pinned: ["1.1.1.1"] }],
         fetchFn: (async () => response) as typeof fetch,
-        lookup: fakeLookup(),
         mode: "test",
       });
       const result = assert.rejects(
@@ -2017,7 +2301,6 @@ describe("ToolExecutor (real validatedFetch path)", () => {
             ]
           : undefined,
       fetchFn,
-      lookup: fakeLookup(),
       mode: "test",
     });
 
@@ -2035,6 +2318,98 @@ describe("ToolExecutor (real validatedFetch path)", () => {
       "Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345",
     );
     assert.equal(result, "echo Bearer ***", "credential-shaped output is redacted");
+  });
+
+  test("wall-clock timeout aborts the fetch with the typed tool timeout", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const executor = new ToolExecutor({
+      registry,
+      getPinnedIps: () => [{
+        entryId: "vikunja-api",
+        url: "https://vikunja.example.com",
+        pinned: ["1.1.1.1"],
+      }],
+      fetchFn: ((_input, init) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        assert.ok(signal);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      })) as typeof fetch,
+      mode: "test",
+      timeoutMs: 5,
+    });
+    await assert.rejects(
+      executor.execute("vikunja", "list_tasks", {}),
+      (error: unknown) =>
+        error instanceof ToolResourceError &&
+        error.code === "tool_timeout" &&
+        error.limit === 5,
+    );
+  });
+
+  test("wall-clock timeout also aborts a response body that stalls", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const executor = new ToolExecutor({
+      registry,
+      getPinnedIps: () => [{
+        entryId: "vikunja-api",
+        url: "https://vikunja.example.com",
+        pinned: ["1.1.1.1"],
+      }],
+      fetchFn: (async () => new Response(new ReadableStream({
+        start() {},
+      }))) as typeof fetch,
+      mode: "test",
+      timeoutMs: 5,
+    });
+    await assert.rejects(
+      executor.execute("vikunja", "list_tasks", {}),
+      (error: unknown) =>
+        error instanceof ToolResourceError && error.code === "tool_timeout",
+    );
+  });
+
+  test("response bytes are bounded before the body is materialized", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const executor = new ToolExecutor({
+      registry,
+      getPinnedIps: () => [{
+        entryId: "vikunja-api",
+        url: "https://vikunja.example.com",
+        pinned: ["1.1.1.1"],
+      }],
+      fetchFn: (async () => new Response("12345")) as typeof fetch,
+      mode: "test",
+      maxResponseBytes: 4,
+    });
+    await assert.rejects(
+      executor.execute("vikunja", "list_tasks", {}),
+      (error: unknown) =>
+        error instanceof ToolResourceError &&
+        error.code === "tool_result_too_large" &&
+        error.unit === "bytes",
+    );
+  });
+
+  test("result characters are redacted before truncation", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const secret = "skAbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    const executor = new ToolExecutor({
+      registry,
+      getPinnedIps: () => [{
+        entryId: "vikunja-api",
+        url: "https://vikunja.example.com",
+        pinned: ["1.1.1.1"],
+      }],
+      fetchFn: (async () =>
+        new Response(`prefix ${secret} ${"x".repeat(200)}`)) as typeof fetch,
+      mode: "test",
+      maxResultChars: 96,
+    });
+    const result = await executor.execute("vikunja", "list_tasks", {});
+    assert.ok(result.length <= 96);
+    assert.match(result, /sk-\*\*\*/);
+    assert.ok(result.endsWith(TOOL_RESULT_TRUNCATION_MARKER));
+    assert.ok(!result.includes(secret));
   });
 
   test("the full path: runJob → bindJobTools → real ToolExecutor → validatedFetch (pins + credentials)", async (t) => {
@@ -2063,7 +2438,6 @@ describe("ToolExecutor (real validatedFetch path)", () => {
             ]
           : undefined,
       fetchFn,
-      lookup: fakeLookup(),
       mode: "test",
     });
 
@@ -2125,7 +2499,6 @@ describe("ToolExecutor (real validatedFetch path)", () => {
         fetched = true;
         return new Response("nope");
       }) as unknown as typeof fetch,
-      lookup: fakeLookup(),
       mode: "test",
     });
     await assert.rejects(
@@ -2135,7 +2508,7 @@ describe("ToolExecutor (real validatedFetch path)", () => {
     assert.equal(fetched, false);
   });
 
-  test("H1: an admin-trusted *.local host is NOT rejected at call time when trustedHosts is forwarded", async (t) => {
+  test("admin-trusted private pins remain continuous without call-time DNS resolution", async (t) => {
     const { registry } = await makeRegistry(t);
     const pinned = [
       {
@@ -2151,27 +2524,22 @@ describe("ToolExecutor (real validatedFetch path)", () => {
           pluginId === "vikunja" ? pinned : undefined,
         fetchFn: (async () =>
           new Response('{"ok":true}', { status: 200 })) as unknown as typeof fetch,
-        lookup: fakeLookup(),
         mode: "test",
         trustedHosts,
       });
 
-    // Without the trusted-host list, the call-time re-resolution rejects the
-    // private .local backend as DNS_REBINDING — the pre-fix behavior that
-    // broke every admin-trusted internal plugin tool call.
     await assert.rejects(
       makeExecutor(undefined).execute("vikunja", "list_tasks", {}, { apiKey: "k" }),
-      (e: unknown) => e instanceof SsrfValidationError && e.code === "DNS_REBINDING",
+      (e: unknown) => e instanceof SsrfValidationError && e.code === "EGRESS_DENIED",
     );
 
-    // With the same list the pins were computed under, the call succeeds.
     const result = await makeExecutor(["vikunja.local"]).execute(
       "vikunja",
       "list_tasks",
       {},
       { apiKey: "k" },
     );
-assert.equal(result, '{"ok":true}');
+    assert.equal(result, '{"ok":true}');
   });
 });
 
@@ -2489,6 +2857,9 @@ describe("JobRunner.runJob — context + budget integration (phase 4 review)", (
         observed.push([owner, kind ?? ""]);
       },
       modelCallCount: () => 0,
+      withToolCallBudget: async <T>(_owner: string, run: () => Promise<T>) => run(),
+      toolCallCount: () => 0,
+      globalToolCallCount: () => 0,
     } as Parameters<typeof createJobRunner>[0]["budget"];
 
     const runner = createJobRunner(
@@ -2530,5 +2901,210 @@ describe("JobRunner.runJob — context + budget integration (phase 4 review)", (
       }),
     );
     assert.equal(result.status, "succeeded", "an oversized snapshot input must still run (no runner-side context cap)");
+  });
+});
+
+describe("JobRunner task-scoped cancellation", () => {
+  test("queued cancellation settles immediately and reports reachedStage=queued", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const runner = createJobRunner(baseDeps(ledger, registry, new CredentialPinStore()));
+    const task = ledger.createTask({ owner: "user-1", intentKey: "cancel-queued", spec: "s" });
+
+    const report = runner.cancelTask(task.id, "user-1");
+    assert.ok(report);
+    assert.equal(report.stage, "cancelled");
+    assert.equal(report.reachedStage, "queued");
+    assert.equal(report.taskStatus, "cancelled");
+    assert.equal(report.projection.code, "done");
+    assert.equal(report.projection.terminalStatus, "cancelled");
+    assert.equal(ledger.getTask(task.id, "user-1")?.status, "cancelled");
+  });
+
+  test("cancel reports at most 64 action metadata entries and never raw results", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const runner = createJobRunner(baseDeps(ledger, registry, new CredentialPinStore()));
+    const task = ledger.createTask({ owner: "user-1", intentKey: "cancel-bounded", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    for (let index = 0; index < 65; index += 1) {
+      ledger.appendStep(
+        task.id,
+        "user-1",
+        { stage: "tool", action: `tool:${index}`, result: `private-${index}` },
+        claimed.fence_token,
+      );
+    }
+    ledger.completeTask(task.id, "user-1", "succeeded", claimed.fence_token);
+
+    const report = runner.cancelTask(task.id, "user-1");
+    assert.ok(report);
+    assert.equal(report.completedActions.length, 64);
+    assert.equal(report.completedActions[0]?.action, "tool:1");
+    assert.equal("result" in report.completedActions[0]!, false);
+  });
+
+  test("admitted cancellation aborts before model dispatch and settles once", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const isEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: async (_id, _config, context) => {
+          entered();
+          await gate;
+          context.signal.throwIfAborted();
+          return new ScriptedChatModel({ responses: [new AIMessage("late")] });
+        },
+      }),
+    );
+
+    const running = runner.runJob(descriptor({ intentKey: "cancel-admitted" }));
+    await isEntered;
+    const report = runner.cancelTask(
+      ledger.getTaskByIntentKey("user-1", "cancel-admitted")!.id,
+      "user-1",
+    );
+    assert.ok(report);
+    assert.equal(report.stage, "cancelling");
+    assert.equal(report.reachedStage, "admitted");
+    assert.equal(report.projection.cancellationPending, true);
+    assert.equal(report.cancellable, false);
+    release();
+    assert.equal((await running).status, "cancelled");
+    assert.equal(
+      ledger.listTasks("user-1").some((task) => task.status === "failed"),
+      false,
+    );
+  });
+
+  test("running-tool cancellation reports unknown effects and never double-settles", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const isEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    const model = new ScriptedChatModel({
+      responses: [
+        toolCallMessage("create_task", { title: "x" }, "call-cancel-tool"),
+        new AIMessage("done"),
+      ],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => model,
+      }),
+    );
+
+    const running = runner.runJob(
+      descriptor({
+        intentKey: "cancel-running-tool",
+        toolHandler: {
+          async execute() {
+            calls += 1;
+            entered();
+            await gate;
+            return '{"applied":true}';
+          },
+        },
+      }),
+    );
+    await isEntered;
+    const taskId = ledger.getTaskByIntentKey("user-1", "cancel-running-tool")!.id;
+    const first = runner.cancelTask(taskId, "user-1");
+    const second = runner.cancelTask(taskId, "user-1");
+    assert.ok(first && second);
+    assert.equal(first.stage, "cancelling");
+    assert.equal(first.reachedStage, "running");
+    assert.equal(first.projection.code, "running_tool");
+    assert.equal(first.projection.effectState, "unknown");
+    assert.equal(second.stage, "cancelling");
+    assert.equal(second.reachedStage, "running");
+    release();
+    assert.equal((await running).status, "cancelled");
+    assert.equal(calls, 1);
+    assert.equal(ledger.getTask(taskId, "user-1")?.status, "cancelled");
+    assert.equal(
+      ledger.listSteps(taskId, "user-1").some((step) => step.stage === "error"),
+      false,
+    );
+  });
+
+  test("orphaned running and stuck tasks report not-cancellable without mutation", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const runner = createJobRunner(baseDeps(ledger, registry, new CredentialPinStore()));
+
+    const runningTask = ledger.createTask({
+      owner: "user-1",
+      intentKey: "cancel-orphaned-running",
+      spec: "s",
+    });
+    ledger.claimTask(runningTask.id, "user-1");
+    const runningReport = runner.cancelTask(runningTask.id, "user-1");
+    assert.ok(runningReport);
+    assert.equal(runningReport.stage, "not-cancellable");
+    assert.equal(runningReport.reachedStage, "running");
+    assert.equal(runningReport.projection.canCancel, false);
+    assert.equal(ledger.getTask(runningTask.id, "user-1")?.status, "running");
+
+    clock.advance(10_001);
+    assert.equal(ledger.markStuckIfHeartbeatStale(runningTask.id)?.status, "stuck");
+    const stuckReport = runner.cancelTask(runningTask.id, "user-1");
+    assert.ok(stuckReport);
+    assert.equal(stuckReport.stage, "not-cancellable");
+    assert.equal(stuckReport.reachedStage, "stuck");
+    assert.equal(stuckReport.projection.canRetry, true);
+    assert.equal(ledger.getTask(runningTask.id, "user-1")?.status, "stuck");
+  });
+
+  test("terminal cancellation is idempotent and awaiting_review is terminal-not-cancellable", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("user-1", "vikunja", { apiKey: "tok" });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () =>
+          new ScriptedChatModel({ responses: [new AIMessage("done")] }),
+      }),
+    );
+    const succeeded = await runner.runJob(descriptor({ intentKey: "cancel-terminal" }));
+    assert.equal(succeeded.status, "succeeded");
+    const first = runner.cancelTask(succeeded.taskId, "user-1");
+    const second = runner.cancelTask(succeeded.taskId, "user-1");
+    assert.ok(first && second);
+    assert.equal(first.stage, "already-terminal");
+    assert.equal(first.terminalStatus, "succeeded");
+    assert.equal(first.cancellable, false);
+    assert.equal(second.terminalStatus, "succeeded");
+    assert.equal(ledger.getTask(succeeded.taskId, "user-1")?.status, "succeeded");
+
+    const review = ledger.createTask({ owner: "user-1", intentKey: "cancel-review", spec: "s" });
+    const claimed = ledger.claimTask(review.id, "user-1");
+    ledger.appendStep(
+      review.id,
+      "user-1",
+      { stage: "sentinel", action: "sentinel:flag", result: "{}" },
+      claimed.fence_token,
+    );
+    ledger.completeTask(review.id, "user-1", "awaiting_review", claimed.fence_token);
+    const reviewReport = runner.cancelTask(review.id, "user-1");
+    assert.ok(reviewReport);
+    assert.equal(reviewReport.stage, "already-terminal");
+    assert.equal(reviewReport.reachedStage, "already-terminal");
+    assert.equal(reviewReport.terminalStatus, "awaiting_review");
+    assert.equal(reviewReport.projection.code, "review");
+    assert.equal(reviewReport.cancellable, false);
+    assert.equal(ledger.getTask(review.id, "user-1")?.status, "awaiting_review");
   });
 });

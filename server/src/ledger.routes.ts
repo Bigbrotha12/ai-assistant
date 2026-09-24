@@ -7,8 +7,9 @@ import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
 import { accountDeletedResponse, keyGateResponse, requireApiKey } from "./api_key.ts";
 import { AccountDeletedError, isDeleting } from "./account_deletion.ts";
-import { Ledger, LedgerError, migrateLedger } from "./ledger.ts";
+import { Ledger, LedgerError, migrateLedger, projectTaskProgress } from "./ledger.ts";
 import type { TaskRow } from "./ledger.ts";
+import type { JobRunner } from "./jobs/runner.ts";
 import type { VerifyApiKeyFn } from "./plugins/routes.ts";
 
 /**
@@ -52,7 +53,7 @@ ledger.startRetentionSweep(env.LEDGER_SWEEP_INTERVAL_MS, {
 
 export function createLedgerRoutes(
   l: Ledger,
-  opts: { verifyKey?: VerifyApiKeyFn } = {},
+  opts: { verifyKey?: VerifyApiKeyFn; jobRunner?: JobRunner } = {},
 ): Hono {
   const verifyKey = opts.verifyKey ?? requireApiKey;
   const routes = new Hono();
@@ -109,7 +110,14 @@ export function createLedgerRoutes(
     if (isDeleting(auth.owner)) return accountDeletedResponse(c);
     const task = l.getTaskByIntentKey(auth.owner, c.req.param("intentKey"));
     if (!task) return c.json({ error: "not_found" }, 404);
-    return c.json(toPublicTask(task));
+    return c.json({
+      ...toPublicTask(task),
+      projection: projectTaskProgress(
+        task,
+        l.listSteps(task.id, auth.owner),
+        opts.jobRunner?.getTaskExecution(task.id, auth.owner),
+      ),
+    });
   });
 
   routes.get("/tasks/:id", async (c) => {
@@ -122,11 +130,30 @@ export function createLedgerRoutes(
     const task = l.getTask(id, owner);
 
     if (!task) return c.json({ error: "not_found" }, 404);
+    const steps = l.listSteps(task.id, owner);
     return c.json({
       ...toPublicTask(task),
-      steps: l.listSteps(task.id, owner),
+      projection: projectTaskProgress(
+        task,
+        steps,
+        opts.jobRunner?.getTaskExecution(task.id, owner),
+      ),
+      steps,
       chain: l.readChain(task.id, owner),
     });
+  });
+
+  routes.post("/tasks/:id/cancel", async (c) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    if (!opts.jobRunner) {
+      return c.json({ error: "background_unavailable" }, 503);
+    }
+    const report = opts.jobRunner.cancelTask(c.req.param("id"), auth.owner);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    if (report === null) return c.json({ error: "not_found" }, 404);
+    return c.json(report, report.stage === "cancelling" ? 202 : 200);
   });
 
   routes.post("/tasks/:id/claim", async (c) => {
@@ -235,19 +262,25 @@ export function createLedgerRoutes(
     const owner = auth.owner;
     const body = (await c.req.json().catch(() => null)) as {
       status?: unknown;
+      fenceToken?: unknown;
     } | null;
     const status = body?.status;
-    if (
-      status !== "succeeded" &&
-      status !== "failed" &&
-      status !== "cancelled" &&
-      status !== "awaiting_review"
-    ) {
+    if (status !== "succeeded" && status !== "failed" && status !== "cancelled") {
       return c.json({ error: "invalid_request" }, 400);
     }
     if (isDeleting(owner)) return accountDeletedResponse(c);
+    const id = c.req.param("id");
+    const task = l.getTask(id, owner);
+    if (!task) return c.json({ error: "not_found" }, 404);
+    const fenceToken =
+      typeof body?.fenceToken === "string" ? body.fenceToken : undefined;
+    if (task.status === "running" && !fenceToken) {
+      return c.json({ error: "fence_conflict" }, 403);
+    }
     try {
-      return c.json(toPublicTask(l.completeTask(c.req.param("id"), owner, status)));
+      return c.json(
+        toPublicTask(l.completeTaskWithFence(id, owner, status, fenceToken).task),
+      );
     } catch (e) {
       return ledgerError(c, e);
     }
@@ -261,8 +294,8 @@ export function createLedgerRoutes(
  *  own message snapshot — the client already owns it; the ledger holds it
  *  transiently ONLY for the runner's crash-resume, purged with the task by the
  *  retention sweep (plan §10). */
-function toPublicTask(task: TaskRow): Omit<TaskRow, "payload"> {
-  const { payload: _payload, ...publicTask } = task;
+function toPublicTask(task: TaskRow): Omit<TaskRow, "payload" | "job_spec"> {
+  const { payload: _payload, job_spec: _jobSpec, ...publicTask } = task;
   return publicTask;
 }
 

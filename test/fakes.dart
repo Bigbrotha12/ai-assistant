@@ -28,6 +28,7 @@ import 'package:ai_assistant/features/plugins/data/managed_conversation_reposito
 import 'package:ai_assistant/features/plugins/data/managed_conversation_service.dart';
 import 'package:ai_assistant/features/plugins/data/managed_resolution.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
+import 'package:ai_assistant/features/sentinel/sentinel.dart';
 
 /// In-memory [AppTierStore] for widget tests.
 class FakeAppTierStore implements AppTierStore {
@@ -984,6 +985,7 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     required this.store,
     required this.script,
     this._poller,
+    this.sentinelGate,
   });
 
   /// Store admission/completion writes go to — usually the same instance as
@@ -993,6 +995,8 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
   /// Scripted client driving stream deltas / errors / hangs through the
   /// managed sender seam ([FakeChatClient.sendTurn]).
   final FakeChatClient script;
+
+  final SentinelInputGate? sentinelGate;
 
   /// Controllable [LedgerPoller] for background-job tests. When null,
   /// background submits are unavailable (existing streaming tests never touch
@@ -1035,6 +1039,8 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
   /// Recorded [submitBackground] calls, in order.
   final List<({String conversationId, List<Message> history, String userText})>
   backgroundSubmits = [];
+  final backgroundCancels = <String>[];
+  ManagedBackgroundCancelResult? backgroundCancelResult;
 
   /// Store-row id of the user message the most recent [sendTurn] admitted —
   /// the fake's stand-in for the real service's minted id (P1b). Null when no
@@ -1084,12 +1090,15 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
   void dispose() {}
 
   @override
-  Future<LedgerPollHandle?> rewatchPendingBackground(
+  Future<ManagedBackgroundWatch?> rewatchPendingBackground(
     String conversationId,
   ) async {
     final pending = _pending[conversationId];
     if (pending == null || !pending.background || _poller == null) return null;
-    return _watchBackgroundTurn(conversationId, pending.messageId);
+    return ManagedBackgroundWatch(
+      handle: _watchBackgroundTurn(conversationId, pending.messageId),
+      projection: LedgerTaskProjection.running(),
+    );
   }
 
   @override
@@ -1116,6 +1125,23 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
       throw StateError('inject a LedgerPoller for background tests');
     }
     return _submitBackground(conversationId, history, userText, injected);
+  }
+
+  @override
+  Future<ManagedBackgroundCancelResult> cancelBackground(
+    String conversationId,
+  ) async {
+    backgroundCancels.add(conversationId);
+    return backgroundCancelResult ??
+        const ManagedBackgroundCancelResult(
+          projection: LedgerTaskProjection(
+            code: LedgerTaskProgressCode.done,
+            canCancel: false,
+            canRetry: false,
+            effectState: LedgerTaskEffectState.noneKnown,
+            terminalStatus: LedgerTaskStatus.cancelled,
+          ),
+        );
   }
 
   Future<LedgerPollHandle> _submitBackground(
@@ -1348,7 +1374,13 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     required String userText,
     String? sessionId,
     void Function(String delta)? onContent,
+    void Function(SentinelAdvisory advisory)? onAdvisory,
   }) async {
+    final gate = sentinelGate;
+    if (gate != null) {
+      final advisory = gate.advisory(userText);
+      if (advisory != null) onAdvisory?.call(advisory);
+    }
     sends.add((
       conversationId: conversationId,
       history: history,

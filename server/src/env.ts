@@ -71,6 +71,10 @@ export const envSchema = z.object({
   // enforced post-read with the same 413 `request_too_large` shape (the
   // establish/delta distinction is only visible from the parsed body).
   MAX_ESTABLISH_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(25_000_000),
+  SENTINEL_POLICY_MODE: z.enum(["advisory", "blocking"]).default("advisory"),
+  SENTINEL_MAX_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(65_536),
+  SENTINEL_RATE_LIMIT: z.coerce.number().int().positive().default(60),
+  SENTINEL_RATE_BURST: z.coerce.number().int().positive().default(20),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),

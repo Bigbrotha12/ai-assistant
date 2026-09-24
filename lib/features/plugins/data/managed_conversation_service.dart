@@ -10,6 +10,7 @@ import '../../chat/data/context_trimmer.dart';
 import '../../chat/data/message_model.dart';
 import '../../chat/data/sse.dart';
 import '../../notifications/data/notif_client.dart';
+import '../../sentinel/sentinel.dart';
 import 'langchain_client.dart';
 import 'langchain_request.dart';
 import 'ledger_client.dart';
@@ -124,7 +125,8 @@ class ManagedConversationService {
     this._poller,
     this._dio,
     this.onAccountDeleted,
-  });
+    SentinelInputGate? sentinelGate,
+  }) : sentinelGate = sentinelGate ?? SentinelInputGate();
 
   final LangChainClient client;
   final ManagedConversationRepository repo;
@@ -145,6 +147,7 @@ class ManagedConversationService {
   /// poller-scoped [AuthCredentials].
   LedgerPoller? _poller;
   final Dio? _dio;
+  final SentinelInputGate sentinelGate;
   final Future<void> Function(Object error)? onAccountDeleted;
 
   Future<void> _notifyAccountDeleted(Object error) async {
@@ -207,7 +210,17 @@ class ManagedConversationService {
     required String userText,
     String? sessionId,
     void Function(String delta)? onContent,
+    void Function(SentinelAdvisory advisory)? onAdvisory,
   }) async {
+    SentinelAdvisory? advisory;
+    try {
+      advisory = sentinelGate.advisory(userText);
+    } catch (_) {}
+    if (advisory != null) {
+      try {
+        onAdvisory?.call(advisory);
+      } catch (_) {}
+    }
     final epoch = repo.epoch(scope);
     final userMessage = Message(
       id: const Uuid().v4(),
@@ -717,8 +730,15 @@ class ManagedConversationService {
     );
     final token = repo.register(scope);
     try {
-      await client.backgroundTurn(request, cancelToken: token);
+      final result = await client.backgroundTurn(request, cancelToken: token);
       _checkEpoch(epoch);
+      await _persistBackgroundState(
+        conversationId,
+        epoch,
+        messageId: messageId,
+        taskId: result.taskId,
+        projection: LedgerTaskProjection.running(),
+      );
     } on PluginClientException catch (error) {
       if (isAccountDeletedError(error)) {
         await _notifyAccountDeleted(error);
@@ -735,20 +755,54 @@ class ManagedConversationService {
     );
   }
 
+  Future<void> _persistBackgroundState(
+    String conversationId,
+    int epoch, {
+    required String messageId,
+    String? taskId,
+    LedgerTaskProjection? projection,
+    LedgerTaskCancelReport? cancelReport,
+  }) => repo.access(scope, epoch, () {}, (_) async {
+    final pending = await repo.pending(scope, conversationId);
+    if (pending == null || pending.messageId != messageId) return;
+    final decoded = jsonDecode(pending.envelope);
+    if (decoded is! Map<String, dynamic>) {
+      throw const PluginClientException(ManagedErrorCodes.invalidConfig);
+    }
+    if (taskId != null) decoded['taskId'] = taskId;
+    if (projection != null) decoded['projection'] = projection.toJson();
+    if (cancelReport != null) {
+      decoded['cancelReport'] = cancelReport.toJson();
+    }
+    await repo.savePending(conversationId, scope, messageId, decoded);
+  });
+
   /// Starts a ledger watch for one background job and wires its terminal
-  /// observation: `succeeded` reads the reply back (via the full task) and
-  /// appends it to the conversation + clears the pending marker; `failed` /
-  /// `cancelled` clear the marker (the server owns the failure); everything
-  /// else keeps the marker for an explicit retry. Epoch-safe: a scope clear
-  /// mid-poll makes the reconciliation a no-op. Each submitBackground call
-  /// creates an independent watch (the poller keys by lookup).
+  /// observation: `succeeded` reads the reply back and clears the marker;
+  /// `failed`, `cancelled`, and `expired` clear it; `awaiting_review` retains a
+  /// visible projected terminal marker; unresolved polling failures retain the
+  /// envelope. Epoch-safe: a scope clear mid-poll makes reconciliation a no-op.
+  /// Each submitBackground call creates an independent watch by lookup.
   LedgerPollHandle _watchBackground(
     String conversationId,
     int epoch, {
     required LedgerLookup lookup,
     required List<Message> history,
   }) {
-    final handle = _ledgerPoller.watch(lookup);
+    final handle = _ledgerPoller.watch(
+      lookup,
+      onUpdate: (task) {
+        unawaited(
+          _persistBackgroundState(
+            conversationId,
+            epoch,
+            messageId: task.messageId,
+            taskId: task.id,
+            projection: task.projection,
+          ).catchError((Object _) {}),
+        );
+      },
+    );
     unawaited(
       handle.done.then((result) async {
         // A poll-completion failure (e.g. the reply read-back fetch) must never
@@ -775,14 +829,10 @@ class ManagedConversationService {
 
   /// Re-arms the ledger watch for a still-pending BACKGROUND job (plan P3
   /// foreground liveness): a suspended app runs no timers, so the original
-  /// handle's fixed deadline may have expired (an expired handle finishes
-  /// `exhausted` with zero polls). Each still-pending background envelope gets
-  /// a FRESH watch keyed by the same `messageId` — the job is already on the
-  /// server, nothing is re-submitted. Returns the new handle, or null when the
-  /// conversation has no pending background envelope (a non-background or
-  /// reconcile-only pending row). The fresh watch replaces the old one for the
-  /// lookup ([LedgerPoller.watch] invalidates the previous handle).
-  Future<LedgerPollHandle?> rewatchPendingBackground(
+  /// handle's fixed deadline may have expired. Returns the fresh watch plus
+  /// its persisted projection, or null when the conversation has no pending
+  /// background envelope. The fresh watch replaces the old one for the lookup.
+  Future<ManagedBackgroundWatch?> rewatchPendingBackground(
     String conversationId,
   ) async {
     final epoch = repo.epoch(scope);
@@ -790,12 +840,127 @@ class ManagedConversationService {
     if (pending == null || pending.reconcileOnly) return null;
     final resumed = _decodeEnvelope(pending.envelope);
     if (!resumed.background) return null;
-    return _watchBackground(
-      conversationId,
-      epoch,
-      lookup: LedgerLookup.byMessageId(pending.messageId),
-      history: _historyFromApi(resumed.messages),
+    return ManagedBackgroundWatch(
+      handle: _watchBackground(
+        conversationId,
+        epoch,
+        lookup: LedgerLookup.byMessageId(pending.messageId),
+        history: _historyFromApi(resumed.messages),
+      ),
+      projection: resumed.projection ?? LedgerTaskProjection.queued(),
     );
+  }
+
+  Future<ManagedBackgroundCancelResult> cancelBackground(
+    String conversationId,
+  ) async {
+    final epoch = repo.epoch(scope);
+    final pending = await repo.pending(scope, conversationId);
+    if (pending == null || pending.reconcileOnly) {
+      throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
+    }
+    final resumed = _decodeEnvelope(pending.envelope);
+    if (!resumed.background) {
+      throw const PluginClientException(ManagedErrorCodes.noPendingTurn);
+    }
+    final resolved = await credentials();
+    if (resolved == null) {
+      throw const PluginClientException(ManagedErrorCodes.missingGatewayKey);
+    }
+    _checkEpoch(epoch);
+
+    final token = repo.register(scope);
+    try {
+      var taskId = resumed.taskId;
+      if (taskId == null || taskId.isEmpty) {
+        final task = await _ledgerPoller.client.getTaskByMessageId(
+          pending.messageId,
+          gatewayKey: resolved.gatewayKey,
+          cancelToken: token,
+        );
+        taskId = task.id;
+        await _persistBackgroundState(
+          conversationId,
+          epoch,
+          messageId: pending.messageId,
+          taskId: taskId,
+          projection: task.projection,
+        );
+      }
+      final resolvedTaskId = taskId;
+      _checkEpoch(epoch);
+      final report = await _ledgerPoller.client.cancelTask(
+        resolvedTaskId,
+        gatewayKey: resolved.gatewayKey,
+        cancelToken: token,
+      );
+      _checkEpoch(epoch);
+      await _persistBackgroundState(
+        conversationId,
+        epoch,
+        messageId: pending.messageId,
+        taskId: taskId,
+        projection: report.projection,
+        cancelReport: report,
+      );
+
+      LedgerPollHandle? watch;
+      if (report.stage == LedgerTaskCancelStage.cancelling ||
+          report.stage == LedgerTaskCancelStage.notCancellable) {
+        watch = _watchBackground(
+          conversationId,
+          epoch,
+          lookup: LedgerLookup.byMessageId(pending.messageId),
+          history: _historyFromApi(resumed.messages),
+        );
+      } else if (report.stage == LedgerTaskCancelStage.cancelled ||
+          (report.stage == LedgerTaskCancelStage.alreadyTerminal &&
+              (report.terminalStatus == LedgerTaskStatus.failed ||
+                  report.terminalStatus == LedgerTaskStatus.cancelled))) {
+        await repo.clearPending(
+          scope,
+          conversationId,
+          messageId: pending.messageId,
+        );
+      } else if (report.stage == LedgerTaskCancelStage.alreadyTerminal &&
+          report.terminalStatus == LedgerTaskStatus.succeeded) {
+        final task = await _ledgerPoller.client.getTask(
+          resolvedTaskId,
+          gatewayKey: resolved.gatewayKey,
+          cancelToken: token,
+        );
+        _checkEpoch(epoch);
+        await _appendBackgroundReply(
+          conversationId,
+          epoch,
+          task,
+          history: _historyFromApi(resumed.messages),
+        );
+      }
+      return ManagedBackgroundCancelResult(
+        projection: report.projection,
+        report: report,
+        watch: watch,
+      );
+    } on PluginClientException catch (error) {
+      if (isAccountDeletedError(error)) {
+        await _notifyAccountDeleted(error);
+        rethrow;
+      }
+      if (error.code == 'not_found' && error.statusCode == 404) {
+        await repo.clearPending(
+          scope,
+          conversationId,
+          messageId: pending.messageId,
+        );
+        return ManagedBackgroundCancelResult(
+          projection: LedgerTaskProjection.expired(),
+        );
+      }
+      rethrow;
+    } finally {
+      repo.unregister(scope, token);
+    }
   }
 
   Future<void> _handleBackgroundTerminal(
@@ -825,8 +990,20 @@ class ManagedConversationService {
       await _notifyAccountDeleted(result.error!);
       return;
     }
-    // Only an observed terminal status reconciles; exhaustion/error/cancelled
-    // polls keep the pending marker for an explicit retry.
+    if (result.end == LedgerPollEnd.expired) {
+      final pending = await repo.pending(scope, conversationId);
+      if (pending != null &&
+          (messageId == null || pending.messageId == messageId)) {
+        await repo.clearPending(
+          scope,
+          conversationId,
+          messageId: pending.messageId,
+        );
+      }
+      return;
+    }
+    // Only an observed server status reconciles. Poll exhaustion, transport
+    // errors, and replacement of a prior watch retain the pending envelope.
     if (result.end != LedgerPollEnd.observed) return;
     final task = result.task;
     if (task == null) return;
@@ -834,6 +1011,13 @@ class ManagedConversationService {
     // The turn must still own the pending row (never clobber a newer turn or
     // duplicate an already-reconciled push-driven re-poll).
     if (pending == null || pending.messageId != task.messageId) return;
+    await _persistBackgroundState(
+      conversationId,
+      epoch,
+      messageId: task.messageId,
+      taskId: task.id,
+      projection: task.projection,
+    );
     switch (task.status) {
       case LedgerTaskStatus.succeeded:
         await _appendBackgroundReply(
@@ -1497,6 +1681,19 @@ class ManagedConversationService {
         rawUserMessageId is String && rawUserMessageId.isNotEmpty
         ? rawUserMessageId
         : null; // pre-P1b envelope — retryTurn derives it.
+    final rawTaskId = decoded['taskId'];
+    final taskId = rawTaskId is String && rawTaskId.isNotEmpty
+        ? rawTaskId
+        : null;
+    final rawProjection = decoded['projection'];
+    LedgerTaskProjection? projection;
+    if (rawProjection != null) {
+      try {
+        projection = LedgerTaskProjection.fromJson(rawProjection);
+      } catch (_) {
+        throw const PluginClientException(ManagedErrorCodes.invalidConfig);
+      }
+    }
     final rawAgent = decoded['agent'];
     final agent = rawAgent is String || rawAgent is Map<String, dynamic>
         ? rawAgent
@@ -1550,6 +1747,8 @@ class ManagedConversationService {
       agent: agent,
       messages: messages,
       userMessageId: userMessageId,
+      taskId: taskId,
+      projection: projection,
     );
   }
 }
@@ -1564,6 +1763,8 @@ class _ResumedTurn {
     this.agent,
     required this.messages,
     this.userMessageId,
+    this.taskId,
+    this.projection,
   });
 
   final String sessionId;
@@ -1573,10 +1774,34 @@ class _ResumedTurn {
   final List<String> enabledPlugins;
   final Object? agent;
   final List<ApiMessage> messages;
+  final String? taskId;
+  final LedgerTaskProjection? projection;
 
   /// The admitted user-message id stored in the envelope (null for pre-P1b
   /// envelopes — the caller derives it from the store).
   final String? userMessageId;
+}
+
+class ManagedBackgroundWatch {
+  const ManagedBackgroundWatch({
+    required this.handle,
+    required this.projection,
+  });
+
+  final LedgerPollHandle handle;
+  final LedgerTaskProjection projection;
+}
+
+class ManagedBackgroundCancelResult {
+  const ManagedBackgroundCancelResult({
+    required this.projection,
+    this.report,
+    this.watch,
+  });
+
+  final LedgerTaskProjection projection;
+  final LedgerTaskCancelReport? report;
+  final LedgerPollHandle? watch;
 }
 
 /// A re-submitted BACKGROUND turn ([retryTurn] on a background pending): the

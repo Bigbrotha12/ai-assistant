@@ -5,7 +5,8 @@ import { z } from "zod";
  * Bump this when the *shape of the store* changes — top-level `schemaVersion`
  * is the version of this file, NOT of any individual plugin definition.
  */
-export const CURRENT_PLUGIN_STORE_SCHEMA_VERSION = 1;
+export const CURRENT_PLUGIN_STORE_SCHEMA_VERSION = 2;
+export const LEGACY_PLUGIN_STORE_SCHEMA_VERSION = 1;
 
 /**
  * Schema version of an individual plugin definition (the per-plugin
@@ -26,6 +27,12 @@ export const pluginIdSchema = z
     /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
     "must be lowercase kebab-case, e.g. 'vikunja' or 'open-router'",
   );
+
+export const MCP_HEADER_REFERENCE_PATTERN = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
+
+export function isMcpHeaderReference(value: string): boolean {
+  return MCP_HEADER_REFERENCE_PATTERN.test(value);
+}
 
 const semverSchema = z
   .string()
@@ -143,7 +150,13 @@ export const agentPluginDefinitionSchema = z.object({
     mcpServers: z.array(z.object({
       name: pluginIdSchema,
       url: z.string().url("must be an absolute URL"),
-      headers: z.record(z.string(), z.string()).optional(),
+      headers: z.record(
+        z.string(),
+        z.string().refine(
+          isMcpHeaderReference,
+          "must be an environment reference such as ${MCP_TOKEN}",
+        ),
+      ).optional(),
     })).optional(),
   });
 
@@ -176,7 +189,12 @@ export type ResolvedAgentDef = {
   description: string;
   systemPrompt?: string;
   skills: { id: string; title: string; content: string }[];
-  mcpServers: { name: string; url: string; headers?: Record<string, string> }[];
+  mcpServers: {
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+    headerRefs?: Record<string, string>;
+  }[];
   tools?: { pluginId: string; required: boolean }[];
   modelRef?: string;
   inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
@@ -188,9 +206,14 @@ export const pluginDefinitionSchema = z.discriminatedUnion("type", [
   agentPluginDefinitionSchema,
 ]);
 
+export const manifestDigestSchema = z
+  .string()
+  .regex(/^sha256:v1:[0-9a-f]{64}$/);
+
 export const pluginStoreConfigSchema: z.ZodType<PluginStoreConfig> = z.object({
   schemaVersion: z.number().int().positive(),
   plugins: z.array(pluginDefinitionSchema),
+  approvedDigests: z.record(z.string(), manifestDigestSchema).default({}),
 });
 
 export class PluginSchemaError extends Error {
@@ -205,7 +228,13 @@ export class PluginSchemaError extends Error {
  * no longer matches this build. Mirrors `env.ts`'s load-time fail-fast
  * philosophy, but throws so the caller (Step 4's store) can route the error.
  */
-export function parsePluginStoreConfig(input: unknown): PluginStoreConfig {
+export type PluginStoreMigration = {
+  config: PluginStoreConfig;
+  migratedFromVersion: typeof LEGACY_PLUGIN_STORE_SCHEMA_VERSION | null;
+  legacyUnpinned: boolean;
+};
+
+export function migratePluginStoreConfig(input: unknown): PluginStoreMigration {
   const result = pluginStoreConfigSchema.safeParse(input);
   if (!result.success) {
     const details = result.error.issues
@@ -213,14 +242,24 @@ export function parsePluginStoreConfig(input: unknown): PluginStoreConfig {
       .join("\n");
     throw new PluginSchemaError(`Invalid plugin store config:\n${details}`);
   }
-  if (result.data.schemaVersion !== CURRENT_PLUGIN_STORE_SCHEMA_VERSION) {
+  const sourceVersion = result.data.schemaVersion;
+  if (
+    sourceVersion !== LEGACY_PLUGIN_STORE_SCHEMA_VERSION &&
+    sourceVersion !== CURRENT_PLUGIN_STORE_SCHEMA_VERSION
+  ) {
     throw new PluginSchemaError(
-      `Unsupported plugin store schemaVersion ${result.data.schemaVersion}; ` +
-        `this build supports ${CURRENT_PLUGIN_STORE_SCHEMA_VERSION}.`,
+      `Unsupported plugin store schemaVersion ${sourceVersion}; ` +
+        `this build supports ${LEGACY_PLUGIN_STORE_SCHEMA_VERSION} and ${CURRENT_PLUGIN_STORE_SCHEMA_VERSION}.`,
     );
   }
+  const legacy = sourceVersion === LEGACY_PLUGIN_STORE_SCHEMA_VERSION;
+  const config: PluginStoreConfig = {
+    ...result.data,
+    schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
+    approvedDigests: legacy ? {} : result.data.approvedDigests,
+  };
   const seen = new Set<string>();
-  for (const plugin of result.data.plugins) {
+  for (const plugin of config.plugins) {
     if (seen.has(plugin.id)) {
       throw new PluginSchemaError(
         `Duplicate plugin id '${plugin.id}' in plugin store; ids must be globally unique`,
@@ -228,7 +267,15 @@ export function parsePluginStoreConfig(input: unknown): PluginStoreConfig {
     }
     seen.add(plugin.id);
   }
-  return result.data;
+  return {
+    config,
+    migratedFromVersion: legacy ? LEGACY_PLUGIN_STORE_SCHEMA_VERSION : null,
+    legacyUnpinned: legacy && config.plugins.length > 0,
+  };
+}
+
+export function parsePluginStoreConfig(input: unknown): PluginStoreConfig {
+  return migratePluginStoreConfig(input).config;
 }
 
 export function isToolPlugin(
@@ -332,12 +379,19 @@ export interface CredentialSpec {
   // future: additional typed credential fields
 }
 
+export type ManifestHashMismatch = {
+  pluginId: string;
+  expected: string | null;
+  actual: string;
+};
+
 /** The persisted shape of `plugins.json` (Step 4's store). */
 export interface PluginStoreConfig {
   /** Store schema version (not plugin schema version) */
   schemaVersion: number;
   /** Admin-curated enabled plugins (installed) */
   plugins: PluginDefinition[];
+  approvedDigests: Record<string, string>;
 }
 
 /**

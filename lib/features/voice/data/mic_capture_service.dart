@@ -85,6 +85,7 @@ class RecordMicCaptureService implements MicCaptureService {
       StreamController<List<int>>.broadcast();
   StreamSubscription<Uint8List>? _subscription;
   bool _isRecording = false;
+  var _captureGeneration = 0;
 
   @override
   bool get isRecording => _isRecording;
@@ -103,6 +104,7 @@ class RecordMicCaptureService implements MicCaptureService {
       throw StateError('Microphone permission denied');
     }
 
+    final generation = ++_captureGeneration;
     final Stream<Uint8List> stream;
     try {
       stream = await _recorder.startStream(
@@ -126,9 +128,17 @@ class RecordMicCaptureService implements MicCaptureService {
 
     _isRecording = true;
     _subscription = stream.listen(
-      (bytes) => _audioController.add(_decodePcm16Le(bytes)),
-      onError: (Object e) => _audioController.addError(e),
-      onDone: () => _isRecording = false,
+      (bytes) {
+        if (!_isRecording || generation != _captureGeneration) return;
+        _audioController.add(_decodePcm16Le(bytes));
+      },
+      onError: (Object e) {
+        if (generation != _captureGeneration) return;
+        _audioController.addError(e);
+      },
+      onDone: () {
+        if (generation == _captureGeneration) _isRecording = false;
+      },
     );
   }
 
@@ -152,6 +162,7 @@ class RecordMicCaptureService implements MicCaptureService {
 
   @override
   Future<void> stop() async {
+    _captureGeneration++;
     if (!_isRecording) return;
     _isRecording = false;
     await _subscription?.cancel();

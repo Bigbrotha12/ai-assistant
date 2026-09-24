@@ -72,6 +72,11 @@ class EngineConfig {
 
   static const int defaultSampleRate = 16000;
   static const String modelStorageDir = '.voice_models';
+  static const int modelDownloadSafetyMarginBytes = 350 * 1024 * 1024;
+  static const int modelDownloadSizeToleranceBytes = 1 * 1024 * 1024;
+  static const int modelDownloadHardCapBytes = 512 * 1024 * 1024;
+  static const int whisperTinyEstimatedBytes = 75 * 1024 * 1024;
+  static const int supertonic3EstimatedBytes = 145 * 1024 * 1024;
 
   /// Whether a real, downloadable Supertonic 3 artifact set is configured.
   ///

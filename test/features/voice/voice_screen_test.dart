@@ -19,7 +19,11 @@ import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/ui/conversation_list.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/voice/data/device_health.dart';
+import 'package:ai_assistant/features/voice/data/engine_manager.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/data/voice_runtime_policy.dart';
+import 'package:ai_assistant/features/voice/data/voice_runtime_policy_provider.dart';
 import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
 import 'package:ai_assistant/features/voice/data/tts_engine.dart';
 import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
@@ -72,6 +76,7 @@ void main() {
     FakeAudioPlayback? playback,
     FakeSttEngine? stt,
     String? activeConversationId,
+    VoiceRuntimePolicyController? runtimePolicy,
   }) {
     // One scripted client drives the managed voice send seam override — the
     // controller's sendTurn goes through voiceTurnSenderProvider, which must
@@ -104,6 +109,8 @@ void main() {
           FakeAudioSessionManager(),
         ),
         screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+        if (runtimePolicy != null)
+          voiceRuntimePolicyProvider.overrideWith((ref) => runtimePolicy),
         voiceTurnSenderProvider.overrideWithValue(({
           required conversationId,
           required messages,
@@ -296,6 +303,58 @@ void main() {
     // composer) is present while on the voice surface.
     expect(find.byType(TextField), findsNothing);
     expect(find.byType(SpeakButton), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('voice-mode-text')));
+    await pumpFrames(tester);
+
+    expect(find.byType(ChatScreen), findsOneWidget);
+  });
+
+  testWidgets('blocked runtime policy shows a fallback notice and keeps text '
+      'mode usable', (tester) async {
+    final source = InMemoryDeviceHealthSource(
+      const DeviceHealthSnapshot(thermalStatus: ThermalStatus.nominal),
+    );
+    final monitor = DeviceHealthMonitor(
+      source: source,
+      thermalSource: const NoopThermalSignalSource(),
+    );
+    final policyManager = FakeEngineManager();
+    final policy =
+        VoiceRuntimePolicyController(
+          healthMonitor: monitor,
+          engineManager: policyManager,
+          recoveryDuration: Duration.zero,
+        )..updateModelReadiness(
+          const VoiceModelReadiness(
+            sttReady: false,
+            ttsReady: true,
+            requiredDownloadBytes: 0,
+          ),
+        );
+    addTearDown(() async {
+      policy.dispose();
+      monitor.dispose();
+      policyManager.dispose();
+      await source.dispose();
+    });
+    final container = buildContainer(runtimePolicy: policy);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    expect(
+      find.text(
+        'Voice capture is unavailable on this device. Continue in text.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('voice-policy-text-fallback')), findsOneWidget);
+    expect(tester.widget<SpeakButton>(find.byType(SpeakButton)).busy, isTrue);
 
     await tester.tap(find.byKey(const Key('voice-mode-text')));
     await pumpFrames(tester);
