@@ -137,6 +137,8 @@ export function createResetPasswordRoutes(): Hono {
   const app = new Hono();
   app.get("/reset-password", (c) => {
     const token = c.req.query("token") ?? "";
+    c.header("Cache-Control", "no-store");
+    c.header("Referrer-Policy", "no-referrer");
     return c.html(renderPage(token));
   });
   return app;

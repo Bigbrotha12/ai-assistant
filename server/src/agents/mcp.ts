@@ -4,6 +4,10 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { z } from "zod";
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
+import {
+  createMcpToolListCache,
+  type McpToolListCache,
+} from "../middleware/cache.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import {
   buildPinnedAgent,
@@ -11,6 +15,7 @@ import {
   resolveAndValidateHost,
   validateStaticUrl,
 } from "../plugins/ssrf.ts";
+import { credentialFingerprint } from "../plugins/credential.ts";
 import type { JsonSchema } from "../plugins/types.ts";
 
 export type McpServerConfig = {
@@ -62,6 +67,48 @@ export type McpClientFactory = (
 export type McpBinding = {
   tools: DynamicStructuredTool[];
   dispose: () => Promise<void>;
+};
+
+type McpTransportLike = {
+  close: () => Promise<void>;
+};
+
+type McpSdkClient = {
+  connect: (transport: McpTransportLike) => Promise<void>;
+  listTools: (
+    params?: unknown,
+    options?: { timeout?: number },
+  ) => Promise<{ tools: McpTool[] }>;
+  callTool: (
+    params: { name: string; arguments: Record<string, unknown> },
+    resultSchema?: unknown,
+    options?: { timeout?: number },
+  ) => Promise<McpCallResult>;
+  close: () => Promise<void>;
+};
+
+type McpAgentLike = {
+  destroy: () => Promise<void>;
+};
+
+export type McpSseFactoryOverrides = {
+  createAgent?: (
+    hostname: string,
+    parsed: URL,
+    pinned: readonly string[],
+  ) => McpAgentLike;
+  createTransport?: (
+    url: URL,
+    options: {
+      requestInit: RequestInit;
+      fetch: (
+        input: string | URL | Request,
+        init?: RequestInit,
+      ) => Promise<Response>;
+    },
+  ) => McpTransportLike;
+  createClient?: (transport: McpTransportLike) => McpSdkClient;
+  timeoutMs?: number;
 };
 
 /**
@@ -119,7 +166,7 @@ function withDescription(field: z.ZodType, schema: JsonSchema): z.ZodType {
  * long-lived) and destroyed on close — it must NOT be closed right after the
  * initial response, which would kill the stream.
  */
-async function defaultSseClientFactory(
+export async function defaultSseClientFactory(
   server: McpServerConfig,
   deps: {
     trustedHosts: readonly string[];
@@ -127,6 +174,7 @@ async function defaultSseClientFactory(
     mode?: Mode;
     signal?: AbortSignal;
   },
+  overrides: McpSseFactoryOverrides = {},
 ): Promise<McpClientLike> {
   const trusted = deps.trustedHosts;
   const parsed = validateStaticUrl(server.url, {
@@ -139,7 +187,7 @@ async function defaultSseClientFactory(
     trustedHosts: trusted,
     lookup: deps.lookup,
   });
-  const agent = buildPinnedAgent(hostname, parsed, pinned);
+  const agent = overrides.createAgent?.(hostname, parsed, pinned) ?? buildPinnedAgent(hostname, parsed, pinned);
   const mcpFetch = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     validateStaticUrl(url, {
@@ -157,11 +205,33 @@ async function defaultSseClientFactory(
   const connectSignal = deps.signal
     ? AbortSignal.any([deps.signal, connectController.signal])
     : connectController.signal;
-  const transport = new SSEClientTransport(new URL(server.url), {
-    requestInit: { headers: server.headers, signal: connectSignal },
-    fetch: mcpFetch,
-  });
-  const client = new Client({ name: "ai-assistant-gateway", version: "0.1.0" });
+  const transport: McpTransportLike =
+    overrides.createTransport?.(new URL(server.url), {
+      requestInit: { headers: server.headers, signal: connectSignal },
+      fetch: mcpFetch,
+    }) ??
+    new SSEClientTransport(new URL(server.url), {
+      requestInit: { headers: server.headers, signal: connectSignal },
+      fetch: mcpFetch,
+    });
+  const client: McpSdkClient =
+    overrides.createClient?.(transport) ??
+    (new Client({ name: "ai-assistant-gateway", version: "0.1.0" }) as unknown as McpSdkClient);
+  let closePromise: Promise<void> | undefined;
+  const closeClient = (): Promise<void> => {
+    closePromise ??= (async () => {
+      connectController.abort();
+      try {
+        await agent.destroy();
+      } catch {
+      }
+      try {
+        await client.close();
+      } catch {
+      }
+    })();
+    return closePromise;
+  };
   // The MCP_CALL_TIMEOUT_MS guard covers the JSON-RPC calls (listTools/
   // callTool) but NOT the SSE handshake — a reachable-but-unresponsive server
   // would otherwise hold the request (and, in the runner, the per-thread
@@ -169,22 +239,33 @@ async function defaultSseClientFactory(
   // abort the underlying SSE fetch on timeout. The timer/controller is cleared
   // once the handshake resolves so the long-lived SSE stream stays live.
   let connectTimer: ReturnType<typeof setTimeout> | undefined;
+  let connectPromise: Promise<void> | undefined;
   try {
-    const connectPromise = client.connect(transport);
+    const pendingConnect = client.connect(transport);
+    connectPromise = pendingConnect;
+    const timeoutMs = overrides.timeoutMs ?? env.MCP_CALL_TIMEOUT_MS;
     const timeout = new Promise<never>((_, reject) => {
       connectTimer = setTimeout(() => {
         connectController.abort();
-        reject(new McpError(`MCP connect to '${server.name}' timed out after ${env.MCP_CALL_TIMEOUT_MS}ms`));
-      }, env.MCP_CALL_TIMEOUT_MS);
+        reject(new McpError(`MCP connect to '${server.name}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
     });
     connectTimer?.unref?.();
-    await Promise.race([connectPromise, timeout]);
+    await Promise.race([pendingConnect, timeout]);
     if (connectTimer) clearTimeout(connectTimer);
     connectTimer = undefined;
   } catch (err) {
     if (connectTimer) clearTimeout(connectTimer);
-    connectController.abort();
-    await agent.destroy().catch(() => {});
+    const pendingConnect = connectPromise;
+    if (pendingConnect) {
+      void pendingConnect
+        .then(
+          () => closeClient(),
+          () => undefined,
+        )
+        .catch(() => {});
+    }
+    await closeClient();
     throw new McpError(err instanceof Error ? err.message : String(err));
   }
   return {
@@ -202,11 +283,49 @@ async function defaultSseClientFactory(
       const r = await client.callTool(params, undefined, { timeout: env.MCP_CALL_TIMEOUT_MS });
       return { content: r.content as McpCallResult["content"] };
     },
-    close: () => {
-      void agent.destroy().catch(() => {});
-      return client.close();
-    },
+    close: closeClient,
   };
+}
+
+/**
+ * Cache key for a server's tool list: the server URL plus a one-way
+ * fingerprint of the resolved auth-header set. Raw header values NEVER
+ * appear in the key (they may carry secrets) — reuse `credentialFingerprint`
+ * (sorted JSON `[key, value]` pairs → versioned SHA-256), the same derivation
+ * used for pin and credential-store identities. Absent headers fingerprint as
+ * the empty set, so unkeyed servers dedupe too. NUL-joins like `internalKey` in
+ * `middleware/cache.ts` (URLs cannot contain `\u0000`).
+ */
+export function mcpToolListCacheKey(
+  server: Pick<McpServerConfig, "url" | "headers">,
+): string {
+  return `${server.url}\u0000${credentialFingerprint(server.headers ?? {})}`;
+}
+
+let toolListCache: McpToolListCache | undefined;
+
+/**
+ * Process-wide MCP tool-list cache singleton. Created on first use so
+ * `bindMcpServers([])` never constructs it; sweep timer is unref'd.
+ */
+export function getMcpToolListCache(): McpToolListCache {
+  toolListCache ??= createMcpToolListCache();
+  return toolListCache;
+}
+
+/**
+ * Test seam: install a (possibly fake-clock) cache; disposes the previous
+ * instance unless it is the same one. `undefined` = reset.
+ */
+export function setMcpToolListCache(cache: McpToolListCache | undefined): void {
+  if (toolListCache === cache) return;
+  toolListCache?.dispose();
+  toolListCache = cache;
+}
+
+/** Test seam: drop the singleton so the next use creates a fresh default. */
+export function resetMcpToolListCache(): void {
+  setMcpToolListCache(undefined);
 }
 
 export async function bindMcpServers(
@@ -224,17 +343,61 @@ export async function bindMcpServers(
   const factory = opts?.clientFactory ?? defaultSseClientFactory;
   for (const server of mcpServers) {
     if (opts?.signal?.aborted) break;
-    let bound: McpClientLike | undefined;
-    try {
-      const client = await factory(server, {
+    // Resolved after the abort check so an empty/aborted bind never
+    // constructs the singleton; tests swap it between binds via the seams.
+    const cache = getMcpToolListCache();
+    // Per-server client state, shared by the eager (cache-miss) and lazy
+    // (cache-hit) paths. `clientPromise` memoizes one connect per binding;
+    // a failed connect clears it so a later tool call may retry cleanly,
+    // while dispose-after-failure stays a no-op.
+    let clientPromise: Promise<McpClientLike> | undefined;
+    let closePromise: Promise<void> | undefined;
+    let disposed = false;
+    const closeClient = (): Promise<void> => {
+      disposed = true;
+      closePromise ??= (async () => {
+        const pendingClient = clientPromise;
+        if (!pendingClient) return;
+        try {
+          const client = await pendingClient;
+          await client.close();
+        } catch {
+        }
+      })();
+      return closePromise;
+    };
+    const getClient = (): Promise<McpClientLike> => {
+      if (disposed) {
+        return Promise.reject(
+          new McpError(`MCP binding for '${server.name}' already disposed`),
+        );
+      }
+      clientPromise ??= factory(server, {
         trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
         lookup: opts?.lookup,
         mode: opts?.mode,
         signal: opts?.signal,
+      }).catch((err) => {
+        clientPromise = undefined;
+        throw err;
       });
-      bound = client;
-      const listed = await client.listTools();
-      for (const tool of listed.tools) {
+      return clientPromise;
+    };
+    try {
+      const key = mcpToolListCacheKey(server);
+      let listed = cache.get(key);
+      if (listed === undefined) {
+        // Miss: connect now — `listTools` requires the handshake anyway —
+        // then snapshot the plain-JSON list (staleness ≤ TTL).
+        const client = await getClient();
+        listed = (await client.listTools()).tools;
+        cache.set(key, listed);
+      }
+      // Hit and miss share one build path from plain `McpTool` entries;
+      // bound `DynamicStructuredTool`s are always rebuilt per request and
+      // resolve the client lazily on first invocation (a hit therefore opens
+      // no connection until a tool is actually called).
+      for (const tool of listed) {
         if (!tool.name) continue;
 
         const schema = tool.inputSchema
@@ -247,6 +410,7 @@ export async function bindMcpServers(
             description: tool.description ?? "",
             schema,
             func: async (args: Record<string, unknown>) => {
+              const client = await getClient();
               const result = await client.callTool({ name: tool.name, arguments: args });
               const content = result.content ?? [];
               return content.map((c) => c.text ?? "").join("\n");
@@ -254,21 +418,21 @@ export async function bindMcpServers(
           }),
         );
       }
-      disposers.push(() => client.close());
+      disposers.push(closeClient);
     } catch (err) {
-      await bound?.close().catch(() => {});
+      await closeClient();
       logger.warn(
         `[mcp] failed to bind tools from server '${server.name}':`,
         err instanceof McpError ? err.message : err,
       );
     }
   }
-  return {
-    tools,
-    dispose: async () => {
-      // One failing close must never prevent the remaining servers from being
-      // closed (a rejected close would otherwise hang the caller's dispose).
-      await Promise.allSettled(disposers.map((d) => d()));
-    },
+  let disposePromise: Promise<void> | undefined;
+  const dispose = (): Promise<void> => {
+    disposePromise ??= Promise.allSettled(
+      disposers.map((d) => Promise.resolve().then(d)),
+    ).then(() => undefined);
+    return disposePromise;
   };
+  return { tools, dispose };
 }

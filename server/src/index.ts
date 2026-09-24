@@ -1,10 +1,12 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { existsSync, unlinkSync } from "node:fs";
-import { auth } from "./auth.ts";
+import * as authModule from "./auth.ts";
+import { runWithAccountDeletionRequest } from "./account_deletion.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
-import { inferenceRoutes, requireApiKey } from "./inference.ts";
+import { createHealthRoutes } from "./health.ts";
+import { inferenceRoutes, requireApiKey } from "./api_key.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { ledgerRoutes, ledger } from "./ledger.routes.ts";
@@ -14,6 +16,12 @@ import { NotifyStore } from "./notify/store.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createResetPasswordRoutes } from "./reset_password.ts";
+import {
+  createApiKeyEmailVerificationGate,
+  createVerifyEmailRoutes,
+  createSendVerificationRateLimit,
+  getSendVerificationRateLimitGate,
+} from "./verify_email.ts";
 import { createModelsRoutes } from "./transport/models.ts";
 import { createAgentsRoutes } from "./transport/agents.ts";
 import { createSkillsRoutes } from "./transport/skills.ts";
@@ -30,6 +38,17 @@ import { createWarmupManager } from "./middleware/warmup.ts";
 import { loadCatalogs } from "./catalog/index.ts";
 import type { Catalogs } from "./catalog/index.ts";
 
+const auth = authModule.auth;
+const sendVerificationRateLimitGate = getSendVerificationRateLimitGate();
+const apiKeyEmailVerificationGate = createApiKeyEmailVerificationGate({
+  getSession: (headers) =>
+    auth.api.getSession({
+      headers,
+      query: { disableCookieCache: true, disableRefresh: true },
+    }),
+  getUserById: authModule.getUserById,
+});
+
 const app = new Hono();
 let stopping = false;
 
@@ -39,6 +58,21 @@ app.use(async (c, next) => {
 });
 
 app.get("/api/auth/ok", (c) => c.json({ status: "ok" }));
+// C2 resend gate: per-address ≥60s limiter for `POST
+// /api/auth/send-verification-email` (better-auth's global rate limit is not
+// per-address). MUST be registered before the catch-all below so it wraps the
+// better-auth handler — Hono runs matched handlers in registration order and
+// the catch-all never calls next().
+app.use(
+  "/api/auth/send-verification-email",
+  createSendVerificationRateLimit(sendVerificationRateLimitGate),
+);
+app.use("/api/auth/api-key/create", apiKeyEmailVerificationGate);
+app.use("/api/auth/api-key/list", apiKeyEmailVerificationGate);
+app.use("/api/auth/delete-user", (c, next) => {
+  if (c.req.method !== "POST") return next();
+  return runWithAccountDeletionRequest(() => next());
+});
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 app.route("/v1", inferenceRoutes);
 app.route("/ledger", ledgerRoutes);
@@ -48,6 +82,10 @@ app.route("/ledger", ledgerRoutes);
 // (the app has no deep-link handling). Mounted OUTSIDE the /api/auth namespace
 // so the page is only ever served by this Hono app.
 app.route("/", createResetPasswordRoutes());
+// Email-verification completion page (C2) — same pattern: the emailed link
+// targets `GET /verify-email?token=…`; the page fetches better-auth's
+// `GET /api/auth/verify-email` wire route from JS.
+app.route("/", createVerifyEmailRoutes());
 
 // D8 (stateless-gateway): the SQLCipher checkpoint store is gone — no
 // checkpoint DB is ever opened. Remove any checkpoints.db left behind by
@@ -72,6 +110,7 @@ for (const base of ["./data/checkpoints.db"]) {
 // lazy-loads, so a corrupt notify file degrades provision 500s rather than
 // taking down the gateway.
 const notifyStore = new NotifyStore({ key: env.NOTIFY_STORE_KEY });
+authModule.configureAccountDeletionNotifyStore?.(notifyStore);
 app.route("/api/notify", createNotifyRoutes({ store: notifyStore }));
 
 const { registry: pluginRegistry, store: pluginStore } = createPluginWiring();
@@ -218,6 +257,12 @@ const chatRateLimiter = createPerOwnerRateLimiter({
 // (GET/DELETE /v1/sessions/:id) and written by the sync transport's
 // managed-session path.
 const sessionStore = createSessionStore();
+authModule.configureAccountDeletionRuntime?.({
+  abortOwner: (owner) => jobRunner?.abortOwner(owner),
+  deleteSessionsForOwner: (owner) => sessionStore.deleteSessionsForOwner(owner),
+  invalidateForUser: (owner) => toolCache.invalidateForUser(owner),
+  releaseOwner: (owner) => jobPins?.releaseOwner(owner),
+});
 app.route("/v1", createSessionRoutes({ store: sessionStore, verifyKey: requireApiKey }));
 app.route(
   "/v1",
@@ -237,6 +282,12 @@ app.route(
   }),
 );
 
+// M5 watchdog: unauthenticated probe for k8s liveness/readiness (200 when
+// both DB checks pass, 503 `degraded` otherwise). The probes themselves are
+// OUT-OF-REPO — the copy-paste k3s patch ships at deploy/k8s/health-probes.yaml
+// and is applied by ops, not this repo's CI.
+app.route("/", createHealthRoutes());
+
 app.get("/", (c) =>
   c.json({
     name: "ai-assistant-gateway",
@@ -244,6 +295,7 @@ app.get("/", (c) =>
     inference: "/v1/chat/completions",
     ledger: "/ledger",
     sessions: "/v1/sessions",
+    health: "/health",
   }),
 );
 

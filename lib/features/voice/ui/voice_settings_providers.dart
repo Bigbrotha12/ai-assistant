@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/engine_registry.dart';
 import '../data/voice_settings.dart';
 import './voice_settings_store.dart';
 
@@ -21,9 +22,13 @@ class VoiceSettingsNotifier extends AsyncNotifier<VoiceSettings?> {
 
   /// Persists [settings] and updates the in-memory state. On write failure
   /// the state becomes [AsyncError] instead of keeping stale data.
+  ///
+  /// Also pushes the (engine-resolved) language into the registered STT
+  /// engine so runtime language/engine switches reach the recognizer.
   Future<void> save(VoiceSettings settings) async {
     try {
       await ref.read(voiceSettingsStoreProvider).save(settings);
+      applyVoiceSettingsToEngines(settings);
       state = AsyncData(settings);
     } catch (e, st) {
       state = AsyncError(e, st);
@@ -36,6 +41,7 @@ class VoiceSettingsNotifier extends AsyncNotifier<VoiceSettings?> {
     final defaults = VoiceSettings.defaults;
     try {
       await ref.read(voiceSettingsStoreProvider).save(defaults);
+      applyVoiceSettingsToEngines(defaults);
       state = AsyncData(defaults);
     } catch (e, st) {
       state = AsyncError(e, st);

@@ -948,6 +948,17 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
   final GeneratedDatabase attachedDatabase;
   final String? _alias;
   $FilesTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _scopeKeyMeta = const VerificationMeta(
+    'scopeKey',
+  );
+  @override
+  late final GeneratedColumn<String> scopeKey = GeneratedColumn<String>(
+    'scope_key',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
   static const VerificationMeta _idMeta = const VerificationMeta('id');
   @override
   late final GeneratedColumn<String> id = GeneratedColumn<String>(
@@ -1061,6 +1072,7 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
   );
   @override
   List<GeneratedColumn> get $columns => [
+    scopeKey,
     id,
     conversationId,
     serverFileId,
@@ -1084,6 +1096,14 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
   }) {
     final context = VerificationContext();
     final data = instance.toColumns(true);
+    if (data.containsKey('scope_key')) {
+      context.handle(
+        _scopeKeyMeta,
+        scopeKey.isAcceptableOrUnknown(data['scope_key']!, _scopeKeyMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_scopeKeyMeta);
+    }
     if (data.containsKey('id')) {
       context.handle(_idMeta, id.isAcceptableOrUnknown(data['id']!, _idMeta));
     } else if (isInserting) {
@@ -1170,11 +1190,15 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
   }
 
   @override
-  Set<GeneratedColumn> get $primaryKey => {id};
+  Set<GeneratedColumn> get $primaryKey => {scopeKey, id};
   @override
   FileRow map(Map<String, dynamic> data, {String? tablePrefix}) {
     final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
     return FileRow(
+      scopeKey: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}scope_key'],
+      )!,
       id: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
         data['${effectivePrefix}id'],
@@ -1225,6 +1249,7 @@ class $FilesTable extends Files with TableInfo<$FilesTable, FileRow> {
 }
 
 class FileRow extends DataClass implements Insertable<FileRow> {
+  final String scopeKey;
   final String id;
   final String? conversationId;
   final String serverFileId;
@@ -1236,6 +1261,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   final DateTime updatedAt;
   final String? description;
   const FileRow({
+    required this.scopeKey,
     required this.id,
     this.conversationId,
     required this.serverFileId,
@@ -1250,6 +1276,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
     final map = <String, Expression>{};
+    map['scope_key'] = Variable<String>(scopeKey);
     map['id'] = Variable<String>(id);
     if (!nullToAbsent || conversationId != null) {
       map['conversation_id'] = Variable<String>(conversationId);
@@ -1269,6 +1296,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
 
   FilesCompanion toCompanion(bool nullToAbsent) {
     return FilesCompanion(
+      scopeKey: Value(scopeKey),
       id: Value(id),
       conversationId: conversationId == null && nullToAbsent
           ? const Value.absent()
@@ -1292,6 +1320,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   }) {
     serializer ??= driftRuntimeOptions.defaultSerializer;
     return FileRow(
+      scopeKey: serializer.fromJson<String>(json['scopeKey']),
       id: serializer.fromJson<String>(json['id']),
       conversationId: serializer.fromJson<String?>(json['conversationId']),
       serverFileId: serializer.fromJson<String>(json['serverFileId']),
@@ -1308,6 +1337,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   Map<String, dynamic> toJson({ValueSerializer? serializer}) {
     serializer ??= driftRuntimeOptions.defaultSerializer;
     return <String, dynamic>{
+      'scopeKey': serializer.toJson<String>(scopeKey),
       'id': serializer.toJson<String>(id),
       'conversationId': serializer.toJson<String?>(conversationId),
       'serverFileId': serializer.toJson<String>(serverFileId),
@@ -1322,6 +1352,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   }
 
   FileRow copyWith({
+    String? scopeKey,
     String? id,
     Value<String?> conversationId = const Value.absent(),
     String? serverFileId,
@@ -1333,6 +1364,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
     DateTime? updatedAt,
     Value<String?> description = const Value.absent(),
   }) => FileRow(
+    scopeKey: scopeKey ?? this.scopeKey,
     id: id ?? this.id,
     conversationId: conversationId.present
         ? conversationId.value
@@ -1348,6 +1380,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   );
   FileRow copyWithCompanion(FilesCompanion data) {
     return FileRow(
+      scopeKey: data.scopeKey.present ? data.scopeKey.value : this.scopeKey,
       id: data.id.present ? data.id.value : this.id,
       conversationId: data.conversationId.present
           ? data.conversationId.value
@@ -1370,6 +1403,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   @override
   String toString() {
     return (StringBuffer('FileRow(')
+          ..write('scopeKey: $scopeKey, ')
           ..write('id: $id, ')
           ..write('conversationId: $conversationId, ')
           ..write('serverFileId: $serverFileId, ')
@@ -1386,6 +1420,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
 
   @override
   int get hashCode => Object.hash(
+    scopeKey,
     id,
     conversationId,
     serverFileId,
@@ -1401,6 +1436,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
   bool operator ==(Object other) =>
       identical(this, other) ||
       (other is FileRow &&
+          other.scopeKey == this.scopeKey &&
           other.id == this.id &&
           other.conversationId == this.conversationId &&
           other.serverFileId == this.serverFileId &&
@@ -1414,6 +1450,7 @@ class FileRow extends DataClass implements Insertable<FileRow> {
 }
 
 class FilesCompanion extends UpdateCompanion<FileRow> {
+  final Value<String> scopeKey;
   final Value<String> id;
   final Value<String?> conversationId;
   final Value<String> serverFileId;
@@ -1426,6 +1463,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
   final Value<String?> description;
   final Value<int> rowid;
   const FilesCompanion({
+    this.scopeKey = const Value.absent(),
     this.id = const Value.absent(),
     this.conversationId = const Value.absent(),
     this.serverFileId = const Value.absent(),
@@ -1439,6 +1477,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     this.rowid = const Value.absent(),
   });
   FilesCompanion.insert({
+    required String scopeKey,
     required String id,
     this.conversationId = const Value.absent(),
     required String serverFileId,
@@ -1450,7 +1489,8 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     required DateTime updatedAt,
     this.description = const Value.absent(),
     this.rowid = const Value.absent(),
-  }) : id = Value(id),
+  }) : scopeKey = Value(scopeKey),
+       id = Value(id),
        serverFileId = Value(serverFileId),
        localPath = Value(localPath),
        filename = Value(filename),
@@ -1459,6 +1499,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
        createdAt = Value(createdAt),
        updatedAt = Value(updatedAt);
   static Insertable<FileRow> custom({
+    Expression<String>? scopeKey,
     Expression<String>? id,
     Expression<String>? conversationId,
     Expression<String>? serverFileId,
@@ -1472,6 +1513,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
+      if (scopeKey != null) 'scope_key': scopeKey,
       if (id != null) 'id': id,
       if (conversationId != null) 'conversation_id': conversationId,
       if (serverFileId != null) 'server_file_id': serverFileId,
@@ -1487,6 +1529,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
   }
 
   FilesCompanion copyWith({
+    Value<String>? scopeKey,
     Value<String>? id,
     Value<String?>? conversationId,
     Value<String>? serverFileId,
@@ -1500,6 +1543,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
     Value<int>? rowid,
   }) {
     return FilesCompanion(
+      scopeKey: scopeKey ?? this.scopeKey,
       id: id ?? this.id,
       conversationId: conversationId ?? this.conversationId,
       serverFileId: serverFileId ?? this.serverFileId,
@@ -1517,6 +1561,9 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
     final map = <String, Expression>{};
+    if (scopeKey.present) {
+      map['scope_key'] = Variable<String>(scopeKey.value);
+    }
     if (id.present) {
       map['id'] = Variable<String>(id.value);
     }
@@ -1556,6 +1603,7 @@ class FilesCompanion extends UpdateCompanion<FileRow> {
   @override
   String toString() {
     return (StringBuffer('FilesCompanion(')
+          ..write('scopeKey: $scopeKey, ')
           ..write('id: $id, ')
           ..write('conversationId: $conversationId, ')
           ..write('serverFileId: $serverFileId, ')
@@ -1578,6 +1626,17 @@ class $MemoriesTable extends Memories
   final GeneratedDatabase attachedDatabase;
   final String? _alias;
   $MemoriesTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _scopeKeyMeta = const VerificationMeta(
+    'scopeKey',
+  );
+  @override
+  late final GeneratedColumn<String> scopeKey = GeneratedColumn<String>(
+    'scope_key',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
   static const VerificationMeta _idMeta = const VerificationMeta('id');
   @override
   late final GeneratedColumn<String> id = GeneratedColumn<String>(
@@ -1631,6 +1690,7 @@ class $MemoriesTable extends Memories
   );
   @override
   List<GeneratedColumn> get $columns => [
+    scopeKey,
     id,
     content,
     source,
@@ -1649,6 +1709,14 @@ class $MemoriesTable extends Memories
   }) {
     final context = VerificationContext();
     final data = instance.toColumns(true);
+    if (data.containsKey('scope_key')) {
+      context.handle(
+        _scopeKeyMeta,
+        scopeKey.isAcceptableOrUnknown(data['scope_key']!, _scopeKeyMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_scopeKeyMeta);
+    }
     if (data.containsKey('id')) {
       context.handle(_idMeta, id.isAcceptableOrUnknown(data['id']!, _idMeta));
     } else if (isInserting) {
@@ -1688,11 +1756,15 @@ class $MemoriesTable extends Memories
   }
 
   @override
-  Set<GeneratedColumn> get $primaryKey => {id};
+  Set<GeneratedColumn> get $primaryKey => {scopeKey, id};
   @override
   MemoryRow map(Map<String, dynamic> data, {String? tablePrefix}) {
     final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
     return MemoryRow(
+      scopeKey: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}scope_key'],
+      )!,
       id: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
         data['${effectivePrefix}id'],
@@ -1723,12 +1795,14 @@ class $MemoriesTable extends Memories
 }
 
 class MemoryRow extends DataClass implements Insertable<MemoryRow> {
+  final String scopeKey;
   final String id;
   final String content;
   final String? source;
   final DateTime createdAt;
   final DateTime updatedAt;
   const MemoryRow({
+    required this.scopeKey,
     required this.id,
     required this.content,
     this.source,
@@ -1738,6 +1812,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
     final map = <String, Expression>{};
+    map['scope_key'] = Variable<String>(scopeKey);
     map['id'] = Variable<String>(id);
     map['content'] = Variable<String>(content);
     if (!nullToAbsent || source != null) {
@@ -1750,6 +1825,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
 
   MemoriesCompanion toCompanion(bool nullToAbsent) {
     return MemoriesCompanion(
+      scopeKey: Value(scopeKey),
       id: Value(id),
       content: Value(content),
       source: source == null && nullToAbsent
@@ -1766,6 +1842,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   }) {
     serializer ??= driftRuntimeOptions.defaultSerializer;
     return MemoryRow(
+      scopeKey: serializer.fromJson<String>(json['scopeKey']),
       id: serializer.fromJson<String>(json['id']),
       content: serializer.fromJson<String>(json['content']),
       source: serializer.fromJson<String?>(json['source']),
@@ -1777,6 +1854,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   Map<String, dynamic> toJson({ValueSerializer? serializer}) {
     serializer ??= driftRuntimeOptions.defaultSerializer;
     return <String, dynamic>{
+      'scopeKey': serializer.toJson<String>(scopeKey),
       'id': serializer.toJson<String>(id),
       'content': serializer.toJson<String>(content),
       'source': serializer.toJson<String?>(source),
@@ -1786,12 +1864,14 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   }
 
   MemoryRow copyWith({
+    String? scopeKey,
     String? id,
     String? content,
     Value<String?> source = const Value.absent(),
     DateTime? createdAt,
     DateTime? updatedAt,
   }) => MemoryRow(
+    scopeKey: scopeKey ?? this.scopeKey,
     id: id ?? this.id,
     content: content ?? this.content,
     source: source.present ? source.value : this.source,
@@ -1800,6 +1880,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   );
   MemoryRow copyWithCompanion(MemoriesCompanion data) {
     return MemoryRow(
+      scopeKey: data.scopeKey.present ? data.scopeKey.value : this.scopeKey,
       id: data.id.present ? data.id.value : this.id,
       content: data.content.present ? data.content.value : this.content,
       source: data.source.present ? data.source.value : this.source,
@@ -1811,6 +1892,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   @override
   String toString() {
     return (StringBuffer('MemoryRow(')
+          ..write('scopeKey: $scopeKey, ')
           ..write('id: $id, ')
           ..write('content: $content, ')
           ..write('source: $source, ')
@@ -1821,11 +1903,13 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
   }
 
   @override
-  int get hashCode => Object.hash(id, content, source, createdAt, updatedAt);
+  int get hashCode =>
+      Object.hash(scopeKey, id, content, source, createdAt, updatedAt);
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       (other is MemoryRow &&
+          other.scopeKey == this.scopeKey &&
           other.id == this.id &&
           other.content == this.content &&
           other.source == this.source &&
@@ -1834,6 +1918,7 @@ class MemoryRow extends DataClass implements Insertable<MemoryRow> {
 }
 
 class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
+  final Value<String> scopeKey;
   final Value<String> id;
   final Value<String> content;
   final Value<String?> source;
@@ -1841,6 +1926,7 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
   final Value<DateTime> updatedAt;
   final Value<int> rowid;
   const MemoriesCompanion({
+    this.scopeKey = const Value.absent(),
     this.id = const Value.absent(),
     this.content = const Value.absent(),
     this.source = const Value.absent(),
@@ -1849,17 +1935,20 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
     this.rowid = const Value.absent(),
   });
   MemoriesCompanion.insert({
+    required String scopeKey,
     required String id,
     required String content,
     this.source = const Value.absent(),
     required DateTime createdAt,
     required DateTime updatedAt,
     this.rowid = const Value.absent(),
-  }) : id = Value(id),
+  }) : scopeKey = Value(scopeKey),
+       id = Value(id),
        content = Value(content),
        createdAt = Value(createdAt),
        updatedAt = Value(updatedAt);
   static Insertable<MemoryRow> custom({
+    Expression<String>? scopeKey,
     Expression<String>? id,
     Expression<String>? content,
     Expression<String>? source,
@@ -1868,6 +1957,7 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
+      if (scopeKey != null) 'scope_key': scopeKey,
       if (id != null) 'id': id,
       if (content != null) 'content': content,
       if (source != null) 'source': source,
@@ -1878,6 +1968,7 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
   }
 
   MemoriesCompanion copyWith({
+    Value<String>? scopeKey,
     Value<String>? id,
     Value<String>? content,
     Value<String?>? source,
@@ -1886,6 +1977,7 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
     Value<int>? rowid,
   }) {
     return MemoriesCompanion(
+      scopeKey: scopeKey ?? this.scopeKey,
       id: id ?? this.id,
       content: content ?? this.content,
       source: source ?? this.source,
@@ -1898,6 +1990,9 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
     final map = <String, Expression>{};
+    if (scopeKey.present) {
+      map['scope_key'] = Variable<String>(scopeKey.value);
+    }
     if (id.present) {
       map['id'] = Variable<String>(id.value);
     }
@@ -1922,6 +2017,7 @@ class MemoriesCompanion extends UpdateCompanion<MemoryRow> {
   @override
   String toString() {
     return (StringBuffer('MemoriesCompanion(')
+          ..write('scopeKey: $scopeKey, ')
           ..write('id: $id, ')
           ..write('content: $content, ')
           ..write('source: $source, ')
@@ -2327,13 +2423,17 @@ abstract class _$AppDatabase extends GeneratedDatabase {
     'messages_conversation_id_idx',
     'CREATE INDEX messages_conversation_id_idx ON messages (conversation_id)',
   );
-  late final Index filesConversationIdIdx = Index(
-    'files_conversation_id_idx',
-    'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
+  late final Index filesScopeKeyConversationIdIdx = Index(
+    'files_scope_key_conversation_id_idx',
+    'CREATE INDEX files_scope_key_conversation_id_idx ON files (scope_key, conversation_id)',
   );
-  late final Index memoriesUpdatedAtIdx = Index(
-    'memories_updated_at_idx',
-    'CREATE INDEX memories_updated_at_idx ON memories (updated_at)',
+  late final Index memoriesScopeKeyUpdatedAtIdx = Index(
+    'memories_scope_key_updated_at_idx',
+    'CREATE INDEX memories_scope_key_updated_at_idx ON memories (scope_key, updated_at)',
+  );
+  late final Index managedPendingTurnsScopeKeyIdx = Index(
+    'managed_pending_turns_scope_key_idx',
+    'CREATE INDEX managed_pending_turns_scope_key_idx ON managed_pending_turns (scope_key)',
   );
   @override
   Iterable<TableInfo<Table, Object?>> get allTables =>
@@ -2346,8 +2446,9 @@ abstract class _$AppDatabase extends GeneratedDatabase {
     memories,
     managedPendingTurns,
     messagesConversationIdIdx,
-    filesConversationIdIdx,
-    memoriesUpdatedAtIdx,
+    filesScopeKeyConversationIdIdx,
+    memoriesScopeKeyUpdatedAtIdx,
+    managedPendingTurnsScopeKeyIdx,
   ];
   @override
   StreamQueryUpdateRules get streamUpdateRules => const StreamQueryUpdateRules([
@@ -3164,6 +3265,7 @@ typedef $$MessagesTableProcessedTableManager =
       PrefetchHooks Function({bool conversationId})
     >;
 typedef $$FilesTableCreateCompanionBuilder = FilesCompanion Function({
+  required String scopeKey,
   required String id,
   Value<String?> conversationId,
   required String serverFileId,
@@ -3177,6 +3279,7 @@ typedef $$FilesTableCreateCompanionBuilder = FilesCompanion Function({
   Value<int> rowid,
 });
 typedef $$FilesTableUpdateCompanionBuilder = FilesCompanion Function({
+  Value<String> scopeKey,
   Value<String> id,
   Value<String?> conversationId,
   Value<String> serverFileId,
@@ -3220,6 +3323,11 @@ class $$FilesTableFilterComposer extends Composer<_$AppDatabase, $FilesTable> {
     super.$addJoinBuilderToRootComposer,
     super.$removeJoinBuilderFromRootComposer,
   });
+  ColumnFilters<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnFilters(column),
+  );
+
   ColumnFilters<String> get id => $composableBuilder(
     column: $table.id,
     builder: (column) => ColumnFilters(column),
@@ -3298,6 +3406,11 @@ class $$FilesTableOrderingComposer
     super.$addJoinBuilderToRootComposer,
     super.$removeJoinBuilderFromRootComposer,
   });
+  ColumnOrderings<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get id => $composableBuilder(
     column: $table.id,
     builder: (column) => ColumnOrderings(column),
@@ -3376,6 +3489,9 @@ class $$FilesTableAnnotationComposer
     super.$addJoinBuilderToRootComposer,
     super.$removeJoinBuilderFromRootComposer,
   });
+  GeneratedColumn<String> get scopeKey =>
+      $composableBuilder(column: $table.scopeKey, builder: (column) => column);
+
   GeneratedColumn<String> get id =>
       $composableBuilder(column: $table.id, builder: (column) => column);
 
@@ -3459,6 +3575,7 @@ class $$FilesTableTableManager
               $$FilesTableAnnotationComposer($db: db, $table: table),
           updateCompanionCallback:
               ({
+                Value<String> scopeKey = const Value.absent(),
                 Value<String> id = const Value.absent(),
                 Value<String?> conversationId = const Value.absent(),
                 Value<String> serverFileId = const Value.absent(),
@@ -3471,6 +3588,7 @@ class $$FilesTableTableManager
                 Value<String?> description = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => FilesCompanion(
+                scopeKey: scopeKey,
                 id: id,
                 conversationId: conversationId,
                 serverFileId: serverFileId,
@@ -3485,6 +3603,7 @@ class $$FilesTableTableManager
               ),
           createCompanionCallback:
               ({
+                required String scopeKey,
                 required String id,
                 Value<String?> conversationId = const Value.absent(),
                 required String serverFileId,
@@ -3497,6 +3616,7 @@ class $$FilesTableTableManager
                 Value<String?> description = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => FilesCompanion.insert(
+                scopeKey: scopeKey,
                 id: id,
                 conversationId: conversationId,
                 serverFileId: serverFileId,
@@ -3573,6 +3693,7 @@ typedef $$FilesTableProcessedTableManager =
       PrefetchHooks Function({bool conversationId})
     >;
 typedef $$MemoriesTableCreateCompanionBuilder = MemoriesCompanion Function({
+  required String scopeKey,
   required String id,
   required String content,
   Value<String?> source,
@@ -3581,6 +3702,7 @@ typedef $$MemoriesTableCreateCompanionBuilder = MemoriesCompanion Function({
   Value<int> rowid,
 });
 typedef $$MemoriesTableUpdateCompanionBuilder = MemoriesCompanion Function({
+  Value<String> scopeKey,
   Value<String> id,
   Value<String> content,
   Value<String?> source,
@@ -3598,6 +3720,11 @@ class $$MemoriesTableFilterComposer
     super.$addJoinBuilderToRootComposer,
     super.$removeJoinBuilderFromRootComposer,
   });
+  ColumnFilters<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnFilters(column),
+  );
+
   ColumnFilters<String> get id => $composableBuilder(
     column: $table.id,
     builder: (column) => ColumnFilters(column),
@@ -3633,6 +3760,11 @@ class $$MemoriesTableOrderingComposer
     super.$addJoinBuilderToRootComposer,
     super.$removeJoinBuilderFromRootComposer,
   });
+  ColumnOrderings<String> get scopeKey => $composableBuilder(
+    column: $table.scopeKey,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get id => $composableBuilder(
     column: $table.id,
     builder: (column) => ColumnOrderings(column),
@@ -3668,6 +3800,9 @@ class $$MemoriesTableAnnotationComposer
     super.$addJoinBuilderToRootComposer,
     super.$removeJoinBuilderFromRootComposer,
   });
+  GeneratedColumn<String> get scopeKey =>
+      $composableBuilder(column: $table.scopeKey, builder: (column) => column);
+
   GeneratedColumn<String> get id =>
       $composableBuilder(column: $table.id, builder: (column) => column);
 
@@ -3712,6 +3847,7 @@ class $$MemoriesTableTableManager
               $$MemoriesTableAnnotationComposer($db: db, $table: table),
           updateCompanionCallback:
               ({
+                Value<String> scopeKey = const Value.absent(),
                 Value<String> id = const Value.absent(),
                 Value<String> content = const Value.absent(),
                 Value<String?> source = const Value.absent(),
@@ -3719,6 +3855,7 @@ class $$MemoriesTableTableManager
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MemoriesCompanion(
+                scopeKey: scopeKey,
                 id: id,
                 content: content,
                 source: source,
@@ -3728,6 +3865,7 @@ class $$MemoriesTableTableManager
               ),
           createCompanionCallback:
               ({
+                required String scopeKey,
                 required String id,
                 required String content,
                 Value<String?> source = const Value.absent(),
@@ -3735,6 +3873,7 @@ class $$MemoriesTableTableManager
                 required DateTime updatedAt,
                 Value<int> rowid = const Value.absent(),
               }) => MemoriesCompanion.insert(
+                scopeKey: scopeKey,
                 id: id,
                 content: content,
                 source: source,

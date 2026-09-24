@@ -129,6 +129,8 @@ test("GET /reset-password serves the completion page with an injected token", as
   const app = createResetPasswordRoutes();
   const res = await app.fetch(new Request("http://localhost:17600/reset-password?token=abc123"));
   assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+  assert.equal(res.headers.get("referrer-policy"), "no-referrer");
   const body = await res.text();
   assert.match(body, /Reset your password/);
   assert.match(body, /const token = "abc123";/);

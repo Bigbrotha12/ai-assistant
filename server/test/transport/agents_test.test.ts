@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { inferenceRoutes } from "../../src/inference.ts";
+import { inferenceRoutes } from "../../src/api_key.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import {
@@ -147,7 +147,7 @@ async function makeApp(
     createAgentsRoutes({
       registry,
       catalogs,
-      verifyKey: verifyKey ?? (async () => "test-user"),
+      verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
     }),
   );
   return { app, registry };
@@ -239,7 +239,7 @@ describe("GET /v1/agents (HTTP)", () => {
       createAgentsRoutes({
         registry,
         catalogs: { skills: [], mcps: [], agents: [] },
-        verifyKey: async () => "test-user",
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
       }),
     );
 
@@ -278,7 +278,7 @@ describe("GET /v1/agents (HTTP)", () => {
             },
           ],
         },
-        verifyKey: async () => "test-user",
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
       }),
     );
 
@@ -289,11 +289,21 @@ describe("GET /v1/agents (HTTP)", () => {
     assert.equal(body.data[0]!.id, "standalone");
   });
 
-  test("401 { error: unauthorized } when the verifier returns null", async (t) => {
-    const { app } = await makeApp(t, async () => null);
+  test("401 { error: unauthorized } when the verifier returns bad_key", async (t) => {
+    const { app } = await makeApp(t, async () => ({ ok: false as const, reason: "bad_key" as const }));
     const res = await app.request("/v1/agents", { headers: auth });
     assert.equal(res.status, 401);
     assert.deepEqual(await res.json(), { error: "unauthorized" });
+  });
+
+  test("403 { error: email_not_verified } when the owner's email is unverified", async (t) => {
+    const { app } = await makeApp(t, async () => ({
+      ok: false as const,
+      reason: "email_not_verified" as const,
+    }));
+    const res = await app.request("/v1/agents", { headers: auth });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "email_not_verified" });
   });
 });
 
@@ -340,7 +350,7 @@ describe("GET /v1/agents — mount order", () => {
             },
           ],
         },
-        verifyKey: async () => "test-user",
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
       }),
     );
 

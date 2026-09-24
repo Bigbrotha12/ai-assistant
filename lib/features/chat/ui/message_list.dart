@@ -12,6 +12,7 @@ class MessageList extends StatefulWidget {
     required this.isStreaming,
     required this.error,
     required this.onRetry,
+    this.isRetryInFlight = false,
     required this.isDbReady,
     required this.scrollController,
   });
@@ -20,6 +21,7 @@ class MessageList extends StatefulWidget {
   final bool isStreaming;
   final String? error;
   final VoidCallback onRetry;
+  final bool isRetryInFlight;
   final bool isDbReady;
   final ScrollController scrollController;
 
@@ -198,7 +200,11 @@ class _MessageListState extends State<MessageList>
     return Column(
       children: [
         if (widget.error != null)
-          _ErrorBanner(error: widget.error!, onRetry: widget.onRetry),
+          _ErrorBanner(
+            error: widget.error!,
+            onRetry: widget.onRetry,
+            isRetryInFlight: widget.isRetryInFlight,
+          ),
         Expanded(
           child: ListView.builder(
             controller: widget.scrollController,
@@ -263,10 +269,15 @@ class _StreamingCaret extends StatelessWidget {
 /// Error banner using the project's error-container pattern, with a Retry
 /// action.
 class _ErrorBanner extends StatelessWidget {
-  const _ErrorBanner({required this.error, required this.onRetry});
+  const _ErrorBanner({
+    required this.error,
+    required this.onRetry,
+    required this.isRetryInFlight,
+  });
 
   final String error;
   final VoidCallback onRetry;
+  final bool isRetryInFlight;
 
   @override
   Widget build(BuildContext context) {
@@ -288,7 +299,7 @@ class _ErrorBanner extends StatelessWidget {
               ),
             ),
             TextButton(
-              onPressed: onRetry,
+              onPressed: isRetryInFlight ? null : onRetry,
               child: Text(
                 'Retry',
                 style: TextStyle(color: scheme.onErrorContainer),

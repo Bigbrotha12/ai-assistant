@@ -17,6 +17,7 @@ import 'package:ai_assistant/app/widgets/speak_button.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/onboarding/ui/onboarding_screen.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
+import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
 import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller_provider.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
@@ -103,30 +104,46 @@ class _CountingAuthStore extends FakeAuthCredentialsStore {
 }
 
 void main() {
+  /// Provider overrides backing the real app: every store faked exactly as in
+  /// `test/widget_test.dart` (voice home reachable, probe faked, …). Return
+  /// type is inferred: `Override` is not exported by flutter_riverpod 3.x.
+  gateOverrides({
+    required SettingsStore settingsStore,
+    required AuthCredentialsStore authStore,
+    AppPrefsStore? prefsStore,
+  }) => [
+      settingsStoreProvider.overrideWithValue(settingsStore),
+      authCredentialsStoreProvider.overrideWithValue(authStore),
+      appPrefsStoreProvider.overrideWithValue(prefsStore ?? FakePrefsStore()),
+      appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
+      backendProbeProvider.overrideWithValue(FakeProbe()),
+      chatStoreProvider.overrideWithValue(FakeChatStore()),
+      engineManagerProvider.overrideWithValue(FakeEngineManager()),
+      micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
+      audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+      audioSessionManagerProvider
+          .overrideWithValue(FakeAudioSessionManager()),
+      vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
+      voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
+      // The platform wakelock channel is unavailable in tests; its provider
+      // onDispose fires an uncaught disable() otherwise (same override the
+      // other voice-hosting suites use).
+      screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+    ];
+
   /// Boots the real [AiAssistantApp] (theme + paper builder + [OnboardingGate])
-  /// with a fully faked provider graph. The voice home is reachable, so every
-  /// voice service is faked exactly as in `test/widget_test.dart`.
+  /// with a fully faked provider graph.
   Widget gateApp({
     required SettingsStore settingsStore,
     required AuthCredentialsStore authStore,
     AppPrefsStore? prefsStore,
   }) {
     return ProviderScope(
-      overrides: [
-        settingsStoreProvider.overrideWithValue(settingsStore),
-        authCredentialsStoreProvider.overrideWithValue(authStore),
-        appPrefsStoreProvider.overrideWithValue(prefsStore ?? FakePrefsStore()),
-        appTierStoreProvider.overrideWithValue(FakeAppTierStore()),
-        backendProbeProvider.overrideWithValue(FakeProbe()),
-        chatStoreProvider.overrideWithValue(FakeChatStore()),
-        engineManagerProvider.overrideWithValue(FakeEngineManager()),
-        micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
-        audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
-        audioSessionManagerProvider
-            .overrideWithValue(FakeAudioSessionManager()),
-        vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
-        voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
-      ],
+      overrides: gateOverrides(
+        settingsStore: settingsStore,
+        authStore: authStore,
+        prefsStore: prefsStore,
+      ),
       child: const AiAssistantApp(),
     );
   }
@@ -222,6 +239,45 @@ void main() {
       // The unconfigured banner only renders on the voice/chat homes, never
       // on the onboarding screen.
       expect(find.text('Backend not configured'), findsNothing);
+    });
+
+    testWidgets(
+        'post-verify sign-in (credentials ready) opens the gate',
+        (tester) async {
+      // C2 return path: an unverified account cannot mint a key, so the gate
+      // sits on onboarding. After the user verifies in the browser and signs
+      // in, AuthFlow persists the minted key — the gate must open purely on
+      // credentials-ready, with no verify-specific gate state to strand it.
+      final container = ProviderContainer(
+        overrides: gateOverrides(
+          settingsStore: FakeSettingsStore(stored: validHost),
+          authStore: FakeAuthCredentialsStore(),
+        ),
+      );
+      addTearDown(container.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const AiAssistantApp(),
+        ),
+      );
+      await pumpGate(tester);
+
+      // No key yet (tokenless sign-up / pre-verify sign-in stored nothing).
+      expect(find.byType(OnboardingScreen), findsOneWidget);
+
+      // Post-verify sign-in: AuthFlow mints and saves the key (what
+      // `authCredentialsProvider.notifier.save` receives after a session).
+      await container.read(authCredentialsProvider.notifier).save(
+            const AuthCredentials(
+              apiKey: 'verified-key',
+              email: 'user@example.com',
+            ),
+          );
+      await pumpGate(tester);
+
+      expect(find.byType(SpeakButton), findsOneWidget);
+      expect(find.byType(OnboardingScreen), findsNothing);
     });
   });
 

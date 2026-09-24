@@ -5,7 +5,8 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
-import { requireApiKey, unauthorized } from "./inference.ts";
+import { accountDeletedResponse, keyGateResponse, requireApiKey } from "./api_key.ts";
+import { AccountDeletedError, isDeleting } from "./account_deletion.ts";
 import { Ledger, LedgerError, migrateLedger } from "./ledger.ts";
 import type { TaskRow } from "./ledger.ts";
 import type { VerifyApiKeyFn } from "./plugins/routes.ts";
@@ -57,8 +58,9 @@ export function createLedgerRoutes(
   const routes = new Hono();
 
   routes.post("/tasks", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
     const body = (await c.req.json().catch(() => null)) as {
       intentKey?: unknown;
       spec?: unknown;
@@ -67,24 +69,34 @@ export function createLedgerRoutes(
     if (!body || typeof body.intentKey !== "string") {
       return c.json({ error: "invalid_request" }, 400);
     }
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     // M2: owner-scoped get-or-create. A repeat (owner, intentKey) returns the
     // EXISTING task with 200 instead of raw-INSERT 500ing on the v4 unique
     // index. The pre-check distinguishes created (201) from returned (200).
     const existing = l.getTaskByIntentKey(owner, body.intentKey);
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const created = existing === null;
-    const task = await getOrCreateTask(l, {
-      owner,
-      intentKey: body.intentKey,
-      spec: JSON.stringify(body.spec ?? {}),
-      worker: typeof body.worker === "string" ? body.worker : undefined,
-    });
+    let task: TaskRow;
+    try {
+      task = await getOrCreateTask(l, {
+        owner,
+        intentKey: body.intentKey,
+        spec: JSON.stringify(body.spec ?? {}),
+        worker: typeof body.worker === "string" ? body.worker : undefined,
+      });
+    } catch (error) {
+      if (error instanceof AccountDeletedError) return accountDeletedResponse(c);
+      throw error;
+    }
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     return c.json(toPublicTask(task), created ? 201 : 200);
   });
 
   routes.get("/tasks", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
-    return c.json(l.listTasks(owner).map(toPublicTask));
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    return c.json(l.listTasks(auth.owner).map(toPublicTask));
   });
 
   // Status-by-idempotency-key: the client's poll-after-drop endpoint (plan
@@ -92,19 +104,23 @@ export function createLedgerRoutes(
   // miss → 404 (IDOR), never a leak. Registered before `/tasks/:id`; Hono's
   // router disambiguates by segment count regardless.
   routes.get("/tasks/by-key/:intentKey", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
-    const task = l.getTaskByIntentKey(owner, c.req.param("intentKey"));
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const task = l.getTaskByIntentKey(auth.owner, c.req.param("intentKey"));
     if (!task) return c.json({ error: "not_found" }, 404);
     return c.json(toPublicTask(task));
   });
 
   routes.get("/tasks/:id", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = auth.owner;
     const id = c.req.param("id");
-    // Scope the read to the caller (IDOR): cross-owner reads are a miss → 404.
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const task = l.getTask(id, owner);
+
     if (!task) return c.json({ error: "not_found" }, 404);
     return c.json({
       ...toPublicTask(task),
@@ -114,18 +130,22 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/claim", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
     try {
-      return c.json(toPublicTask(l.claimTask(c.req.param("id"), owner)));
+      return c.json(toPublicTask(l.claimTask(c.req.param("id"), auth.owner)));
     } catch (e) {
+      if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
       return ledgerError(c, e);
     }
   });
 
   routes.post("/tasks/:id/steps", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = auth.owner;
     const body = (await c.req.json().catch(() => null)) as {
       stage?: unknown;
       action?: unknown;
@@ -140,6 +160,7 @@ export function createLedgerRoutes(
       return c.json({ error: "invalid_request" }, 400);
     }
     const id = c.req.param("id");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const task = l.getTask(id, owner);
     if (!task) return c.json({ error: "not_found" }, 404);
     const fenceToken =
@@ -169,12 +190,15 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/heartbeat", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = auth.owner;
     const body = (await c.req.json().catch(() => null)) as {
       fenceToken?: unknown;
     } | null;
     const id = c.req.param("id");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const task = l.getTask(id, owner);
     if (!task) return c.json({ error: "not_found" }, 404);
     const fenceToken =
@@ -193,18 +217,22 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/resume", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
     try {
-      return c.json(toPublicTask(l.resumeTask(c.req.param("id"), owner)));
+      return c.json(toPublicTask(l.resumeTask(c.req.param("id"), auth.owner)));
     } catch (e) {
+      if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
       return ledgerError(c, e);
     }
   });
 
   routes.post("/tasks/:id/complete", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = auth.owner;
     const body = (await c.req.json().catch(() => null)) as {
       status?: unknown;
     } | null;
@@ -217,6 +245,7 @@ export function createLedgerRoutes(
     ) {
       return c.json({ error: "invalid_request" }, 400);
     }
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     try {
       return c.json(toPublicTask(l.completeTask(c.req.param("id"), owner, status)));
     } catch (e) {
@@ -238,6 +267,7 @@ function toPublicTask(task: TaskRow): Omit<TaskRow, "payload"> {
 }
 
 function ledgerError(c: Context, e: unknown): Response {
+  if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
   if (e instanceof LedgerError) {
     if (e.code === "TASK_NOT_FOUND") return c.json({ error: "not_found" }, 404);
     if (e.code === "FORBIDDEN" || e.code === "LEASE_CONFLICT" || e.code === "FENCE_CONFLICT") {

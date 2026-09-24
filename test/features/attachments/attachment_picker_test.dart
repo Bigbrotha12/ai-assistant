@@ -38,9 +38,9 @@ class FakeImagePicker extends ImagePicker {
 
   @override
   bool supportsImageSource(ImageSource source) => switch (source) {
-        ImageSource.gallery => galleryAvailable,
-        ImageSource.camera => cameraAvailable,
-      };
+    ImageSource.gallery => galleryAvailable,
+    ImageSource.camera => cameraAvailable,
+  };
 
   @override
   Future<XFile?> pickImage({
@@ -67,14 +67,14 @@ class FakeFilesClient implements FilesClient {
     required String mimeType,
     CancelToken? cancelToken,
     void Function(int sent, int total)? onProgress,
-  }) =>
-      throw UnimplementedError();
+  }) => throw UnimplementedError();
 
   @override
   Future<List<FileInfo>> listFiles() async => const [];
 
   @override
-  Future<Uint8List> fetchFile(String fileId) => throw UnimplementedError();
+  Future<Uint8List> fetchFile(String fileId, {CancelToken? cancelToken}) =>
+      throw UnimplementedError();
 
   @override
   Future<void> deleteFile(String fileId) async {}
@@ -161,19 +161,22 @@ void main() {
   });
 
   AttachmentDraft draft(String name) => AttachmentDraft(
-        path: '${tempDir.path}/$name',
-        filename: name,
-        sizeBytes: 10,
-        mimeType: 'image/png',
-      );
+    path: '${tempDir.path}/$name',
+    filename: name,
+    sizeBytes: 10,
+    mimeType: 'image/png',
+  );
 
   group('AttachmentRow', () {
-    testWidgets('renders an image thumbnail and remove button per attachment',
-        (tester) async {
-      await tester.pumpWidget(AttachmentRowHarness(
-        initial: [draft('photo.png'), draft('second.png')],
-        picker: FakeImagePicker(),
-      ));
+    testWidgets('renders an image thumbnail and remove button per attachment', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        AttachmentRowHarness(
+          initial: [draft('photo.png'), draft('second.png')],
+          picker: FakeImagePicker(),
+        ),
+      );
       await tester.pump();
 
       expect(find.byType(AttachmentRow), findsOneWidget);
@@ -182,12 +185,15 @@ void main() {
       expect(find.byIcon(Icons.add), findsOneWidget);
     });
 
-    testWidgets('tapping remove drops the attachment from the selection',
-        (tester) async {
-      await tester.pumpWidget(AttachmentRowHarness(
-        initial: [draft('photo.png')],
-        picker: FakeImagePicker(),
-      ));
+    testWidgets('tapping remove drops the attachment from the selection', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        AttachmentRowHarness(
+          initial: [draft('photo.png')],
+          picker: FakeImagePicker(),
+        ),
+      );
       await tester.pump();
 
       await tester.tap(find.byIcon(Icons.close));
@@ -199,10 +205,12 @@ void main() {
 
     testWidgets('add button is disabled at the max of 5 files', (tester) async {
       final picker = FakeImagePicker();
-      await tester.pumpWidget(AttachmentRowHarness(
-        initial: [for (var i = 0; i < 5; i++) draft('$i.png')],
-        picker: picker,
-      ));
+      await tester.pumpWidget(
+        AttachmentRowHarness(
+          initial: [for (var i = 0; i < 5; i++) draft('$i.png')],
+          picker: picker,
+        ),
+      );
       await tester.pump();
 
       expect(find.byTooltip('Max 5 files per message'), findsOneWidget);
@@ -213,24 +221,26 @@ void main() {
     });
 
     testWidgets(
-        'add button is disabled with a hint when the files service is not '
-        'configured', (tester) async {
-      final picker = FakeImagePicker();
-      await tester.pumpWidget(AttachmentRowHarness(
-        picker: picker,
-        enabled: false,
-      ));
-      await tester.pump();
+      'add button is disabled with a hint when the files service is not '
+      'configured',
+      (tester) async {
+        final picker = FakeImagePicker();
+        await tester.pumpWidget(
+          AttachmentRowHarness(picker: picker, enabled: false),
+        );
+        await tester.pump();
 
-      expect(find.byTooltip('Files service not configured'), findsOneWidget);
-      await tester.tap(find.byIcon(Icons.add));
-      await tester.pump();
+        expect(find.byTooltip('Files service not configured'), findsOneWidget);
+        await tester.tap(find.byIcon(Icons.add));
+        await tester.pump();
 
-      expect(picker.pickCalls, 0);
-    });
+        expect(picker.pickCalls, 0);
+      },
+    );
 
-    testWidgets('shows a hint when no image source is available',
-        (tester) async {
+    testWidgets('shows a hint when no image source is available', (
+      tester,
+    ) async {
       final picker = FakeImagePicker(
         galleryAvailable: false,
         cameraAvailable: false,
@@ -245,8 +255,9 @@ void main() {
       expect(picker.pickCalls, 0);
     });
 
-    testWidgets('tapping add picks a gallery image and reports the draft',
-        (tester) async {
+    testWidgets('tapping add picks a gallery image and reports the draft', (
+      tester,
+    ) async {
       final picker = FakeImagePicker(picked: XFile(pngFile.path));
       await tester.pumpWidget(AttachmentRowHarness(picker: picker));
       await tester.pump();
@@ -264,8 +275,9 @@ void main() {
       expect(find.byIcon(Icons.close), findsOneWidget);
     });
 
-    testWidgets('falls back to the camera when the gallery is unavailable',
-        (tester) async {
+    testWidgets('falls back to the camera when the gallery is unavailable', (
+      tester,
+    ) async {
       final picker = FakeImagePicker(
         galleryAvailable: false,
         cameraAvailable: true,
@@ -281,8 +293,9 @@ void main() {
       expect(picker.lastSource, ImageSource.camera);
     });
 
-    testWidgets('a cancelled pick leaves the selection unchanged',
-        (tester) async {
+    testWidgets('a cancelled pick leaves the selection unchanged', (
+      tester,
+    ) async {
       final picker = FakeImagePicker(picked: null);
       await tester.pumpWidget(AttachmentRowHarness(picker: picker));
       await tester.pump();
@@ -294,21 +307,24 @@ void main() {
       expect(find.byType(Image), findsNothing);
     });
 
-    testWidgets('upload status overlays reflect each upload state',
-        (tester) async {
+    testWidgets('upload status overlays reflect each upload state', (
+      tester,
+    ) async {
       Future<void> pumpFor(UploadStatus status) async {
         final job = UploadJobStatus(
           jobId: 'j1',
           status: status,
           progress: status == UploadStatus.done ? 1.0 : 0.25,
         );
-        await tester.pumpWidget(AttachmentRowHarness(
-          key: ValueKey(status),
-          initial: [draft('photo.png')],
-          draftToJobId: {pngFile.path: 'j1'},
-          uploadStatus: {'j1': job},
-          picker: FakeImagePicker(),
-        ));
+        await tester.pumpWidget(
+          AttachmentRowHarness(
+            key: ValueKey(status),
+            initial: [draft('photo.png')],
+            draftToJobId: {pngFile.path: 'j1'},
+            uploadStatus: {'j1': job},
+            picker: FakeImagePicker(),
+          ),
+        );
         await tester.pump();
       }
 
@@ -333,9 +349,9 @@ void main() {
     Widget chatApp({required FilesClient filesClient}) {
       return ProviderScope(
         overrides: [
-          settingsStoreProvider.overrideWithValue(FakeSettingsStore(
-            stored: const BackendSettings(host: 'myhost'),
-          )),
+          settingsStoreProvider.overrideWithValue(
+            FakeSettingsStore(stored: const BackendSettings(host: 'myhost')),
+          ),
           backendProbeProvider.overrideWithValue(FakeProbe()),
           chatStoreProvider.overrideWithValue(FakeChatStore()),
           filesServiceProvider.overrideWithValue(filesClient),
@@ -345,23 +361,25 @@ void main() {
     }
 
     testWidgets(
-        'hides the attachment picker when the files service is unconfigured',
-        (tester) async {
-      await tester.pumpWidget(chatApp(filesClient: NoOpFilesClient()));
-      await tester.pumpAndSettle();
+      'hides the attachment picker when the files service is unconfigured',
+      (tester) async {
+        await tester.pumpWidget(chatApp(filesClient: NoOpFilesClient()));
+        await tester.pumpAndSettle();
 
-      expect(find.byType(AttachmentRow), findsNothing);
-      expect(find.byIcon(Icons.add), findsNothing);
-    });
+        expect(find.byType(AttachmentRow), findsNothing);
+        expect(find.byIcon(Icons.add), findsNothing);
+      },
+    );
 
     testWidgets(
-        'shows the attachment add button when the files service is configured',
-        (tester) async {
-      await tester.pumpWidget(chatApp(filesClient: FakeFilesClient()));
-      await tester.pumpAndSettle();
+      'shows the attachment add button when the files service is configured',
+      (tester) async {
+        await tester.pumpWidget(chatApp(filesClient: FakeFilesClient()));
+        await tester.pumpAndSettle();
 
-      expect(find.byType(AttachmentRow), findsOneWidget);
-      expect(find.byIcon(Icons.add), findsOneWidget);
-    });
+        expect(find.byType(AttachmentRow), findsOneWidget);
+        expect(find.byIcon(Icons.add), findsOneWidget);
+      },
+    );
   });
 }

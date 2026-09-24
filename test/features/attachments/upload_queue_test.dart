@@ -77,7 +77,10 @@ class FakeFilesClient implements FilesClient {
   Future<List<FileInfo>> listFiles() async => const [];
 
   @override
-  Future<Uint8List> fetchFile(String fileId) async => Uint8List(0);
+  Future<Uint8List> fetchFile(
+    String fileId, {
+    CancelToken? cancelToken,
+  }) async => Uint8List(0);
 
   @override
   Future<void> deleteFile(String fileId) async {}

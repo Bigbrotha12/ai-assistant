@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { AIMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
-import { requireApiKey, unauthorized } from "../inference.ts";
+import { keyGateResponse, requireApiKey } from "../api_key.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { SessionStore } from "./store.ts";
 
@@ -67,7 +67,7 @@ export function serializeSessionMessages(messages: readonly BaseMessage[]): Sess
 
 export type SessionRoutesOptions = {
   store: SessionStore;
-  /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 
@@ -78,8 +78,9 @@ export function createSessionRoutes(opts: SessionRoutesOptions): Hono {
   const routes = new Hono();
 
   routes.get("/sessions/:id", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
     const sessionId = c.req.param("id");
     const record = store.get(owner, sessionId);
     c.header("cache-control", "no-store");
@@ -104,8 +105,9 @@ export function createSessionRoutes(opts: SessionRoutesOptions): Hono {
   // Another owner's session, or an absent one, is a 404 — never a successful
   // delete and never a leak.
   routes.delete("/sessions/:id", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
     const sessionId = c.req.param("id");
     c.header("cache-control", "no-store");
     const ownerOf = store.lookupOwner(sessionId);

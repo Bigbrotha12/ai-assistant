@@ -129,6 +129,7 @@ async function makeStore(
     manifests: readonly ToolPluginDefinition[];
     lookup: LookupFn;
     mode: "production" | "development" | "test";
+    writeFile: typeof writeFile;
   }> = {},
 ): Promise<{ store: PluginStore; storePath: string }> {
   const storePath = join(dir, "plugins.json");
@@ -139,6 +140,7 @@ async function makeStore(
     manifests: opts.manifests ?? [vikunjaManifest(), mealieManifest()],
     lookup: opts.lookup ?? fakeLookup(),
     mode: opts.mode,
+    writeFile: opts.writeFile,
   });
   await store.load();
   return { store, storePath };
@@ -302,6 +304,268 @@ describe("PluginStore install/uninstall lifecycle", () => {
     const { store } = await makeStore(dir);
     assert.equal(store.getPlugin("vikunja"), undefined);
     assert.ok(store.getPlugin("openrouter"));
+  });
+});
+
+describe("PluginStore mutation serialization", () => {
+  test("concurrent installs validate and persist exactly one manifest", async (t) => {
+    const dir = await makeTempDir(t);
+    let releaseDns!: () => void;
+    let enterDns!: () => void;
+    const dnsGate = new Promise<void>((resolve) => {
+      releaseDns = resolve;
+    });
+    const dnsEntered = new Promise<void>((resolve) => {
+      enterDns = resolve;
+    });
+    let lookupCount = 0;
+    const lookup: LookupFn = async (hostname, _options) => {
+      lookupCount += 1;
+      if (lookupCount === 1) {
+        enterDns();
+        await dnsGate;
+      }
+      return [...(DNS[hostname.toLowerCase()] ?? [])];
+    };
+    const { store, storePath } = await makeStore(dir, { lookup });
+
+    const first = store.install("vikunja");
+    await dnsEntered;
+    const second = store.install("vikunja");
+    releaseDns();
+
+    assert.deepEqual(await Promise.all([first, second]), [undefined, undefined]);
+    assert.equal(lookupCount, 1);
+    assert.deepEqual(
+      store.getInstalled().map((p) => p.id),
+      ["openrouter", "vikunja"],
+    );
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.deepEqual(
+      persisted.plugins.map((p) => p.id),
+      ["vikunja"],
+    );
+    assert.equal(
+      persisted.plugins.filter((p) => p.id === "vikunja").length,
+      1,
+    );
+  });
+
+  test("concurrent install and uninstall serialize to a matching disk snapshot", async (t) => {
+    const dir = await makeTempDir(t);
+    const { store, storePath } = await makeStore(dir);
+
+    const install = store.install("vikunja");
+    const uninstall = store.uninstall("vikunja");
+    assert.deepEqual(await Promise.all([install, uninstall]), [undefined, undefined]);
+
+    assert.deepEqual(
+      store.getInstalled().map((p) => p.id),
+      ["openrouter"],
+    );
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.deepEqual(
+      persisted.plugins.map((p) => p.id),
+      [],
+    );
+    assert.deepEqual(
+      persisted.plugins.map((p) => p.id),
+      store.getInstalled().slice(1).map((p) => p.id),
+    );
+  });
+
+  test("readers see old state until a delayed install save commits", async (t) => {
+    const dir = await makeTempDir(t);
+    let releaseSave!: () => void;
+    let enterSave!: () => void;
+    const saveGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const saveEntered = new Promise<void>((resolve) => {
+      enterSave = resolve;
+    });
+    let delayNextSave = false;
+    const writeFileSeam = (async (
+      path: string,
+      data: string,
+      options: { encoding: "utf8" },
+    ) => {
+      if (delayNextSave) {
+        delayNextSave = false;
+        enterSave();
+        await saveGate;
+      }
+      return writeFile(path, data, options);
+    }) as typeof writeFile;
+    const { store, storePath } = await makeStore(dir, { writeFile: writeFileSeam });
+    const idsBefore = store.getInstalled().map((p) => p.id);
+    const diskBefore = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+
+    delayNextSave = true;
+    const install = store.install("vikunja");
+    const reload = store.reload();
+    await saveEntered;
+    try {
+      assert.deepEqual(store.getInstalled().map((p) => p.id), idsBefore);
+      assert.equal(store.getPinnedIps("vikunja"), undefined);
+      const diskDuringSave = JSON.parse(
+        await readFile(storePath, "utf8"),
+      ) as PluginStoreConfig;
+      assert.deepEqual(diskDuringSave, diskBefore);
+    } finally {
+      releaseSave();
+    }
+
+    await install;
+    assert.deepEqual(
+      store.getInstalled().map((p) => p.id),
+      ["openrouter", "vikunja"],
+    );
+    assert.deepEqual(store.getPinnedIps("vikunja"), [
+      { entryId: "vikunja-api", url: "https://vikunja.example.com", pinned: ["1.1.1.1"] },
+    ]);
+    await reload;
+    const diskAfterSave = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.deepEqual(
+      diskAfterSave.plugins.map((p) => p.id),
+      ["vikunja"],
+    );
+  });
+
+  test("reload called during an in-flight install cannot clobber it", async (t) => {
+    const dir = await makeTempDir(t);
+    let releaseInstallDns!: () => void;
+    let enterInstallDns!: () => void;
+    const installDnsGate = new Promise<void>((resolve) => {
+      releaseInstallDns = resolve;
+    });
+    const installDnsEntered = new Promise<void>((resolve) => {
+      enterInstallDns = resolve;
+    });
+    let releaseReload!: () => void;
+    let enterReload!: () => void;
+    const reloadGate = new Promise<void>((resolve) => {
+      releaseReload = resolve;
+    });
+    const reloadEntered = new Promise<void>((resolve) => {
+      enterReload = resolve;
+    });
+    let holdReload = false;
+    const lookup: LookupFn = async (hostname, _options) => {
+      const normalized = hostname.toLowerCase();
+      if (normalized === "vikunja.example.com") {
+        enterInstallDns();
+        await installDnsGate;
+      }
+      if (holdReload && normalized === "mealie.example.com") {
+        enterReload();
+        await reloadGate;
+      }
+      return [...(DNS[normalized] ?? [])];
+    };
+    const { store, storePath } = await makeStore(dir, { lookup });
+    await store.install("mealie");
+    await writeFile(
+      storePath,
+      JSON.stringify({
+        schemaVersion: CURRENT_PLUGIN_STORE_SCHEMA_VERSION,
+        plugins: [{ ...mealieManifest(), version: "2.0.0" }],
+      } satisfies PluginStoreConfig),
+      "utf8",
+    );
+
+    holdReload = true;
+    const install = store.install("vikunja");
+    await installDnsEntered;
+    const reload = store.reload();
+    let reloadEntryTimer: ReturnType<typeof setTimeout> | undefined;
+    const reloadEnteredBeforeInstall = await Promise.race([
+      reloadEntered.then(() => true),
+      new Promise<boolean>((resolve) => {
+        reloadEntryTimer = setTimeout(() => resolve(false), 100);
+      }),
+    ]);
+    try {
+      releaseInstallDns();
+      await install;
+      releaseReload();
+      await reload;
+    } finally {
+      if (reloadEntryTimer !== undefined) clearTimeout(reloadEntryTimer);
+      releaseInstallDns();
+      releaseReload();
+    }
+
+    assert.equal(reloadEnteredBeforeInstall, false);
+    assert.deepEqual(
+      store.getInstalled().map((p) => p.id),
+      ["openrouter", "mealie", "vikunja"],
+    );
+    const persisted = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.deepEqual(
+      persisted.plugins.map((p) => p.id),
+      ["mealie", "vikunja"],
+    );
+  });
+
+  test("a failed save leaves live state unchanged and releases the mutex", async (t) => {
+    const dir = await makeTempDir(t);
+    let failNextSave = false;
+    let releaseFailedSave!: () => void;
+    let enterFailedSave!: () => void;
+    const failedSaveGate = new Promise<void>((resolve) => {
+      releaseFailedSave = resolve;
+    });
+    const failedSaveEntered = new Promise<void>((resolve) => {
+      enterFailedSave = resolve;
+    });
+    const writeFileSeam = (async (
+      path: string,
+      data: string,
+      options: { encoding: "utf8" },
+    ) => {
+      if (failNextSave) {
+        failNextSave = false;
+        enterFailedSave();
+        await failedSaveGate;
+        throw new Error("injected write failure");
+      }
+      return writeFile(path, data, options);
+    }) as typeof writeFile;
+    const { store, storePath } = await makeStore(dir, {
+      writeFile: writeFileSeam,
+      manifests: [vikunjaManifest(), mealieManifest()],
+    });
+    await store.install("vikunja");
+    const pinsBefore = structuredClone(store.getPinnedIps("vikunja"));
+    const idsBefore = store.getInstalled().map((p) => p.id);
+    const diskBefore = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+
+    failNextSave = true;
+    const uninstall = store.uninstall("vikunja");
+    await failedSaveEntered;
+    try {
+      assert.deepEqual(store.getInstalled().map((p) => p.id), idsBefore);
+      assert.deepEqual(store.getPinnedIps("vikunja"), pinsBefore);
+    } finally {
+      releaseFailedSave();
+    }
+
+    await assert.rejects(
+      uninstall,
+      (e: unknown) => e instanceof PluginStoreError && e.code === "FILE_IO",
+    );
+    assert.deepEqual(store.getInstalled().map((p) => p.id), idsBefore);
+    assert.deepEqual(store.getPinnedIps("vikunja"), pinsBefore);
+    const diskAfterFailure = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.deepEqual(diskAfterFailure, diskBefore);
+
+    await store.install("mealie");
+    const diskAfterRetry = JSON.parse(await readFile(storePath, "utf8")) as PluginStoreConfig;
+    assert.deepEqual(
+      diskAfterRetry.plugins.map((p) => p.id),
+      ["vikunja", "mealie"],
+    );
   });
 });
 

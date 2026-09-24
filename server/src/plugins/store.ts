@@ -32,6 +32,7 @@ import {
 } from "./ssrf.ts";
 import type { LookupFn, Mode } from "./ssrf.ts";
 import { isRecord } from "../util.ts";
+import { AsyncMutex } from "../jobs/mutex.ts";
 
 /**
  * `PluginStore` persists which tool-plugin manifests an admin has installed
@@ -100,6 +101,7 @@ export type PluginStoreOptions = {
    * `node:dns/promises`; tests inject a mapping so no network is needed.
    */
   lookup?: LookupFn;
+  writeFile?: StoreWriteFile;
   /**
    * Override NODE_ENV for SSRF validation. Defaults to the process NODE_ENV.
    * Pass "production" to enforce https-only at validation time.
@@ -114,9 +116,18 @@ function emptyStore(): PluginStoreConfig {
   };
 }
 
+type PinnedUrlEntry = { entryId: string; url: string; pinned: string[] };
+type PinnedUrls = Map<string, PinnedUrlEntry[]>;
+type StoreWriteFile = typeof writeFile;
+type PluginStoreState = {
+  config: PluginStoreConfig;
+  pinnedUrls: PinnedUrls;
+};
+
 export class PluginStore {
   private config: PluginStoreConfig | null = null;
   private loaded = false;
+  private readonly stateMutex = new AsyncMutex();
   /**
    * The exact JSON this instance last wrote. `reload()` skips a re-read that
    * matches it, so a self-save triggered file-watch event is a no-op instead
@@ -129,6 +140,7 @@ export class PluginStore {
   private readonly builtinPlugins: readonly PluginDefinition[];
   private readonly manifests: readonly ToolPluginDefinition[];
   private readonly lookup?: LookupFn;
+  private readonly writeFile: StoreWriteFile;
   private readonly mode: Mode;
   /**
    * Validated, pinned IPs per plugin, populated whenever a plugin's URLs pass
@@ -136,10 +148,7 @@ export class PluginStore {
    * consumers fetch these via `getPinnedIps` instead of re-resolving, so the
    * resolve-then-validate result is never discarded.
    */
-  private readonly pinnedUrls = new Map<
-    string,
-    Array<{ entryId: string; url: string; pinned: string[] }>
-  >();
+  private pinnedUrls: PinnedUrls = new Map();
 
   constructor(opts: PluginStoreOptions) {
     this.storePath = opts.storePath;
@@ -147,8 +156,32 @@ export class PluginStore {
     this.builtinPlugins = opts.builtinPlugins;
     this.manifests = opts.manifests;
     this.lookup = opts.lookup;
+    this.writeFile = opts.writeFile ?? writeFile;
     this.mode = opts.mode ?? NODE_ENV;
     this.assertUniqueIds();
+  }
+
+  private stageState(): PluginStoreState {
+    this.assertLoaded();
+    return {
+      config: structuredClone(this.config!),
+      pinnedUrls: this.clonePinnedUrls(this.pinnedUrls),
+    };
+  }
+
+  private clonePinnedUrls(pinnedUrls: PinnedUrls): PinnedUrls {
+    return new Map(
+      [...pinnedUrls].map(([id, entries]) => [
+        id,
+        entries.map((entry) => ({ ...entry, pinned: [...entry.pinned] })),
+      ]),
+    );
+  }
+
+  private commitState(state: PluginStoreState, lastWrittenContent: string): void {
+    this.config = state.config;
+    this.pinnedUrls = state.pinnedUrls;
+    this.lastWrittenContent = lastWrittenContent;
   }
 
   /** Absolute/configured path of the store file (used by the file watcher). */
@@ -202,14 +235,22 @@ export class PluginStore {
 
   /** Read the store file. Missing file → empty store written with schemaVersion. */
   async load(): Promise<void> {
+    return this.stateMutex.runExclusive(() => this._loadUnlocked());
+  }
+
+  private async _loadUnlocked(): Promise<void> {
     let raw: string;
     try {
       raw = await readFile(this.storePath, "utf8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        this.config = emptyStore();
+        const staged: PluginStoreState = {
+          config: emptyStore(),
+          pinnedUrls: new Map(),
+        };
+        const lastWrittenContent = await this._saveConfigUnlocked(staged.config);
+        this.commitState(staged, lastWrittenContent);
         this.loaded = true;
-        await this.save();
         return;
       }
       throw new PluginStoreError(
@@ -233,8 +274,9 @@ export class PluginStore {
     // policy tightening (Fix 6).
     const config = parsePluginStoreConfig(parsed);
     this.assertNoBuiltinCollisions(config);
-    await this.revalidateSsrSafe(config);
+    const pinnedUrls = await this.revalidateSsrSafe(config);
     this.config = config;
+    this.pinnedUrls = pinnedUrls;
     this.loaded = true;
   }
 
@@ -244,6 +286,10 @@ export class PluginStore {
    * itself, coordinating with `fs.watch` so a self-save is never a reload.
    */
   async reload(): Promise<void> {
+    return this.stateMutex.runExclusive(() => this._reloadUnlocked());
+  }
+
+  private async _reloadUnlocked(): Promise<void> {
     this.assertLoaded();
     let raw: string;
     try {
@@ -272,8 +318,9 @@ export class PluginStore {
     // effect (the store is left untouched), so a bad hand-edit never activates.
     const config = parsePluginStoreConfig(parsed);
     this.assertNoBuiltinCollisions(config);
-    await this.revalidateSsrSafe(config);
+    const pinnedUrls = await this.revalidateSsrSafe(config);
     this.config = config;
+    this.pinnedUrls = pinnedUrls;
   }
 
   /** Installed plugins = builtins (always available) + user-installed manifests. */
@@ -303,6 +350,10 @@ export class PluginStore {
    * NOT installed and an `SSRF_REJECTED` error carries the per-entry reasons.
    */
   async install(manifestId: string): Promise<void> {
+    return this.stateMutex.runExclusive(() => this._installUnlocked(manifestId));
+  }
+
+  private async _installUnlocked(manifestId: string): Promise<void> {
     this.assertLoaded();
     const manifest = this.manifests.find((m) => m.id === manifestId);
     if (!manifest) {
@@ -313,9 +364,12 @@ export class PluginStore {
     }
     if (this.installedIds.has(manifest.id)) return;
 
+    const staged = this.stageState();
     const validated = await this.validateAllowedUrls(manifest);
 
     const mcpValidated = await this.validateMcpUrls(manifest);
+
+    if (this.installedIds.has(manifest.id)) return;
 
     // Re-validate against the plugin schema so unknown keys — including any
     // smuggled credential VALUES — are stripped before the definition reaches
@@ -329,12 +383,13 @@ export class PluginStore {
         `manifest '${manifest.id}' failed plugin schema validation: ${(err as Error).message}`,
       );
     }
-    this.config!.plugins.push(definition);
-    this.pinnedUrls.set(manifest.id, validated);
+    staged.config.plugins.push(definition);
+    staged.pinnedUrls.set(manifest.id, validated);
     for (const entry of mcpValidated) {
-      this.pinnedUrls.set(`${manifest.id}:${entry.entryId}`, [entry]);
+      staged.pinnedUrls.set(`${manifest.id}:${entry.entryId}`, [entry]);
     }
-    await this.save();
+    const lastWrittenContent = await this._saveConfigUnlocked(staged.config);
+    this.commitState(staged, lastWrittenContent);
   }
 
   /**
@@ -343,6 +398,10 @@ export class PluginStore {
    * available.
    */
   async uninstall(pluginId: string): Promise<void> {
+    return this.stateMutex.runExclusive(() => this._uninstallUnlocked(pluginId));
+  }
+
+  private async _uninstallUnlocked(pluginId: string): Promise<void> {
     this.assertLoaded();
     if (this.builtinPlugins.some((b) => b.id === pluginId)) {
       throw new PluginStoreError(
@@ -357,30 +416,41 @@ export class PluginStore {
         `plugin '${pluginId}' is not installed; nothing to uninstall`,
       );
     }
-    this.config!.plugins.splice(index, 1);
-    this.pinnedUrls.delete(pluginId);
-    for (const key of this.pinnedUrls.keys()) {
+    const staged = this.stageState();
+    staged.config.plugins.splice(index, 1);
+    staged.pinnedUrls.delete(pluginId);
+    for (const key of staged.pinnedUrls.keys()) {
       if (key.startsWith(`${pluginId}:mcp:`)) {
-        this.pinnedUrls.delete(key);
+        staged.pinnedUrls.delete(key);
       }
     }
-    await this.save();
+    const lastWrittenContent = await this._saveConfigUnlocked(staged.config);
+    this.commitState(staged, lastWrittenContent);
   }
 
   /**
    * Persist atomically: write a temp file in the same directory (same
    * filesystem → rename is atomic), chmod `0600`, then rename over the target.
-   * `lastWrittenContent` is snapshotted so the file watcher's reload is a no-op.
+   * This public path stages deep clones of config and pins, then publishes the
+   * staged references and `lastWrittenContent` only after the successful rename.
+   * Lifecycle mutations use the same stage → save → swap transaction.
    */
   async save(): Promise<void> {
-    this.assertLoaded();
-    this.assertNoCredentialValues(this.config!);
+    return this.stateMutex.runExclusive(async () => {
+      const staged = this.stageState();
+      const lastWrittenContent = await this._saveConfigUnlocked(staged.config);
+      this.commitState(staged, lastWrittenContent);
+    });
+  }
 
-    const json = `${JSON.stringify(this.config, null, 2)}\n`;
+  private async _saveConfigUnlocked(config: PluginStoreConfig): Promise<string> {
+    this.assertNoCredentialValues(config);
+
+    const json = `${JSON.stringify(config, null, 2)}\n`;
     const tmpPath = `${this.storePath}.${randomUUID()}.tmp`;
     try {
       await mkdir(dirname(this.storePath), { recursive: true });
-      await writeFile(tmpPath, json, { encoding: "utf8" });
+      await this.writeFile(tmpPath, json, { encoding: "utf8" });
       await chmod(tmpPath, 0o600);
       await rename(tmpPath, this.storePath);
     } catch (err) {
@@ -390,7 +460,7 @@ export class PluginStore {
         `could not write plugin store ${this.storePath}: ${String(err)}`,
       );
     }
-    this.lastWrittenContent = json;
+    return json;
   }
 
   /** Collect the allowlisted URLs of a plugin (tool baseUrls; model endpoint + baseUrls). */
@@ -525,15 +595,16 @@ export class PluginStore {
    * entry throws SSRF_REJECTED and the configuration is NOT applied (reload
    * keeps the last known-good config).
    */
-  private async revalidateSsrSafe(config: PluginStoreConfig): Promise<void> {
+  private async revalidateSsrSafe(config: PluginStoreConfig): Promise<PinnedUrls> {
     const failures: string[] = [];
+    const pinnedUrls: PinnedUrls = new Map();
     for (const plugin of config.plugins) {
       try {
         const validated = await this.validateUrlEntries(plugin.id, this.urlEntries(plugin));
-        this.pinnedUrls.set(plugin.id, validated);
+        pinnedUrls.set(plugin.id, validated);
         const mcpValidated = await this.validateMcpUrls(plugin);
         for (const entry of mcpValidated) {
-          this.pinnedUrls.set(`${plugin.id}:${entry.entryId}`, [entry]);
+          pinnedUrls.set(`${plugin.id}:${entry.entryId}`, [entry]);
         }
       } catch (err) {
         if (err instanceof PluginStoreError && err.code === "SSRF_REJECTED") {
@@ -551,6 +622,7 @@ export class PluginStore {
           `fix plugins.json or PLUGINS_TRUSTED_HOSTS`,
       );
     }
+    return pinnedUrls;
   }
 
   /**

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
@@ -7,6 +8,7 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
+import 'package:ai_assistant/features/chat/data/context_trimmer.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_request.dart';
 import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
@@ -42,6 +44,105 @@ class _FakeRegistryClient extends PluginRegistryClient {
   }) async => models;
 }
 
+class _FakeLedgerAdapter implements HttpClientAdapter {
+  _FakeLedgerAdapter(this.respond);
+
+  final FutureOr<ResponseBody> Function(RequestOptions) respond;
+  final requests = <RequestOptions>[];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests.add(options);
+    return respond(options);
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _FakeLedgerScheduler implements LedgerScheduler {
+  @override
+  Duration elapsed = Duration.zero;
+  final jobs = <({Duration at, void Function() callback, List<bool> active})>[];
+
+  @override
+  LedgerCancel schedule(Duration delay, void Function() callback) {
+    final active = [true];
+    jobs.add((at: elapsed + delay, callback: callback, active: active));
+    return () => active[0] = false;
+  }
+
+  Future<void> advance(Duration duration) async {
+    final target = elapsed + duration;
+    await _flushLedger();
+    while (true) {
+      jobs.sort((a, b) => a.at.compareTo(b.at));
+      final ready = jobs
+          .where((j) => j.active[0] && j.at <= target)
+          .firstOrNull;
+      if (ready == null) break;
+      elapsed = ready.at;
+      ready.active[0] = false;
+      ready.callback();
+      await _flushLedger();
+    }
+    elapsed = target;
+    await _flushLedger();
+  }
+}
+
+class _PollerHarness {
+  _PollerHarness({
+    required this.scope,
+    required this.poller,
+    required this.adapter,
+    required this.clock,
+  });
+
+  final AuthAccountScope scope;
+  final LedgerPoller poller;
+  final _FakeLedgerAdapter adapter;
+  final _FakeLedgerScheduler clock;
+}
+
+Future<void> _flushLedger() async {
+  for (var i = 0; i < 12; i++) {
+    await Future<void>.delayed(Duration.zero);
+  }
+}
+
+ResponseBody _ledgerResponse(
+  AuthAccountScope scope,
+  String id, {
+  String status = 'succeeded',
+}) => ResponseBody.fromString(
+  jsonEncode({
+    'id': id,
+    'owner': scope.ownerId,
+    'intent_key': id,
+    'status': status,
+    'created_ts': 1,
+    'updated_ts': 2,
+    'last_heartbeat_ts': 2,
+  }),
+  200,
+  headers: {
+    'content-type': ['application/json'],
+  },
+);
+
+FutureOr<ResponseBody> _defaultLedgerResponse(
+  _PollerHarness harness,
+  RequestOptions request,
+) {
+  final id = Uri.decodeComponent(request.uri.pathSegments.last);
+  return _ledgerResponse(harness.scope, id);
+}
+
 PluginModelDto _model(String id) => PluginModelDto.fromJson({
   'id': id,
   'object': 'model',
@@ -69,6 +170,10 @@ void main() {
   late FakeLangChainClient client;
   late AuthAccountScope scope;
   late Future<ManagedTurnResult> Function(LangChainRequest) respondWith;
+  late List<_PollerHarness> pollers;
+  late ManagedChatPollerFactory pollerFactory;
+  late FutureOr<ResponseBody> Function(_PollerHarness, RequestOptions)
+      ledgerResponder;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
@@ -85,6 +190,33 @@ void main() {
       ),
     );
     client = FakeLangChainClient((request) => respondWith(request));
+    pollers = [];
+    ledgerResponder = _defaultLedgerResponse;
+    pollerFactory = ({required scope, required credentials}) {
+      late _PollerHarness harness;
+      final adapter = _FakeLedgerAdapter(
+        (request) => ledgerResponder(harness, request),
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+      final clock = _FakeLedgerScheduler();
+      final poller = LedgerPoller(
+        client: LedgerClient(dio: dio, scope: scope),
+        credentials: credentials,
+        scheduler: clock,
+      );
+      harness = _PollerHarness(
+        scope: scope,
+        poller: poller,
+        adapter: adapter,
+        clock: clock,
+      );
+      pollers.add(harness);
+      addTearDown(() {
+        poller.dispose();
+        dio.close(force: true);
+      });
+      return poller;
+    };
     container = ProviderContainer(
       overrides: [
         authCredentialsStoreProvider.overrideWithValue(
@@ -95,6 +227,7 @@ void main() {
         ),
         pluginCredentialsStoreProvider.overrideWithValue(pluginStore),
         pluginRegistryClientProvider.overrideWithValue(registry),
+        managedChatPollerFactoryProvider.overrideWithValue(pollerFactory),
         databaseProvider.overrideWithValue(db),
         managedLangChainClientProvider.overrideWithValue(client),
       ],
@@ -105,12 +238,16 @@ void main() {
     scope = container.read(pluginAccountScopeProvider);
   });
 
-  Future<void> seedReadyConfig() async {
+  Future<void> seedReadyConfigFor(AuthAccountScope target) async {
     registry.models = [_model('text')];
-    await pluginStore.setSelectedModel(scope, 'text');
-    await pluginStore.setCredentials(scope, 'text', {'apiKey': 'text-test'});
-    await pluginStore.setEnabled(scope, 'web', true);
-    await pluginStore.setCredentials(scope, 'web', {'apiKey': 'web-test'});
+    await pluginStore.setSelectedModel(target, 'text');
+    await pluginStore.setCredentials(target, 'text', {'apiKey': 'text-test'});
+    await pluginStore.setEnabled(target, 'web', true);
+    await pluginStore.setCredentials(target, 'web', {'apiKey': 'web-test'});
+  }
+
+  Future<void> seedReadyConfig() async {
+    await seedReadyConfigFor(scope);
   }
 
   test(
@@ -143,6 +280,119 @@ void main() {
       expect(switched.scope.ownerId, 'b');
     },
   );
+
+  test(
+    'scope replacement disposes the old owned poller and leaves the new one usable',
+    () async {
+      final scopeB = _credentials('b').accountScope!;
+      await seedReadyConfigFor(scope);
+      await seedReadyConfigFor(scopeB);
+      final oldResponse = Completer<ResponseBody>();
+      ledgerResponder = (harness, request) {
+        if (harness.scope.ownerId == 'a') return oldResponse.future;
+        final id = Uri.decodeComponent(request.uri.pathSegments.last);
+        return _ledgerResponse(harness.scope, id);
+      };
+
+      final first = container.read(managedChatAdapterProvider);
+      final oldPoller = first.poller;
+      final oldHarness = pollers.single;
+      final oldHandle = oldPoller.watch(const LedgerLookup.byTaskId('old-task'));
+      first.setForeground(true);
+      await oldHarness.clock.advance(Duration.zero);
+      expect(oldHarness.adapter.requests, hasLength(1));
+
+      await container
+          .read(authCredentialsProvider.notifier)
+          .save(_credentials('b'));
+      final switched = container.read(managedChatAdapterProvider);
+      final newPoller = switched.poller;
+      final newHarness = pollers.last;
+
+      expect(switched, isNot(same(first)));
+      expect(oldHarness.scope.ownerId, 'a');
+      expect(newHarness.scope.ownerId, 'b');
+      expect(
+        () => oldPoller.watch(const LedgerLookup.byTaskId('after-switch')),
+        throwsA(isA<PluginClientException>()),
+      );
+      expect((await oldHandle.done).end, LedgerPollEnd.cancelled);
+
+      oldResponse.complete(_ledgerResponse(scope, 'old-task'));
+      await _flushLedger();
+      await oldHarness.clock.advance(const Duration(seconds: 30));
+      expect(oldHarness.adapter.requests, hasLength(1));
+
+      final newHandle = newPoller.watch(const LedgerLookup.byTaskId('new-task'));
+      switched.setForeground(true);
+      await newHarness.clock.advance(Duration.zero);
+      expect((await newHandle.done).end, LedgerPollEnd.observed);
+    },
+  );
+
+  test(
+    'container disposal cancels the active poller and its late response',
+    () async {
+      final response = Completer<ResponseBody>();
+      ledgerResponder = (harness, request) => response.future;
+      await seedReadyConfig();
+
+      final adapter = container.read(managedChatAdapterProvider);
+      final poller = adapter.poller;
+      final harness = pollers.single;
+      final handle = poller.watch(const LedgerLookup.byTaskId('task'));
+      poller.setForeground(true);
+      await harness.clock.advance(Duration.zero);
+      expect(harness.adapter.requests, hasLength(1));
+
+      container.dispose();
+
+      expect(
+        () => poller.watch(const LedgerLookup.byTaskId('after-dispose')),
+        throwsA(isA<PluginClientException>()),
+      );
+      expect((await handle.done).end, LedgerPollEnd.cancelled);
+      response.complete(_ledgerResponse(scope, 'task'));
+      await _flushLedger();
+      await harness.clock.advance(const Duration(seconds: 30));
+      expect(harness.adapter.requests, hasLength(1));
+    },
+  );
+
+  test('an externally injected poller remains owned by its caller', () async {
+    final external = pollerFactory(
+      scope: scope,
+      credentials: () async => _credentials('a'),
+    );
+    final adapter = ManagedChatAdapter(
+      scope: scope,
+      client: client,
+      repo: container.read(managedConversationRepositoryProvider),
+      trimmer: const ContextTrimmer(),
+      resolveSelection: () async => throw StateError('unused'),
+      poller: external,
+    );
+    final handle = external.watch(const LedgerLookup.byTaskId('external'));
+    external.setForeground(true);
+
+    adapter.dispose();
+    adapter.dispose();
+
+    expect(handle.isCurrent, isTrue);
+    expect(
+      () => external.watch(const LedgerLookup.byTaskId('still-usable')),
+      returnsNormally,
+    );
+    external.dispose();
+    expect((await handle.done).end, LedgerPollEnd.cancelled);
+  });
+
+  test('disposing before lazy poller creation is idempotent and safe', () {
+    final adapter = container.read(managedChatAdapterProvider);
+    adapter.dispose();
+    adapter.dispose();
+    expect(() => adapter.poller, throwsA(isA<PluginClientException>()));
+  });
 
   test(
     'sendTurn succeeds end-to-end through the adapter into the scoped store '

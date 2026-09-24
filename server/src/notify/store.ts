@@ -15,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { dirname } from "node:path";
 import { isRecord } from "../util.ts";
+import { AsyncMutex } from "../jobs/mutex.ts";
 
 /**
  * Encrypted-at-rest store for per-owner ntfy push credentials (plan §
@@ -86,6 +87,7 @@ export type NotifyStoreOptions = {
    * operate with a blank key (`KEY_REQUIRED`).
    */
   key: string;
+  renameFile?: typeof rename;
 };
 
 /** Derives the 32-byte AES-256-GCM key from the injected secret. */
@@ -96,6 +98,8 @@ function deriveAesKey(key: string): Buffer {
 export class NotifyStore {
   private readonly storePath: string;
   private readonly aesKey: Buffer;
+  private readonly renameFile: typeof rename;
+  private readonly mutationMutex = new AsyncMutex();
   private file: NotifyStoreFile | null = null;
 
   constructor(opts: NotifyStoreOptions) {
@@ -109,6 +113,7 @@ export class NotifyStore {
       );
     }
     this.aesKey = deriveAesKey(opts.key);
+    this.renameFile = opts.renameFile ?? rename;
   }
 
   /** Absolute/configured path of the store file. */
@@ -128,25 +133,35 @@ export class NotifyStore {
 
   /** Encrypts and persists the owner's credentials (upsert). */
   async set(owner: string, credentials: NotifyCredentials): Promise<void> {
-    await this.ensureLoaded();
-    const next: NotifyStoreFile = {
-      schemaVersion: CURRENT_NOTIFY_STORE_VERSION,
-      accounts: {
-        ...this.file!.accounts,
-        [owner]: { credentials: this.encrypt(credentials) },
-      },
-    };
-    await this.persist(next);
+    await this.mutationMutex.runExclusive(async () => {
+      await this.ensureLoaded();
+      const next: NotifyStoreFile = {
+        schemaVersion: CURRENT_NOTIFY_STORE_VERSION,
+        accounts: {
+          ...this.file!.accounts,
+          [owner]: { credentials: this.encrypt(credentials) },
+        },
+      };
+      await this.persist(next);
+      this.file = next;
+    });
   }
 
   /** Deletes the owner's credentials. Returns whether a record was removed. */
   async delete(owner: string): Promise<boolean> {
-    await this.ensureLoaded();
-    if (!(owner in this.file!.accounts)) return false;
-    const accounts = { ...this.file!.accounts };
-    delete accounts[owner];
-    await this.persist({ schemaVersion: CURRENT_NOTIFY_STORE_VERSION, accounts });
-    return true;
+    return this.mutationMutex.runExclusive(async () => {
+      await this.ensureLoaded();
+      if (!(owner in this.file!.accounts)) return false;
+      const accounts = { ...this.file!.accounts };
+      delete accounts[owner];
+      const next: NotifyStoreFile = {
+        schemaVersion: CURRENT_NOTIFY_STORE_VERSION,
+        accounts,
+      };
+      await this.persist(next);
+      this.file = next;
+      return true;
+    });
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -195,7 +210,7 @@ export class NotifyStore {
       await mkdir(dirname(this.storePath), { recursive: true });
       await writeFile(tmpPath, json, { encoding: "utf8" });
       await chmod(tmpPath, 0o600);
-      await rename(tmpPath, this.storePath);
+      await this.renameFile(tmpPath, this.storePath);
     } catch (err) {
       await rm(tmpPath, { force: true }).catch(() => undefined);
       throw new NotifyStoreError(
@@ -203,7 +218,6 @@ export class NotifyStore {
         `could not write notify store ${this.storePath}: ${String(err)}`,
       );
     }
-    this.file = file;
   }
 
   private encrypt(credentials: NotifyCredentials): NotifyCipherBundle {

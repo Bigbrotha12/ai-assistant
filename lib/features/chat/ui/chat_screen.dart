@@ -271,6 +271,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               messages: state?.messages ?? const [],
               isStreaming: isStreaming,
               error: authRequired ? null : error,
+              isRetryInFlight: state?.isRetryInFlight ?? false,
               onRetry: () => ref
                   .read(conversationProvider(_conversationId).notifier)
                   .retry(),

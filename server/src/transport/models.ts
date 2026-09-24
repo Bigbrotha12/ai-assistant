@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { requireApiKey, unauthorized } from "../inference.ts";
+import { keyGateResponse, requireApiKey } from "../api_key.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isModelPlugin } from "../plugins/types.ts";
@@ -9,7 +9,8 @@ import { isRecord } from "../util.ts";
 /**
  * OpenAI-compatible `GET /v1/models` transport (Phase 3, Wave B).
  *
- * Replaces the Phase 1 proxy in `inference.ts` that forwarded `/v1/models` to
+ * Replaces the Phase 1 proxy (formerly in `inference.ts`, now `api_key.ts`)
+ * that forwarded `/v1/models` to
  * `INFERENCE_URL`. The models list is now compiled from the installed MODEL
  * plugins in the registry, so the client sees exactly what this gateway can
  * actually route to (incl. `visionCapable`) instead of whatever upstream
@@ -28,6 +29,7 @@ import { isRecord } from "../util.ts";
  *
  * ERROR SHAPES (kept consistent with the proxy it replaces):
  *   - no/invalid key        -> 401 {"error":"unauthorized"}
+ *   - unverified owner      -> 403 {"error":"email_not_verified"} (C2 backstop)
  *   - registry unavailable  -> 502 {"error":"inference_unavailable"}
  *   - empty registry        -> 200 {"object":"list","data":[]}  (not an error)
  */
@@ -98,7 +100,7 @@ export function sanitizeParameters(
 
 export type ModelsRoutesOptions = {
   registry: PluginRegistry;
-  /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 
@@ -109,8 +111,8 @@ export function createModelsRoutes(opts: ModelsRoutesOptions): Hono {
   const routes = new Hono();
 
   routes.get("/models", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
 
     let modelPlugins: ModelPluginDefinition[];
     try {

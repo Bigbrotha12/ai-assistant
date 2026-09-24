@@ -152,11 +152,9 @@ void main() {
 
       // Fresh saves through the scoped store stamp its scope_key — no new
       // null-scope rows are ever created.
-      final rows =
-          await (db.select(db.conversations)..where(
-                (t) => t.id.equals('c-a1'),
-              ))
-              .get();
+      final rows = await (db.select(
+        db.conversations,
+      )..where((t) => t.id.equals('c-a1'))).get();
       expect(rows.single.scopeKey, 'acctA');
     },
   );
@@ -303,8 +301,7 @@ void main() {
     expect(row.messageCount, 1);
   });
 
-  test(
-      'deleteMessage of a never-persisted message (zero-row delete) does NOT '
+  test('deleteMessage of a never-persisted message (zero-row delete) does NOT '
       'decrement messageCount', () async {
     await store.saveConversation(
       conversation(messages: [userMessage('m1', 'a'), userMessage('m2', 'b')]),
@@ -342,12 +339,16 @@ void main() {
   });
 
   test(
-    'schemaVersion is 7 and a fresh database round-trips a FileRow',
+    'schemaVersion is 9 and a fresh database round-trips a FileRow',
     () async {
-      expect(db.schemaVersion, 7);
+      expect(db.schemaVersion, 9);
 
-      await store.saveConversation(conversation(id: 'c1'));
-      final fileStore = DriftFileStore(db);
+      const fileScope = 'scope-a';
+      await DriftChatStore(
+        db,
+        scopeKey: fileScope,
+      ).saveConversation(conversation(id: 'c1'));
+      final fileStore = DriftFileStore(db, scopeKey: fileScope);
       await fileStore.saveFile(
         const FileInfo(
           id: 'f1',
@@ -377,7 +378,7 @@ void main() {
     // Build a v1 database containing only Conversations + Messages. The schema
     // is created via raw SQL in the setup hook (which runs BEFORE drift's
     // onUpgrade), with user_version pinned to 1 so opening AppDatabase (at
-    // schema version 5) runs the onUpgrade path instead of onCreate.
+    // schema version 9) runs the onUpgrade path instead of onCreate.
     final v1 = AppDatabase(
       NativeDatabase(
         file,
@@ -413,11 +414,12 @@ void main() {
     addTearDown(upgraded.close);
     await upgraded.customSelect('SELECT 1').get();
 
-    final upgradedStore = DriftChatStore(upgraded);
+    const fileScope = 'scope-a';
+    final upgradedStore = DriftChatStore(upgraded, scopeKey: fileScope);
     await upgradedStore.saveConversation(
       conversation(id: 'c1', title: 'Migrated'),
     );
-    final fileStore = DriftFileStore(upgraded);
+    final fileStore = DriftFileStore(upgraded, scopeKey: fileScope);
     await fileStore.saveFile(
       const FileInfo(
         id: 'f1',
@@ -434,7 +436,7 @@ void main() {
     final indexRows = await upgraded
         .customSelect(
           "SELECT name FROM sqlite_master "
-          "WHERE type = 'index' AND name = 'files_conversation_id_idx'",
+          "WHERE type = 'index' AND name = 'files_scope_key_conversation_id_idx'",
         )
         .get();
     expect(indexRows, hasLength(1));
@@ -452,7 +454,7 @@ void main() {
     // Build a v3 database containing Conversations + Messages + Files. The
     // schema is created via raw SQL in the setup hook (which runs BEFORE
     // drift's onUpgrade), with user_version pinned to 3 so opening AppDatabase
-    // (at schema version 5) runs the onUpgrade path instead of onCreate.
+    // (at schema version 9) runs the onUpgrade path instead of onCreate.
     final v3 = AppDatabase(
       NativeDatabase(
         file,
@@ -520,7 +522,7 @@ void main() {
     final indexRows = await upgraded
         .customSelect(
           "SELECT name FROM sqlite_master "
-          "WHERE type = 'index' AND name = 'memories_updated_at_idx'",
+          "WHERE type = 'index' AND name = 'memories_scope_key_updated_at_idx'",
         )
         .get();
     expect(indexRows, hasLength(1));
@@ -534,7 +536,7 @@ void main() {
         .get();
     expect(messagesIndexRows, hasLength(1));
 
-    final memoryStore = DriftMemoryStore(upgraded);
+    final memoryStore = DriftMemoryStore(upgraded, scopeKey: 'scope-a');
     await memoryStore.saveMemory(
       Memory(
         id: 'mem1',
@@ -672,8 +674,8 @@ void main() {
     expect(await scoped.loadConversation('legacy'), isNull);
   });
 
-  test('migrating a v6 database renames public_thread_id to session_id and '
-      'preserves the mapping', () async {
+  test('migrating a v6 database renames public_thread_id to session_id, '
+      'preserves the mapping, and adds the pending scope index', () async {
     final dir = await Directory.systemTemp.createTemp('migration_v7_test');
     final file = File('${dir.path}/app.db');
     addTearDown(() async {
@@ -765,7 +767,7 @@ void main() {
       ),
     );
     // Force the lazy-open so the setup callback (table creation + seed insert)
-    // actually runs before the file is closed and reopened at v7.
+    // actually runs before the file is closed and reopened at v9.
     await v6.customSelect('SELECT 1').get();
     await v6.close();
 
@@ -788,9 +790,17 @@ void main() {
     expect(mapping, hasLength(1));
     expect(mapping.single.read<String>('session_id'), 'sess-123');
 
-    // (c) PRAGMA user_version reaches 7.
+    // (c) PRAGMA user_version reaches 9.
     final version = await upgraded.customSelect('PRAGMA user_version').get();
-    expect(version.single.read<int>('user_version'), 7);
+    expect(version.single.read<int>('user_version'), 9);
+
+    final pendingScopeIndex = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master "
+          "WHERE type = 'index' AND name = 'managed_pending_turns_scope_key_idx'",
+        )
+        .get();
+    expect(pendingScopeIndex, hasLength(1));
 
     // A fresh onCreate schema uses session_id and never emits the legacy name.
     final fresh = AppDatabase(NativeDatabase.memory());
@@ -802,5 +812,302 @@ void main() {
     final freshNames = freshColumns.map((r) => r.read<String>('name')).toSet();
     expect(freshNames, contains('session_id'));
     expect(freshNames, isNot(contains('public_thread_id')));
+  });
+
+  test('v9 migration selectively scopes files, deletes all memories, and rebuilds FTS', () async {
+    final dir = await Directory.systemTemp.createTemp('migration_v9_test');
+    final file = File('${dir.path}/app.db');
+    addTearDown(() async {
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    });
+
+    final v8 = AppDatabase(
+      NativeDatabase(
+        file,
+        setup: (raw) {
+          raw.execute(
+            'CREATE TABLE conversations ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'title TEXT NOT NULL DEFAULT \'\', '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'message_count INTEGER NOT NULL DEFAULT 0, '
+            'scope_key TEXT, '
+            'session_id TEXT)',
+          );
+          raw.execute(
+            'CREATE TABLE messages ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT NOT NULL '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'role TEXT NOT NULL, '
+            'content TEXT NOT NULL DEFAULT \'\', '
+            'tool_calls TEXT, '
+            'tool_call_id TEXT, '
+            'created_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE INDEX messages_conversation_id_idx '
+            'ON messages (conversation_id)',
+          );
+          raw.execute(
+            'CREATE TABLE files ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'conversation_id TEXT '
+            'REFERENCES conversations (id) ON DELETE CASCADE, '
+            'server_file_id TEXT NOT NULL, '
+            'local_path TEXT NOT NULL, '
+            'filename TEXT NOT NULL, '
+            'size_bytes INTEGER NOT NULL, '
+            'mime_type TEXT NOT NULL, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL, '
+            'description TEXT)',
+          );
+          raw.execute(
+            'CREATE INDEX files_conversation_id_idx ON files (conversation_id)',
+          );
+          raw.execute(
+            'CREATE TABLE memories ('
+            'id TEXT NOT NULL PRIMARY KEY, '
+            'content TEXT NOT NULL, '
+            'source TEXT, '
+            'created_at INTEGER NOT NULL, '
+            'updated_at INTEGER NOT NULL)',
+          );
+          raw.execute(
+            'CREATE INDEX memories_updated_at_idx ON memories (updated_at)',
+          );
+          raw.execute(
+            'CREATE VIRTUAL TABLE memories_fts USING '
+            "fts5(content, content='memories', content_rowid='rowid')",
+          );
+          raw.execute(
+            'CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN '
+            'INSERT INTO memories_fts(rowid, content) '
+            'VALUES (new.rowid, new.content); END;',
+          );
+          raw.execute(
+            'CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN '
+            "INSERT INTO memories_fts(memories_fts, rowid, content) "
+            "VALUES ('delete', old.rowid, old.content); END;",
+          );
+          raw.execute(
+            'CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN '
+            "INSERT INTO memories_fts(memories_fts, rowid, content) "
+            "VALUES ('delete', old.rowid, old.content); "
+            'INSERT INTO memories_fts(rowid, content) '
+            'VALUES (new.rowid, new.content); END;',
+          );
+          raw.execute(
+            'CREATE TABLE managed_pending_turns ('
+            'conversation_id TEXT NOT NULL, '
+            'scope_key TEXT NOT NULL, '
+            'message_id TEXT NOT NULL, '
+            'envelope TEXT NOT NULL, '
+            'reconcile_only INTEGER NOT NULL DEFAULT 0, '
+            'PRIMARY KEY (conversation_id, scope_key))',
+          );
+          raw.execute(
+            'CREATE INDEX managed_pending_turns_scope_key_idx '
+            'ON managed_pending_turns (scope_key)',
+          );
+
+          for (final row in [
+            ('c-scoped', 'scope-a'),
+            ('c-other', 'scope-b'),
+            ('c-null', null),
+          ]) {
+            raw.execute(
+              'INSERT INTO conversations '
+              '(id, title, created_at, updated_at, scope_key, session_id) '
+              'VALUES (?, ?, 0, 0, ?, NULL)',
+              [row.$1, row.$1, row.$2],
+            );
+          }
+          for (final row in [
+            ('keep-a', 'c-scoped'),
+            ('keep-b', 'c-other'),
+            ('drop-null-link', null),
+            ('drop-null-parent', 'c-null'),
+            ('drop-orphan', 'missing-parent'),
+          ]) {
+            raw.execute(
+              'INSERT INTO files '
+              '(id, conversation_id, server_file_id, local_path, filename, '
+              'size_bytes, mime_type, created_at, updated_at, description) '
+              'VALUES (?, ?, ?, ?, ?, 1, ?, 0, 0, ?)',
+              [
+                row.$1,
+                row.$2,
+                row.$1,
+                '',
+                '${row.$1}.jpg',
+                'image/jpeg',
+                row.$2 == null ? null : 'legacy description',
+              ],
+            );
+          }
+          raw.execute(
+            'INSERT INTO memories (id, content, source, created_at, updated_at) '
+            "VALUES ('legacy-a', 'legacy fox', 'c-scoped', 0, 0)",
+          );
+          raw.execute(
+            'INSERT INTO memories (id, content, source, created_at, updated_at) '
+            "VALUES ('legacy-b', 'legacy dog', 'manual', 0, 0)",
+          );
+          raw.execute('PRAGMA user_version = 8;');
+        },
+      ),
+    );
+    await v8.customSelect('SELECT 1').get();
+    await v8.close();
+
+    final upgraded = AppDatabase(NativeDatabase(file));
+    addTearDown(upgraded.close);
+    await upgraded.customSelect('SELECT 1').get();
+
+    final version = await upgraded.customSelect('PRAGMA user_version').get();
+    expect(version.single.read<int>('user_version'), 9);
+
+    final fileRows = await upgraded
+        .customSelect('SELECT id, scope_key FROM files ORDER BY id')
+        .get();
+    expect(fileRows.map((r) => r.read<String>('id')).toSet(), {
+      'keep-a',
+      'keep-b',
+    });
+    final scopeById = {
+      for (final row in fileRows)
+        row.read<String>('id'): row.read<String>('scope_key'),
+    };
+    expect(scopeById['keep-a'], 'scope-a');
+    expect(scopeById['keep-b'], 'scope-b');
+    expect(
+      (await DriftFileStore(
+        upgraded,
+        scopeKey: 'scope-a',
+      ).getFileById('keep-a')),
+      isNotNull,
+    );
+    expect(
+      (await DriftFileStore(
+        upgraded,
+        scopeKey: 'scope-b',
+      ).getFileById('keep-b')),
+      isNotNull,
+    );
+    expect(
+      await DriftFileStore(upgraded, scopeKey: 'scope-a').getFileById('keep-b'),
+      isNull,
+    );
+
+    final filesInfo = await upgraded
+        .customSelect('PRAGMA table_info(files)')
+        .get();
+    final filePk = <String, int>{
+      for (final row in filesInfo)
+        if (row.read<int>('pk') > 0)
+          row.read<String>('name'): row.read<int>('pk'),
+    };
+    expect(filePk, {'scope_key': 1, 'id': 2});
+    final memoriesInfo = await upgraded
+        .customSelect('PRAGMA table_info(memories)')
+        .get();
+    final memoryPk = <String, int>{
+      for (final row in memoriesInfo)
+        if (row.read<int>('pk') > 0)
+          row.read<String>('name'): row.read<int>('pk'),
+    };
+    expect(memoryPk, {'scope_key': 1, 'id': 2});
+    expect(
+      filesInfo
+          .singleWhere((r) => r.read<String>('name') == 'scope_key')
+          .read<int>('notnull'),
+      1,
+    );
+    expect(
+      memoriesInfo
+          .singleWhere((r) => r.read<String>('name') == 'scope_key')
+          .read<int>('notnull'),
+      1,
+    );
+
+    final indexes = await upgraded
+        .customSelect(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN "
+          "('files_scope_key_conversation_id_idx', "
+          "'memories_scope_key_updated_at_idx') ORDER BY name",
+        )
+        .get();
+    expect(indexes.map((r) => r.read<String>('name')), [
+      'files_scope_key_conversation_id_idx',
+      'memories_scope_key_updated_at_idx',
+    ]);
+    final fileIndexColumns = await upgraded
+        .customSelect(
+          "PRAGMA index_info('files_scope_key_conversation_id_idx')",
+        )
+        .get();
+    expect(fileIndexColumns.map((r) => r.read<String>('name')), [
+      'scope_key',
+      'conversation_id',
+    ]);
+    final memoryIndexColumns = await upgraded
+        .customSelect("PRAGMA index_info('memories_scope_key_updated_at_idx')")
+        .get();
+    expect(memoryIndexColumns.map((r) => r.read<String>('name')), [
+      'scope_key',
+      'updated_at',
+    ]);
+
+    // F8 LEGACY POLICY — INTENTIONALLY DESTRUCTIVE: memory.source is free-form
+    // provenance, not a conversation link. Every legacy memory is deleted even
+    // when its source happens to name a scoped conversation. FTS is recreated
+    // empty so deleted content cannot survive in the external-content index.
+    final legacyMemories = await upgraded.select(upgraded.memories).get();
+    expect(legacyMemories, isEmpty);
+    final staleFts = await upgraded
+        .customSelect(
+          'SELECT count(*) AS hits FROM memories_fts '
+          "WHERE memories_fts MATCH 'fox OR dog'",
+        )
+        .get();
+    expect(staleFts.single.read<int>('hits'), 0);
+
+    final storeA = DriftMemoryStore(upgraded, scopeKey: 'scope-a');
+    final storeB = DriftMemoryStore(upgraded, scopeKey: 'scope-b');
+    await storeA.saveMemory(
+      Memory(
+        id: 'same-id',
+        content: 'fresh account A fox',
+        createdAt: DateTime(2024),
+        updatedAt: DateTime(2024),
+      ),
+    );
+    await storeB.saveMemory(
+      Memory(
+        id: 'same-id',
+        content: 'fresh account B fox',
+        createdAt: DateTime(2024),
+        updatedAt: DateTime(2024),
+      ),
+    );
+    expect(
+      (await storeA.searchMemories('fox')).single.content,
+      'fresh account A fox',
+    );
+    expect(
+      (await storeB.searchMemories('fox')).single.content,
+      'fresh account B fox',
+    );
+    await storeA.deleteAllMemoriesForScope('scope-a');
+    expect(await storeA.searchMemories('fox'), isEmpty);
+    expect(
+      (await storeB.searchMemories('fox')).single.content,
+      'fresh account B fox',
+    );
   });
 }

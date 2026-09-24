@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { requireApiKey, unauthorized } from "../inference.ts";
+import { keyGateResponse, requireApiKey } from "../api_key.ts";
+import type { KeyAuth } from "../api_key.ts";
 import { createTokenBucketLimiter } from "../rate_limit.ts";
 import { PluginRegistryError } from "./registry.ts";
 import type { PluginRegistry } from "./registry.ts";
@@ -15,8 +16,10 @@ import { PluginSchemaError } from "./types.ts";
  * takes the dependencies explicitly so tests pass a real `PluginStore`/
  * `PluginRegistry` over temp fixtures (no network, no DB) instead of booting
  * the server. The `verifyKey` seam swaps the real `requireApiKey` (which
- * verifies against better-auth's DB) for a deterministic stub in tests that
- * returns an owner id — or `null` to exercise the 401 path without ever
+ * verifies against better-auth's DB and applies the C2 email-verification
+ * backstop) for a deterministic stub in tests that returns a `KeyAuth` —
+ * `{ ok: false, reason: "bad_key" }` exercises the 401 path and
+ * `{ ok: false, reason: "email_not_verified" }` the 403 path without ever
  * touching auth. The `limiter` seam swaps the default token bucket for a
  * deterministic stub in tests.
  *
@@ -69,8 +72,10 @@ import { PluginSchemaError } from "./types.ts";
  *   installed ids and cannot signal "already there" on its own.
  */
 
-/** Shape of `requireApiKey`: returns the owned user id or null (unauthenticated). */
-export type VerifyApiKeyFn = (c: Context) => Promise<string | null>;
+/** Shape of `requireApiKey`: tri-state key verification — owner (`ok:true`),
+ *  `bad_key`, or `email_not_verified` (C2 backstop); gate via
+ *  `keyGateResponse`. */
+export type VerifyApiKeyFn = (c: Context) => Promise<KeyAuth>;
 
 /** Per-owner token-bucket gate for the plugin-management endpoints. */
 export type RateLimiterFn = (key: string) => boolean;
@@ -79,7 +84,7 @@ export type PluginRoutesOptions = {
   registry: PluginRegistry;
   /** Backing store; install/uninstall operate on it. Must be loaded first. */
   store: PluginStore;
-  /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
   verifyKey?: VerifyApiKeyFn;
   /** Test seam; defaults to a real token bucket (30 req/min, burst 10). */
   limiter?: RateLimiterFn;
@@ -97,24 +102,24 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
   // Public marketplace list. Auth-gated: the CLI/UI client needs a valid key
   // to see the catalog. Never leaks baseUrl url values (registry redacts).
   routes.get("/plugins", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
     return c.json({ plugins: registry.listAvailablePlugins() });
   });
 
   // Full detail incl. baseUrl urls + inference.endpoint for the config form.
   routes.get("/plugins/:id", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
     const detail = registry.getPluginDetails(c.req.param("id"));
     if (!detail) return c.json({ error: "plugin_not_found" }, 404);
     return c.json(detail);
   });
 
   routes.post("/plugins/reload", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
-    if (!limiter(owner)) return c.json({ error: "rate_limited" }, 429);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
     try {
       await registry.hotReload();
       return c.json({ status: "ok" });
@@ -126,9 +131,9 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
   // Install an admin-curated manifest. No credentials ride this request; keys
   // are configured client-side per request at call time (credential.ts).
   routes.post("/plugins/:id/install", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
-    if (!limiter(owner)) return c.json({ error: "rate_limited" }, 429);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
     const id = c.req.param("id");
     try {
       if (store.getPlugin(id)) {
@@ -142,9 +147,9 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
   });
 
   routes.post("/plugins/:id/uninstall", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
-    if (!limiter(owner)) return c.json({ error: "rate_limited" }, 429);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    if (!limiter(auth.owner)) return c.json({ error: "rate_limited" }, 429);
     try {
       await store.uninstall(c.req.param("id"));
       return c.json({ status: "ok" });

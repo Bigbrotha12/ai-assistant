@@ -81,6 +81,11 @@ void main() {
     expect(successful!.ownerId, 'actual-user');
     expect(store.stored!.apiKey, 'new-key');
     expect(store.stored!.keyId, 'key-record-id');
+    expect(store.stored!.mintedAt, isNotNull);
+    expect(
+      DateTime.now().difference(store.stored!.mintedAt!),
+      lessThan(const Duration(minutes: 1)),
+    );
     expect(store.stored!.ownerId, 'actual-user');
     expect(store.stored!.backendOrigin, 'https://accounts.example');
     expect(container.read(authCredentialsProvider).value, store.stored);
@@ -116,8 +121,9 @@ void main() {
     expect(store.stored!.apiKey, 'old');
   });
 
-  testWidgets('forgot-password sub-flow sends the reset request and confirms',
-      (tester) async {
+  testWidgets('forgot-password sub-flow sends the reset request and confirms', (
+    tester,
+  ) async {
     final store = FakeAuthCredentialsStore();
     final client = FakeAuthClient();
     final container = ProviderContainer(
@@ -134,9 +140,7 @@ void main() {
       UncontrolledProviderScope(
         container: container,
         child: const MaterialApp(
-          home: Scaffold(
-            body: AuthFlow(onSuccess: _noop),
-          ),
+          home: Scaffold(body: AuthFlow(onSuccess: _noop)),
         ),
       ),
     );
@@ -160,13 +164,15 @@ void main() {
     // Back to sign in keeps the addressed email prefilled.
     await tester.tap(find.byKey(const Key('auth-forgot-back')));
     await tester.pumpAndSettle();
-    final emailField =
-        tester.widget<TextField>(find.byKey(const Key('auth-email')));
+    final emailField = tester.widget<TextField>(
+      find.byKey(const Key('auth-email')),
+    );
     expect(emailField.controller!.text, 'user@example.com');
   });
 
-  testWidgets('a failed reset request shows an error and stays on the form',
-      (tester) async {
+  testWidgets('a failed reset request shows an error and stays on the form', (
+    tester,
+  ) async {
     final store = FakeAuthCredentialsStore();
     final client = FakeAuthClient(
       onRequestPasswordReset: (email) async =>
@@ -186,9 +192,7 @@ void main() {
       UncontrolledProviderScope(
         container: container,
         child: const MaterialApp(
-          home: Scaffold(
-            body: AuthFlow(onSuccess: _noop),
-          ),
+          home: Scaffold(body: AuthFlow(onSuccess: _noop)),
         ),
       ),
     );
@@ -207,63 +211,290 @@ void main() {
     expect(find.byKey(const Key('auth-forgot-submit')), findsOneWidget);
   });
 
-  testWidgets('a duplicate-email sign-up offers Sign in instead and prefills it',
-      (tester) async {
-    final store = FakeAuthCredentialsStore();
-    final client = FakeAuthClient(
-      onSignUp: (name, email, password) async =>
-          throw const AuthEmailTaken('already exists'),
-    );
-    final container = ProviderContainer(
-      overrides: [
-        authCredentialsStoreProvider.overrideWithValue(store),
-        authClientProvider.overrideWithValue(client),
-        authBackendOriginProvider.overrideWithValue('https://example.com'),
-        accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
-      ],
-    );
-    addTearDown(container.dispose);
-    await container.read(authCredentialsProvider.future);
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(
-          home: Scaffold(
-            body: AuthFlow(onSuccess: _noop),
+  testWidgets(
+    'a duplicate-email sign-up offers Sign in instead and prefills it',
+    (tester) async {
+      final store = FakeAuthCredentialsStore();
+      final client = FakeAuthClient(
+        onSignUp: (name, email, password) async =>
+            throw const AuthEmailTaken('already exists'),
+      );
+      final container = ProviderContainer(
+        overrides: [
+          authCredentialsStoreProvider.overrideWithValue(store),
+          authClientProvider.overrideWithValue(client),
+          authBackendOriginProvider.overrideWithValue('https://example.com'),
+          accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
+        ],
+      );
+      addTearDown(container.dispose);
+      await container.read(authCredentialsProvider.future);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(
+            home: Scaffold(body: AuthFlow(onSuccess: _noop)),
           ),
         ),
-      ),
-    );
-    await tester.pumpAndSettle();
+      );
+      await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Create account'));
-    await tester.pumpAndSettle();
-    await tester.enterText(find.byKey(const Key('auth-name')), 'Ada');
-    await tester.enterText(
-      find.byKey(const Key('auth-email')),
-      'user@example.com',
-    );
-    await tester.enterText(
-      find.byKey(const Key('auth-password')),
-      'password1',
-    );
-    await tester.tap(find.byKey(const Key('auth-submit')));
-    await tester.pumpAndSettle();
+      await tester.tap(find.text('Create account'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('auth-name')), 'Ada');
+      await tester.enterText(
+        find.byKey(const Key('auth-email')),
+        'user@example.com',
+      );
+      await tester.enterText(
+        find.byKey(const Key('auth-password')),
+        'password1',
+      );
+      await tester.tap(find.byKey(const Key('auth-submit')));
+      await tester.pumpAndSettle();
 
-    // The duplicate-email error explains itself and offers the escape hatch.
-    expect(
-      find.text('An account already exists for this email'),
-      findsOneWidget,
-    );
-    expect(find.byKey(const Key('auth-signin-instead')), findsOneWidget);
+      // The duplicate-email error explains itself and offers the escape hatch.
+      expect(
+        find.text('An account already exists for this email'),
+        findsOneWidget,
+      );
+      expect(find.byKey(const Key('auth-signin-instead')), findsOneWidget);
 
-    // Switching lands in sign-in mode with the email carried over.
-    await tester.tap(find.byKey(const Key('auth-signin-instead')));
-    await tester.pumpAndSettle();
-    final emailField =
-        tester.widget<TextField>(find.byKey(const Key('auth-email')));
-    expect(emailField.controller!.text, 'user@example.com');
-    expect(find.byKey(const Key('auth-forgot-link')), findsOneWidget);
+      // Switching lands in sign-in mode with the email carried over.
+      await tester.tap(find.byKey(const Key('auth-signin-instead')));
+      await tester.pumpAndSettle();
+      final emailField = tester.widget<TextField>(
+        find.byKey(const Key('auth-email')),
+      );
+      expect(emailField.controller!.text, 'user@example.com');
+      expect(find.byKey(const Key('auth-forgot-link')), findsOneWidget);
+    },
+  );
+
+  group('email verification (C2)', () {
+    /// Mounts [AuthFlow] on a container with the standard fake overrides.
+    Future<void> pumpAuthFlow(
+      WidgetTester tester, {
+      required FakeAuthCredentialsStore store,
+      required FakeAuthClient client,
+      required ValueChanged<AuthSession> onSuccess,
+    }) async {
+      final container = ProviderContainer(
+        overrides: [
+          authCredentialsStoreProvider.overrideWithValue(store),
+          authClientProvider.overrideWithValue(client),
+          authBackendOriginProvider.overrideWithValue('https://example.com'),
+          accountLifecycleProvider.overrideWithValue(AccountLifecycle()),
+        ],
+      );
+      addTearDown(container.dispose);
+      await container.read(authCredentialsProvider.future);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: MaterialApp(
+            home: Scaffold(body: AuthFlow(onSuccess: onSuccess)),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets(
+      'tokenless sign-up shows check-inbox, never mints a key, stores nothing',
+      (tester) async {
+        final store = FakeAuthCredentialsStore();
+        // C2: the server answers token: null (no session). onMintApiKey is
+        // deliberately NOT stubbed — a mint attempt would throw UnimplementedError.
+        final client = FakeAuthClient(
+          onSignUp: (name, email, password) async => AuthSession(
+            token: '',
+            email: email,
+            ownerId: 'owner-1',
+            backendOrigin: 'https://example.com',
+          ),
+        );
+        AuthSession? successful;
+        await pumpAuthFlow(
+          tester,
+          store: store,
+          client: client,
+          onSuccess: (session) => successful = session,
+        );
+
+        await tester.tap(find.text('Create account'));
+        await tester.pumpAndSettle();
+        await tester.enterText(find.byKey(const Key('auth-name')), 'Ada');
+        await tester.enterText(
+          find.byKey(const Key('auth-email')),
+          'user@example.com',
+        );
+        await tester.enterText(
+          find.byKey(const Key('auth-password')),
+          'password1',
+        );
+        await tester.tap(find.byKey(const Key('auth-submit')));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.text('Verify your email — check your inbox'),
+          findsOneWidget,
+        );
+        expect(find.byKey(const Key('auth-verify-email')), findsOneWidget);
+        expect(
+          tester.widget<Text>(find.byKey(const Key('auth-verify-email'))).data,
+          'user@example.com',
+        );
+        // No key mint, no credential write, no success publication.
+        expect(successful, isNull);
+        expect(store.stored, isNull);
+        expect(store.saveCalls, 0);
+      },
+    );
+
+    testWidgets('the check-inbox Resend action posts the verification email', (
+      tester,
+    ) async {
+      final store = FakeAuthCredentialsStore();
+      final client = FakeAuthClient(
+        onSignUp: (name, email, password) async =>
+            AuthSession(token: '', email: email),
+      );
+      await pumpAuthFlow(
+        tester,
+        store: store,
+        client: client,
+        onSuccess: _noop,
+      );
+
+      await tester.tap(find.text('Create account'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('auth-name')), 'Ada');
+      await tester.enterText(
+        find.byKey(const Key('auth-email')),
+        'user@example.com',
+      );
+      await tester.enterText(
+        find.byKey(const Key('auth-password')),
+        'password1',
+      );
+      await tester.tap(find.byKey(const Key('auth-submit')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('auth-resend')), findsOneWidget);
+
+      await tester.tap(find.byKey(const Key('auth-resend')));
+      await tester.pumpAndSettle();
+
+      expect(client.verificationEmailRequests, ['user@example.com']);
+      expect(
+        find.text('Verification email sent again to user@example.com.'),
+        findsOneWidget,
+      );
+
+      // Back to sign in restores the form with the address prefilled.
+      await tester.tap(find.byKey(const Key('auth-verify-back')));
+      await tester.pumpAndSettle();
+      final emailField = tester.widget<TextField>(
+        find.byKey(const Key('auth-email')),
+      );
+      expect(emailField.controller!.text, 'user@example.com');
+      expect(find.byKey(const Key('auth-submit')), findsOneWidget);
+    });
+
+    testWidgets('a rate-limited resend surfaces the retry-after wait', (
+      tester,
+    ) async {
+      final store = FakeAuthCredentialsStore();
+      final client = FakeAuthClient(
+        onSignUp: (name, email, password) async =>
+            AuthSession(token: '', email: email),
+        onSendVerificationEmail: (email) async => throw const AuthRateLimited(
+          'Too many verification emails requested for this address.',
+          statusCode: 429,
+          code: 'RATE_LIMIT_EXCEEDED',
+          retryAfterSeconds: 60,
+        ),
+      );
+      await pumpAuthFlow(
+        tester,
+        store: store,
+        client: client,
+        onSuccess: _noop,
+      );
+
+      await tester.tap(find.text('Create account'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('auth-name')), 'Ada');
+      await tester.enterText(
+        find.byKey(const Key('auth-email')),
+        'user@example.com',
+      );
+      await tester.enterText(
+        find.byKey(const Key('auth-password')),
+        'password1',
+      );
+      await tester.tap(find.byKey(const Key('auth-submit')));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('auth-resend')));
+      await tester.pumpAndSettle();
+
+      expect(client.verificationEmailRequests, ['user@example.com']);
+      expect(
+        find.text('Too many requests — try again in 60 seconds.'),
+        findsOneWidget,
+      );
+      // Still on the check-inbox state, able to retry later.
+      expect(find.byKey(const Key('auth-resend')), findsOneWidget);
+    });
+
+    testWidgets(
+      'sign-in rejected with EMAIL_NOT_VERIFIED routes to check-inbox',
+      (tester) async {
+        final store = FakeAuthCredentialsStore();
+        final client = FakeAuthClient(
+          onSignIn: (email, password) async => throw const AuthEmailNotVerified(
+            'Email not verified',
+            statusCode: 403,
+            code: 'EMAIL_NOT_VERIFIED',
+          ),
+        );
+        AuthSession? successful;
+        await pumpAuthFlow(
+          tester,
+          store: store,
+          client: client,
+          onSuccess: (session) => successful = session,
+        );
+
+        await tester.enterText(
+          find.byKey(const Key('auth-email')),
+          'user@example.com',
+        );
+        await tester.enterText(
+          find.byKey(const Key('auth-password')),
+          'password1',
+        );
+        await tester.tap(find.byKey(const Key('auth-submit')));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.text('Verify your email — check your inbox'),
+          findsOneWidget,
+        );
+        expect(
+          tester.widget<Text>(find.byKey(const Key('auth-verify-email'))).data,
+          'user@example.com',
+        );
+        expect(successful, isNull);
+        expect(store.stored, isNull);
+
+        // Resend is pre-filled with the address the sign-in attempted.
+        await tester.tap(find.byKey(const Key('auth-resend')));
+        await tester.pumpAndSettle();
+        expect(client.verificationEmailRequests, ['user@example.com']);
+      },
+    );
   });
 }
 

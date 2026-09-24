@@ -121,6 +121,17 @@ void main() {
     );
   });
 
+  test('unsupported persisted preferredLanguage loads unchanged '
+      '(fallback is applied where the engine set is known)', () async {
+    await storage.write(key: 'voice_stt_engine', value: 'whisper_tiny');
+    await storage.write(key: 'voice_language', value: 'xx');
+
+    final loaded = await store.load();
+
+    expect(loaded, isNotNull);
+    expect(loaded!.preferredLanguage, 'xx');
+  });
+
   test('visionEnabled key round-trips', () async {
     await store.save(const VoiceSettings(visionEnabled: false));
     final loaded = await store.load();

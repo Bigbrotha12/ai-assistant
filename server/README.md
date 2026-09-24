@@ -69,6 +69,7 @@ the ledger needs migrating.
 | `BUDGET_MAX_CONCURRENT`| no    | `2`                    | Per-user in-flight chat cap (sync streams + background jobs share the pool).     |
 | `BUDGET_QUEUE_MAX`    | no     | `3`                    | Per-user background queue depth before rejection (`503 busy` + `Retry-After`).   |
 | `NODE_ENV`          | no       | `development`          | `production` switches on secure cookies.                                        |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | no | `""` / `587` / `""` / `""` / `""` | Relay for password-reset and email-verification mail. Empty `SMTP_HOST` disables sending and logs the link instead (dev fallback). Deployment points these at the k3s `mail` namespace. |
 
 The server refuses to start on invalid/missing env (fails fast). The `migrate`
 script also reads these via dotenv, so `.env` must exist before migrating.
@@ -80,10 +81,13 @@ Auth (better-auth standard endpoint + shape, all under the gateway base URL):
 | Endpoint                                  | Auth            | Purpose                                        |
 | ----------------------------------------- | --------------- | ---------------------------------------------- |
 | `GET  /api/auth/ok`                       | none            | Health check → `{"status":"ok"}`. |
-| `POST /api/auth/sign-up/email`            | none            | Body `{ name, email, password }`.              |
-| `POST /api/auth/sign-in/email`            | none            | Body `{ email, password }` → response contains **`token`** (session token). |
+| `POST /api/auth/sign-up/email`            | none            | Body `{ name, email, password }`. Fresh signup gets `token: null` and **no session** until the email is verified. |
+| `POST /api/auth/sign-in/email`            | none            | Body `{ email, password }` → response contains **`token`** (session token). Unverified accounts → `403 email_not_verified` (also triggers a verification resend). |
 | `POST /api/auth/sign-out`                 | session         | Revokes current session.                       |
 | `GET  /api/auth/get-session`              | session         | Current session (`Authorization: Bearer <token>` or session cookie). |
+| `POST /api/auth/send-verification-email`  | none + rate     | Resend the verification mail; custom ≥60s per-address limiter fronts it. |
+| `POST /api/auth/delete-user`              | session         | Account deletion (M12); password-confirmed body; cascades apiKeys + notify + ledger rows. |
+| `GET  /verify-email?token=…`              | none            | Hono HTML page that runs better-auth's `GET /api/auth/verify-email` wire route (1h signed JWT; never echoed into the DOM). |
 
 > **Note:** better-auth 1.7's own `/api/auth/ok` returns `{"ok":true}`. This gateway
 > shadows that route with an explicit Hono handler that returns the documented
@@ -106,23 +110,35 @@ plugin registers it server-only, so the app must call `auth.api.verifyApiKey`
 internally (as the inference routes do); an HTTP request to it returns 404.
 The same applies to `delete-all-expired-api-keys`.
 
-Keys are long-lived (1 year expiry), revocable via `api-key/delete`. Creation
+Keys expire after **90 days** by default (`keyExpiration.defaultExpiresIn` is
+in **seconds**: `90*24*60*60`; applies at create — older keys keep their
+original expiry until rotated; the app rotates silently after ~60d with a
+valid session), revocable via `api-key/delete`. Creation
 returns the full key **once** (top-level `key` in the response); the app should
 store it immediately (e.g. `flutter_secure_storage`) — same flow as the
 onboarding plan (§3.3).
+
+Health (unauthenticated — k8s probes cannot auth):
+
+| Endpoint     | Purpose                                                            |
+| ------------ | ------------------------------------------------------------------ |
+| `GET /health` | `200 {"status":"ok",…}` when auth + ledger DB checks pass, else `503 {"status":"degraded"}`; includes `version`, `uptime`, per-check `ok\|error`. Probe spec: `deploy/k8s/health-probes.yaml` (applied by ops, not repo CI). |
 
 Inference (OpenAI-compatible; `Authorization: Bearer <api-key>` — the **API key**,
 not the session token):
 
 | Endpoint                  | Purpose                                                              |
 | ------------------------- | -------------------------------------------------------------------- |
-| `GET  /v1/auth/check`     | API-key validity check (no upstream call). `200 {"status":"ok"}` with a valid key, else `401 {"error":"unauthorized"}`. |
+| `GET  /v1/auth/check`     | API-key validity check (no upstream call). `200 {"status":"ok"}` with a valid key, else `401 {"error":"unauthorized"}` — or `403 email_not_verified` for an unverified owner (probe surfaces "verify your email"). |
 | `POST /v1/chat/completions` | LangGraph agent run streamed as OpenAI-compatible SSE (see `docs/wire-spec.md`). |
 | `GET  /v1/models`         | Lists installed MODEL plugins (id + capability flags incl. `visionCapable`); never leaks provider endpoints. |
+| `GET  /v1/agents`         | Redacted agent-template summaries (no systemPrompt/skill content/mcp url). |
+| `GET  /v1/skills`         | Redacted skill catalog (`id`, `title` only — content never serialized). |
+| `GET  /v1/mcps`           | Redacted MCP catalog (`name` only — url/headers never serialized).    |
 
 Invalid or missing key → `401 {"error":"unauthorized"}`. Upstream unreachable →
 `502 {"error":"inference_unavailable"}`. `POST /v1/chat/completions` is
-rate-limited per API key with an in-memory token bucket
+rate-limited per owner with an in-memory token bucket
 (`INFERENCE_RATE_LIMIT` sustained requests/minute, `INFERENCE_RATE_BURST`
 burst ceiling); exceeding it → `429 {"error":"rate_limited"}`. No CORS headers
 are set (this is a desktop/mobile client, not a browser).
@@ -180,8 +196,8 @@ the auth admin surface (user/session/apikey).
 - **Owner binding**: `createTask` sets `owner` (the API-key user id, via
   `requireApiKey`); `appendStep`/`heartbeat`/`resumeTask` re-validate ownership
   and reject non-owners (`FORBIDDEN`).
-- `intentKey` is stored raw with **no unique constraint** — canonicalization
-  and the unique constraint land in Phase 6 (M12).
+- `intentKey` is stored raw with a **`(owner, intent_key)` unique constraint**
+  (migration v4, with dedupe + golden tests); canonicalization was dropped.
 
 Endpoints (all require `Authorization: Bearer <api-key>`; owner is the key's
 user id):
@@ -301,7 +317,8 @@ client no longer routes through `thread_id`.
   dedupe handles that.
 - **API keys**: the `@better-auth/api-key` plugin (separate package since better-auth
   1.7). The gateway configures `defaultPrefix: "sk"`, `defaultKeyLength: 32`,
-  `keyExpiration.defaultExpiresIn` (1 year, in **milliseconds**), and
+  `keyExpiration.defaultExpiresIn` (`90*24*60*60` — **90 days, in seconds**;
+  better-auth's unit for this option is seconds, not milliseconds), and
   `rateLimit: { enabled: false }` — the plugin's default per-key cap (10
   verifications/24h) is disabled so the gateway's own per-user inference limiter
   (`INFERENCE_RATE_LIMIT`/`INFERENCE_RATE_BURST`) is the effective throttle.

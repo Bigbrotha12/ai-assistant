@@ -58,7 +58,8 @@ import { createBudgetManager } from "../../src/middleware/budget.ts";
 import type { BudgetManager } from "../../src/middleware/budget.ts";
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolResultCache } from "../../src/middleware/cache.ts";
-import { redactForCheckpoint } from "../../src/checkpoints/store.ts";
+import { clearDeleting, markDeleting } from "../../src/account_deletion.ts";
+import { redactForOutbound } from "../../src/redact.ts";
 import { createWarmupManager } from "../../src/middleware/warmup.ts";
 import type { WarmupManager } from "../../src/middleware/warmup.ts";
 
@@ -296,7 +297,7 @@ async function makeApp(
     createChatRoutes({
       registry,
       pluginStore: store,
-      verifyKey: opts.verifyKey ?? (async () => "test-user"),
+      verifyKey: opts.verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
       limiter: opts.limiter ?? (() => true),
       rateLimiter: opts.rateLimiter,
       budget: opts.budget,
@@ -395,10 +396,45 @@ function contentsOf(messages: BaseMessage[]): string[] {
 
 describe("POST /v1/chat/completions — pre-stream errors (§5.1)", () => {
   test("401 { error: unauthorized } without a gateway key", async (t) => {
-    const { app } = await makeApp(t, { verifyKey: async () => null });
+    const { app } = await makeApp(t, { verifyKey: async () => ({ ok: false as const, reason: "bad_key" as const }) });
     const res = await postChat(app, chatBody());
     assert.equal(res.status, 401);
     assert.deepEqual(await res.json(), { error: "unauthorized" });
+  });
+
+  test("403 { error: email_not_verified } when the owner's email is unverified", async (t) => {
+    const { app } = await makeApp(t, {
+      verifyKey: async () => ({ ok: false as const, reason: "email_not_verified" as const }),
+    });
+    const res = await postChat(app, chatBody());
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "email_not_verified" });
+  });
+
+  test("sync chat rechecks a tombstone after authentication before model work", async (t) => {
+    const owner = "sync-deleted-owner";
+    let modelCalls = 0;
+    const { app } = await makeApp(t, {
+      verifyKey: async () => ({ ok: true as const, owner }),
+      rateLimiter: {
+        check() {
+          markDeleting(owner);
+          return { allowed: true, retryAfterSeconds: 0 };
+        },
+      },
+      buildModel: (() => {
+        modelCalls += 1;
+        throw new Error("model must not be built");
+      }) as typeof buildModel,
+    });
+    try {
+      const res = await postChat(app, chatBody());
+      assert.equal(res.status, 403);
+      assert.deepEqual(await res.json(), { error: "account_deleted" });
+      assert.equal(modelCalls, 0);
+    } finally {
+      clearDeleting(owner);
+    }
   });
 
   test("429 { error: rate_limited } when the limiter rejects", async (t) => {
@@ -743,6 +779,51 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       (e: unknown) => (e as { code?: string }).code === "pin_not_found",
       "a rejected admission must not leave a model pin behind",
     );
+  });
+
+  test("a tombstone recheck before background admission rejects and releases every pin", async (t) => {
+    const owner = "background-deleted-owner";
+    class MarkingPinStore extends CredentialPinStore {
+      private first = true;
+      override pin(pluginOwner: string, pluginId: string, credentials: Record<string, string>) {
+        const pin = super.pin(pluginOwner, pluginId, credentials);
+        if (this.first) {
+          this.first = false;
+          markDeleting(pluginOwner);
+        }
+        return pin;
+      }
+    }
+    const pins = new MarkingPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([]);
+    const { app } = await makeApp(t, {
+      pins,
+      ledger,
+      jobRunner: fake as unknown as JobRunner,
+      verifyKey: async () => ({ ok: true as const, owner }),
+    });
+    try {
+      const res = await postChat(
+        app,
+        chatBody({
+          background: true,
+          messageId: "deleted-before-admission",
+          credentials: {
+            openrouter: { apiKey: "model-key" },
+            vikunja: { apiKey: "tool-key" },
+          },
+        }),
+      );
+      assert.equal(res.status, 403);
+      assert.deepEqual(await res.json(), { error: "account_deleted" });
+      assert.equal(fake.calls.length, 0);
+      assert.equal(ledger.getTaskByIntentKey(owner, "deleted-before-admission"), null);
+      assert.throws(() => pins.get(owner, "vikunja"));
+      assert.throws(() => pins.get(owner, "openrouter"));
+    } finally {
+      clearDeleting(owner);
+    }
   });
 
   test("runJob failed: JobErrorCode -> HTTP mapping", async (t) => {
@@ -1581,8 +1662,10 @@ describe("Phase 4, Wave A — middleware gates (rate limiter + budget)", () => {
       let ownerN = 0;
       // Returns "user-a" for the first TWO calls (requests 1 + 2 by the same
       // owner), then "user-b" for request 3 (a different owner, unaffected).
-      const verifyKey: VerifyApiKeyFn = async () =>
-        ownerN++ < 2 ? "user-a" : "user-b";
+      const verifyKey: VerifyApiKeyFn = async () => ({
+        ok: true,
+        owner: ownerN++ < 2 ? "user-a" : "user-b",
+      });
       const rateLimiter = createPerOwnerRateLimiter({
         ratePerMinute: 1,
         burst: 1,
@@ -1841,7 +1924,7 @@ describe("Phase 4, Wave B — sync path tool-result cache", () => {
           return JSON.stringify({
             ok: true,
             seq: handlerCalls,
-            token: "Bearer sk-secret123",
+            token: "Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345",
           });
         },
       },
@@ -1874,8 +1957,8 @@ describe("Phase 4, Wave B — sync path tool-result cache", () => {
     // Each request produces two model turns; the SECOND turn of each carries
     // the tool's ToolMessage. Both must hold the same REDACTED payload even
     // though only the first request executed the backend.
-    const redacted = redactForCheckpoint(
-      JSON.stringify({ ok: true, seq: 1, token: "Bearer sk-secret123" }),
+    const redacted = redactForOutbound(
+      JSON.stringify({ ok: true, seq: 1, token: "Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345" }),
     );
     assert.equal(recorded.length, 4, "two requests x two turns each");
     for (const turn of [recorded[1]!, recorded[3]!]) {
@@ -1883,7 +1966,10 @@ describe("Phase 4, Wave B — sync path tool-result cache", () => {
       assert.equal(toolMessages.length, 1, "the model saw exactly one ToolMessage");
       const content = String(toolMessages[0]!.content);
       assert.equal(content, redacted, "the served result is identical and redacted");
-      assert.ok(!content.includes("sk-secret123"), "no raw credential-shaped value leaks");
+      assert.ok(
+        !content.includes("skAbCdEfGhIjKlMnOpQrStUvWxYz012345"),
+        "no raw credential-shaped value leaks",
+      );
     }
   });
 

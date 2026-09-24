@@ -6,8 +6,13 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/chat_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
+import 'package:ai_assistant/features/attachments/data/file_model.dart';
+import 'package:ai_assistant/features/attachments/data/file_store.dart';
+import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
+import 'package:ai_assistant/features/memory/data/memory_model.dart';
+import 'package:ai_assistant/features/memory/data/memory_store.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_catalog_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
@@ -49,7 +54,10 @@ class _GatedAuthCredentialsStore implements AuthCredentialsStore {
   }
 }
 
-ProviderContainer _container(AppDatabase db, {required AuthCredentialsStore authStore}) {
+ProviderContainer _container(
+  AppDatabase db, {
+  required AuthCredentialsStore authStore,
+}) {
   final container = ProviderContainer(
     overrides: [
       authCredentialsStoreProvider.overrideWithValue(authStore),
@@ -97,61 +105,92 @@ void main() {
     addTearDown(() => db.close());
   });
 
-  test(
-    'while access is loading, chatStoreProvider gates to an empty sentinel '
-    'store instead of throwing PluginReauthenticationRequired',
-    () async {
-      final gate = Completer<void>();
-      final container = _container(
-        db,
-        authStore: _GatedAuthCredentialsStore(_credentials('a'), gate),
-      );
+  test('while access is loading, chatStoreProvider gates to an empty sentinel '
+      'store instead of throwing PluginReauthenticationRequired', () async {
+    final gate = Completer<void>();
+    final accountScope = AuthAccountScope.fromIdentity(
+      backendOrigin: 'http://example.com:17600',
+      ownerId: 'a',
+    )!;
+    await DriftFileStore(db, scopeKey: accountScope.storageId).saveFile(
+      const FileInfo(
+        id: 'private-file',
+        filename: 'private.jpg',
+        sizeBytes: 1,
+        mimeType: 'image/jpeg',
+      ),
+    );
+    await DriftMemoryStore(db, scopeKey: accountScope.storageId).saveMemory(
+      Memory(
+        id: 'private-memory',
+        content: 'private memory',
+        createdAt: DateTime(2024),
+        updatedAt: DateTime(2024),
+      ),
+    );
+    final container = _container(
+      db,
+      authStore: _GatedAuthCredentialsStore(_credentials('a'), gate),
+    );
 
-      // Reading the store must not forward the scope provider's re-auth
-      // throw into the history graph.
-      final store = container.read(chatStoreProvider);
-      expect(store, isA<DriftChatStore>());
-      expect((store as DriftChatStore).scopeKey, pendingScopeKey);
-      expect(container.read(pluginAccessProvider), PluginAccess.loading);
-      // Nothing was ready yet, so the one-shot cleanup has not run.
-      expect(container.exists(nullScopeCleanupProvider), isFalse);
+    // Reading the store must not forward the scope provider's re-auth
+    // throw into the history graph.
+    final store = container.read(chatStoreProvider);
+    expect(store, isA<DriftChatStore>());
+    expect((store as DriftChatStore).scopeKey, pendingScopeKey);
+    final files = container.read(filesStoreProvider) as DriftFileStore;
+    final memories = container.read(memoryStoreProvider) as DriftMemoryStore;
+    final cache = container.read(fileCacheProvider);
+    expect(files.scopeKey, pendingScopeKey);
+    expect(memories.scopeKey, pendingScopeKey);
+    expect(cache.scopeKey, pendingScopeKey);
+    expect(await files.listAllFiles(), isEmpty);
+    expect(await memories.countMemories(), 0);
+    expect(container.read(pluginAccessProvider), PluginAccess.loading);
+    // Nothing was ready yet, so the one-shot cleanup has not run.
+    expect(container.exists(nullScopeCleanupProvider), isFalse);
 
-      // History resolves to an empty list — no error surface at all.
-      final sub = container.listen(conversationsProvider, (_, _) {});
-      addTearDown(sub.close);
-      await container.read(conversationsProvider.future);
-      final rows = container.read(conversationsProvider);
-      expect(rows.hasError, isFalse);
-      expect(rows.value, isEmpty);
-    },
-  );
+    // History resolves to an empty list — no error surface at all.
+    final sub = container.listen(conversationsProvider, (_, _) {});
+    addTearDown(sub.close);
+    await container.read(conversationsProvider.future);
+    final rows = container.read(conversationsProvider);
+    expect(rows.hasError, isFalse);
+    expect(rows.value, isEmpty);
+  });
 
-  test(
-    'when access flips to ready, chatStoreProvider rebuilds into the store '
-    'scoped to scope.storageId and kicks the one-shot cleanup',
-    () async {
-      final gate = Completer<void>();
-      final container = _container(
-        db,
-        authStore: _GatedAuthCredentialsStore(_credentials('a'), gate),
-      );
+  test('when access flips to ready, chatStoreProvider rebuilds into the store '
+      'scoped to scope.storageId and kicks the one-shot cleanup', () async {
+    final gate = Completer<void>();
+    final container = _container(
+      db,
+      authStore: _GatedAuthCredentialsStore(_credentials('a'), gate),
+    );
 
-      final gated = container.read(chatStoreProvider) as DriftChatStore;
-      expect(gated.scopeKey, pendingScopeKey);
-      expect(container.exists(nullScopeCleanupProvider), isFalse);
+    final gated = container.read(chatStoreProvider) as DriftChatStore;
+    expect(gated.scopeKey, pendingScopeKey);
+    expect(container.exists(nullScopeCleanupProvider), isFalse);
 
-      gate.complete();
-      await container.read(authCredentialsProvider.future);
-      await container.read(settingsProvider.future);
+    gate.complete();
+    await container.read(authCredentialsProvider.future);
+    await container.read(settingsProvider.future);
 
-      expect(container.read(pluginAccessProvider), PluginAccess.ready);
-      final scope = container.read(pluginAccountScopeProvider);
-      final ready = container.read(chatStoreProvider) as DriftChatStore;
-      expect(ready.scopeKey, scope.storageId);
-      // The first ready build kicked the one-shot cleanup.
-      expect(container.exists(nullScopeCleanupProvider), isTrue);
-    },
-  );
+    expect(container.read(pluginAccessProvider), PluginAccess.ready);
+    final scope = container.read(pluginAccountScopeProvider);
+    final ready = container.read(chatStoreProvider) as DriftChatStore;
+    expect(ready.scopeKey, scope.storageId);
+    expect(
+      (container.read(filesStoreProvider) as DriftFileStore).scopeKey,
+      scope.storageId,
+    );
+    expect(
+      (container.read(memoryStoreProvider) as DriftMemoryStore).scopeKey,
+      scope.storageId,
+    );
+    expect(container.read(fileCacheProvider).scopeKey, scope.storageId);
+    // The first ready build kicked the one-shot cleanup.
+    expect(container.exists(nullScopeCleanupProvider), isTrue);
+  });
 
   test(
     'one-shot cleanup deletes null-scope legacy rows once, keeps scoped rows, '
@@ -189,11 +228,9 @@ void main() {
       container.invalidate(chatStoreProvider);
       container.read(chatStoreProvider);
       await Future<void>.delayed(Duration.zero);
-      final late =
-          await (db.select(db.conversations)..where(
-                (t) => t.id.equals('late-null'),
-              ))
-              .get();
+      final late = await (db.select(
+        db.conversations,
+      )..where((t) => t.id.equals('late-null'))).get();
       expect(late, hasLength(1));
 
       // The named cleanup path stays idempotent when invoked again directly.
@@ -204,25 +241,20 @@ void main() {
     },
   );
 
-  test(
-    'a fresh save through the account-scoped store stamps '
-    'scope_key = storageId (no new null-scope rows)',
-    () async {
-      final container = await _readyContainer(db);
-      final store = container.read(chatStoreProvider);
-      final scope = container.read(pluginAccountScopeProvider);
+  test('a fresh save through the account-scoped store stamps '
+      'scope_key = storageId (no new null-scope rows)', () async {
+    final container = await _readyContainer(db);
+    final store = container.read(chatStoreProvider);
+    final scope = container.read(pluginAccountScopeProvider);
 
-      await store.saveConversation(
-        _conversation('fresh', messages: [_message('m1', 'hello')]),
-      );
+    await store.saveConversation(
+      _conversation('fresh', messages: [_message('m1', 'hello')]),
+    );
 
-      final row =
-          await (db.select(db.conversations)..where(
-                (t) => t.id.equals('fresh'),
-              ))
-              .getSingle();
-      expect(row.scopeKey, isNotNull);
-      expect(row.scopeKey, scope.storageId);
-    },
-  );
+    final row = await (db.select(
+      db.conversations,
+    )..where((t) => t.id.equals('fresh'))).getSingle();
+    expect(row.scopeKey, isNotNull);
+    expect(row.scopeKey, scope.storageId);
+  });
 }

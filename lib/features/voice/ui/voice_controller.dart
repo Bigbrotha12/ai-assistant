@@ -209,8 +209,19 @@ final class VoiceController {
   late final StreamSubscription<bool> _isPlayingSubscription;
   StreamSubscription<Object>? _playbackErrorSubscription;
 
-  /// Accumulates PCM audio chunks for on-device STT when [sttEngine] is set.
+  /// Accumulates PCM audio samples for on-device STT when [sttEngine] is set.
+  /// Bounded by [micBufferCapSamples]: when an append would exceed the cap the
+  /// oldest samples are dropped (keep-tail — see [_onMicAudio]).
   final List<int> _micAudioBuffer = [];
+
+  /// Upper bound on [_micAudioBuffer]: 3 minutes @ 16 kHz mono —
+  /// 16,000 samples/s × 180 s = 2,880,000 samples. The 16-bitness of PCM is
+  /// irrelevant to a sample count. Bounds a rambling hold-to-talk so the buffer
+  /// can never grow without limit (OOM).
+  /// On overflow the HEAD (oldest samples) is dropped and the tail kept:
+  /// Whisper transcribes the end of an utterance best, where the actual
+  /// request usually is.
+  static const int micBufferCapSamples = 16000 * 180; // 2,880,000 samples
 
   /// Serialisation tail: turns (STT → LLM → TTS) run one at a time so a VAD
   /// flush racing the release-flush can never interleave two chat streams or
@@ -365,7 +376,7 @@ final class VoiceController {
     } catch (_) {
       // Best-effort stop.
     }
-    _micAudioBuffer.clear();
+    _clearMicBuffer();
     // Drop per-turn fields so a later restarted session cannot re-emit the
     // previous session's utterance/reply as phantom bubbles.
     clearTurnFields();
@@ -468,7 +479,7 @@ final class VoiceController {
     try {
       // Stale audio (e.g. a released hold before speech) must never leak
       // into the next utterance's transcription.
-      _micAudioBuffer.clear();
+      _clearMicBuffer();
       // 16 kHz mono matches the buffer format for the on-device STT engine.
       await micCapture.start(sampleRate: kPlaybackSampleRate);
       _update(_state.copyWith(isRecording: true, error: null));
@@ -507,7 +518,7 @@ final class VoiceController {
   Future<void> flushTranscriptionBuffer() async {
     final engine = sttEngine;
     final buffer = List<int>.from(_micAudioBuffer);
-    _micAudioBuffer.clear();
+    _clearMicBuffer();
 
     if (kDebugMode) {
       debugPrint(
@@ -1357,7 +1368,7 @@ final class VoiceController {
     _echoGateUntil = DateTime.now().add(_echoGateDuration);
     // Stale audio from the interrupted utterance must never leak into the
     // next one's transcription.
-    _micAudioBuffer.clear();
+    _clearMicBuffer();
     _update(_state.copyWith(isAiSpeaking: false, isSpeaking: false, notice: null, status: null));
     try {
       // Bounded: one hung stop must never wedge the mic gates shut for a
@@ -1446,7 +1457,7 @@ final class VoiceController {
     // above (missing its window) — arm it unconditionally.
     _echoGateUntil = DateTime.now().add(_echoGateDuration);
     // Buffered speech spanning the interruption is stale; starting fresh.
-    _micAudioBuffer.clear();
+    _clearMicBuffer();
   }
 
   /// Clears the paused flag once an OS audio interruption ends.
@@ -1489,6 +1500,29 @@ final class VoiceController {
     // Buffer for on-device STT when the engine is configured.
     if (sttEngine != null) {
       _micAudioBuffer.addAll(chunk);
+      if (_micAudioBuffer.length > micBufferCapSamples) {
+        // Keep-tail cap: drop the oldest samples in ONE front slice (a single
+        // O(len) memmove — bounded per call because mic chunks are small),
+        // so the buffer never holds more than [micBufferCapSamples]. Latch the
+        // truncation notice once per buffer generation: later trims of the
+        // same buffer must not re-emit a state change (no per-chunk spam).
+        final excess = _micAudioBuffer.length - micBufferCapSamples;
+        _micAudioBuffer.removeRange(0, excess);
+        if (!_state.micBufferTruncated) {
+          _update(_state.copyWith(micBufferTruncated: true));
+        }
+      }
+    }
+  }
+
+  /// Clears the mic STT buffer and its truncation latch together: every
+  /// clear ends a buffer generation (flush, fresh recording, interruption,
+  /// teardown), so the next utterance starts with neither stale audio nor a
+  /// stale "truncated" notice.
+  void _clearMicBuffer() {
+    _micAudioBuffer.clear();
+    if (_state.micBufferTruncated) {
+      _update(_state.copyWith(micBufferTruncated: false));
     }
   }
 

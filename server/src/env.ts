@@ -105,10 +105,10 @@ export const envSchema = z.object({
       );
       return NOTIFY_STORE_DEV_DEFAULT_KEY;
     }),
-  // SMTP settings for the password-reset email (better-auth
-  // `sendResetPassword`). Empty SMTP_HOST (the default) disables sending and
-  // logs the reset link instead — a development fallback so the forgot-password
-  // flow stays testable without a mail server.
+  // SMTP settings for the password-reset and email-verification emails
+  // (better-auth `sendResetPassword` / `sendVerificationEmail`). Empty
+  // SMTP_HOST (the default) disables sending and logs the link instead — a
+  // development fallback so those flows stay testable without a mail server.
   SMTP_HOST: z.string().default(""),
   SMTP_PORT: z.coerce.number().int().positive().max(65535).default(587),
   SMTP_USER: z.string().default(""),

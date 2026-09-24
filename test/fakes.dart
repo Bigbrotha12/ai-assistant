@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:uuid/uuid.dart';
 
 import 'package:ai_assistant/features/auth/data/auth_client.dart';
@@ -18,6 +19,8 @@ import 'package:ai_assistant/features/attachments/data/file_store.dart';
 import 'package:ai_assistant/features/chat/data/chat_store.dart';
 import 'package:ai_assistant/features/chat/data/context_trimmer.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/memory/data/memory_model.dart';
+import 'package:ai_assistant/features/memory/data/memory_store.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_client.dart';
 import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
 import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
@@ -68,10 +71,12 @@ class FakeSettingsStore implements SettingsStore {
 
 /// Configurable [BackendProbe] that records invocations.
 class FakeProbe implements BackendProbe {
-  FakeProbe({this.status});
+  FakeProbe({this.status, this.failure});
 
   /// The status returned by [probe]; defaults to an empty result.
   final BackendStatus? status;
+
+  Object? failure;
 
   /// Number of times [probe] has been called.
   int calls = 0;
@@ -83,9 +88,12 @@ class FakeProbe implements BackendProbe {
   Future<BackendStatus> probe(BackendSettings settings) async {
     calls++;
     lastSettings = settings;
+    final failure = this.failure;
+    if (failure != null) throw failure;
     return status ?? const BackendStatus(checks: []);
   }
 }
+
 /// In-memory [ChatStore] for notifier tests.
 class FakeChatStore implements ChatStore {
   FakeChatStore({List<Conversation>? initial}) {
@@ -325,8 +333,7 @@ class FakeChatClient {
     List<Map<String, Object?>>? tools,
     bool enableThinking = false,
     CancelToken? cancelToken,
-    void Function(int index, String name, String argsFragment)?
-        onToolCallDelta,
+    void Function(int index, String name, String argsFragment)? onToolCallDelta,
     void Function()? onReceived,
   }) async {
     final wire = messages ?? toApiMessages(history);
@@ -375,6 +382,7 @@ class FakeFilesClient implements FilesClient {
     this.uploadCompleter,
     this.uploadError,
     this.fetchError,
+    this.fetchCompleter,
     this.fetchBytes = const [1, 2, 3],
     this.listError,
     this.deleteError,
@@ -390,8 +398,14 @@ class FakeFilesClient implements FilesClient {
   /// When set, [fetchFile] throws [fetchError].
   Object? fetchError;
 
+  /// When set, [fetchFile] waits on this before returning.
+  Completer<Uint8List>? fetchCompleter;
+
   /// Bytes returned by [fetchFile] unless [fetchError] is set.
   final List<int> fetchBytes;
+
+  /// Cancellation tokens passed to [fetchFile], in order.
+  final List<CancelToken?> fetchTokens = [];
 
   /// When set, every [listFiles] call throws.
   Object? listError;
@@ -411,7 +425,7 @@ class FakeFilesClient implements FilesClient {
 
   /// The arguments of each [uploadFile] call, in order.
   final List<({String path, String filename, int sizeBytes, String mimeType})>
-      uploadCalls = [];
+  uploadCalls = [];
 
   /// The file ids passed to [fetchFile], in order.
   final List<String> fetchedIds = [];
@@ -447,10 +461,13 @@ class FakeFilesClient implements FilesClient {
   }
 
   @override
-  Future<Uint8List> fetchFile(String fileId) async {
+  Future<Uint8List> fetchFile(String fileId, {CancelToken? cancelToken}) async {
     fetchedIds.add(fileId);
+    fetchTokens.add(cancelToken);
     final error = fetchError;
     if (error != null) throw error;
+    final completer = fetchCompleter;
+    if (completer != null) return completer.future;
     return Uint8List.fromList(fetchBytes);
   }
 
@@ -473,6 +490,10 @@ class FakeFilesClient implements FilesClient {
 
 /// In-memory [FileStore] for notifier tests.
 class FakeFileStore implements FileStore {
+  FakeFileStore({this.scopeKey = 'test-scope'});
+
+  final String scopeKey;
+
   /// Every [FileInfo] passed to [saveFile], in order.
   final List<FileInfo> saved = [];
 
@@ -494,11 +515,12 @@ class FakeFileStore implements FileStore {
   Future<FileInfo?> getFileById(String id) async => _files[id];
 
   @override
-  Future<List<FileInfo>> listFilesForConversation(String conversationId) async =>
-      [
-        for (final entry in _links.entries)
-          if (entry.value == conversationId) _files[entry.key]!,
-      ];
+  Future<List<FileInfo>> listFilesForConversation(
+    String conversationId,
+  ) async => [
+    for (final entry in _links.entries)
+      if (entry.value == conversationId) _files[entry.key]!,
+  ];
 
   @override
   Future<List<FileInfo>> listAllFiles() async => _files.values.toList();
@@ -510,8 +532,23 @@ class FakeFileStore implements FileStore {
     _links.remove(id);
   }
 
+  /// When true, the next [deleteAllForScope] throws and leaves rows intact.
+  bool failDeleteAll = false;
+
+  /// Number of [deleteAllForScope] calls.
+  int deleteAllCalls = 0;
+  final List<String> deletedScopes = [];
+
   @override
-  Future<void> deleteAll() async {
+  Future<void> deleteAllForScope(String targetScope) async {
+    if (targetScope != scopeKey) {
+      throw StateError('File store scope mismatch');
+    }
+    if (failDeleteAll) {
+      throw StateError('storage unavailable');
+    }
+    deleteAllCalls++;
+    deletedScopes.add(targetScope);
     _files.clear();
     _links.clear();
     _descriptions.clear();
@@ -562,6 +599,72 @@ class FakeDio {
   }
 }
 
+/// In-memory [MemoryStore] for wipe/lifecycle tests.
+class FakeMemoryStore implements MemoryStore {
+  FakeMemoryStore({List<Memory>? initial, this.scopeKey = 'test-scope'}) {
+    for (final m in initial ?? const <Memory>[]) {
+      _memories[m.id] = m;
+    }
+  }
+
+  final String scopeKey;
+
+  final Map<String, Memory> _memories = {};
+
+  /// Number of [deleteAllMemoriesForScope] calls.
+  int deleteAllCalls = 0;
+  final List<String> deletedScopes = [];
+
+  /// When true, [deleteAllMemoriesForScope] throws.
+  bool failDeleteAll = false;
+
+  @override
+  Future<void> saveMemory(Memory memory) async => _memories[memory.id] = memory;
+
+  @override
+  Future<Memory?> getMemory(String id) async => _memories[id];
+
+  @override
+  Future<List<Memory>> listMemories({int limit = 50}) async {
+    final list = _memories.values.toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return list.take(limit).toList();
+  }
+
+  @override
+  Future<List<Memory>> searchMemories(String query, {int limit = 20}) async {
+    final lower = query.toLowerCase();
+    final matches =
+        _memories.values
+            .where((m) => m.content.toLowerCase().contains(lower))
+            .toList()
+          ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return matches.take(limit).toList();
+  }
+
+  @override
+  Future<void> deleteMemory(String id) async => _memories.remove(id);
+
+  @override
+  Future<void> deleteAllMemoriesForScope(String targetScope) async {
+    if (targetScope != scopeKey) {
+      throw StateError('Memory store scope mismatch');
+    }
+    if (failDeleteAll) {
+      throw StateError('storage unavailable');
+    }
+    deleteAllCalls++;
+    deletedScopes.add(targetScope);
+    _memories.clear();
+  }
+
+  @override
+  Future<int> compact({required Duration olderThan}) async => 0;
+
+  @override
+  Future<int> countMemories() async => _memories.length;
+}
+
 /// In-memory [AuthCredentialsStore] for widget tests.
 class FakeAuthCredentialsStore implements AuthCredentialsStore {
   FakeAuthCredentialsStore({this.stored});
@@ -593,10 +696,97 @@ class FakeAuthCredentialsStore implements AuthCredentialsStore {
   }
 }
 
+class FailureInjectingSecureStorage extends FlutterSecureStorage {
+  FailureInjectingSecureStorage({Map<String, String>? initialValues})
+    : _values = Map<String, String>.from(initialValues ?? const {});
+
+  final Map<String, String> _values;
+  final List<String> operations = [];
+  Completer<void>? gate;
+  String? failReadKey;
+  String? failWriteKey;
+  String? failDeleteKey;
+  bool failNextWrite = false;
+  bool failNextDelete = false;
+
+  Map<String, String> get values => Map.unmodifiable(_values);
+
+  void seed(Map<String, String> values) {
+    _values.addAll(values);
+  }
+
+  void removeValue(String key) {
+    _values.remove(key);
+  }
+
+  @override
+  Future<String?> read({
+    required String key,
+    IOSOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    MacOsOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async {
+    await gate?.future;
+    if (failReadKey == key) {
+      failReadKey = null;
+      throw StateError('storage unavailable');
+    }
+    operations.add('read:$key');
+    return _values[key];
+  }
+
+  @override
+  Future<void> write({
+    required String key,
+    required String? value,
+    IOSOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    MacOsOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async {
+    await gate?.future;
+    if (failNextWrite || failWriteKey == key) {
+      failNextWrite = false;
+      if (failWriteKey == key) failWriteKey = null;
+      throw StateError('storage unavailable');
+    }
+    if (value == null) {
+      _values.remove(key);
+    } else {
+      _values[key] = value;
+    }
+    operations.add('write:$key');
+  }
+
+  @override
+  Future<void> delete({
+    required String key,
+    IOSOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    MacOsOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async {
+    await gate?.future;
+    if (failNextDelete || failDeleteKey == key) {
+      failNextDelete = false;
+      if (failDeleteKey == key) failDeleteKey = null;
+      throw StateError('storage unavailable');
+    }
+    _values.remove(key);
+    operations.add('delete:$key');
+  }
+}
+
 /// In-memory [AppPrefsStore] for widget tests.
 class FakePrefsStore implements AppPrefsStore {
-  FakePrefsStore({AppPrefs? initial})
-      : prefs = initial ?? const AppPrefs();
+  FakePrefsStore({AppPrefs? initial}) : prefs = initial ?? const AppPrefs();
 
   AppPrefs prefs;
 
@@ -623,50 +813,91 @@ class FakeAuthClient implements AuthClient {
     this.onSignIn,
     this.onMintApiKey,
     this.onSignOut,
+    this.onDeleteAccount,
     this.onRevokeApiKey,
+    this.onListApiKeys,
     this.onRequestPasswordReset,
+    this.onSendVerificationEmail,
+    this.onGetSession,
   });
 
-  Future<AuthSession> Function(String name, String email, String password)? onSignUp;
+  Future<AuthSession> Function(String name, String email, String password)?
+  onSignUp;
   Future<AuthSession> Function(String email, String password)? onSignIn;
   Future<MintedApiKey> Function(String sessionToken)? onMintApiKey;
   Future<void> Function(String sessionToken)? onSignOut;
   Future<void> Function(String sessionToken, String keyId)? onRevokeApiKey;
+
+  /// Scripted `api-key/list` result (C3 rotation pass / legacy backfill).
+  /// When null the call still records the token then rejects with
+  /// [UnimplementedError] — the pass treats that like any transport failure
+  /// and aborts silently.
+  Future<List<ApiKeyListEntry>> Function(String sessionToken)? onListApiKeys;
+
   Future<void> Function(String email)? onRequestPasswordReset;
+  Future<void> Function(String email)? onSendVerificationEmail;
+
+  /// Scripted `delete-user` verdict (M12). When null the call still records
+  /// the arguments then succeeds — the wipe path runs either way.
+  Future<void> Function(String sessionToken, String password)? onDeleteAccount;
+
+  /// Scripted `get-session` verdict (H2 startup ping). When null the call is
+  /// still recorded but rejects with [UnimplementedError] — the ping treats
+  /// that like any transport failure and leaves SessionStatus.unknown.
+  Future<CurrentSession?> Function(String sessionToken)? onGetSession;
 
   final List<String> signOutTokens = [];
   final List<(String, String)> revokeCalls = [];
   final List<String> passwordResetRequests = [];
+  final List<String> verificationEmailRequests = [];
+  final List<String> getSessionRequests = [];
+  final List<String> listApiKeysRequests = [];
+  final List<MintedApiKey> mintRequests = [];
+
+  /// Recorded `delete-user` calls: (sessionToken, password).
+  final List<(String, String)> deleteAccountCalls = [];
 
   @override
   Future<AuthSession> signUp({
     required String name,
     required String email,
     required String password,
-  }) =>
-      onSignUp != null
-          ? onSignUp!(name, email, password)
-          : Future.error(UnimplementedError('signUp not stubbed'));
+  }) => onSignUp != null
+      ? onSignUp!(name, email, password)
+      : Future.error(UnimplementedError('signUp not stubbed'));
 
   @override
   Future<AuthSession> signIn({
     required String email,
     required String password,
-  }) =>
-      onSignIn != null
-          ? onSignIn!(email, password)
-          : Future.error(UnimplementedError('signIn not stubbed'));
+  }) => onSignIn != null
+      ? onSignIn!(email, password)
+      : Future.error(UnimplementedError('signIn not stubbed'));
 
   @override
-  Future<MintedApiKey> mintApiKey({required String sessionToken}) =>
-      onMintApiKey != null
-          ? onMintApiKey!(sessionToken)
-          : Future.error(UnimplementedError('mintApiKey not stubbed'));
+  Future<MintedApiKey> mintApiKey({required String sessionToken}) async {
+    final handler = onMintApiKey;
+    if (handler == null) {
+      throw UnimplementedError('mintApiKey not stubbed');
+    }
+    final minted = await handler(sessionToken);
+    mintRequests.add(minted);
+    return minted;
+  }
 
   @override
   Future<void> signOut({required String sessionToken}) async {
     signOutTokens.add(sessionToken);
     await onSignOut?.call(sessionToken);
+  }
+
+  @override
+  Future<void> deleteAccount({
+    required String sessionToken,
+    required String password,
+  }) async {
+    deleteAccountCalls.add((sessionToken, password));
+    await onDeleteAccount?.call(sessionToken, password);
   }
 
   @override
@@ -679,9 +910,37 @@ class FakeAuthClient implements AuthClient {
   }
 
   @override
+  Future<List<ApiKeyListEntry>> listApiKeys({
+    required String sessionToken,
+  }) async {
+    listApiKeysRequests.add(sessionToken);
+    final handler = onListApiKeys;
+    if (handler == null) {
+      throw UnimplementedError('listApiKeys not stubbed');
+    }
+    return handler(sessionToken);
+  }
+
+  @override
   Future<void> requestPasswordReset({required String email}) async {
     passwordResetRequests.add(email);
     await onRequestPasswordReset?.call(email);
+  }
+
+  @override
+  Future<void> sendVerificationEmail({required String email}) async {
+    verificationEmailRequests.add(email);
+    await onSendVerificationEmail?.call(email);
+  }
+
+  @override
+  Future<CurrentSession?> getSession({required String sessionToken}) async {
+    getSessionRequests.add(sessionToken);
+    final handler = onGetSession;
+    if (handler == null) {
+      throw UnimplementedError('getSession not stubbed');
+    }
+    return handler(sessionToken);
   }
 }
 
@@ -734,7 +993,7 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
   /// (trailing optimistic user message excluded), and the user text exactly
   /// as admitted (describe-expanded when vision ran).
   final List<({String conversationId, List<Message> history, String userText})>
-      sends = [];
+  sends = [];
 
   /// Recorded [retryTurn] conversation ids, in order.
   final List<String> retries = [];
@@ -747,7 +1006,7 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
 
   /// Recorded [submitBackground] calls, in order.
   final List<({String conversationId, List<Message> history, String userText})>
-      backgroundSubmits = [];
+  backgroundSubmits = [];
 
   /// Store-row id of the user message the most recent [sendTurn] admitted —
   /// the fake's stand-in for the real service's minted id (P1b). Null when no
@@ -786,11 +1045,15 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
       throw UnimplementedError();
 
   @override
-  LedgerPoller get poller => _poller ??
+  LedgerPoller get poller =>
+      _poller ??
       (throw StateError('inject a LedgerPoller for background tests'));
 
   @override
   void setForeground(bool foreground) => _poller?.setForeground(foreground);
+
+  @override
+  void dispose() {}
 
   @override
   Future<LedgerPollHandle?> rewatchPendingBackground(
@@ -850,13 +1113,15 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
       createdAt: now,
     );
     if (existing == null) {
-      await store.saveConversation(Conversation(
-        id: conversationId,
-        title: userText,
-        messages: [...history, userMessage],
-        createdAt: now,
-        updatedAt: now,
-      ));
+      await store.saveConversation(
+        Conversation(
+          id: conversationId,
+          title: userText,
+          messages: [...history, userMessage],
+          createdAt: now,
+          updatedAt: now,
+        ),
+      );
     } else {
       await store.appendMessage(conversationId, userMessage);
     }
@@ -880,24 +1145,28 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     String messageId,
   ) {
     final handle = _poller!.watch(LedgerLookup.byMessageId(messageId));
-    handle.done.then((result) async {
-      if (result.end != LedgerPollEnd.observed || result.task == null) return;
-      if (result.task!.status == LedgerTaskStatus.succeeded) {
-        final reply = result.task!.reply ?? 'background reply';
-        await store.appendMessage(
-          conversationId,
-          Message(
-            id: _uuid.v4(),
-            role: MessageRole.assistant,
-            content: reply,
-            createdAt: DateTime.now(),
-          ),
-        );
-      }
-      if (result.task!.status.isTerminal) {
-        _pending.remove(conversationId);
-      }
-    }).catchError((Object _) {});
+    handle.done
+        .then((result) async {
+          if (result.end != LedgerPollEnd.observed || result.task == null) {
+            return;
+          }
+          if (result.task!.status == LedgerTaskStatus.succeeded) {
+            final reply = result.task!.reply ?? 'background reply';
+            await store.appendMessage(
+              conversationId,
+              Message(
+                id: _uuid.v4(),
+                role: MessageRole.assistant,
+                content: reply,
+                createdAt: DateTime.now(),
+              ),
+            );
+          }
+          if (result.task!.status.isTerminal) {
+            _pending.remove(conversationId);
+          }
+        })
+        .catchError((Object _) {});
     return handle;
   }
 
@@ -976,10 +1245,7 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     int? generation,
     String? partialText,
   }) async {
-    abandons.add((
-      conversationId: conversationId,
-      partialText: partialText,
-    ));
+    abandons.add((conversationId: conversationId, partialText: partialText));
     final hadPending = _pending.remove(conversationId) != null;
     _turnGen[conversationId] = (_turnGen[conversationId] ?? 0) + 1;
     if (!hadPending) return;
@@ -1027,13 +1293,15 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     if (scripted != null) {
       final now = DateTime.now();
       final existing = await store.loadConversation(conversationId);
-      await store.saveConversation(Conversation(
-        id: conversationId,
-        title: existing?.title ?? 'Conversation',
-        messages: scripted,
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-      ));
+      await store.saveConversation(
+        Conversation(
+          id: conversationId,
+          title: existing?.title ?? 'Conversation',
+          messages: scripted,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        ),
+      );
       return scripted;
     }
     final conversation = await store.loadConversation(conversationId);
@@ -1063,13 +1331,15 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
       if (scripted != null) {
         final now = DateTime.now();
         final existing = await store.loadConversation(conversationId);
-        await store.saveConversation(Conversation(
-          id: conversationId,
-          title: existing?.title ?? 'Conversation',
-          messages: scripted,
-          createdAt: existing?.createdAt ?? now,
-          updatedAt: now,
-        ));
+        await store.saveConversation(
+          Conversation(
+            id: conversationId,
+            title: existing?.title ?? 'Conversation',
+            messages: scripted,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+          ),
+        );
       }
       return ManagedAlreadyCompleted('session-fake', 'resumed', _uuid.v4());
     }
@@ -1108,13 +1378,15 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     if (existing == null) {
       // New conversation: title mirrors the service's `_title` (the user
       // text itself) and the row starts from the full local history.
-      await store.saveConversation(Conversation(
-        id: conversationId,
-        title: userText,
-        messages: [...history, userMessage],
-        createdAt: now,
-        updatedAt: now,
-      ));
+      await store.saveConversation(
+        Conversation(
+          id: conversationId,
+          title: userText,
+          messages: [...history, userMessage],
+          createdAt: now,
+          updatedAt: now,
+        ),
+      );
       admittedId = userMessage.id;
     } else if (!(lastIsSameUser && !historyHasUserText)) {
       await store.appendMessage(conversationId, userMessage);

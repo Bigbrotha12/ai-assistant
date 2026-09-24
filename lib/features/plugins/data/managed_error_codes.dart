@@ -18,6 +18,12 @@ abstract final class ManagedErrorCodes {
   static const cancelled = 'cancelled';
   static const unauthorized = 'unauthorized';
   static const credentialsExpired = 'credentials_expired';
+
+  /// Valid gateway key, but the owning account's email is unverified
+  /// (gateway 403). Distinct from [unauthorized]: the fix is verifying the
+  /// email, not re-authenticating.
+  static const emailNotVerified = 'email_not_verified';
+  static const accountDeleted = 'account_deleted';
   static const noCredentials = 'no_credentials';
   static const noSelectedModel = 'no_selected_model';
   static const noCapableModel = 'no_capable_model';

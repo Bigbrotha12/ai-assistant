@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -6,6 +7,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
+import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/attachments/data/file_cache.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
@@ -27,8 +30,9 @@ class FakeFileCache extends FileCache {
     FileInfo? cached,
     this.fetchCompleter,
     this.cacheExtension,
-  })  : _cached = cached,
-        super(cacheDir: Directory.systemTemp);
+    super.scopeKey = 'test-scope',
+  }) : _cached = cached,
+       super(cacheDir: Directory.systemTemp);
 
   final FileInfo? _cached;
 
@@ -75,6 +79,7 @@ Widget chipApp({
   required FilesClient files,
   required FileCache cache,
   FileStore? fileStore,
+  AccountLifecycle? lifecycle,
   String fileId = 'f1',
   String filename = 'photo.jpg',
   Future<void> Function(String path)? openFile,
@@ -84,6 +89,9 @@ Widget chipApp({
       filesServiceProvider.overrideWithValue(files),
       fileCacheProvider.overrideWithValue(cache),
       filesStoreProvider.overrideWithValue(fileStore ?? FakeFileStore()),
+      accountLifecycleProvider.overrideWithValue(
+        lifecycle ?? AccountLifecycle(),
+      ),
     ],
     child: MaterialApp(
       home: Scaffold(
@@ -97,19 +105,58 @@ Widget chipApp({
   );
 }
 
+class _ImmediateDiskFileCache extends FileCache {
+  _ImmediateDiskFileCache({required super.cacheDir, required super.scopeKey})
+    : _cacheDir = cacheDir;
+
+  final Directory _cacheDir;
+  int cacheFileCalls = 0;
+
+  Directory get _scopeDirectory =>
+      Directory('${_cacheDir.path}/${base64Url.encode(utf8.encode(scopeKey))}');
+
+  @override
+  Future<FileInfo?> getCached(String fileId) async => null;
+
+  @override
+  Future<String> cacheFile(
+    String fileId,
+    String extension,
+    Uint8List data,
+  ) async {
+    cacheFileCalls++;
+    final directory = _scopeDirectory..createSync(recursive: true);
+    final file = File('${directory.path}/$fileId$extension')
+      ..writeAsBytesSync(data, flush: true);
+    return file.path;
+  }
+
+  @override
+  Future<void> evictAllForScope(String targetScope) async {
+    if (targetScope != scopeKey) {
+      throw StateError('File cache scope mismatch');
+    }
+    final directory = _scopeDirectory;
+    if (directory.existsSync()) directory.deleteSync(recursive: true);
+  }
+}
+
 void main() {
-  testWidgets('chip shows downloading then ready when the file is cached',
-      (tester) async {
+  testWidgets('chip shows downloading then ready when the file is cached', (
+    tester,
+  ) async {
     final cacheLookup = Completer<FileInfo?>();
     final cache = FakeFileCache(fetchCompleter: cacheLookup);
     final files = FakeFilesClient();
     final opened = <String>[];
 
-    await tester.pumpWidget(chipApp(
-      files: files,
-      cache: cache,
-      openFile: (path) async => opened.add(path),
-    ));
+    await tester.pumpWidget(
+      chipApp(
+        files: files,
+        cache: cache,
+        openFile: (path) async => opened.add(path),
+      ),
+    );
 
     await tester.tap(find.byType(ActionChip));
     await tester.pump();
@@ -117,13 +164,15 @@ void main() {
 
     // Resolve the cache hit: the chip becomes ready and opens the local file
     // directly, without a network fetch.
-    cacheLookup.complete(const FileInfo(
-      id: 'f1',
-      filename: 'f1.jpg',
-      sizeBytes: 3,
-      mimeType: 'image/jpeg',
-      localPath: '/cache/f1.jpg',
-    ));
+    cacheLookup.complete(
+      const FileInfo(
+        id: 'f1',
+        filename: 'f1.jpg',
+        sizeBytes: 3,
+        mimeType: 'image/jpeg',
+        localPath: '/cache/f1.jpg',
+      ),
+    );
     await tester.pump();
 
     expect(find.byType(CircularProgressIndicator), findsNothing);
@@ -133,18 +182,21 @@ void main() {
     expect(opened, ['/cache/f1.jpg']);
   });
 
-  testWidgets('chip downloads, caches, and shows ready when not cached',
-      (tester) async {
+  testWidgets('chip downloads, caches, and shows ready when not cached', (
+    tester,
+  ) async {
     final cache = FakeFileCache(cacheExtension: '.jpg');
     final files = FakeFilesClient();
     final opened = <String>[];
 
-    await tester.pumpWidget(chipApp(
-      files: files,
-      cache: cache,
-      filename: 'photo.jpg',
-      openFile: (path) async => opened.add(path),
-    ));
+    await tester.pumpWidget(
+      chipApp(
+        files: files,
+        cache: cache,
+        filename: 'photo.jpg',
+        openFile: (path) async => opened.add(path),
+      ),
+    );
 
     await tester.tap(find.byType(ActionChip));
     await tester.pump();
@@ -158,8 +210,9 @@ void main() {
     expect(opened, [cache.lastCachePath]);
   });
 
-  testWidgets('chip shows an error with retry when the download fails',
-      (tester) async {
+  testWidgets('chip shows an error with retry when the download fails', (
+    tester,
+  ) async {
     final cache = FakeFileCache();
     final files = FakeFilesClient(fetchError: StateError('boom'));
 
@@ -184,14 +237,12 @@ void main() {
     expect(files.fetchedIds, ['f1', 'f1']);
   });
 
-  testWidgets('chip reports files service not configured for a NoOp client',
-      (tester) async {
+  testWidgets('chip reports files service not configured for a NoOp client', (
+    tester,
+  ) async {
     final cache = FakeFileCache();
 
-    await tester.pumpWidget(chipApp(
-      files: NoOpFilesClient(),
-      cache: cache,
-    ));
+    await tester.pumpWidget(chipApp(files: NoOpFilesClient(), cache: cache));
 
     await tester.tap(find.byType(ActionChip));
     await tester.pump();
@@ -201,43 +252,96 @@ void main() {
   });
 
   testWidgets(
-      'bot-generated chip derives the real image extension from the file '
-      'store (not octet-stream)', (tester) async {
-    // Bot chips carry only the server file id as the display name (no
-    // extension), so the filename alone would resolve to
-    // application/octet-stream and cache as `.bin` — unopenable on Android /
-    // iOS. The local store knows the real mime from the upload.
-    final cache = FakeFileCache();
-    final fileStore = FakeFileStore();
-    await fileStore.saveFile(
-      const FileInfo(
-        id: 'f1',
-        filename: 'photo.jpg',
-        sizeBytes: 10,
-        mimeType: 'image/jpeg',
+    'bot-generated chip derives the real image extension from the file '
+    'store (not octet-stream)',
+    (tester) async {
+      // Bot chips carry only the server file id as the display name (no
+      // extension), so the filename alone would resolve to
+      // application/octet-stream and cache as `.bin` — unopenable on Android /
+      // iOS. The local store knows the real mime from the upload.
+      final cache = FakeFileCache();
+      final fileStore = FakeFileStore();
+      await fileStore.saveFile(
+        const FileInfo(
+          id: 'f1',
+          filename: 'photo.jpg',
+          sizeBytes: 10,
+          mimeType: 'image/jpeg',
+        ),
+      );
+      final files = FakeFilesClient();
+      final opened = <String>[];
+
+      await tester.pumpWidget(
+        chipApp(
+          files: files,
+          cache: cache,
+          fileStore: fileStore,
+          fileId: 'f1',
+          filename: 'f1',
+          openFile: (path) async => opened.add(path),
+        ),
+      );
+
+      await tester.tap(find.byType(ActionChip));
+      await tester.pump();
+      await tester.pump();
+
+      expect(files.fetchedIds, ['f1']);
+      // Cached with the real image extension, not `.bin`.
+      expect(cache.cacheExtensions, ['.jpg']);
+      expect(cache.lastCachePath, endsWith('f1.jpg'));
+      expect(opened, [cache.lastCachePath]);
+      expect(find.text('f1'), findsOneWidget);
+    },
+  );
+
+  testWidgets('account wipe drains a gated chip download before cache sweep', (
+    tester,
+  ) async {
+    final scope = AuthAccountScope.fromIdentity(
+      backendOrigin: 'http://example.com:17600',
+      ownerId: 'chip-owner',
+    )!;
+    final root = Directory.systemTemp.createTempSync('chip_download_wipe');
+    addTearDown(() => root.delete(recursive: true));
+    final lifecycle = AccountLifecycle();
+    final fetchGate = Completer<Uint8List>();
+    final files = FakeFilesClient(fetchCompleter: fetchGate);
+    final cache = _ImmediateDiskFileCache(
+      cacheDir: root,
+      scopeKey: scope.storageId,
+    );
+
+    await tester.pumpWidget(
+      chipApp(
+        files: files,
+        cache: cache,
+        lifecycle: lifecycle,
+        openFile: (_) async {},
       ),
     );
-    final files = FakeFilesClient();
-    final opened = <String>[];
-
-    await tester.pumpWidget(chipApp(
-      files: files,
-      cache: cache,
-      fileStore: fileStore,
-      fileId: 'f1',
-      filename: 'f1',
-      openFile: (path) async => opened.add(path),
-    ));
-
     await tester.tap(find.byType(ActionChip));
-    await tester.pump();
-    await tester.pump();
-
+    for (var i = 0; i < 5 && files.fetchedIds.isEmpty; i++) {
+      await tester.pump();
+    }
     expect(files.fetchedIds, ['f1']);
-    // Cached with the real image extension, not `.bin`.
-    expect(cache.cacheExtensions, ['.jpg']);
-    expect(cache.lastCachePath, endsWith('f1.jpg'));
-    expect(opened, [cache.lastCachePath]);
-    expect(find.text('f1'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+    final wipe = wipeLocalAccountData(
+      scope: scope,
+      lifecycle: lifecycle,
+      clearCredentials: () async {},
+      fileStore: FakeFileStore(scopeKey: scope.storageId),
+      memoryStore: FakeMemoryStore(scopeKey: scope.storageId),
+      fileCache: cache,
+    );
+    await tester.pump();
+    expect(files.fetchTokens.single?.isCancelled, isTrue);
+
+    fetchGate.complete(Uint8List.fromList([1, 2, 3]));
+    await wipe;
+    expect(cache.cacheFileCalls, 0);
+    expect(root.listSync(), isEmpty);
   });
 }

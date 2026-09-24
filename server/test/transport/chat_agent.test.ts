@@ -132,7 +132,7 @@ function makeApp(
     createChatRoutes({
       registry: makeFakeRegistry(registry),
       pluginStore: makeFakePluginStore() as never,
-      verifyKey: async () => "test-user",
+      verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
       limiter: () => true,
       trustedHosts: [],
       catalogs: chatCatalogs,
@@ -439,4 +439,197 @@ describe("POST /v1/chat/completions — build-on-the-fly agent resolution", () =
     assert.deepEqual(result.value.enabledPlugins, []);
   });
 
+});
+
+// ----- Server caps + validation (open-gaps P0, Agent editor C.4b server half) -----
+
+function items<T>(n: number, make: (i: number) => T): T[] {
+  return Array.from({ length: n }, (_, i) => make(i));
+}
+
+describe("custom agent spec — server caps (open-gaps P0)", () => {
+  test("systemPrompt at cap (8000 chars) passes", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { systemPrompt: "a".repeat(8000) } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.agentOverride?.systemPrompt.length, 8000);
+  });
+
+  test("systemPrompt over cap (8001 chars) → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({ agent: { systemPrompt: "a".repeat(8001) } }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+    assert.match(String(json.message ?? ""), /invalid agent spec/);
+  });
+
+  test("skills at cap (50 entries) passes", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { skills: items(50, (i) => `skill-${String(i).padStart(3, "0")}`) } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+  });
+
+  test("skills over cap (51 entries) → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({
+      agent: { skills: items(51, (i) => `skill-${String(i).padStart(3, "0")}`) },
+    }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+  });
+
+  test("mcpServers at cap (20 entries) passes", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { mcpServers: items(20, (i) => ({ name: `mcp-${i}` })) } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+  });
+
+  test("mcpServers over cap (21 entries) → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({
+      agent: { mcpServers: items(21, (i) => ({ name: `mcp-${i}` })) },
+    }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+  });
+
+  test("tools at cap (100 entries) passes", async (_t) => {
+    const result = resolveOk(
+      chatBody({
+        agent: { tools: items(100, () => ({ pluginId: "vikunja", required: false })) },
+      }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepEqual(result.value.enabledPlugins, ["vikunja"]);
+  });
+
+  test("tools over cap (101 entries) → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({
+      agent: { tools: items(101, () => ({ pluginId: "vikunja", required: false })) },
+    }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+  });
+
+  test("inference.maxTokens at cap (200000) passes and rides requestParameters", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { inference: { maxTokens: 200000 } } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.requestParameters["maxTokens"], 200000);
+  });
+
+  test("inference.maxTokens over cap (200001) → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({ agent: { inference: { maxTokens: 200001 } } }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+  });
+});
+
+describe("custom agent spec — temperature clamp [0,2]", () => {
+  test("temperature 2.5 clamps to 2 in requestParameters", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { inference: { temperature: 2.5 } } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.requestParameters["temperature"], 2);
+    assert.equal(result.value.agentOverride?.inference?.temperature, 2);
+  });
+
+  test("temperature -1 clamps to 0 in requestParameters", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { inference: { temperature: -1 } } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.requestParameters["temperature"], 0);
+  });
+
+  test("temperature 1.5 is untouched", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { inference: { temperature: 1.5 } } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.requestParameters["temperature"], 1.5);
+  });
+});
+
+describe("custom agent spec — grant + modelRef validation (server registry)", () => {
+  test("unknown tool plugin in grants (required) → 400 invalid_credentials", async (_t) => {
+    const app = makeApp(makeRegistryWithModelOnly(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({
+      agent: { tools: [{ pluginId: "nonexistent", required: true }] },
+    }));
+    assert.equal(res.status, 400, "never 500 for an unknown grant");
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_credentials");
+  });
+
+  test("model-typed plugin used as tool grant (required) → 400 invalid_credentials", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({
+      agent: { tools: [{ pluginId: "openrouter", required: true }] },
+    }));
+    assert.equal(res.status, 400, "wrong-type grant → 400, never 500");
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_credentials");
+  });
+
+  test("unknown modelRef → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelOnly(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({ agent: { modelRef: "nonexistent-model" } }));
+    assert.equal(res.status, 400);
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+  });
+
+  test("tool-typed modelRef → 400 invalid_request", async (_t) => {
+    const app = makeApp(makeRegistryWithModelAndTool(), makeCatalogs([defaultTemplate]));
+    const res = await postChat(app, chatBody({ agent: { modelRef: "vikunja" } }));
+    assert.equal(res.status, 400, "tool plugin is not a model");
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+  });
+
+  test("model-typed modelRef → passes and pins modelPluginId", async (_t) => {
+    const result = resolveOk(
+      chatBody({ agent: { modelRef: "openrouter" } }),
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.modelPluginId, "openrouter");
+  });
 });

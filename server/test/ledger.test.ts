@@ -1122,6 +1122,10 @@ describe("snapshot payload (v5)", () => {
       .prepare("SELECT id, payload FROM ledger_task WHERE id = 't1'")
       .get() as { id: string; payload: string | null };
     assert.equal(row.payload, null, "existing rows get a NULL payload");
+    const retentionIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_tasks_status_updated") as { name: string } | undefined;
+    assert.equal(retentionIndex?.name, "idx_tasks_status_updated");
     const fresh = new Database(":memory:");
     migrateLedger(fresh);
     const cols = fresh
@@ -1137,7 +1141,12 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
+    assert.equal(CURRENT_LEDGER_VERSION, 6);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
+    const retentionIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_tasks_status_updated") as { name: string } | undefined;
+    assert.equal(retentionIndex?.name, "idx_tasks_status_updated");
     const tables = db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ledger_%'",
@@ -1146,6 +1155,23 @@ describe("migration", () => {
       .map((r) => (r as { name: string }).name)
       .sort();
     assert.deepEqual(tables, ["ledger_chain", "ledger_step", "ledger_task"]);
+  });
+
+  test("v6 migration adds the retention index when upgrading from v5", () => {
+    const db = new Database(":memory:");
+    migrateLedger(db);
+    db.exec("DROP INDEX idx_tasks_status_updated");
+    db.pragma("user_version = 5");
+    assert.equal(db.pragma("user_version", { simple: true }), 5);
+
+    migrateLedger(db);
+
+    assert.equal(db.pragma("user_version", { simple: true }), 6);
+    assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
+    const retentionIndex = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_tasks_status_updated") as { name: string } | undefined;
+    assert.equal(retentionIndex?.name, "idx_tasks_status_updated");
   });
 
   test("migration is idempotent and preserves data on re-run", () => {

@@ -6,8 +6,9 @@ LLM provider keys), and a LangChain orchestrator that runs the agent graph.
 
 Speak to it like a person. Speech-to-text and text-to-speech run **on device**
 (no audio ever leaves your phone), the conversation is streamed through the
-LangChain gateway, which resolves model and tool plugins, runs tools in the
-agent graph, and manages conversation state on the server.
+LangChain gateway, which resolves model and tool plugins and runs tools in the
+agent graph. The gateway is stateless: the client owns conversation history and
+sends it with each turn.
 
 ## Highlights
 
@@ -20,7 +21,7 @@ agent graph, and manages conversation state on the server.
 - **Plugin architecture** — admin-curated tool plugins (Vikunja, Mealie,
   SpielIndexer, calendar) and model plugins with user-owned provider keys.
 - **LangChain agent graph** — server-side orchestration with tool execution,
-  budget, idempotency, and checkpoint management.
+  budget, and idempotency; the gateway is stateless.
 - **Push notifications** — ntfy-based provisioning for async job status.
 
 ## Architecture
@@ -31,7 +32,7 @@ agent graph, and manages conversation state on the server.
 │  ┌────────────────────┐  │  ─────▶│  · better-auth (email/pass)          │
 │  │ Chat UI / SSE      │  │        │  · LangChain agent graph            │
 │  │ Voice (STT + TTS)  │  │        │  · Tool execution + budget          │
-│  │ Plugin credentials  │  │  ◀─────│  · Conversation checkpoints        │
+│  │ Plugin credentials  │  │  ◀─────│  · Request-scoped execution        │
 │  │ Local SQLite +      │  │  SSE   │  · Task ledger + idempotency       │
 │  │ secure storage      │  │        │  · ntfy notification hook          │
 │  └────────────────────┘  │        └─────────┬──────────────────────┬─────┘
@@ -71,7 +72,7 @@ server/            Node.js gateway (Hono + better-auth)
     auth/          better-auth server configuration
     plugins/       plugin types, registry, store, SSRF validation
     transport/     LangChain agent graph, OpenAI-compatible /v1/chat/completions
-    checkpoints/   conversation state (thread + checkpoint store)
+    sessions/      ephemeral, owner-scoped conversation mirror
     notify/        encrypted ntfy notification provisioning + push hook
     ledger/        task ledger with idempotency and lease management
   test/            server unit tests (567+, node:test)

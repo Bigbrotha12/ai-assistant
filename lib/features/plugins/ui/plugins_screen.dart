@@ -267,9 +267,28 @@ class _PluginList extends ConsumerWidget {
           children: [
             if (agent.skillCount > 0)
               Padding(
-                padding: const EdgeInsets.only(right: 8),
+                padding: const EdgeInsets.only(right: 4),
                 child: Chip(
                   label: Text('${agent.skillCount} skills'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            if (agent.toolGrants.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Chip(
+                  label: Text('${agent.toolGrants.length} tools'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            if (agent.defaultModel != null)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Chip(
+                  label: Text(
+                    agent.defaultModel!,
+                    style: const TextStyle(fontSize: 10),
+                  ),
                   visualDensity: VisualDensity.compact,
                 ),
               ),
@@ -391,6 +410,25 @@ class _PluginList extends ConsumerWidget {
                 padding: const EdgeInsets.only(right: 4),
                 child: Chip(
                   label: Text('${agent.mcpServers.length} MCP'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            if (agent.tools.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Chip(
+                  label: Text('${agent.tools.length} tools'),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            if (agent.modelRef != null)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Chip(
+                  label: Text(
+                    agent.modelRef!,
+                    style: const TextStyle(fontSize: 10),
+                  ),
                   visualDensity: VisualDensity.compact,
                 ),
               ),

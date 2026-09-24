@@ -82,10 +82,15 @@ final voiceTurnSenderProvider = Provider<VoiceManagedTurnSender>((ref) {
 });
 
 /// Microphone capture streaming raw PCM16 chunks.
+///
+/// Wrapped in [MicReopenDiscardGate]: every subscriber — the capture
+/// pipeline's VAD leg and the controller's STT buffer — drops the first
+/// [micReopenDiscardWindow] of frames after each mic (re)open (W1.5), so
+/// warm-up/glitch audio never reaches STT either.
 final micCaptureServiceProvider = Provider<MicCaptureService>((ref) {
   final service = RecordMicCaptureService();
   ref.onDispose(service.dispose);
-  return service;
+  return MicReopenDiscardGate(service);
 });
 
 /// Audio playback of received AI TTS frames.

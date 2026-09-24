@@ -30,6 +30,7 @@ import type { CredentialPinHandle } from "../../src/credentials/pins.ts";
 import { AsyncMutex } from "../../src/jobs/mutex.ts";
 import { Ledger, migrateLedger } from "../../src/ledger.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
+import { clearDeleting, markDeleting } from "../../src/account_deletion.ts";
 import { CredentialPinError } from "../../src/credentials/pins.ts";
 
 function isNotFound(e: unknown): boolean {
@@ -572,7 +573,7 @@ describe("JobRunner.runJob", () => {
     const model = new ScriptedChatModel({
       responses: [new AIMessage("never")],
       onGenerate: () => {
-        throw new Error("model exploded with Bearer sk-secret123");
+        throw new Error("model exploded with Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345");
       },
     });
     const runner = createJobRunner(
@@ -589,7 +590,7 @@ describe("JobRunner.runJob", () => {
       .listSteps(result.taskId)
       .find((s) => s.action === "error:job_failed");
     assert.ok(errorStep, "an error step must be appended");
-    assert.ok(!String(errorStep.result).includes("sk-secret123"));
+    assert.ok(!String(errorStep.result).includes("skAbCdEfGhIjKlMnOpQrStUvWxYz012345"));
     assert.ok(String(errorStep.result).includes("Bearer ***"));
   });
 
@@ -910,6 +911,139 @@ describe("JobRunner.runJob", () => {
       (e: unknown) => (e as { code?: string }).code === "pin_not_found",
       "the model pin must be released when the job completes",
     );
+  });
+});
+
+describe("JobRunner deletion admission and owner abort", () => {
+  test("aborts an in-flight job for one owner without affecting a bystander", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger } = makeLedger();
+    const pins = new CredentialPinStore();
+    for (const owner of ["delete-victim", "delete-bystander"]) {
+      pins.pin(owner, "vikunja", { apiKey: `${owner}-tool` });
+      pins.pin(owner, "openrouter", { apiKey: `${owner}-model` });
+    }
+
+    let releaseVictim!: () => void;
+    const victimGate = new Promise<void>((resolve) => {
+      releaseVictim = resolve;
+    });
+    let victimEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      victimEntered = resolve;
+    });
+    const victimModel = new ScriptedChatModel({
+      responses: [new AIMessage("victim done")],
+      onGenerate: async () => {
+        victimEntered();
+        await victimGate;
+      },
+    });
+    const bystanderModel = new ScriptedChatModel({
+      responses: [new AIMessage("bystander done")],
+    });
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (_id, config) =>
+          (config as { owner?: string } | undefined)?.owner === "delete-victim"
+            ? victimModel
+            : bystanderModel,
+      }),
+    );
+
+    const victimJob = runner.runJob(
+      descriptor({
+        owner: "delete-victim",
+        intentKey: "victim-job",
+        modelRequestConfig: { owner: "delete-victim" },
+      }),
+    );
+    try {
+      await entered;
+      markDeleting("delete-victim");
+      assert.equal(runner.abortOwner("delete-victim"), 1);
+
+      const bystander = await runner.runJob(
+        descriptor({
+          owner: "delete-bystander",
+          intentKey: "bystander-job",
+          modelRequestConfig: { owner: "delete-bystander" },
+        }),
+      );
+      assert.equal(bystander.status, "succeeded");
+
+      releaseVictim();
+      const victim = await victimJob;
+      assert.equal(victim.status, "account_deleted");
+      assert.equal(ledger.listTasks("delete-bystander")[0]?.status, "succeeded");
+      assert.throws(
+        () => pins.get("delete-victim", "vikunja"),
+        isNotFound,
+      );
+    } finally {
+      releaseVictim();
+      await victimJob.catch(() => undefined);
+      clearDeleting("delete-victim");
+    }
+  });
+
+  test("rejects claim and stuck resume after tombstoning without changing task state", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    const pins = new CredentialPinStore();
+    pins.pin("claim-deleted", "vikunja", { apiKey: "tool" });
+    pins.pin("claim-deleted", "openrouter", { apiKey: "model" });
+    const queued = ledger.createTask({
+      owner: "claim-deleted",
+      intentKey: "queued-after-delete",
+      spec: "s",
+    });
+    pins.pin("resume-deleted", "vikunja", { apiKey: "tool" });
+    pins.pin("resume-deleted", "openrouter", { apiKey: "model" });
+    const stuck = ledger.createTask({
+      owner: "resume-deleted",
+      intentKey: "stuck-after-delete",
+      spec: "s",
+    });
+    ledger.claimTask(stuck.id, "resume-deleted");
+    clock.advance(20_000);
+    assert.equal(ledger.markStuckIfHeartbeatStale(stuck.id)?.status, "stuck");
+
+    let modelCalls = 0;
+    let credentialSourceCalls = 0;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: () => {
+          modelCalls += 1;
+          return new ScriptedChatModel({ responses: [new AIMessage("never")] });
+        },
+        credentialSource: () => {
+          credentialSourceCalls += 1;
+          return { openrouter: { apiKey: "restored" } };
+        },
+      }),
+    );
+
+    try {
+      markDeleting("claim-deleted");
+      const rejected = await runner.runJob(
+        descriptor({ owner: "claim-deleted", intentKey: queued.intent_key }),
+      );
+      assert.equal(rejected.status, "account_deleted");
+      assert.equal(ledger.getTask(queued.id, "claim-deleted")?.status, "queued");
+
+      markDeleting("resume-deleted");
+      const resumed = await runner.resumeStuckJobs();
+      assert.deepEqual(resumed.outcomes, [
+        { taskId: stuck.id, owner: "resume-deleted", outcome: "account_deleted" },
+      ]);
+      assert.equal(ledger.getTask(stuck.id, "resume-deleted")?.status, "stuck");
+      assert.equal(modelCalls, 0);
+      assert.equal(credentialSourceCalls, 0);
+    } finally {
+      clearDeleting("claim-deleted");
+      clearDeleting("resume-deleted");
+    }
   });
 });
 
@@ -1749,7 +1883,7 @@ describe("ToolExecutor (real validatedFetch path)", () => {
       spy.count += 1;
       spy.url = String(input);
       spy.init = init;
-      return new Response("echo Bearer sk-secret123", { status: 200 });
+      return new Response("echo Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345", { status: 200 });
     }) as unknown as typeof fetch;
 
     const executor = new ToolExecutor({
@@ -1773,14 +1907,14 @@ describe("ToolExecutor (real validatedFetch path)", () => {
       "vikunja",
       "list_tasks",
       { projectId: "p1" },
-      { apiKey: "sk-secret123" },
+      { apiKey: "skAbCdEfGhIjKlMnOpQrStUvWxYz012345" },
     );
 
     assert.equal(spy.count, 1);
     assert.equal(spy.url, "https://vikunja.example.com/list_tasks");
     assert.equal(
       (spy.init?.headers as Record<string, string>)?.authorization,
-      "Bearer sk-secret123",
+      "Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345",
     );
     assert.equal(result, "echo Bearer ***", "credential-shaped output is redacted");
   });
@@ -1925,7 +2059,7 @@ assert.equal(result, '{"ok":true}');
 
 describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", () => {
   /** Raw (UNREDACTED) handler output containing a credential shape. */
-  const RAW_RESULT = '{"ok":true,"token":"Bearer sk-secret999"}';
+  const RAW_RESULT = '{"ok":true,"token":"Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345"}';
 
   /** Shared `calls` recording handler that ALSO returns a credential-shaped raw payload. */
   function credentialHandler(calls: RecordedCall[]): ToolCallHandler {
@@ -2105,7 +2239,7 @@ describe("JobRunner.runJob — Phase 4 Wave B tool-result cache (async seam)", (
       "the ledger's stored result is what served the tool (dedupe wins over the warm cache)",
     );
     assert.ok(
-      !String(toolStep?.result).includes("sk-secret999"),
+      !String(toolStep?.result).includes("skAbCdEfGhIjKlMnOpQrStUvWxYz012345"),
       "the cache's raw (unredacted) value never reached the ledger or graph state",
     );
   });

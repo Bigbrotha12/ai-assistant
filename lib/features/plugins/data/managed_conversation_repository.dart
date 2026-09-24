@@ -159,6 +159,18 @@ class ManagedConversationRepository {
           ))
           .get();
 
+  /// Live set view of [pendingRows]: the conversation ids in [scope] that
+  /// currently own a pending-turn row, for the conversation list's
+  /// pending-job indicator. Emits the current set immediately and re-emits on
+  /// every `managed_pending_turns` write, so a job starting or finishing while
+  /// the list stays mounted under the open chat refreshes in place.
+  Stream<Set<String>> pendingConversationIds(AuthAccountScope scope) =>
+      (db.select(db.managedPendingTurns)..where(
+            (t) => t.scopeKey.equals(scope.storageId),
+          ))
+          .watch()
+          .map((rows) => rows.map((row) => row.conversationId).toSet());
+
   Future<void> savePending(
     String id,
     AuthAccountScope scope,

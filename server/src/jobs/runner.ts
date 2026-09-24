@@ -11,7 +11,8 @@ import { bindMcpServers, type McpServerConfig } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import { jsonSchemaToZod, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
-import { redactForCheckpoint } from "../checkpoints/store.ts";
+import { redactForOutbound } from "../redact.ts";
+import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { env } from "../env.ts";
 import {
   canRetryTool,
@@ -98,7 +99,8 @@ export type JobErrorCode =
   | "job_failed"
   | "tool_retry_forbidden"
   | "budget_exhausted"
-  | "context_length_exceeded";
+  | "context_length_exceeded"
+  | "account_deleted";
 
 /** Raised by the job runner / tool executor. Never carries credential values. */
 export class JobError extends Error {
@@ -188,7 +190,7 @@ export type ToolExecutorOptions = {
  *   - calls `validatedFetch` — the ONLY sanctioned outbound path — against the
  *     allowlisted URL with the pinned credentials (bearer header),
  *   - refuses any 3xx (validatedFetch does this; redirects are never followed),
- *   - redacts the result with `redactForCheckpoint` before it is returned so
+ *   - redacts the result with `redactForOutbound` before it is returned so
  *     credential-shaped material never reaches graph state.
  *
  * Credentials arrive as a single-invocation COPY per call — the executor holds
@@ -252,7 +254,7 @@ export class ToolExecutor implements ToolCallHandler {
       );
     }
     const text = await response.text();
-    return redactForCheckpoint(text);
+    return redactForOutbound(text);
   }
 }
 
@@ -318,7 +320,17 @@ export type RunJobResult =
   | { status: "succeeded"; taskId: string; threadId: string }
   | { status: "failed"; taskId: string; threadId: string; code: JobErrorCode; error: string }
   | { status: "in_flight"; taskId: string; threadId: string }
-  | { status: "already_terminal"; taskId: string; threadId: string; terminalStatus: TaskStatus };
+  | { status: "already_terminal"; taskId: string; threadId: string; terminalStatus: TaskStatus }
+  | { status: "account_deleted"; taskId?: string; threadId: string; error: string };
+
+function accountDeletedResult(
+  threadId: string,
+  taskId?: string,
+): Extract<RunJobResult, { status: "account_deleted" }> {
+  return taskId === undefined
+    ? { status: "account_deleted", threadId, error: "account_deleted" }
+    : { status: "account_deleted", taskId, threadId, error: "account_deleted" };
+}
 
 export type StuckTaskOutcome = {
   taskId: string;
@@ -556,7 +568,7 @@ function bindJobTool(
           argsHash: cache.argsHash(input as Record<string, unknown>),
         };
         const cached = cache.get(cacheKey);
-        if (cached !== undefined) return redactForCheckpoint(cached);
+        if (cached !== undefined) return redactForOutbound(cached);
       }
       if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
         throw new JobError(
@@ -586,6 +598,7 @@ export class JobRunner {
   private disposed = false;
   private readonly pinUsers = new Map<CredentialPinHandle, number>();
   private readonly controllers = new Set<AbortController>();
+  private readonly controllersByOwner = new Map<string, Set<AbortController>>();
 
   constructor(deps: JobRunnerDeps) {
     this.deps = deps;
@@ -601,6 +614,35 @@ export class JobRunner {
       }, deps.sweepIntervalMs);
       if (typeof this.sweepTimer.unref === "function") this.sweepTimer.unref();
     }
+  }
+
+  private registerController(owner: string, controller: AbortController): void {
+    let byController = this.controllersByOwner.get(owner);
+    if (!byController) {
+      byController = new Set();
+      this.controllersByOwner.set(owner, byController);
+    }
+    byController.add(controller);
+  }
+
+  private unregisterController(owner: string, controller: AbortController): void {
+    const byController = this.controllersByOwner.get(owner);
+    if (!byController) return;
+    byController.delete(controller);
+    if (byController.size === 0) this.controllersByOwner.delete(owner);
+  }
+
+  abortOwner(owner: string): number {
+    const byController = this.controllersByOwner.get(owner);
+    if (!byController) return 0;
+    const controllers = [...byController];
+    this.controllersByOwner.delete(owner);
+    for (const controller of controllers) {
+      if (!controller.signal.aborted) {
+        controller.abort(new AccountDeletedError(owner));
+      }
+    }
+    return controllers.length;
   }
 
   /** Owner-scoped status-by-idempotency-key (the client's poll-after-drop). */
@@ -637,6 +679,9 @@ export class JobRunner {
       this.pinUsers.set(handle, (this.pinUsers.get(handle) ?? 0) + 1);
     }
     try {
+      if (isDeleting(descriptor.owner)) {
+        return accountDeletedResult(descriptor.clientThreadId);
+      }
       return await this.runAdmittedJob({ ...descriptor, toolPlugins: [...descriptor.toolPlugins], pinHandles }, pinError);
     } finally {
       for (const [pluginId, handle] of Object.entries(pinHandles)) {
@@ -654,6 +699,7 @@ export class JobRunner {
 
   private async runAdmittedJob(descriptor: JobDescriptor, pinError?: unknown): Promise<RunJobResult> {
     const { owner, intentKey, spec, clientThreadId, toolPlugins, input } = descriptor;
+    if (isDeleting(owner)) return accountDeletedResult(clientThreadId);
     // No checkpoint thread: the raw client thread id IS the public thread
     // handle surfaced in results (and the ledger `worker` label).
     const threadId = clientThreadId;
@@ -674,12 +720,22 @@ export class JobRunner {
 
     // 1. Owner-scoped idempotent admission (persists the snapshot payload on
     //    first creation).
-    let task = await getOrCreateTask(this.deps.ledger, {
-      owner,
-      intentKey,
-      spec,
-      payload,
-    });
+    let task: TaskRow;
+    try {
+      if (isDeleting(owner)) return accountDeletedResult(threadId);
+      task = await getOrCreateTask(this.deps.ledger, {
+        owner,
+        intentKey,
+        spec,
+        payload,
+      });
+    } catch (error) {
+      if (error instanceof AccountDeletedError || isDeleting(owner)) {
+        return accountDeletedResult(threadId);
+      }
+      throw error;
+    }
+    if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
 
     // 2. Duplicate/in-flight handling — never double-execute. M6: a running
     //    task whose heartbeat has gone stale past the stuck-timeout means the
@@ -687,7 +743,9 @@ export class JobRunner {
     //    instead of returning `in_flight` forever (which would wedge the
     //    intentKey until a reboot).
     if (task.status === "running") {
+      if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
       const marked = this.deps.ledger.markStuckIfHeartbeatStale(task.id);
+      if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
       if (marked && marked.status === "stuck") {
         task = marked;
       } else {
@@ -703,9 +761,11 @@ export class JobRunner {
     // 3. Claim: lease + fresh fence token. A `stuck` task is resumed (new
     //    fence) so the snapshot re-run owns a live lease.
     let claimed: TaskRow;
+    if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
     if (task.status === "queued") {
       try {
         claimed = this.deps.ledger.claimTask(task.id, owner);
+        if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
       } catch (e) {
         if (isConflict(e)) {
           // A concurrent worker won the claim between admission and claim.
@@ -716,6 +776,7 @@ export class JobRunner {
     } else if (task.status === "stuck") {
       try {
         claimed = this.deps.ledger.resumeTask(task.id, owner);
+        if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
       } catch (e) {
         if (isConflict(e)) {
           // A concurrent worker resumed the stuck task first.
@@ -732,16 +793,19 @@ export class JobRunner {
         terminalStatus: task.status,
       };
     }
+    if (isDeleting(owner)) return accountDeletedResult(threadId, task.id);
     const fenceToken = claimed.fence_token;
 
     // 3b. Backfill the snapshot payload on a task admitted by a caller that
     //     stored none (e.g. the transport's pre-run admission, or a pre-v5
     //     row): `resumeStuckJobs` re-runs from it, so it must be durable before
     //     the job runs. Only touches a task we actually claimed (an
-    //     in_flight/already_terminal duplicate never mutates the stored row).
+    //    in_flight/already_terminal duplicate never mutates the stored row).
+    if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
     if (payload !== null && (claimed.payload == null || claimed.payload === "")) {
       this.deps.ledger.updateTaskPayload(claimed.id, owner, payload);
     }
+    if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
 
     // 4. Timer heartbeat covers the WHOLE job (pin fetch → graph invoke →
     //    tool execution); started INSIDE the try so a misconfigured interval
@@ -750,10 +814,12 @@ export class JobRunner {
     let heartbeat: { stop(): void } | undefined;
     const controller = new AbortController();
     this.controllers.add(controller);
+    this.registerController(owner, controller);
     const signal = descriptor.signal
       ? AbortSignal.any([descriptor.signal, controller.signal])
       : controller.signal;
     const assertActive = () => {
+      if (isDeleting(owner)) controller.abort(new AccountDeletedError(owner));
       if (this.disposed) controller.abort(new JobError("task_conflict", "job runner disposed"));
       const current = this.deps.ledger.getTask(claimed.id, owner);
       if (!current || current.status !== "running" || current.fence_token !== fenceToken) {
@@ -771,6 +837,7 @@ export class JobRunner {
     };
 
     try {
+      if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
       if (pinError) throw pinError;
       assertActive();
       heartbeat = this.deps.ledger.startHeartbeat(claimed.id, owner, fenceToken, {
@@ -906,12 +973,16 @@ export class JobRunner {
         }
       }
     } catch (e) {
+      if (isDeleting(owner) || e instanceof AccountDeletedError) {
+        return accountDeletedResult(threadId, claimed.id);
+      }
       const code = jobErrorCodeOf(e);
       return this.failJob(claimed, owner, fenceToken, threadId, code, errorMessageOf(e));
     } finally {
       heartbeat?.stop();
       controller.abort();
       this.controllers.delete(controller);
+      this.unregisterController(owner, controller);
     }
   }
 
@@ -940,13 +1011,30 @@ export class JobRunner {
       .filter((task) => task.status === "stuck");
     const outcomes: StuckTaskOutcome[] = [];
     for (const task of stuck) {
+      if (isDeleting(task.owner)) {
+        outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
+        continue;
+      }
       try {
         const reestablished = this.deps.credentialSource
           ? await this.deps.credentialSource(task.owner, task)
           : null;
+        if (isDeleting(task.owner)) {
+          this.deps.pins.releaseOwner(task.owner);
+          outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
+          continue;
+        }
         if (reestablished !== null && reestablished !== undefined) {
           for (const [pluginId, credentials] of Object.entries(reestablished)) {
+            if (isDeleting(task.owner)) {
+              break;
+            }
             this.deps.pins.pin(task.owner, pluginId, credentials);
+          }
+          if (isDeleting(task.owner)) {
+            this.deps.pins.releaseOwner(task.owner);
+            outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
+            continue;
           }
           if (this.deps.buildModel) {
             // Pins restored AND a model seam is wired: identify the model
@@ -996,7 +1084,11 @@ export class JobRunner {
               taskId: task.id,
               owner: task.owner,
               outcome:
-                replay.status === "failed" ? replay.code : "repinned",
+                replay.status === "account_deleted"
+                  ? "account_deleted"
+                  : replay.status === "failed"
+                    ? replay.code
+                    : "repinned",
             });
           } else {
             // No model seam: the job cannot be re-run, and there is no
@@ -1014,6 +1106,11 @@ export class JobRunner {
           outcomes.push(await this.failStuck(task, "credentials_expired"));
         }
       } catch (e) {
+        if (isDeleting(task.owner) || e instanceof AccountDeletedError) {
+          this.deps.pins.releaseOwner(task.owner);
+          outcomes.push({ taskId: task.id, owner: task.owner, outcome: "account_deleted" });
+          continue;
+        }
         outcomes.push(await this.failStuck(task, jobErrorCodeOf(e)));
       }
     }
@@ -1027,6 +1124,7 @@ export class JobRunner {
     for (const controller of this.controllers) {
       controller.abort(new JobError("task_conflict", "job runner disposed"));
     }
+    this.controllersByOwner.clear();
     if (this.sweepTimer) {
       const clearInterval =
         this.deps.clearInterval ?? globalThis.clearInterval.bind(globalThis);
@@ -1123,7 +1221,7 @@ export class JobRunner {
     code: JobErrorCode,
     message: string,
   ): RunJobResult & { status: "failed" } {
-    const redacted = redactForCheckpoint(message);
+    const redacted = redactForOutbound(message);
     try {
       const current = this.deps.ledger.getTask(claimed.id, owner);
       if (current?.status === "running" && current.fence_token === fenceToken) {
@@ -1149,20 +1247,29 @@ export class JobRunner {
     code: JobErrorCode,
     reason?: string,
   ): Promise<StuckTaskOutcome> {
+    if (isDeleting(task.owner)) {
+      return { taskId: task.id, owner: task.owner, outcome: "account_deleted" };
+    }
     try {
       const resumed = this.deps.ledger.resumeTask(task.id, task.owner);
+      if (isDeleting(task.owner)) {
+        return { taskId: task.id, owner: task.owner, outcome: "account_deleted" };
+      }
       this.deps.ledger.appendStep(
         task.id,
         task.owner,
         {
           stage: "error",
           action: `error:${code}`,
-          result: redactForCheckpoint(
+          result: redactForOutbound(
             reason ?? `orphaned background job cannot resume after restart: ${code}`,
           ),
         },
         resumed.fence_token,
       );
+      if (isDeleting(task.owner)) {
+        return { taskId: task.id, owner: task.owner, outcome: "account_deleted" };
+      }
       this.deps.ledger.completeTask(task.id, task.owner, "failed");
     } catch (err) {
       // Best-effort: another pass already handled this task.
@@ -1189,6 +1296,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 
 function jobErrorCodeOf(e: unknown): JobErrorCode {
   if (e instanceof JobError) return e.code;
+  if (e instanceof AccountDeletedError) return "account_deleted";
   if (e instanceof BudgetExhaustedError) return "budget_exhausted";
   if (e instanceof ContextBudgetError) return "context_length_exceeded";
   if (e instanceof CredentialPinError) return "credentials_expired";

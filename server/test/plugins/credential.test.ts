@@ -274,9 +274,13 @@ describe("credentialFingerprint", () => {
     );
   });
 
-  test("is the deterministic sha256 hex over sorted key=value pairs", () => {
+  test("is the deterministic sha256 hex over versioned sorted JSON pairs", () => {
+    const canonicalJson = JSON.stringify([
+      ["apiKey", "sk-a"],
+      ["b", "c"],
+    ]);
     const expected = createHash("sha256")
-      .update("apiKey=sk-a|b=c", "utf8")
+      .update(`v2\0${canonicalJson}`, "utf8")
       .digest("hex");
     assert.equal(credentialFingerprint({ b: "c", apiKey: "sk-a" }), expected);
     // deterministic: same input, same digest
@@ -285,6 +289,24 @@ describe("credentialFingerprint", () => {
       credentialFingerprint({ b: "c", apiKey: "sk-a" }),
     );
     assert.match(expected, /^[0-9a-f]{64}$/);
+  });
+
+  test("distinguishes delimiter-bearing values that collided under key=value encoding", () => {
+    assert.notEqual(
+      credentialFingerprint({ x: "a|y=b", y: "c" }),
+      credentialFingerprint({ x: "a", y: "b|y=c" }),
+    );
+  });
+
+  test("distinguishes newline and unicode values", () => {
+    assert.notEqual(
+      credentialFingerprint({ header: "a\nb" }),
+      credentialFingerprint({ header: "ab" }),
+    );
+    assert.notEqual(
+      credentialFingerprint({ header: "café" }),
+      credentialFingerprint({ header: "cafe" }),
+    );
   });
 
   test("empty credentials still produce a fingerprint", () => {

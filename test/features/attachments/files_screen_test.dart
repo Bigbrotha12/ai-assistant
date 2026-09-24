@@ -1,10 +1,12 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/core/backend_settings.dart';
+import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
 import 'package:ai_assistant/features/attachments/data/file_cache.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
@@ -19,9 +21,9 @@ import '../../fakes.dart';
 /// [FileCache] fake that performs no disk IO: lookups return scripted state and
 /// evictions are recorded, so widget tests never touch the filesystem.
 class FakeFileCache extends FileCache {
-  FakeFileCache({Map<String, FileInfo>? cached})
-      : _cached = cached ?? {},
-        super(cacheDir: Directory.systemTemp);
+  FakeFileCache({Map<String, FileInfo>? cached, super.scopeKey = 'test-scope'})
+    : _cached = cached ?? {},
+      super(cacheDir: Directory.systemTemp);
 
   final Map<String, FileInfo> _cached;
 
@@ -30,6 +32,8 @@ class FakeFileCache extends FileCache {
 
   /// Number of [evictExpired] calls.
   int evictExpiredCalls = 0;
+
+  final List<String> cachedIds = [];
 
   Map<String, FileInfo> get cached => _cached;
 
@@ -52,44 +56,64 @@ class FakeFileCache extends FileCache {
   }
 
   @override
+  Future<String> cacheFile(
+    String fileId,
+    String extension,
+    Uint8List data,
+  ) async {
+    cachedIds.add(fileId);
+    return '/tmp/$fileId$extension';
+  }
+
+  @override
   String extensionForMime(String mime) => '.bin';
 }
 
 void main() {
-  FileInfo fileInfo(String id, String name,
-          {String mime = 'image/png', int size = 2048}) =>
-      FileInfo(
-        id: id,
-        filename: name,
-        sizeBytes: size,
-        mimeType: mime,
-        uploadedAt: DateTime(2026, 1, 1),
-      );
+  FileInfo fileInfo(
+    String id,
+    String name, {
+    String mime = 'image/png',
+    int size = 2048,
+  }) => FileInfo(
+    id: id,
+    filename: name,
+    sizeBytes: size,
+    mimeType: mime,
+    uploadedAt: DateTime(2026, 1, 1),
+  );
 
   Widget filesApp({
     required FilesClient filesClient,
     FileStore? store,
     FileCache? fileCache,
+    AccountLifecycle? lifecycle,
   }) {
     return ProviderScope(
       overrides: [
-        settingsStoreProvider.overrideWithValue(FakeSettingsStore(
-          stored: const BackendSettings(host: 'myhost'),
-        )),
+        settingsStoreProvider.overrideWithValue(
+          FakeSettingsStore(stored: const BackendSettings(host: 'myhost')),
+        ),
         filesServiceProvider.overrideWithValue(filesClient),
         filesStoreProvider.overrideWithValue(store ?? FakeFileStore()),
         fileCacheProvider.overrideWithValue(fileCache ?? FakeFileCache()),
+        accountLifecycleProvider.overrideWithValue(
+          lifecycle ?? AccountLifecycle(),
+        ),
       ],
       child: const MaterialApp(home: FilesScreen()),
     );
   }
 
-  testWidgets('renders a grid tile per file from the files service',
-      (tester) async {
-    final client = FakeFilesClient(files: [
-      fileInfo('f1', 'photo.png'),
-      fileInfo('f2', 'doc.pdf', mime: 'application/pdf'),
-    ]);
+  testWidgets('renders a grid tile per file from the files service', (
+    tester,
+  ) async {
+    final client = FakeFilesClient(
+      files: [
+        fileInfo('f1', 'photo.png'),
+        fileInfo('f2', 'doc.pdf', mime: 'application/pdf'),
+      ],
+    );
     await tester.pumpWidget(filesApp(filesClient: client));
     await tester.pumpAndSettle();
 
@@ -102,8 +126,26 @@ void main() {
     expect(find.byType(Image), findsNothing);
   });
 
-  testWidgets('shows the empty state when no files are uploaded',
-      (tester) async {
+  testWidgets('tile download uses the scoped attachment coordinator', (
+    tester,
+  ) async {
+    final client = FakeFilesClient(files: [fileInfo('f1', 'photo.png')]);
+    final cache = FakeFileCache();
+
+    await tester.pumpWidget(filesApp(filesClient: client, fileCache: cache));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('photo.png'));
+    await tester.pump();
+    await tester.pump();
+
+    expect(client.fetchedIds, ['f1']);
+    expect(client.fetchTokens.single, isNotNull);
+    expect(cache.cachedIds, ['f1']);
+  });
+
+  testWidgets('shows the empty state when no files are uploaded', (
+    tester,
+  ) async {
     await tester.pumpWidget(filesApp(filesClient: FakeFilesClient()));
     await tester.pumpAndSettle();
 
@@ -111,8 +153,9 @@ void main() {
     expect(find.text('Go to Chat'), findsOneWidget);
   });
 
-  testWidgets('shows an error state with a working Retry button',
-      (tester) async {
+  testWidgets('shows an error state with a working Retry button', (
+    tester,
+  ) async {
     final client = FakeFilesClient(
       files: [fileInfo('f1', 'photo.png')],
       listError: StateError('boom'),
@@ -131,8 +174,9 @@ void main() {
     expect(find.text('Could not load files'), findsNothing);
   });
 
-  testWidgets('long-pressing a tile and choosing Delete removes the file',
-      (tester) async {
+  testWidgets('long-pressing a tile and choosing Delete removes the file', (
+    tester,
+  ) async {
     final client = FakeFilesClient(files: [fileInfo('f1', 'photo.png')]);
     final store = FakeFileStore();
     await tester.pumpWidget(filesApp(filesClient: client, store: store));
@@ -153,8 +197,9 @@ void main() {
     expect(find.text('No files uploaded yet'), findsOneWidget);
   });
 
-  testWidgets('shows the not-configured state for a NoOpFilesClient',
-      (tester) async {
+  testWidgets('shows the not-configured state for a NoOpFilesClient', (
+    tester,
+  ) async {
     await tester.pumpWidget(filesApp(filesClient: NoOpFilesClient()));
     await tester.pumpAndSettle();
 
@@ -162,20 +207,23 @@ void main() {
     expect(find.textContaining('Settings'), findsOneWidget);
   });
 
-  testWidgets('Clear Cache confirms, evicts downloads, and keeps the list',
-      (tester) async {
-    final client = FakeFilesClient(files: [
-      fileInfo('f1', 'doc.pdf', mime: 'application/pdf'),
-    ]);
-    final cache = FakeFileCache(cached: {
-      'f1': FileInfo(
-        id: 'f1',
-        filename: 'doc.pdf',
-        sizeBytes: 2048,
-        mimeType: 'application/pdf',
-        localPath: '/cache/f1.pdf',
-      ),
-    });
+  testWidgets('Clear Cache confirms, evicts downloads, and keeps the list', (
+    tester,
+  ) async {
+    final client = FakeFilesClient(
+      files: [fileInfo('f1', 'doc.pdf', mime: 'application/pdf')],
+    );
+    final cache = FakeFileCache(
+      cached: {
+        'f1': FileInfo(
+          id: 'f1',
+          filename: 'doc.pdf',
+          sizeBytes: 2048,
+          mimeType: 'application/pdf',
+          localPath: '/cache/f1.pdf',
+        ),
+      },
+    );
     await tester.pumpWidget(filesApp(filesClient: client, fileCache: cache));
     await tester.pumpAndSettle();
 

@@ -70,11 +70,21 @@ final chatStoreProvider = Provider<ChatStore>((ref) {
 });
 
 /// Provides the [FileStore] used to persist file attachment metadata.
-final filesStoreProvider = Provider<FileStore>(
-  (ref) => DriftFileStore(ref.watch(databaseProvider)),
-);
+final filesStoreProvider = Provider<FileStore>((ref) {
+  final db = ref.watch(databaseProvider);
+  if (ref.watch(pluginAccessProvider) != PluginAccess.ready) {
+    return DriftFileStore(db, scopeKey: pendingScopeKey);
+  }
+  final scope = ref.watch(pluginAccountScopeProvider);
+  return DriftFileStore(db, scopeKey: scope.storageId);
+});
 
 /// Provides the [MemoryStore] used to persist and search memories.
-final memoryStoreProvider = Provider<MemoryStore>(
-  (ref) => DriftMemoryStore(ref.watch(databaseProvider)),
-);
+final memoryStoreProvider = Provider<MemoryStore>((ref) {
+  final db = ref.watch(databaseProvider);
+  if (ref.watch(pluginAccessProvider) != PluginAccess.ready) {
+    return DriftMemoryStore(db, scopeKey: pendingScopeKey);
+  }
+  final scope = ref.watch(pluginAccountScopeProvider);
+  return DriftMemoryStore(db, scopeKey: scope.storageId);
+});

@@ -1,5 +1,6 @@
 import './stt_engine.dart';
 import './tts_engine.dart';
+import './voice_settings.dart';
 
 /// Registry for speech-to-text and text-to-speech engine instances.
 ///
@@ -43,4 +44,20 @@ class EngineRegistry {
 
   /// All registered TTS engine identifiers.
   Iterable<String> get ttsEngineIds => _ttsEngines.keys;
+}
+
+/// Pushes [settings]' preferred language into the STT engine registered under
+/// [VoiceSettings.sttEngine]: the persisted code is kept when the engine
+/// supports it, otherwise it falls back deterministically via
+/// [resolveSttLanguage] (prefer `'en'`, else the engine's first entry).
+///
+/// A no-op when the engine is not registered yet — engine registration races
+/// the settings load at boot, so callers re-apply once both are ready.
+void applyVoiceSettingsToEngines(VoiceSettings settings) {
+  final engine = EngineRegistry.instance.getSttEngine(settings.sttEngine);
+  if (engine == null) return;
+  engine.preferredLanguage = resolveSttLanguage(
+    settings.preferredLanguage,
+    engine.supportedLanguages,
+  );
 }

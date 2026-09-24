@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createPerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
+import { createSendVerificationRateLimiter } from "../../src/rate_limit.ts";
 
 describe("createPerOwnerRateLimiter", () => {
   it("allows up to the burst, then denies, with a retry-after derived from the refill rate", () => {
@@ -54,5 +55,36 @@ describe("createPerOwnerRateLimiter", () => {
     const denied = limiter.check(owner);
     assert.equal(denied.allowed, false);
     assert.equal(denied.retryAfterSeconds, 1);
+  });
+});
+
+describe("createSendVerificationRateLimiter", () => {
+  it("evicts the oldest bucket when the entry cap is reached", () => {
+    let now = 0;
+    const limiter = createSendVerificationRateLimiter({
+      maxEntries: 2,
+      staleAfterMs: 1_000,
+      now: () => now,
+    });
+
+    assert.equal(limiter("first@example.com").allowed, true);
+    assert.equal(limiter("second@example.com").allowed, true);
+    now = 1;
+    assert.equal(limiter("third@example.com").allowed, true);
+    assert.equal(limiter("first@example.com").allowed, true);
+  });
+
+  it("prunes stale buckets when a new address is admitted", () => {
+    let now = 0;
+    const limiter = createSendVerificationRateLimiter({
+      maxEntries: 10,
+      staleAfterMs: 100,
+      now: () => now,
+    });
+
+    assert.equal(limiter("stale@example.com").allowed, true);
+    now = 101;
+    assert.equal(limiter("fresh@example.com").allowed, true);
+    assert.equal(limiter("stale@example.com").allowed, true);
   });
 });

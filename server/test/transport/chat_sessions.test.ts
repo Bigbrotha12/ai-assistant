@@ -292,7 +292,7 @@ async function makeApp(
     createChatRoutes({
       registry,
       pluginStore: store,
-      verifyKey: opts.verifyKey ?? (async () => "test-user"),
+      verifyKey: opts.verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
       limiter: () => true,
       buildModel: opts.buildModel,
       sessionStore,
@@ -304,7 +304,7 @@ async function makeApp(
   );
   app.route(
     "/v1",
-    createSessionRoutes({ store: sessionStore, verifyKey: opts.verifyKey ?? (async () => "test-user") }),
+    createSessionRoutes({ store: sessionStore, verifyKey: opts.verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })) }),
   );
   return { app, sessionStore };
 }
@@ -1201,6 +1201,24 @@ describe("POST /v1/chat/completions — managed session path (plan §4/§5)", ()
 });
 
 describe("GET /v1/sessions/:id read-back (§5)", () => {
+  test("401 { error: unauthorized } when the verifier returns bad_key", async (t) => {
+    const { app } = await makeApp(t, {
+      verifyKey: async () => ({ ok: false as const, reason: "bad_key" as const }),
+    });
+    const res = await getSession(app, SID);
+    assert.equal(res.status, 401);
+    assert.deepEqual(await res.json(), { error: "unauthorized" });
+  });
+
+  test("403 { error: email_not_verified } when the owner's email is unverified", async (t) => {
+    const { app } = await makeApp(t, {
+      verifyKey: async () => ({ ok: false as const, reason: "email_not_verified" as const }),
+    });
+    const res = await getSession(app, SID);
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "email_not_verified" });
+  });
+
   test("returns the accumulated messages for the owner", async (t) => {
     const fake = makeFakeBuildModel([[{ content: "reply one" }], [{ content: "reply two" }]]);
     const { app } = await makeApp(t, { buildModel: fake.buildModelFn });
@@ -1255,7 +1273,7 @@ describe("GET /v1/sessions/:id read-back (§5)", () => {
     const fake = makeFakeBuildModel([[{ content: "reply" }]]);
     const { app } = await makeApp(t, {
       buildModel: fake.buildModelFn,
-      verifyKey: async () => owner,
+      verifyKey: async () => ({ ok: true as const, owner }),
     });
 
     const seed = await postChat(
@@ -1421,7 +1439,7 @@ describe("DELETE /v1/sessions/:id (§5)", () => {
     const fake = makeFakeBuildModel([[{ content: "reply" }]]);
     const { app } = await makeApp(t, {
       buildModel: fake.buildModelFn,
-      verifyKey: async () => owner,
+      verifyKey: async () => ({ ok: true as const, owner }),
     });
 
     const seed = await postChat(
@@ -1461,7 +1479,7 @@ describe("DELETE /v1/sessions/:id (§5)", () => {
     const fake = makeFakeBuildModel([[{ content: "a" }], [{ content: "b" }]]);
     const { app } = await makeApp(t, {
       buildModel: fake.buildModelFn,
-      verifyKey: async () => owner,
+      verifyKey: async () => ({ ok: true as const, owner }),
     });
     const sidB = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
 

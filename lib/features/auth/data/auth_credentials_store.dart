@@ -64,6 +64,7 @@ class AuthCredentials {
     this.sessionToken,
     this.ownerId,
     this.backendOrigin,
+    this.mintedAt,
   });
 
   /// The full API key string. Stored exactly as returned by the mint endpoint
@@ -83,10 +84,38 @@ class AuthCredentials {
   final String? ownerId;
   final String? backendOrigin;
 
+  /// When this [apiKey] was minted (client clock). Null on legacy installs
+  /// that predate the field — backfilled from `listApiKeys.createdAt` by the
+  /// startup rotation pass (M12) once the session is known valid.
+  final DateTime? mintedAt;
+
   AuthAccountScope? get accountScope => AuthAccountScope.fromIdentity(
     backendOrigin: backendOrigin,
     ownerId: ownerId,
   );
+
+  /// Returns a copy with the given fields replaced (used by the startup
+  /// rotation pass to stamp [mintedAt] or swap in a freshly minted key
+  /// without rebuilding the whole record by hand).
+  AuthCredentials copyWith({
+    String? apiKey,
+    String? email,
+    String? keyId,
+    String? sessionToken,
+    String? ownerId,
+    String? backendOrigin,
+    DateTime? mintedAt,
+  }) {
+    return AuthCredentials(
+      apiKey: apiKey ?? this.apiKey,
+      email: email ?? this.email,
+      keyId: keyId ?? this.keyId,
+      sessionToken: sessionToken ?? this.sessionToken,
+      ownerId: ownerId ?? this.ownerId,
+      backendOrigin: backendOrigin ?? this.backendOrigin,
+      mintedAt: mintedAt ?? this.mintedAt,
+    );
+  }
 
   @override
   bool operator ==(Object other) =>
@@ -96,11 +125,19 @@ class AuthCredentials {
       other.keyId == keyId &&
       other.sessionToken == sessionToken &&
       other.ownerId == ownerId &&
-      other.backendOrigin == backendOrigin;
+      other.backendOrigin == backendOrigin &&
+      other.mintedAt == mintedAt;
 
   @override
-  int get hashCode =>
-      Object.hash(apiKey, email, keyId, sessionToken, ownerId, backendOrigin);
+  int get hashCode => Object.hash(
+    apiKey,
+    email,
+    keyId,
+    sessionToken,
+    ownerId,
+    backendOrigin,
+    mintedAt,
+  );
 }
 
 /// Persistence for [AuthCredentials].
@@ -130,69 +167,187 @@ class SecureAuthCredentialsStore implements AuthCredentialsStore {
   static const _kSessionToken = 'auth_session_token';
   static const _kOwnerId = 'auth_owner_id';
   static const _kBackendOrigin = 'auth_backend_origin';
+  static const _kMintedAt = 'auth_minted_at';
+  static const _kRecord = 'auth_credentials_v2';
+  static const _recordVersion = 2;
+  static const _legacyKeys = <String>[
+    _kOwnerId,
+    _kBackendOrigin,
+    _kApiKey,
+    _kEmail,
+    _kKeyId,
+    _kSessionToken,
+    _kMintedAt,
+  ];
 
   final FlutterSecureStorage _storage;
+  Future<void> _pending = Future<void>.value();
+
+  Future<T> _serialized<T>(Future<T> Function() operation) {
+    final result = _pending.then((_) => operation());
+    _pending = result.then<void>((_) {}, onError: (Object _, StackTrace _) {});
+    return result;
+  }
 
   @override
-  Future<AuthCredentials?> load() async {
-    final apiKey = await _storage.read(key: _kApiKey);
-    if (apiKey == null || apiKey.trim().isEmpty) {
+  Future<AuthCredentials?> load() => _serialized(_load);
+
+  Future<AuthCredentials?> _load() async {
+    final rawRecord = await _storage.read(key: _kRecord);
+    if (rawRecord != null) {
+      final record = _decodeRecord(rawRecord);
+      if (record != null) return record;
+    }
+
+    final legacy = await _readLegacy();
+    if (legacy == null) return null;
+
+    try {
+      await _writeRecord(legacy);
+      await _deleteLegacyKeys();
+    } catch (_) {
+      return legacy;
+    }
+    return legacy;
+  }
+
+  @override
+  Future<void> save(AuthCredentials credentials) =>
+      _serialized(() => _save(credentials));
+
+  Future<void> _save(AuthCredentials credentials) async {
+    await _writeRecord(credentials);
+    await _deleteLegacyKeys();
+  }
+
+  Future<void> _writeRecord(AuthCredentials credentials) {
+    return _storage.write(
+      key: _kRecord,
+      value: jsonEncode({
+        'version': _recordVersion,
+        'scope': _nonBlank(credentials.ownerId),
+        'origin': normalizeBackendOrigin(credentials.backendOrigin),
+        'email': _trimmedOrNull(credentials.email),
+        'apiKey': credentials.apiKey,
+        'keyId': _trimmedOrNull(credentials.keyId),
+        'sessionToken': _trimmedOrNull(credentials.sessionToken),
+        'mintedAt': credentials.mintedAt?.toIso8601String(),
+      }),
+    );
+  }
+
+  AuthCredentials? _decodeRecord(String raw) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final data = Map<String, dynamic>.from(decoded);
+      if (data['version'] != _recordVersion) return null;
+
+      final apiKey = _stringField(data, 'apiKey');
+      if (apiKey == null || apiKey.trim().isEmpty) return null;
+
+      return AuthCredentials(
+        apiKey: apiKey,
+        email: _storedOptionalField(data, 'email'),
+        keyId: _storedOptionalField(data, 'keyId'),
+        sessionToken: _storedOptionalField(data, 'sessionToken'),
+        ownerId: _decodeScope(data),
+        backendOrigin: normalizeBackendOrigin(_decodeOrigin(data)),
+        mintedAt: _decodeMintedAt(data),
+      );
+    } catch (_) {
       return null;
     }
+  }
+
+  Future<AuthCredentials?> _readLegacy() async {
+    final apiKey = await _storage.read(key: _kApiKey);
+    if (apiKey == null || apiKey.trim().isEmpty) return null;
+
     final email = await _storage.read(key: _kEmail);
     final keyId = await _storage.read(key: _kKeyId);
     final sessionToken = await _storage.read(key: _kSessionToken);
     final ownerId = await _storage.read(key: _kOwnerId);
     final backendOrigin = await _storage.read(key: _kBackendOrigin);
+    final mintedAtRaw = await _storage.read(key: _kMintedAt);
     return AuthCredentials(
-      ownerId: ownerId == null || ownerId.trim().isEmpty ? null : ownerId,
-      backendOrigin: normalizeBackendOrigin(backendOrigin),
       apiKey: apiKey,
-      email: email == null || email.trim().isEmpty ? null : email,
-      keyId: keyId == null || keyId.trim().isEmpty ? null : keyId,
-      sessionToken: sessionToken == null || sessionToken.trim().isEmpty
+      email: _storedOptional(email),
+      keyId: _storedOptional(keyId),
+      sessionToken: _storedOptional(sessionToken),
+      ownerId: _storedOptional(ownerId),
+      backendOrigin: normalizeBackendOrigin(backendOrigin),
+      mintedAt: mintedAtRaw == null || mintedAtRaw.trim().isEmpty
           ? null
-          : sessionToken,
+          : DateTime.tryParse(mintedAtRaw),
     );
   }
 
-  @override
-  Future<void> save(AuthCredentials credentials) async {
-    await _storage.delete(key: _kOwnerId);
-    await _storage.delete(key: _kBackendOrigin);
-    // The key must be stored exactly as returned; never trim it.
-    await _storage.write(key: _kApiKey, value: credentials.apiKey);
-    await _writeTrimmedOrDelete(_kEmail, credentials.email);
-    await _writeTrimmedOrDelete(_kKeyId, credentials.keyId);
-    await _writeTrimmedOrDelete(_kSessionToken, credentials.sessionToken);
-    final origin = normalizeBackendOrigin(credentials.backendOrigin);
-    if (origin != null) {
-      await _storage.write(key: _kBackendOrigin, value: origin);
+  String? _decodeScope(Map<String, dynamic> data) {
+    if (data.containsKey('scope')) {
+      final value = data['scope'];
+      if (value is Map) {
+        return _storedOptionalField(
+          Map<String, dynamic>.from(value),
+          'ownerId',
+        );
+      }
+      return _storedOptionalField(data, 'scope');
     }
-    final ownerId = credentials.ownerId;
-    if (ownerId != null && ownerId.trim().isNotEmpty) {
-      await _storage.write(key: _kOwnerId, value: ownerId);
-    }
+    return _storedOptionalField(data, 'ownerId');
   }
 
-  /// Writes [value] under [key] when non-blank, otherwise removes the stored
-  /// value so a cleared field never lingers after being reset.
-  Future<void> _writeTrimmedOrDelete(String key, String? value) async {
+  String? _decodeOrigin(Map<String, dynamic> data) {
+    final key = data.containsKey('origin') ? 'origin' : 'backendOrigin';
+    return _stringField(data, key);
+  }
+
+  DateTime? _decodeMintedAt(Map<String, dynamic> data) {
+    final raw = _stringField(data, 'mintedAt');
+    if (raw == null || raw.trim().isEmpty) return null;
+    return DateTime.tryParse(raw);
+  }
+
+  String? _stringField(Map<String, dynamic> data, String key) {
+    final value = data[key];
+    if (value == null) return null;
+    if (value is! String) throw const FormatException();
+    return value;
+  }
+
+  String? _storedOptionalField(Map<String, dynamic> data, String key) =>
+      _storedOptional(_stringField(data, key));
+
+  String? _storedOptional(String? value) =>
+      value == null || value.trim().isEmpty ? null : value;
+
+  String? _nonBlank(String? value) =>
+      value == null || value.trim().isEmpty ? null : value;
+
+  String? _trimmedOrNull(String? value) {
     final trimmed = value?.trim();
-    if (trimmed != null && trimmed.isNotEmpty) {
-      await _storage.write(key: key, value: trimmed);
-    } else {
-      await _storage.delete(key: key);
+    return trimmed == null || trimmed.isEmpty ? null : trimmed;
+  }
+
+  Future<void> _deleteLegacyKeys() => _deleteKeys(_legacyKeys);
+
+  Future<void> _deleteKeys(Iterable<String> keys) async {
+    Object? firstError;
+    StackTrace? firstStack;
+    for (final key in keys) {
+      try {
+        await _storage.delete(key: key);
+      } catch (error, stack) {
+        firstError ??= error;
+        firstStack ??= stack;
+      }
+    }
+    if (firstError != null) {
+      Error.throwWithStackTrace(firstError, firstStack!);
     }
   }
 
   @override
-  Future<void> clear() async {
-    await _storage.delete(key: _kOwnerId);
-    await _storage.delete(key: _kBackendOrigin);
-    await _storage.delete(key: _kApiKey);
-    await _storage.delete(key: _kEmail);
-    await _storage.delete(key: _kKeyId);
-    await _storage.delete(key: _kSessionToken);
-  }
+  Future<void> clear() =>
+      _serialized(() => _deleteKeys(<String>[_kRecord, ..._legacyKeys]));
 }

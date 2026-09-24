@@ -165,7 +165,7 @@ async function makeApp(
     createPluginRoutes({
       registry,
       store,
-      verifyKey: verifyKey ?? (async () => "test-user"),
+      verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
     }),
   );
   return { app, store, registry, storePath };
@@ -283,7 +283,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createPluginRoutes({ registry, store, verifyKey: async () => "test-user" }),
+      createPluginRoutes({ registry, store, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
     );
 
     const res = await app.request("/v1/plugins/evil/install", {
@@ -359,7 +359,7 @@ describe("plugin routes — reload", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createPluginRoutes({ registry, store, verifyKey: async () => "test-user" }),
+      createPluginRoutes({ registry, store, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
     );
 
     const res = await app.request("/v1/plugins/reload", {
@@ -384,7 +384,7 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
       createPluginRoutes({
         registry,
         store,
-        verifyKey: async () => "test-user",
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
         limiter,
       }),
     );
@@ -422,7 +422,7 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createPluginRoutes({ registry, store, verifyKey: async () => "test-user" }),
+      createPluginRoutes({ registry, store, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
     );
     for (let i = 0; i < 25; i++) {
       const list = await app.request("/v1/plugins", { headers: auth });
@@ -432,8 +432,8 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
 });
 
 describe("plugin routes — auth", () => {
-  test("every endpoint → 401 unauthorized when the verifier returns null", async (t) => {
-    const { app } = await makeApp(t, async () => null);
+  test("every endpoint → 401 unauthorized when the verifier returns bad_key", async (t) => {
+    const { app } = await makeApp(t, async () => ({ ok: false as const, reason: "bad_key" as const }));
     const cases: Array<[string, string]> = [
       ["GET", "/v1/plugins"],
       ["GET", "/v1/plugins/openrouter"],
@@ -445,6 +445,25 @@ describe("plugin routes — auth", () => {
       const res = await app.request(path, { method, headers: auth });
       assert.equal(res.status, 401, `${method} ${path}`);
       assert.deepEqual(await json(res), { error: "unauthorized" }, `${method} ${path}`);
+    }
+  });
+
+  test("every endpoint → 403 email_not_verified when the owner's email is unverified", async (t) => {
+    const { app } = await makeApp(t, async () => ({
+      ok: false as const,
+      reason: "email_not_verified" as const,
+    }));
+    const cases: Array<[string, string]> = [
+      ["GET", "/v1/plugins"],
+      ["GET", "/v1/plugins/openrouter"],
+      ["POST", "/v1/plugins/vikunja/install"],
+      ["POST", "/v1/plugins/vikunja/uninstall"],
+      ["POST", "/v1/plugins/reload"],
+    ];
+    for (const [method, path] of cases) {
+      const res = await app.request(path, { method, headers: auth });
+      assert.equal(res.status, 403, `${method} ${path}`);
+      assert.deepEqual(await json(res), { error: "email_not_verified" }, `${method} ${path}`);
     }
   });
 });

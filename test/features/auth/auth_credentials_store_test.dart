@@ -1,7 +1,29 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
+
+import '../../fakes.dart';
+
+const _recordKey = 'auth_credentials_v2';
+const _legacyKeys = <String>[
+  'auth_api_key',
+  'auth_email',
+  'auth_key_id',
+  'auth_session_token',
+  'auth_owner_id',
+  'auth_backend_origin',
+  'auth_minted_at',
+];
+
+Map<String, dynamic> _storedRecord(InMemorySecureStorage storage) {
+  final raw = storage.values[_recordKey];
+  if (raw == null) throw StateError('missing credential record');
+  return jsonDecode(raw) as Map<String, dynamic>;
+}
 
 /// In-memory [FlutterSecureStorage] double, mirroring the one in
 /// `settings_store_test.dart` (not exported for reuse).
@@ -79,6 +101,178 @@ void main() {
     },
   );
 
+  test('v2 record round-trips every credential field', () async {
+    final storage = FailureInjectingSecureStorage();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    final credentials = AuthCredentials(
+      apiKey: 'sk-  exact key  ',
+      email: 'a@b.c',
+      keyId: 'key-42',
+      sessionToken: 'tok-99',
+      ownerId: 'user-1',
+      backendOrigin: 'HTTPS://Example.COM:443/',
+      mintedAt: DateTime.utc(2026, 6, 1, 12, 30, 45),
+    );
+
+    await store.save(credentials);
+
+    final record =
+        jsonDecode(storage.values[_recordKey]!) as Map<String, dynamic>;
+    expect(record['version'], 2);
+    expect(record['scope'], 'user-1');
+    expect(record['origin'], 'https://example.com');
+    expect(record['email'], 'a@b.c');
+    expect(record['apiKey'], 'sk-  exact key  ');
+    expect(record['keyId'], 'key-42');
+    expect(record['sessionToken'], 'tok-99');
+    expect(record['mintedAt'], credentials.mintedAt!.toIso8601String());
+    expect(_legacyKeys.any(storage.values.containsKey), isFalse);
+    expect(
+      await store.load(),
+      credentials.copyWith(backendOrigin: 'https://example.com'),
+    );
+  });
+
+  test('legacy seven-key data loads and is upgraded to v2', () async {
+    final legacy = <String, String>{
+      'auth_api_key': 'legacy-key',
+      'auth_email': 'legacy@example.com',
+      'auth_key_id': 'legacy-id',
+      'auth_session_token': 'legacy-token',
+      'auth_owner_id': 'legacy-owner',
+      'auth_backend_origin': 'https://legacy.example/',
+      'auth_minted_at': '2025-01-02T03:04:05.000Z',
+    };
+    final storage = FailureInjectingSecureStorage(initialValues: legacy);
+    final store = SecureAuthCredentialsStore(storage: storage);
+
+    final loaded = await store.load();
+
+    expect(
+      loaded,
+      AuthCredentials(
+        apiKey: 'legacy-key',
+        email: 'legacy@example.com',
+        keyId: 'legacy-id',
+        sessionToken: 'legacy-token',
+        ownerId: 'legacy-owner',
+        backendOrigin: 'https://legacy.example',
+        mintedAt: DateTime.utc(2025, 1, 2, 3, 4, 5),
+      ),
+    );
+    expect(storage.values[_recordKey], isNotNull);
+    expect(_legacyKeys.any(storage.values.containsKey), isFalse);
+  });
+
+  test('a failed v2 write preserves all legacy data', () async {
+    final legacy = <String, String>{
+      'auth_api_key': 'legacy-key',
+      'auth_email': 'legacy@example.com',
+      'auth_key_id': 'legacy-id',
+      'auth_session_token': 'legacy-token',
+      'auth_owner_id': 'legacy-owner',
+      'auth_backend_origin': 'https://legacy.example',
+      'auth_minted_at': '2025-01-02T03:04:05.000Z',
+    };
+    final storage = FailureInjectingSecureStorage(initialValues: legacy)
+      ..failWriteKey = _recordKey;
+    final store = SecureAuthCredentialsStore(storage: storage);
+
+    await expectLater(
+      store.save(const AuthCredentials(apiKey: 'new-key')),
+      throwsStateError,
+    );
+    expect(storage.values.length, legacy.length);
+    for (final entry in legacy.entries) {
+      expect(storage.values[entry.key], entry.value);
+    }
+    expect(storage.values.containsKey(_recordKey), isFalse);
+    expect((await store.load())!.apiKey, 'legacy-key');
+  });
+
+  test(
+    'a failed legacy cleanup leaves the committed v2 record usable',
+    () async {
+      final storage = FailureInjectingSecureStorage(
+        initialValues: const {'auth_api_key': 'legacy-key'},
+      )..failDeleteKey = 'auth_owner_id';
+      final store = SecureAuthCredentialsStore(storage: storage);
+
+      await expectLater(
+        store.save(const AuthCredentials(apiKey: 'new-key')),
+        throwsStateError,
+      );
+
+      expect(storage.values[_recordKey], isNotNull);
+      expect((await store.load())!.apiKey, 'new-key');
+    },
+  );
+
+  test('malformed v2 data falls back without throwing', () async {
+    final legacy = <String, String>{
+      'auth_api_key': 'legacy-key',
+      'auth_email': 'legacy@example.com',
+    };
+    final storage = FailureInjectingSecureStorage(
+      initialValues: {...legacy, _recordKey: '{not-json'},
+    );
+    final store = SecureAuthCredentialsStore(storage: storage);
+
+    expect((await store.load())!.apiKey, 'legacy-key');
+    expect(storage.values[_recordKey], isNotNull);
+    expect(storage.values.containsKey('auth_api_key'), isFalse);
+
+    final emptyStorage = FailureInjectingSecureStorage(
+      initialValues: const {_recordKey: '{not-json'},
+    );
+    expect(
+      await SecureAuthCredentialsStore(storage: emptyStorage).load(),
+      isNull,
+    );
+  });
+
+  test('a valid v2 record is never mixed with legacy fields', () async {
+    final storage = FailureInjectingSecureStorage();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    await store.save(
+      const AuthCredentials(
+        apiKey: 'new-key',
+        keyId: 'new-id',
+        sessionToken: 'new-token',
+      ),
+    );
+    storage.seed(const {
+      'auth_api_key': 'old-key',
+      'auth_key_id': 'old-id',
+      'auth_session_token': 'old-token',
+    });
+    storage.operations.clear();
+
+    final loaded = await store.load();
+
+    expect(loaded!.apiKey, 'new-key');
+    expect(loaded.keyId, 'new-id');
+    expect(loaded.sessionToken, 'new-token');
+    expect(storage.operations, ['read:$_recordKey']);
+  });
+
+  test('concurrent save, save, load, and clear serialize in order', () async {
+    final storage = FailureInjectingSecureStorage()..gate = Completer<void>();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    final firstSave = store.save(const AuthCredentials(apiKey: 'first-key'));
+    final secondSave = store.save(const AuthCredentials(apiKey: 'second-key'));
+    final load = store.load();
+    final clear = store.clear();
+
+    storage.gate!.complete();
+    final loaded = await load;
+    await Future.wait<void>([firstSave, secondSave, clear]);
+
+    expect(loaded!.apiKey, 'second-key');
+    expect(await store.load(), isNull);
+    expect(storage.values, isEmpty);
+  });
+
   test('scope is stable, collision-safe, and requires verified identity', () {
     AuthAccountScope? scope(String? origin, String? owner) =>
         AuthAccountScope.fromIdentity(backendOrigin: origin, ownerId: owner);
@@ -118,8 +312,9 @@ void main() {
 
     await store.save(const AuthCredentials(apiKey: 'cake_x', email: 'a@b.c'));
 
-    expect(storage.values['auth_api_key'], 'cake_x');
-    expect(storage.values['auth_email'], 'a@b.c');
+    final record = _storedRecord(storage);
+    expect(record['apiKey'], 'cake_x');
+    expect(record['email'], 'a@b.c');
   });
 
   test('load returns null email when stored value is blank', () async {
@@ -127,7 +322,9 @@ void main() {
     final store = SecureAuthCredentialsStore(storage: storage);
 
     await store.save(const AuthCredentials(apiKey: 'cake_x', email: 'a@b.c'));
-    storage._values['auth_email'] = '   ';
+    final record = _storedRecord(storage);
+    record['email'] = '   ';
+    storage._values[_recordKey] = jsonEncode(record);
     final loaded = await store.load();
 
     expect(loaded!.apiKey, 'cake_x');
@@ -139,10 +336,11 @@ void main() {
     final store = SecureAuthCredentialsStore(storage: storage);
 
     await store.save(const AuthCredentials(apiKey: 'cake_x', email: 'a@b.c'));
-    expect(storage.values.containsKey('auth_email'), isTrue);
+    expect(_storedRecord(storage)['email'], 'a@b.c');
 
     await store.save(const AuthCredentials(apiKey: 'cake_x'));
 
+    expect(_storedRecord(storage)['email'], isNull);
     expect(storage.values.containsKey('auth_email'), isFalse);
     final loaded = await store.load();
     expect(loaded!.email, isNull);
@@ -155,7 +353,7 @@ void main() {
     const key = 'sk-  with internal spaces  ';
     await store.save(const AuthCredentials(apiKey: key));
 
-    expect(storage.values['auth_api_key'], key);
+    expect(_storedRecord(storage)['apiKey'], key);
     expect((await store.load())!.apiKey, key);
   });
 
@@ -172,8 +370,9 @@ void main() {
       ),
     );
 
-    expect(storage.values['auth_key_id'], 'key-42');
-    expect(storage.values['auth_session_token'], 'tok-99');
+    final record = _storedRecord(storage);
+    expect(record['keyId'], 'key-42');
+    expect(record['sessionToken'], 'tok-99');
     final loaded = await store.load();
     expect(
       loaded,
@@ -199,11 +398,15 @@ void main() {
           sessionToken: 'tok-99',
         ),
       );
-      expect(storage.values.containsKey('auth_key_id'), isTrue);
-      expect(storage.values.containsKey('auth_session_token'), isTrue);
+      var record = _storedRecord(storage);
+      expect(record['keyId'], 'key-42');
+      expect(record['sessionToken'], 'tok-99');
 
       await store.save(const AuthCredentials(apiKey: 'cake_x'));
 
+      record = _storedRecord(storage);
+      expect(record['keyId'], isNull);
+      expect(record['sessionToken'], isNull);
       expect(storage.values.containsKey('auth_key_id'), isFalse);
       expect(storage.values.containsKey('auth_session_token'), isFalse);
       final loaded = await store.load();
@@ -219,8 +422,10 @@ void main() {
     await store.save(
       const AuthCredentials(apiKey: 'cake_x', keyId: 'k', sessionToken: 't'),
     );
-    storage._values['auth_key_id'] = '   ';
-    storage._values['auth_session_token'] = '   ';
+    final record = _storedRecord(storage);
+    record['keyId'] = '   ';
+    record['sessionToken'] = '   ';
+    storage._values[_recordKey] = jsonEncode(record);
     final loaded = await store.load();
 
     expect(loaded!.apiKey, 'cake_x');
@@ -266,5 +471,78 @@ void main() {
     expect(base.hashCode, isNot(withKeyId.hashCode));
     expect(base, isNot(withToken));
     expect(base.hashCode, isNot(withToken.hashCode));
+  });
+
+  test('mintedAt round-trips through save/load (M12)', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    final mintedAt = DateTime.utc(2026, 6, 1, 12, 30, 45);
+
+    await store.save(
+      AuthCredentials(apiKey: 'cake_x', keyId: 'k1', mintedAt: mintedAt),
+    );
+
+    expect(_storedRecord(storage)['mintedAt'], mintedAt.toIso8601String());
+    final loaded = await store.load();
+    expect(loaded!.mintedAt, mintedAt);
+  });
+
+  test('legacy installs load mintedAt as null (field absent)', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    storage._values
+      ..clear()
+      ..['auth_api_key'] = 'cake_x';
+
+    final loaded = await store.load();
+    expect(loaded!.mintedAt, isNull);
+    expect(loaded.apiKey, 'cake_x');
+    expect(_storedRecord(storage)['mintedAt'], isNull);
+  });
+
+  test('saving without mintedAt deletes a previously stamped value', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    await store.save(
+      AuthCredentials(apiKey: 'cake_x', mintedAt: DateTime.utc(2026, 1, 1)),
+    );
+    expect(_storedRecord(storage)['mintedAt'], isNotNull);
+
+    await store.save(const AuthCredentials(apiKey: 'cake_x'));
+
+    expect(_storedRecord(storage)['mintedAt'], isNull);
+    expect(storage.values.containsKey('auth_minted_at'), isFalse);
+    expect((await store.load())!.mintedAt, isNull);
+  });
+
+  test('clear removes mintedAt too', () async {
+    final storage = InMemorySecureStorage();
+    final store = SecureAuthCredentialsStore(storage: storage);
+    await store.save(
+      AuthCredentials(apiKey: 'cake_x', mintedAt: DateTime.utc(2026, 1, 1)),
+    );
+
+    await store.clear();
+
+    expect(storage.values, isEmpty);
+    expect(await store.load(), isNull);
+  });
+
+  test('equality and hashCode include mintedAt', () {
+    final t = DateTime.utc(2026, 3, 1);
+    final a = AuthCredentials(apiKey: 'k', mintedAt: t);
+    final b = AuthCredentials(apiKey: 'k', mintedAt: t);
+    final c = AuthCredentials(
+      apiKey: 'k',
+      mintedAt: t.add(const Duration(days: 1)),
+    );
+    final d = const AuthCredentials(apiKey: 'k');
+
+    expect(a, b);
+    expect(a.hashCode, b.hashCode);
+    expect(a, isNot(c));
+    expect(a.hashCode, isNot(c.hashCode));
+    expect(a, isNot(d));
+    expect(a.hashCode, isNot(d.hashCode));
   });
 }

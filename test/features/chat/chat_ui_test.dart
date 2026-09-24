@@ -58,18 +58,34 @@ Widget chatApp({
   );
 }
 
+class _GatedDeleteStore extends FakeChatStore {
+  Completer<void>? deleteGate;
+  int deleteCalls = 0;
+
+  @override
+  Future<void> deleteMessage(String conversationId, String messageId) async {
+    deleteCalls++;
+    final gate = deleteGate;
+    if (gate != null) await gate.future;
+    return super.deleteMessage(conversationId, messageId);
+  }
+}
+
 void main() {
-  testWidgets('ChatScreen renders empty state with input enabled',
-      (tester) async {
+  testWidgets('ChatScreen renders empty state with input enabled', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: FakeChatClient(),
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: FakeChatClient(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     expect(find.text('Voice Assist'), findsOneWidget);
@@ -77,7 +93,10 @@ void main() {
     final textField = tester.widget<TextField>(find.byType(TextField));
     expect(textField.enabled, isTrue);
     final sendButton = tester.widget<IconButton>(
-      find.ancestor(of: find.byIcon(Icons.send), matching: find.byType(IconButton)),
+      find.ancestor(
+        of: find.byIcon(Icons.send),
+        matching: find.byType(IconButton),
+      ),
     );
     expect(sendButton.onPressed, isNull);
   });
@@ -88,20 +107,22 @@ void main() {
       stored: const BackendSettings(host: 'myhost'),
     );
     final chatStore = FakeChatStore();
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: chatStore,
-      client: FakeChatClient(),
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: chatStore,
+        client: FakeChatClient(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     IconButton button() => tester.widget<IconButton>(
-          find.ancestor(
-            of: find.byIcon(Icons.schedule_send),
-            matching: find.byType(IconButton),
-          ),
-        );
+      find.ancestor(
+        of: find.byIcon(Icons.schedule_send),
+        matching: find.byType(IconButton),
+      ),
+    );
 
     expect(find.byIcon(Icons.schedule_send), findsOneWidget);
     expect(button().onPressed, isNull);
@@ -130,21 +151,23 @@ void main() {
       FakeScheduler(),
     );
     addTearDown(poller.dispose);
-    await tester.pumpWidget(ProviderScope(
-      overrides: [
-        settingsStoreProvider.overrideWithValue(store),
-        backendProbeProvider.overrideWithValue(FakeProbe()),
-        chatStoreProvider.overrideWithValue(chatStore),
-        managedChatAdapterProvider.overrideWithValue(
-          FakeManagedChatAdapter(
-            store: chatStore,
-            script: FakeChatClient(),
-            poller: poller,
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          settingsStoreProvider.overrideWithValue(store),
+          backendProbeProvider.overrideWithValue(FakeProbe()),
+          chatStoreProvider.overrideWithValue(chatStore),
+          managedChatAdapterProvider.overrideWithValue(
+            FakeManagedChatAdapter(
+              store: chatStore,
+              script: FakeChatClient(),
+              poller: poller,
+            ),
           ),
-        ),
-      ],
-      child: const MaterialApp(home: ChatScreen()),
-    ));
+        ],
+        child: const MaterialApp(home: ChatScreen()),
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'later');
@@ -162,36 +185,40 @@ void main() {
     );
   });
 
-  testWidgets('typing and tapping Send appends a user bubble and assistant reply',
-      (tester) async {
-    final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost'),
-    );
-    final client = FakeChatClient(
-      results: const [
-        ChatResult(
-          content: 'Hello back',
-          toolCalls: [],
-          finishReason: 'stop',
+  testWidgets(
+    'typing and tapping Send appends a user bubble and assistant reply',
+    (tester) async {
+      final store = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(
+            content: 'Hello back',
+            toolCalls: [],
+            finishReason: 'stop',
+          ),
+        ],
+      );
+      await tester.pumpWidget(
+        chatApp(
+          store: store,
+          probe: FakeProbe(),
+          chatStore: FakeChatStore(),
+          client: client,
         ),
-      ],
-    );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
-    await tester.pumpAndSettle();
+      );
+      await tester.pumpAndSettle();
 
-    await tester.enterText(find.byType(TextField), 'Hi there');
-    await tester.pump();
-    await tester.tap(find.byIcon(Icons.send));
-    await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'Hi there');
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.send));
+      await tester.pumpAndSettle();
 
-    expect(find.text('Hi there'), findsOneWidget);
-    expect(find.text('Hello back'), findsOneWidget);
-  });
+      expect(find.text('Hi there'), findsOneWidget);
+      expect(find.text('Hello back'), findsOneWidget);
+    },
+  );
 
   testWidgets('assistant reply renders markdown', (tester) async {
     final store = FakeSettingsStore(
@@ -206,12 +233,14 @@ void main() {
         ),
       ],
     );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: client,
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'Hello');
@@ -222,26 +251,30 @@ void main() {
     expect(find.textContaining('bold'), findsOneWidget);
   });
 
-  testWidgets('markdown images never render an Image widget (SSRF guard)',
-      (tester) async {
+  testWidgets('markdown images never render an Image widget (SSRF guard)', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient(
       results: const [
         ChatResult(
-          content: '![x](http://10.0.0.1/) ![sized](http://10.0.0.2/a.png#50x50)',
+          content:
+              '![x](http://10.0.0.1/) ![sized](http://10.0.0.2/a.png#50x50)',
           toolCalls: [],
           finishReason: 'stop',
         ),
       ],
     );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: client,
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'Hello');
@@ -260,8 +293,9 @@ void main() {
     );
   });
 
-  testWidgets('tool-call chip renders when assistant message has toolCalls',
-      (tester) async {
+  testWidgets('tool-call chip renders when assistant message has toolCalls', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
@@ -276,12 +310,14 @@ void main() {
         ),
       ],
     );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: client,
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'list voices');
@@ -292,8 +328,9 @@ void main() {
     expect(find.textContaining('list_voices'), findsWidgets);
   });
 
-  testWidgets('Stop button appears while streaming and stops the stream',
-      (tester) async {
+  testWidgets('Stop button appears while streaming and stops the stream', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
@@ -304,12 +341,14 @@ void main() {
     );
     final hang = Completer<ChatResult>();
     client.hang = hang;
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: client,
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'Hello');
@@ -329,18 +368,21 @@ void main() {
     expect(find.byIcon(Icons.stop), findsNothing);
   });
 
-  testWidgets('error banner and Retry button appear when client errors',
-      (tester) async {
+  testWidgets('error banner and Retry button appear when client errors', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
     final client = FakeChatClient()..error = 'boom';
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: client,
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'Hello');
@@ -352,68 +394,135 @@ void main() {
   });
 
   testWidgets(
-      'a 401 failure renders the ReauthCard and completing AuthFlow clears it',
-      (tester) async {
+    'retry disables while deleting and dispatches once on a double tap',
+    (tester) async {
+      final settings = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      final store = _GatedDeleteStore();
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'Recovered', toolCalls: [], finishReason: 'stop'),
+        ],
+      )..error = const ChatNetworkError('boom');
+      final adapter = FakeManagedChatAdapter(store: store, script: client);
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            settingsStoreProvider.overrideWithValue(settings),
+            backendProbeProvider.overrideWithValue(FakeProbe()),
+            chatStoreProvider.overrideWithValue(store),
+            filesStoreProvider.overrideWithValue(FakeFileStore()),
+            managedChatAdapterProvider.overrideWithValue(adapter),
+          ],
+          child: const MaterialApp(home: ChatScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField), 'Hello');
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.send));
+      await tester.pumpAndSettle();
+      expect(find.text('Retry'), findsOneWidget);
+
+      client.error = null;
+      store.deleteGate = Completer<void>();
+      addTearDown(() {
+        if (!store.deleteGate!.isCompleted) store.deleteGate!.complete();
+      });
+
+      final retry = find.text('Retry');
+      await tester.tap(retry);
+      await tester.tap(retry);
+      await tester.pump();
+
+      expect(store.deleteCalls, 1);
+      expect(adapter.retries, isEmpty);
+      final button = tester.widget<TextButton>(
+        find.widgetWithText(TextButton, 'Retry'),
+      );
+      expect(button.onPressed, isNull);
+
+      store.deleteGate!.complete();
+      await tester.pumpAndSettle();
+
+      expect(adapter.retries, hasLength(1));
+      expect(store.deleteCalls, 1);
+      expect(find.text('Retry'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'a 401 failure renders the ReauthCard and completing AuthFlow clears it',
+    (tester) async {
+      final store = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      // First send 401s; the retry after re-auth must succeed.
+      final client = FakeChatClient()
+        ..error = const ChatServerError('HTTP 401', statusCode: 401);
+      final authClient = FakeAuthClient(
+        onSignIn: (email, password) async =>
+            AuthSession(token: 'tok-1', email: email),
+        onMintApiKey: (token) async =>
+            const MintedApiKey(key: 'sk-fresh', id: 'key-id-fresh'),
+      );
+      await tester.pumpWidget(
+        chatApp(
+          store: store,
+          probe: FakeProbe(),
+          chatStore: FakeChatStore(),
+          client: client,
+          authCredentialsStore: FakeAuthCredentialsStore(),
+          authClient: authClient,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField), 'Hello');
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.send));
+      await tester.pumpAndSettle();
+
+      // A 401 surfaces the re-auth card, not the generic error banner.
+      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.text('Retry'), findsNothing);
+      expect(find.text('Session expired'), findsOneWidget);
+
+      // Allow the post-re-auth retry to succeed, then complete AuthFlow.
+      client.error = null;
+      await tester.enterText(
+        find.byKey(const Key('auth-email')),
+        'me@example.com',
+      );
+      await tester.enterText(find.byKey(const Key('auth-password')), 's3cret');
+      await tester.tap(find.byKey(const Key('auth-submit')));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(ReauthCard), findsNothing);
+      expect(find.text('Hello'), findsOneWidget);
+      expect(find.text('Retry'), findsNothing);
+    },
+  );
+
+  testWidgets('ReauthCard dismiss clears the auth-required state', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
-    // First send 401s; the retry after re-auth must succeed.
     final client = FakeChatClient()
       ..error = const ChatServerError('HTTP 401', statusCode: 401);
-    final authClient = FakeAuthClient(
-      onSignIn: (email, password) async =>
-          AuthSession(token: 'tok-1', email: email),
-      onMintApiKey: (token) async =>
-        const MintedApiKey(key: 'sk-fresh', id: 'key-id-fresh'),
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: client,
+      ),
     );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-      authCredentialsStore: FakeAuthCredentialsStore(),
-      authClient: authClient,
-    ));
-    await tester.pumpAndSettle();
-
-    await tester.enterText(find.byType(TextField), 'Hello');
-    await tester.pump();
-    await tester.tap(find.byIcon(Icons.send));
-    await tester.pumpAndSettle();
-
-    // A 401 surfaces the re-auth card, not the generic error banner.
-    expect(find.byType(ReauthCard), findsOneWidget);
-    expect(find.text('Retry'), findsNothing);
-    expect(find.text('Session expired'), findsOneWidget);
-
-    // Allow the post-re-auth retry to succeed, then complete AuthFlow.
-    client.error = null;
-    await tester.enterText(find.byKey(const Key('auth-email')), 'me@example.com');
-    await tester.enterText(
-      find.byKey(const Key('auth-password')),
-      's3cret',
-    );
-    await tester.tap(find.byKey(const Key('auth-submit')));
-    await tester.pumpAndSettle();
-
-    expect(find.byType(ReauthCard), findsNothing);
-    expect(find.text('Hello'), findsOneWidget);
-    expect(find.text('Retry'), findsNothing);
-  });
-
-  testWidgets('ReauthCard dismiss clears the auth-required state',
-      (tester) async {
-    final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost'),
-    );
-    final client = FakeChatClient()
-      ..error = const ChatServerError('HTTP 401', statusCode: 401);
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'Hello');
@@ -429,36 +538,41 @@ void main() {
     expect(find.byType(ReauthCard), findsNothing);
   });
 
-  testWidgets('missing credentials render the ReauthCard, not an error banner',
-      (tester) async {
-    final store = FakeSettingsStore(
-      stored: const BackendSettings(host: 'myhost'),
-    );
-    // No stored session/API key: the credential resolver throws a
-    // ChatAuthRequiredError before any network call. The UI must treat it
-    // exactly like a gateway 401 and show the login flow.
-    final client = FakeChatClient()
-      ..error = const ChatAuthRequiredError('Not authenticated');
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: client,
-    ));
-    await tester.pumpAndSettle();
+  testWidgets(
+    'missing credentials render the ReauthCard, not an error banner',
+    (tester) async {
+      final store = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      // No stored session/API key: the credential resolver throws a
+      // ChatAuthRequiredError before any network call. The UI must treat it
+      // exactly like a gateway 401 and show the login flow.
+      final client = FakeChatClient()
+        ..error = const ChatAuthRequiredError('Not authenticated');
+      await tester.pumpWidget(
+        chatApp(
+          store: store,
+          probe: FakeProbe(),
+          chatStore: FakeChatStore(),
+          client: client,
+        ),
+      );
+      await tester.pumpAndSettle();
 
-    await tester.enterText(find.byType(TextField), 'Hello');
-    await tester.pump();
-    await tester.tap(find.byIcon(Icons.send));
-    await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'Hello');
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.send));
+      await tester.pumpAndSettle();
 
-    expect(find.byType(ReauthCard), findsOneWidget);
-    expect(find.text('Retry'), findsNothing);
-    expect(find.text('Session expired'), findsOneWidget);
-  });
+      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.text('Retry'), findsNothing);
+      expect(find.text('Session expired'), findsOneWidget);
+    },
+  );
 
-  testWidgets('History screen lists conversations and delete removes one',
-      (tester) async {
+  testWidgets('History screen lists conversations and delete removes one', (
+    tester,
+  ) async {
     final now = DateTime.now();
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
@@ -481,12 +595,14 @@ void main() {
         ),
       ],
     );
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: chatStore,
-      client: FakeChatClient(),
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: chatStore,
+        client: FakeChatClient(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const Key('history')));
@@ -504,15 +620,18 @@ void main() {
     expect(find.text('Second chat'), findsOneWidget);
   });
 
-  testWidgets('Configure Backend banner shows when settings invalid',
-      (tester) async {
+  testWidgets('Configure Backend banner shows when settings invalid', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(); // no stored settings -> invalid
-    await tester.pumpWidget(chatApp(
-      store: store,
-      probe: FakeProbe(),
-      chatStore: FakeChatStore(),
-      client: FakeChatClient(),
-    ));
+    await tester.pumpWidget(
+      chatApp(
+        store: store,
+        probe: FakeProbe(),
+        chatStore: FakeChatStore(),
+        client: FakeChatClient(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     expect(find.text('Backend not configured'), findsOneWidget);
@@ -520,61 +639,71 @@ void main() {
   });
 
   testWidgets(
-      'assistant message with a [file:...] ref renders a FileAttachmentChip '
-      'between text blocks', (tester) async {
-    await tester.pumpWidget(ProviderScope(
-      overrides: [
-        filesServiceProvider.overrideWithValue(FakeFilesClient()),
-        fileCacheProvider.overrideWithValue(
-          FileCache(cacheDir: Directory.systemTemp),
-        ),
-        filesStoreProvider.overrideWithValue(FakeFileStore()),
-      ],
-      child: const MaterialApp(
-        home: Scaffold(
-          body: MessageBubble(
-            message: Message(
-              id: 'a1',
-              role: MessageRole.assistant,
-              content: 'Here is the file [file:abc123] for you.',
-              createdAt: null,
+    'assistant message with a [file:...] ref renders a FileAttachmentChip '
+    'between text blocks',
+    (tester) async {
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            filesServiceProvider.overrideWithValue(FakeFilesClient()),
+            fileCacheProvider.overrideWithValue(
+              FileCache(cacheDir: Directory.systemTemp, scopeKey: 'test-scope'),
+            ),
+            filesStoreProvider.overrideWithValue(FakeFileStore()),
+          ],
+          child: const MaterialApp(
+            home: Scaffold(
+              body: MessageBubble(
+                message: Message(
+                  id: 'a1',
+                  role: MessageRole.assistant,
+                  content: 'Here is the file [file:abc123] for you.',
+                  createdAt: null,
+                ),
+              ),
             ),
           ),
         ),
-      ),
-    ));
-    await tester.pump();
+      );
+      await tester.pump();
 
-    expect(find.byType(FileAttachmentChip), findsOneWidget);
-    // The chip is the bare file id (no filename context in the content).
-    expect(find.text('abc123'), findsOneWidget);
-    // Surrounding text still renders.
-    expect(find.textContaining('Here is the file'), findsOneWidget);
-    expect(find.textContaining('for you'), findsOneWidget);
-  });
+      expect(find.byType(FileAttachmentChip), findsOneWidget);
+      // The chip is the bare file id (no filename context in the content).
+      expect(find.text('abc123'), findsOneWidget);
+      // Surrounding text still renders.
+      expect(find.textContaining('Here is the file'), findsOneWidget);
+      expect(find.textContaining('for you'), findsOneWidget);
+    },
+  );
 
-  testWidgets('the Voice segment of the pill opens the voice screen',
-      (tester) async {
+  testWidgets('the Voice segment of the pill opens the voice screen', (
+    tester,
+  ) async {
     final store = FakeSettingsStore(
       stored: const BackendSettings(host: 'myhost'),
     );
-    await tester.pumpWidget(ProviderScope(
-      overrides: [
-        settingsStoreProvider.overrideWithValue(store),
-        backendProbeProvider.overrideWithValue(FakeProbe()),
-        chatStoreProvider.overrideWithValue(FakeChatStore()),
-        filesStoreProvider.overrideWithValue(FakeFileStore()),
-        // The voice screen needs the faked voice service graph.
-        engineManagerProvider.overrideWithValue(FakeEngineManager()),
-        micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
-        audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
-        audioSessionManagerProvider
-            .overrideWithValue(FakeAudioSessionManager()),
-        screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
-        voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
-      ],
-      child: const MaterialApp(home: ChatScreen()),
-    ));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          settingsStoreProvider.overrideWithValue(store),
+          backendProbeProvider.overrideWithValue(FakeProbe()),
+          chatStoreProvider.overrideWithValue(FakeChatStore()),
+          filesStoreProvider.overrideWithValue(FakeFileStore()),
+          // The voice screen needs the faked voice service graph.
+          engineManagerProvider.overrideWithValue(FakeEngineManager()),
+          micCaptureServiceProvider.overrideWithValue(FakeMicCaptureService()),
+          audioPlaybackServiceProvider.overrideWithValue(FakeAudioPlayback()),
+          audioSessionManagerProvider.overrideWithValue(
+            FakeAudioSessionManager(),
+          ),
+          screenWakeLockProvider.overrideWithValue(NoopScreenWakeLock()),
+          voiceSettingsStoreProvider.overrideWithValue(
+            FakeVoiceSettingsStore(),
+          ),
+        ],
+        child: const MaterialApp(home: ChatScreen()),
+      ),
+    );
     await tester.pumpAndSettle();
 
     // The chat screen has no mic FAB — voice is reached through the pill.

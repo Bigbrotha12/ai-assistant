@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_file/open_file.dart';
 
+import '../../auth/data/account_lifecycle.dart';
 import '../data/files_providers.dart';
 import '../data/files_service.dart';
 import '../../chat/data/database_providers.dart';
+import '../data/file_store.dart';
 import '../data/file_utils.dart';
 
 /// A tap-to-open file reference rendered inside an assistant message.
@@ -32,8 +34,7 @@ class FileAttachmentChip extends ConsumerStatefulWidget {
   final Future<void> Function(String path)? openFile;
 
   @override
-  ConsumerState<FileAttachmentChip> createState() =>
-      _FileAttachmentChipState();
+  ConsumerState<FileAttachmentChip> createState() => _FileAttachmentChipState();
 }
 
 enum _ChipPhase { idle, downloading, ready, error }
@@ -52,9 +53,9 @@ class _FileAttachmentChipState extends ConsumerState<FileAttachmentChip> {
   /// records uploads with their real mime) can. Falls back to the filename.
   String? _resolvedMime;
 
-  Future<String?> _resolveMime() async {
+  Future<String?> _resolveMime(FileStore store) async {
     try {
-      final info = await ref.read(filesStoreProvider).getFileById(widget.fileId);
+      final info = await store.getFileById(widget.fileId);
       if (info != null && info.mimeType.isNotEmpty) return info.mimeType;
     } catch (_) {
       // The store is best-effort metadata; fall through to the filename.
@@ -63,15 +64,18 @@ class _FileAttachmentChipState extends ConsumerState<FileAttachmentChip> {
   }
 
   Future<void> _downloadAndOpen() async {
-    if (_phase == _ChipPhase.downloading) return;
+    if (_phase == _ChipPhase.downloading || !mounted) return;
     setState(() {
       _phase = _ChipPhase.downloading;
       _error = '';
     });
 
-    // NoOpFilesClient (no files secret configured) fails fast with a clear
-    // message instead of surfacing a generic download error.
-    if (ref.read(filesServiceProvider) is NoOpFilesClient) {
+    final files = ref.read(filesServiceProvider);
+    final cache = ref.read(fileCacheProvider);
+    final store = ref.read(filesStoreProvider);
+    final lifecycle = ref.read(accountLifecycleProvider);
+
+    if (files is NoOpFilesClient) {
       if (!mounted) return;
       setState(() {
         _phase = _ChipPhase.error;
@@ -80,32 +84,41 @@ class _FileAttachmentChipState extends ConsumerState<FileAttachmentChip> {
       return;
     }
 
-    final cache = ref.read(fileCacheProvider);
+    String? path;
     try {
-      // Resolve the real type up front so a freshly-downloaded file is cached
-      // with its real extension (e.g. `.jpg`) instead of `.bin` — the OS open
-      // handlers rely on that extension to pick an activity/UTI.
-      final mime =
-          _resolvedMime ??= (await _resolveMime()) ?? mimeForFilename(widget.filename);
-      String path;
-      final cached = await cache.getCached(widget.fileId);
-      if (cached != null) {
-        path = cached.localPath!;
-        _sizeBytes = cached.sizeBytes;
-      } else {
-        final bytes = await ref
-            .read(filesServiceProvider)
-            .fetchFile(widget.fileId);
-        path = await cache.cacheFile(
+      await lifecycle.runAttachmentDownload(cache.scopeKey, (
+        registration,
+      ) async {
+        final mime = _resolvedMime ??=
+            (await _resolveMime(store)) ?? mimeForFilename(widget.filename);
+        registration.checkCurrent();
+        final cached = await cache.getCached(widget.fileId);
+        registration.checkCurrent();
+        if (cached != null) {
+          path = cached.localPath!;
+          _sizeBytes = cached.sizeBytes;
+          return;
+        }
+
+        final bytes = await files.fetchFile(
           widget.fileId,
-          cache.extensionForMime(mime),
+          cancelToken: registration.cancelToken,
+        );
+        registration.checkCurrent();
+        final extension = cache.extensionForMime(mime);
+        registration.checkCurrent();
+        final cachedPath = await cache.cacheFile(
+          widget.fileId,
+          extension,
           bytes,
         );
+        registration.checkCurrent();
+        path = cachedPath;
         _sizeBytes = bytes.length;
-      }
+      });
       if (!mounted) return;
       setState(() => _phase = _ChipPhase.ready);
-      await _openPath(path);
+      await _openPath(path!);
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -158,52 +171,44 @@ class _FileAttachmentChipState extends ConsumerState<FileAttachmentChip> {
   }
 
   Widget _avatar(ColorScheme scheme) => switch (_phase) {
-        _ChipPhase.idle =>
-          Icon(Icons.attach_file, size: 16, color: scheme.primary),
-        _ChipPhase.downloading => const SizedBox(
-            width: 16,
-            height: 16,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-        _ChipPhase.ready =>
-          Icon(Icons.description, size: 16, color: scheme.primary),
-        _ChipPhase.error =>
-          Icon(Icons.error_outline, size: 16, color: scheme.error),
-      };
+    _ChipPhase.idle => Icon(Icons.attach_file, size: 16, color: scheme.primary),
+    _ChipPhase.downloading => const SizedBox(
+      width: 16,
+      height: 16,
+      child: CircularProgressIndicator(strokeWidth: 2),
+    ),
+    _ChipPhase.ready => Icon(
+      Icons.description,
+      size: 16,
+      color: scheme.primary,
+    ),
+    _ChipPhase.error => Icon(
+      Icons.error_outline,
+      size: 16,
+      color: scheme.error,
+    ),
+  };
 
   List<Widget> _labelChildren(ColorScheme scheme) => switch (_phase) {
-        _ChipPhase.idle ||
-        _ChipPhase.downloading ||
-        _ChipPhase.ready => [
-            Flexible(
-              child: Text(
-                widget.filename,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-if (_phase == _ChipPhase.ready && _sizeBytes != null) ...[
-              const SizedBox(width: 6),
-              Text(
-                formatBytes(_sizeBytes!),
-                style: TextStyle(
-                  fontSize: 11,
-                  color: scheme.onSurfaceVariant,
-                ),
-              ),
-            ],
-          ],
-        _ChipPhase.error => [
-            Flexible(
-              child: Text(
-                _error.isEmpty ? 'Failed to download' : _error,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            const SizedBox(width: 6),
-            Text(
-              'Retry',
-              style: TextStyle(fontSize: 12, color: scheme.primary),
-            ),
-          ],
-      };
+    _ChipPhase.idle || _ChipPhase.downloading || _ChipPhase.ready => [
+      Flexible(child: Text(widget.filename, overflow: TextOverflow.ellipsis)),
+      if (_phase == _ChipPhase.ready && _sizeBytes != null) ...[
+        const SizedBox(width: 6),
+        Text(
+          formatBytes(_sizeBytes!),
+          style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+        ),
+      ],
+    ],
+    _ChipPhase.error => [
+      Flexible(
+        child: Text(
+          _error.isEmpty ? 'Failed to download' : _error,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+      const SizedBox(width: 6),
+      Text('Retry', style: TextStyle(fontSize: 12, color: scheme.primary)),
+    ],
+  };
 }

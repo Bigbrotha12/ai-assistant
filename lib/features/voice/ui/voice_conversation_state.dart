@@ -18,6 +18,7 @@ class VoiceConversationState {
     this.lastTranscript,
     this.lastReply,
     this.onDeviceTranscript,
+    this.micBufferTruncated = false,
   });
 
   factory VoiceConversationState.initial() => const VoiceConversationState();
@@ -87,6 +88,13 @@ class VoiceConversationState {
   /// emissions carry it for exactly one append opportunity per utterance.
   final String? onDeviceTranscript;
 
+  /// Latched while the mic STT buffer is over its 3-minute cap for the
+  /// current buffer generation: set on the FIRST head-drop trim (further
+  /// trims of the same buffer do not re-emit), reset when the buffer is
+  /// cleared (flush / recording start / interrupt / teardown). Drives the
+  /// on-screen "utterance truncated" notice.
+  final bool micBufferTruncated;
+
   VoiceConversationState copyWith({
     bool? isConnected,
     bool? isRecording,
@@ -100,6 +108,7 @@ class VoiceConversationState {
     Object? lastTranscript = _unset,
     Object? lastReply = _unset,
     Object? onDeviceTranscript = _unset,
+    bool? micBufferTruncated,
   }) => VoiceConversationState(
     isConnected: isConnected ?? this.isConnected,
     isRecording: isRecording ?? this.isRecording,
@@ -119,6 +128,7 @@ class VoiceConversationState {
     onDeviceTranscript: identical(onDeviceTranscript, _unset)
         ? this.onDeviceTranscript
         : onDeviceTranscript as String?,
+    micBufferTruncated: micBufferTruncated ?? this.micBufferTruncated,
   );
 
   static const Object _unset = Object();
@@ -137,7 +147,8 @@ class VoiceConversationState {
       other.status == status &&
       other.lastTranscript == lastTranscript &&
       other.lastReply == lastReply &&
-      other.onDeviceTranscript == onDeviceTranscript;
+      other.onDeviceTranscript == onDeviceTranscript &&
+      other.micBufferTruncated == micBufferTruncated;
 
   @override
   int get hashCode => Object.hash(
@@ -153,6 +164,7 @@ class VoiceConversationState {
     lastTranscript,
     lastReply,
     onDeviceTranscript,
+    micBufferTruncated,
   );
 
   @override
@@ -163,5 +175,6 @@ class VoiceConversationState {
       'generating: $isGenerating, '
       'error: $error, notice: $notice, status: $status, '
       'transcript: $lastTranscript, reply: $lastReply, '
-      'deviceTranscript: $onDeviceTranscript)';
+      'deviceTranscript: $onDeviceTranscript, '
+      'micBufferTruncated: $micBufferTruncated)';
 }

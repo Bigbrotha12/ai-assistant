@@ -5,7 +5,7 @@ import 'config.dart';
 import 'network_errors.dart';
 
 /// Individual backend endpoint probed by [BackendProbe.probe].
-enum BackendCheck { auth, inference, vision }
+enum BackendCheck { auth, inference, vision, health }
 
 /// Human-readable label for a [BackendCheck], used by the settings screen.
 extension BackendCheckLabel on BackendCheck {
@@ -13,6 +13,7 @@ extension BackendCheckLabel on BackendCheck {
         BackendCheck.auth => 'Auth',
         BackendCheck.inference => 'Inference',
         BackendCheck.vision => 'Vision (VL)',
+        BackendCheck.health => 'Health',
       };
 }
 
@@ -25,9 +26,21 @@ enum ProbeStatus {
   /// Downstream UI routes this to a re-authentication flow.
   unauthorized,
 
+  /// The stored gateway API key is valid, but the owning account's email is
+  /// unverified (HTTP 403 `email_not_verified`). Distinct from [unauthorized]:
+  /// downstream UI must offer "verify your email" (resend), never re-auth.
+  emailNotVerified,
+
   /// No API key is stored, so the authenticated checks cannot run.
   noCredentials,
   unreachable,
+
+  /// The gateway's unauthenticated `GET /health` answered with a degraded
+  /// body (`status: "degraded"`, typically HTTP 503): the gateway process is
+  /// up but a dependency (auth/ledger DB) is failing. Distinct from [error]
+  /// and [unreachable] — the gateway itself is responding and self-reporting
+  /// the problem (M5 watchdog, client half).
+  gatewayDegraded,
 }
 
 /// Outcome of probing one backend endpoint.
@@ -60,6 +73,42 @@ class BackendStatus {
   /// True when at least one check ran and every check succeeded.
   bool get allOk =>
       checks.isNotEmpty && checks.every((c) => c.status == ProbeStatus.ok);
+
+  /// Aggregate verdict over [checks] (M5 gateway-degraded mapping).
+  ///
+  /// Precedence — first matching status present in [checks] wins:
+  /// 1. [ProbeStatus.unauthorized] — the stored key was rejected; the
+  ///    re-auth flow is required regardless of gateway health.
+  /// 2. [ProbeStatus.emailNotVerified] — the account must verify its email
+  ///    (never re-auth), also independent of gateway health.
+  /// 3. [ProbeStatus.gatewayDegraded] — `/health` self-reports degraded; it
+  ///    surfaces as the overall verdict even when auth/inference/vision all
+  ///    pass (the affirmative "server is up but broken" signal outranks the
+  ///    absence-of-signal failures below).
+  /// 4. [ProbeStatus.unreachable] — an endpoint (including `/health`
+  ///    itself) could not be reached at all.
+  /// 5. [ProbeStatus.error] — an endpoint responded but failed.
+  /// 6. [ProbeStatus.noCredentials] — no API key stored (health still runs
+  ///    unauthenticated and may pass).
+  /// 7. [ProbeStatus.ok] — every check that ran succeeded.
+  ///
+  /// Null when [checks] is empty (nothing ran).
+  ProbeStatus? get overall {
+    if (checks.isEmpty) return null;
+    const precedence = [
+      ProbeStatus.unauthorized,
+      ProbeStatus.emailNotVerified,
+      ProbeStatus.gatewayDegraded,
+      ProbeStatus.unreachable,
+      ProbeStatus.error,
+      ProbeStatus.noCredentials,
+      ProbeStatus.ok,
+    ];
+    for (final status in precedence) {
+      if (checks.any((c) => c.status == status)) return status;
+    }
+    return ProbeStatus.error;
+  }
 }
 
 /// Reads the stored API key used to authenticate probe requests (injectable
@@ -69,11 +118,11 @@ typedef ApiKeyReader = Future<String?> Function();
 /// Probes reachability and readiness of the backend gateway.
 abstract interface class BackendProbe {
   /// Probes the gateway chain concurrently; results ordered
-  /// [BackendCheck.auth, inference, vision].
+  /// [BackendCheck.auth, inference, vision, health].
   Future<BackendStatus> probe(BackendSettings settings);
 }
 
-/// Probes the gateway's auth, inference, and vision endpoints.
+/// Probes the gateway's auth, inference, vision, and health endpoints.
 class DioBackendProbe implements BackendProbe {
   DioBackendProbe({
     Dio? dio,
@@ -81,6 +130,7 @@ class DioBackendProbe implements BackendProbe {
     Duration authTimeout = const Duration(seconds: 8),
     Duration inferenceTimeout = const Duration(seconds: 25),
     Duration visionTimeout = const Duration(seconds: 5),
+    Duration healthTimeout = const Duration(seconds: 5),
   }) : _dio = dio ??
             Dio(
               BaseOptions(
@@ -93,30 +143,69 @@ class DioBackendProbe implements BackendProbe {
           auth: authTimeout,
           inference: inferenceTimeout,
           vision: visionTimeout,
+          health: healthTimeout,
         );
 
   final Dio _dio;
   final ApiKeyReader _apiKeyReader;
-  final ({Duration auth, Duration inference, Duration vision}) _timeouts;
+  final ({
+    Duration auth,
+    Duration inference,
+    Duration vision,
+    Duration health,
+  }) _timeouts;
 
   @override
   Future<BackendStatus> probe(BackendSettings settings) async {
-    final results = await Future.wait([
-      _probeAuth(settings),
-      _probeInference(settings),
-      _probeVision(settings),
-    ]);
-    return BackendStatus(checks: results);
+    try {
+      final apiKey = await _readApiKey();
+      final results = await Future.wait([
+        _probeAuth(settings, apiKey),
+        _probeInference(settings, apiKey),
+        _probeVision(settings, apiKey),
+        _probeHealth(settings),
+      ]);
+      return BackendStatus(checks: results);
+    } catch (_) {
+      return const BackendStatus(checks: [
+        CheckResult(
+          check: BackendCheck.auth,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+        CheckResult(
+          check: BackendCheck.inference,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+        CheckResult(
+          check: BackendCheck.vision,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+        CheckResult(
+          check: BackendCheck.health,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+      ]);
+    }
   }
 
   /// The stored API key, or null when absent/blank.
   Future<String?> _readApiKey() async {
-    final key = await _apiKeyReader();
-    return (key == null || key.isEmpty) ? null : key;
+    try {
+      final key = await _apiKeyReader();
+      return (key == null || key.isEmpty) ? null : key;
+    } catch (_) {
+      return null;
+    }
   }
 
-  Future<CheckResult> _probeAuth(BackendSettings settings) async {
-    final apiKey = await _readApiKey();
+  Future<CheckResult> _probeAuth(
+    BackendSettings settings,
+    String? apiKey,
+  ) async {
     if (apiKey == null) {
       return const CheckResult(
         check: BackendCheck.auth,
@@ -160,8 +249,10 @@ class DioBackendProbe implements BackendProbe {
     );
   }
 
-  Future<CheckResult> _probeInference(BackendSettings settings) async {
-    final apiKey = await _readApiKey();
+  Future<CheckResult> _probeInference(
+    BackendSettings settings,
+    String? apiKey,
+  ) async {
     if (apiKey == null) {
       return const CheckResult(
         check: BackendCheck.inference,
@@ -206,6 +297,15 @@ class DioBackendProbe implements BackendProbe {
             detail: 'gateway API key rejected (401)',
           );
         }
+        // 403 `email_not_verified`: the key is valid but the account's email
+        // is unconfirmed (C2) — surface verification, not re-auth.
+        if (resp.statusCode == 403 && _isEmailNotVerifiedBody(resp.data)) {
+          return const CheckResult(
+            check: BackendCheck.inference,
+            status: ProbeStatus.emailNotVerified,
+            detail: 'verify your email (403)',
+          );
+        }
         // 2xx, 400, or 422: gateway endpoint is reachable and auth works;
         // the test model '_probe' won't resolve but the response confirms the
         // gateway is alive and the API key is valid.
@@ -228,8 +328,10 @@ class DioBackendProbe implements BackendProbe {
     );
   }
 
-  Future<CheckResult> _probeVision(BackendSettings settings) async {
-    final apiKey = await _readApiKey();
+  Future<CheckResult> _probeVision(
+    BackendSettings settings,
+    String? apiKey,
+  ) async {
     if (apiKey == null) {
       return const CheckResult(
         check: BackendCheck.vision,
@@ -294,6 +396,64 @@ class DioBackendProbe implements BackendProbe {
     );
   }
 
+  /// M5 watchdog (client half): unauthenticated `GET {origin}/health`.
+  ///
+  /// Deliberately sends no Authorization header (the endpoint is public by
+  /// contract so infrastructure probes can hit it) and never follows
+  /// redirects. Interpretation is body-driven:
+  /// - body `status: "degraded"` (any 2xx/5xx code, normally 503) →
+  ///   [ProbeStatus.gatewayDegraded],
+  /// - 200 + `status: "ok"` → [ProbeStatus.ok],
+  /// - anything else → [ProbeStatus.error];
+  /// network failures flow through [_guard]/[_classify] like every other
+  /// check (→ [ProbeStatus.unreachable]).
+  Future<CheckResult> _probeHealth(BackendSettings settings) async {
+    final host = settings.trimmedHost;
+    final url = BackendConfig.gatewayBase(
+      host,
+      environment: settings.environment,
+    ).replace(path: '/health');
+
+    return _guard(
+      BackendCheck.health,
+      () async {
+        final resp = await _dio
+            .getUri(
+              url,
+              options: Options(
+                // Public endpoint: never attach the API key, and keep the
+                // probe's no-redirect hardening consistent with the rest.
+                followRedirects: false,
+                // 503 is the degraded signal — accept every status so the
+                // body arrives as a normal response, not a badResponse throw.
+                validateStatus: (status) => true,
+              ),
+            )
+            .timeout(_timeouts.health);
+        final data = resp.data;
+        if (_healthBodyStatus(data) == 'degraded') {
+          return CheckResult(
+            check: BackendCheck.health,
+            status: ProbeStatus.gatewayDegraded,
+            detail: _degradedDetail(data, resp.statusCode),
+          );
+        }
+        if (resp.statusCode == 200 && _healthBodyStatus(data) == 'ok') {
+          return const CheckResult(
+            check: BackendCheck.health,
+            status: ProbeStatus.ok,
+            detail: 'gateway healthy',
+          );
+        }
+        return CheckResult(
+          check: BackendCheck.health,
+          status: ProbeStatus.error,
+          detail: 'HTTP ${resp.statusCode}',
+        );
+      },
+    );
+  }
+
   /// Runs [run], translating non-2xx responses into error results and every
   /// other failure through [_classify]. [httpError] fully customizes the
   /// result of an HTTP error response (e.g. the auth check mapping 401 to
@@ -333,11 +493,34 @@ class DioBackendProbe implements BackendProbe {
         detail: 'API key rejected (401)',
       );
     }
+    // C2: `GET /v1/auth/check` answers 403 {error: "email_not_verified"} for
+    // a valid key whose owner is unverified — a distinct outcome from the
+    // 401 re-auth path. A bare 403 without the signal stays a generic error.
+    if (code == 403 && _isEmailNotVerifiedBody(e.response?.data)) {
+      return CheckResult(
+        check: check,
+        status: ProbeStatus.emailNotVerified,
+        detail: 'verify your email (403)',
+      );
+    }
     return CheckResult(
       check: check,
       status: ProbeStatus.error,
       detail: 'HTTP $code',
     );
+  }
+
+  /// True when an HTTP (error) body carries the gateway's distinct
+  /// `email_not_verified` signal — the `{error: "email_not_verified"}` shape,
+  /// a `code` twin, or a raw string body containing it.
+  static bool _isEmailNotVerifiedBody(Object? data) {
+    if (data is Map) {
+      return data['error'] == 'email_not_verified' ||
+          data['code'] == 'email_not_verified' ||
+          data['code'] == 'EMAIL_NOT_VERIFIED';
+    }
+    if (data is String) return data.contains('email_not_verified');
+    return false;
   }
 
   static CheckResult _inferenceHttpError(BackendCheck check, DioException e) {
@@ -347,6 +530,13 @@ class DioBackendProbe implements BackendProbe {
         check: check,
         status: ProbeStatus.unauthorized,
         detail: 'gateway API key rejected (401)',
+      );
+    }
+    if (code == 403 && _isEmailNotVerifiedBody(e.response?.data)) {
+      return CheckResult(
+        check: check,
+        status: ProbeStatus.emailNotVerified,
+        detail: 'verify your email (403)',
       );
     }
     return switch (code) {
@@ -386,11 +576,46 @@ class DioBackendProbe implements BackendProbe {
         detail: 'gateway API key rejected (401)',
       );
     }
+    if (code == 403 && _isEmailNotVerifiedBody(e.response?.data)) {
+      return CheckResult(
+        check: check,
+        status: ProbeStatus.emailNotVerified,
+        detail: 'verify your email (403)',
+      );
+    }
     return CheckResult(
       check: check,
       status: ProbeStatus.error,
       detail: 'HTTP $code',
     );
+  }
+
+  /// The `status` field of a `/health` body (`"ok"` / `"degraded"`), or null
+  /// when unreadable. A raw string body tolerates the load-bearing
+  /// `degraded` token; a decoded Map is the normal (JSON) shape.
+  static String? _healthBodyStatus(Object? data) {
+    if (data is Map) {
+      final status = data['status'];
+      return status is String ? status : null;
+    }
+    if (data is String && data.contains('degraded')) return 'degraded';
+    return null;
+  }
+
+  /// Detail line for a degraded health response, naming the failing
+  /// dependency checks when the body carries them (e.g.
+  /// `gateway degraded: ledgerDb (HTTP 503)`).
+  static String _degradedDetail(Object? data, int? code) {
+    final suffix = code == null ? '' : ' (HTTP $code)';
+    if (data is Map && data['checks'] is Map) {
+      final failing = (data['checks'] as Map)
+          .entries
+          .where((e) => e.value != 'ok')
+          .map((e) => e.key)
+          .join(', ');
+      if (failing.isNotEmpty) return 'gateway degraded: $failing$suffix';
+    }
+    return 'gateway degraded$suffix';
   }
 
   /// Classifies a non-HTTP failure into (status, detail). Network-family

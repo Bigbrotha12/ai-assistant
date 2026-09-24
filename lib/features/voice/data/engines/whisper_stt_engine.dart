@@ -30,13 +30,14 @@ abstract interface class WhisperTranscriber {
   /// and reused for every subsequent utterance.
   int get modelInitCount;
 
-  /// Transcribes the WAV file at [wavPath], returning the recognised text.
-  Future<String> transcribe(String wavPath);
+  /// Transcribes the WAV file at [wavPath] as [language] (ISO 639-1 code),
+  /// returning the recognised text.
+  Future<String> transcribe(String wavPath, {required String language});
 }
 
 /// Self-hosted speech-to-text engine backed by whisper_kit.
 ///
-/// Uses [WhisperModel.tiny] (English-only download, smallest footprint) and
+/// Uses [WhisperModel.tiny] (multilingual ggml-tiny, smallest footprint) and
 /// keeps a **single persistent, warm engine instance** across turns: the
 /// [Whisper] model handle is constructed once (lazily, on first use) and
 /// reused for every subsequent utterance instead of being re-instantiated per
@@ -69,16 +70,55 @@ class WhisperSttEngine implements SttEngine {
   ///
   /// [modelPath] must point to a valid `ggml-*.bin` model file on disk.
   ///
+  /// [language] is the initial ISO 639-1 recognition language (default `'en'`);
+  /// it is threaded into every `TranscribeRequest` and can be changed later
+  /// via [preferredLanguage].
+  ///
   /// [transcriberFactory] is injectable for tests; it defaults to a real
   /// whisper-backed handle.
   WhisperSttEngine({
     required this.modelPath,
     WhisperTranscriberFactory? transcriberFactory,
-  }) : _transcriberFactory =
-            transcriberFactory ?? _nativeTranscriberFactory;
+    String language = 'en',
+  }) : _transcriberFactory = transcriberFactory ?? _nativeTranscriberFactory,
+       _preferredLanguage = language;
 
   @override
   final String name = EngineConfig.whisperTinyId;
+
+  /// Curated subset of whisper.cpp's ISO 639-1 language set — the tiny model
+  /// is multilingual, but only the major languages below are offered in the
+  /// UI. This is a **curated, not exhaustive** list: the codes are the ones
+  /// whisper.cpp accepts on `TranscribeRequest.language`, picked for decent
+  /// tiny-model quality on widely-spoken languages.
+  static const _curatedLanguages = <({String code, String label})>[
+    (code: 'en', label: 'English'),
+    (code: 'es', label: 'Español'),
+    (code: 'fr', label: 'Français'),
+    (code: 'de', label: 'Deutsch'),
+    (code: 'it', label: 'Italiano'),
+    (code: 'pt', label: 'Português'),
+    (code: 'nl', label: 'Nederlands'),
+    (code: 'pl', label: 'Polski'),
+    (code: 'ru', label: 'Русский'),
+    (code: 'tr', label: 'Türkçe'),
+    (code: 'ja', label: '日本語'),
+    (code: 'ko', label: '한국어'),
+    (code: 'zh', label: '中文'),
+    (code: 'ar', label: 'العربية'),
+  ];
+
+  @override
+  List<({String code, String label})> get supportedLanguages =>
+      _curatedLanguages;
+
+  String _preferredLanguage;
+
+  @override
+  String get preferredLanguage => _preferredLanguage;
+
+  @override
+  set preferredLanguage(String value) => _preferredLanguage = value;
 
   /// Path to the Whisper ggml model file.
   final String modelPath;
@@ -141,6 +181,8 @@ class WhisperSttEngine implements SttEngine {
     int sampleRate,
   ) async {
     final stopwatch = Stopwatch()..start();
+    // Snapshot the setting: it may change while this turn is queued/in flight.
+    final language = _preferredLanguage;
     try {
       _ensureWarmHandle();
 
@@ -160,7 +202,10 @@ class WhisperSttEngine implements SttEngine {
       });
 
       try {
-        final text = await _transcriber!.transcribe(wavPath);
+        final text = await _transcriber!.transcribe(
+          wavPath,
+          language: language,
+        );
         return text.trim();
       } catch (e) {
         throw EngineInferenceError('Whisper inference failed: $e');
@@ -220,7 +265,7 @@ class _NativeWhisperTranscriber implements WhisperTranscriber {
   int get modelInitCount => _modelInitCount;
 
   @override
-  Future<String> transcribe(String wavPath) {
+  Future<String> transcribe(String wavPath, {required String language}) {
     // Construct the shared Whisper handle once and keep it warm. whisper_kit
     // re-runs its native context init per request internally (see class docs),
     // but on the Dart side the handle — and its _initModel() file check — are
@@ -237,7 +282,7 @@ class _NativeWhisperTranscriber implements WhisperTranscriber {
         .transcribe(
           transcribeRequest: TranscribeRequest(
             audio: wavPath,
-            language: 'en',
+            language: language,
             isNoTimestamps: true,
             threads: 1,
           ),

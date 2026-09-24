@@ -19,12 +19,13 @@ const _base = 'http://192.168.1.5:17600';
 BetterAuthClient _client(Dio dio) => BetterAuthClient(baseUrl: _base, dio: dio);
 
 /// Captures every actual request (path/headers/body) so tests can assert on
-/// what was sent, and returns a scripted response.
+/// what was sent, and returns a scripted response. The body may be null to
+/// script a bare JSON-null payload (e.g. get-session's expired verdict).
 class _CaptureAdapter implements HttpClientAdapter {
   _CaptureAdapter({this.body = const {}});
 
   final int statusCode = 200;
-  final Map<String, dynamic> body;
+  final Object? body;
   final List<RequestOptions> requests = [];
 
   @override
@@ -110,6 +111,27 @@ void main() {
 
       expect(session.token, 'tok');
       expect(session.email, 'a@b.c');
+    });
+
+    test('parses a tokenless sign-up (token: null) without throwing', () async {
+      // C2: autoSignIn is disabled, so a fresh sign-up answers token: null
+      // and creates no session. The parse must accept it (empty token) and
+      // still extract the user identity.
+      final adapter = _CaptureAdapter(
+        body: {
+          'token': null,
+          'user': {'email': 'a@b.c', 'id': 'owner-1'},
+        },
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      final session = await _client(dio)
+          .signUp(name: 'Ada', email: 'a@b.c', password: 'p@ss');
+
+      expect(session.token, '');
+      expect(session.email, 'a@b.c');
+      expect(session.ownerId, 'owner-1');
+      expect(session.backendOrigin, _base);
     });
 
     test('throws AuthEmailTaken on a 409 response', () async {
@@ -243,6 +265,47 @@ void main() {
       await expectLater(
         _client(dio).signIn(email: 'a@b.c', password: 'wrong'),
         throwsA(isA<AuthUnauthorized>()),
+      );
+    });
+
+    test('maps a 403 EMAIL_NOT_VERIFIED sign-in to AuthEmailNotVerified',
+        () async {
+      // C2: signing in before the email is verified is a 403 with the
+      // better-auth EMAIL_NOT_VERIFIED code — distinct from a credential or
+      // session failure so the UI can offer check-inbox/resend.
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/sign-in/email',
+        (r) => r.reply(403, {
+          'message': 'Email not verified',
+          'code': 'EMAIL_NOT_VERIFIED',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).signIn(email: 'a@b.c', password: 'secret123'),
+        throwsA(
+          isA<AuthEmailNotVerified>()
+              .having((e) => e.statusCode, 'statusCode', 403)
+              .having((e) => e.code, 'code', 'EMAIL_NOT_VERIFIED'),
+        ),
+      );
+    });
+
+    test('a 403 without the verification signal stays a server error',
+        () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/sign-in/email',
+        (r) => r.reply(403, {'message': 'Forbidden'}),
+      );
+
+      await expectLater(
+        _client(dio).signIn(email: 'a@b.c', password: 'secret123'),
+        throwsA(
+          isA<AuthServerError>()
+              .having((e) => e.statusCode, 'statusCode', 403),
+        ),
       );
     });
 
@@ -425,6 +488,350 @@ void main() {
       await expectLater(
         _client(dio).requestPasswordReset(email: 'not-an-email'),
         throwsA(isA<AuthInvalidCredentials>()),
+      );
+    });
+  });
+
+  group('sendVerificationEmail', () {
+    test('posts the email to the send-verification endpoint', () async {
+      final adapter = _CaptureAdapter(body: {'status': true});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await _client(dio).sendVerificationEmail(email: 'a@b.c');
+
+      final req = adapter.requests.single;
+      expect(req.path, '$_base/api/auth/send-verification-email');
+      final body = req.data as Map<String, dynamic>;
+      expect(body['email'], 'a@b.c');
+    });
+
+    test('maps a 429 RATE_LIMIT_EXCEEDED to AuthRateLimited with the wait',
+        () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/send-verification-email',
+        (r) => r.reply(429, {
+          'message':
+              'Too many verification emails requested for this address. '
+                  'Try again in a minute.',
+          'code': 'RATE_LIMIT_EXCEEDED',
+          'retryAfterSeconds': 60,
+        }),
+      );
+
+      await expectLater(
+        _client(dio).sendVerificationEmail(email: 'a@b.c'),
+        throwsA(
+          isA<AuthRateLimited>()
+              .having((e) => e.statusCode, 'statusCode', 429)
+              .having((e) => e.code, 'code', 'RATE_LIMIT_EXCEEDED')
+              .having((e) => e.retryAfterSeconds, 'retryAfterSeconds', 60),
+        ),
+      );
+    });
+  });
+
+  group('getSession', () {
+    test('sends the bearer token and parses the session', () async {
+      final adapter = _CaptureAdapter(
+        body: {
+          'session': {'id': 'sess-1', 'expiresAt': '2026-10-24T00:00:00.000Z'},
+          'user': {'id': 'owner-9', 'email': 'a@b.c'},
+        },
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      final session = await _client(dio).getSession(sessionToken: 'tok-7');
+
+      expect(session, isNotNull);
+      expect(session!.userId, 'owner-9');
+      expect(session.email, 'a@b.c');
+      expect(session.expiresAt, DateTime.utc(2026, 10, 24));
+      final req = adapter.requests.single;
+      expect(req.method, 'GET');
+      expect(req.path, '$_base/api/auth/get-session');
+      expect(req.headers['Authorization'], 'Bearer tok-7');
+    });
+
+    test('maps a 200 null body (absent/expired session) to null', () async {
+      // better-auth answers a bare JSON null when the session is absent or
+      // has just expired — "no session", not an error (H2).
+      final adapter = _CaptureAdapter(body: null);
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      final session = await _client(dio).getSession(sessionToken: 'tok-exp');
+
+      expect(session, isNull);
+      expect(adapter.requests, hasLength(1));
+    });
+
+    test('maps HTTP 401 to null (rejected session is not an error)', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onGet(
+        '$_base/api/auth/get-session',
+        (r) => r.reply(401, {'message': 'Unauthorized'}),
+      );
+
+      final session = await _client(dio).getSession(sessionToken: 'tok-bad');
+
+      expect(session, isNull);
+    });
+
+    test('an empty session token short-circuits without a request', () async {
+      // C1's tokenless sign-up sentinel: no session exists, so there is
+      // nothing to ping.
+      final adapter = _CaptureAdapter(
+        body: {
+          'session': {'id': 'sess-1'},
+          'user': {'id': 'owner-9'},
+        },
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      final session = await _client(dio).getSession(sessionToken: '');
+
+      expect(session, isNull);
+      expect(adapter.requests, isEmpty);
+    });
+
+    test('maps a connection failure to AuthNetworkError', () async {
+      final dio = Dio()
+        ..httpClientAdapter = _FailingAdapter(DioExceptionType.connectionError);
+
+      await expectLater(
+        _client(dio).getSession(sessionToken: 'tok'),
+        throwsA(isA<AuthNetworkError>()),
+      );
+    });
+
+    test('rejects a malformed body with AuthServerError', () async {
+      final adapter = _CaptureAdapter(body: {'unexpected': true});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await expectLater(
+        _client(dio).getSession(sessionToken: 'tok'),
+        throwsA(isA<AuthServerError>()),
+      );
+    });
+  });
+
+  group('listApiKeys', () {
+    test('sends the bearer token and parses the entry list', () async {
+      final adapter = _CaptureAdapter(
+        body: {
+          'apiKeys': [
+            {
+              'id': 'key-1',
+              'start': 'sk_abc',
+              'enabled': true,
+              'createdAt': '2026-01-15T10:00:00.000Z',
+              'expiresAt': '2026-04-15T10:00:00.000Z',
+            },
+            {
+              'id': 'key-2',
+              'start': 'sk_def',
+              'enabled': false,
+              'createdAt': '2025-11-01T08:00:00.000Z',
+            },
+          ],
+          'total': 2,
+          'limit': 10,
+          'offset': 0,
+        },
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      final entries = await _client(dio).listApiKeys(sessionToken: 'tok-8');
+
+      expect(entries, hasLength(2));
+      expect(entries[0].id, 'key-1');
+      expect(entries[0].start, 'sk_abc');
+      expect(entries[0].enabled, isTrue);
+      expect(entries[0].createdAt, DateTime.utc(2026, 1, 15, 10));
+      expect(entries[0].expiresAt, DateTime.utc(2026, 4, 15, 10));
+      expect(entries[1].id, 'key-2');
+      expect(entries[1].enabled, isFalse);
+      expect(entries[1].createdAt, DateTime.utc(2025, 11, 1, 8));
+      expect(entries[1].expiresAt, isNull);
+
+      final req = adapter.requests.single;
+      expect(req.method, 'GET');
+      expect(req.path, '$_base/api/auth/api-key/list');
+      expect(req.headers['Authorization'], 'Bearer tok-8');
+    });
+
+    test('an empty session token short-circuits without a request', () async {
+      final adapter = _CaptureAdapter(body: {'apiKeys': [], 'total': 0});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      final entries = await _client(dio).listApiKeys(sessionToken: '');
+
+      expect(entries, isEmpty);
+      expect(adapter.requests, isEmpty);
+    });
+
+    test('throws AuthUnauthorized on HTTP 401', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onGet(
+        '$_base/api/auth/api-key/list',
+        (r) => r.reply(401, {'message': 'Unauthorized'}),
+      );
+
+      await expectLater(
+        _client(dio).listApiKeys(sessionToken: 'tok-bad'),
+        throwsA(isA<AuthUnauthorized>()),
+      );
+    });
+
+    test('throws AuthServerError on a malformed payload', () async {
+      final adapter = _CaptureAdapter(body: {'apiKeys': 'nope'});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await expectLater(
+        _client(dio).listApiKeys(sessionToken: 'tok'),
+        throwsA(isA<AuthServerError>()),
+      );
+    });
+
+    test('throws AuthServerError when an entry lacks an id', () async {
+      final adapter = _CaptureAdapter(
+        body: {
+          'apiKeys': [
+            {'start': 'sk_abc'},
+          ],
+        },
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await expectLater(
+        _client(dio).listApiKeys(sessionToken: 'tok'),
+        throwsA(isA<AuthServerError>()),
+      );
+    });
+
+    test('maps a connection failure to AuthNetworkError', () async {
+      final dio = Dio()
+        ..httpClientAdapter = _FailingAdapter(DioExceptionType.connectionError);
+
+      await expectLater(
+        _client(dio).listApiKeys(sessionToken: 'tok'),
+        throwsA(isA<AuthNetworkError>()),
+      );
+    });
+  });
+
+  group('deleteAccount', () {
+    test('posts password with bearer session + Origin and reads success',
+        () async {
+      final adapter = _CaptureAdapter(body: {'success': true});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await _client(dio)
+          .deleteAccount(sessionToken: 'tok-9', password: 'secret123');
+
+      final req = adapter.requests.single;
+      expect(req.path, '$_base/api/auth/delete-user');
+      expect(req.headers['Authorization'], 'Bearer tok-9');
+      // better-auth 403s a state-changing auth request without an Origin
+      // matching the server origin (MISSING_OR_NULL_ORIGIN).
+      expect(req.headers['Origin'], 'http://192.168.1.5:17600');
+      final body = req.data as Map<String, dynamic>;
+      expect(body['password'], 'secret123');
+    });
+
+    test('maps a 400 INVALID_PASSWORD to AuthInvalidCredentials', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/delete-user',
+        (r) => r.reply(400, {
+          'message': 'Invalid password',
+          'code': 'INVALID_PASSWORD',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).deleteAccount(sessionToken: 'tok', password: 'wrong'),
+        throwsA(
+          isA<AuthInvalidCredentials>()
+              .having((e) => e.statusCode, 'statusCode', 400)
+              .having((e) => e.code, 'code', 'INVALID_PASSWORD'),
+        ),
+      );
+    });
+
+    test('maps a 400 SESSION_EXPIRED to AuthUnauthorized', () async {
+      // Stale (non-fresh) session — re-auth semantics, not a credential
+      // failure, so the delete dialog offers "sign in again".
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/delete-user',
+        (r) => r.reply(400, {
+          'message': 'Session expired',
+          'code': 'SESSION_EXPIRED',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).deleteAccount(sessionToken: 'stale', password: 'p'),
+        throwsA(
+          isA<AuthUnauthorized>()
+              .having((e) => e.statusCode, 'statusCode', 400)
+              .having((e) => e.code, 'code', 'SESSION_EXPIRED'),
+        ),
+      );
+    });
+
+    test('throws AuthUnauthorized on HTTP 401', () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/delete-user',
+        (r) => r.reply(401, {'message': 'Unauthorized'}),
+      );
+
+      await expectLater(
+        _client(dio).deleteAccount(sessionToken: 'bad', password: 'p'),
+        throwsA(isA<AuthUnauthorized>()),
+      );
+    });
+
+    test('maps a 403 MISSING_OR_NULL_ORIGIN to AuthServerError with its code',
+        () async {
+      final (dio, adapter) = makeDio();
+      adapter.onPost(
+        '$_base/api/auth/delete-user',
+        (r) => r.reply(403, {
+          'message': 'Missing or null origin',
+          'code': 'MISSING_OR_NULL_ORIGIN',
+        }),
+      );
+
+      await expectLater(
+        _client(dio).deleteAccount(sessionToken: 'tok', password: 'p'),
+        throwsA(
+          isA<AuthServerError>()
+              .having((e) => e.statusCode, 'statusCode', 403)
+              .having((e) => e.code, 'code', 'MISSING_OR_NULL_ORIGIN'),
+        ),
+      );
+    });
+
+    test('maps a connection failure to AuthNetworkError', () async {
+      final dio = Dio()
+        ..httpClientAdapter = _FailingAdapter(DioExceptionType.connectionError);
+
+      await expectLater(
+        _client(dio).deleteAccount(sessionToken: 'tok', password: 'p'),
+        throwsA(isA<AuthNetworkError>()),
+      );
+    });
+
+    test('throws AuthServerError when success is not true', () async {
+      final adapter = _CaptureAdapter(body: {'success': false});
+      final dio = Dio()..httpClientAdapter = adapter;
+
+      await expectLater(
+        _client(dio).deleteAccount(sessionToken: 'tok', password: 'p'),
+        throwsA(isA<AuthServerError>()),
       );
     });
   });

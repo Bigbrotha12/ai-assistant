@@ -126,7 +126,10 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     },
     "./auth.ts": { auth: { handler: () => new Response() } },
     "./env.ts": { env: environment },
-    "./inference.ts": { inferenceRoutes: new Hono(), requireApiKey: async () => "test-user" },
+    "./api_key.ts": {
+      inferenceRoutes: new Hono(),
+      requireApiKey: async () => ({ ok: true as const, owner: "test-user" }),
+    },
     "./ledger.routes.ts": { ledger: { close() {} }, ledgerRoutes: new Hono() },
     "./plugins/index.ts": { createPluginWiring: () => ({ registry, store }) },
     "./plugins/routes.ts": { createPluginRoutes: () => new Hono() },

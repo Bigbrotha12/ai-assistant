@@ -12,6 +12,7 @@ class ConversationListScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final conversations = ref.watch(conversationsProvider);
+    final pendingIds = ref.watch(pendingConversationIdsProvider);
     final store = ref.read(chatStoreProvider);
 
     return Scaffold(
@@ -23,6 +24,7 @@ class ConversationListScreen extends ConsumerWidget {
           if (items.isEmpty) {
             return const Center(child: Text('No conversations yet'));
           }
+          final pending = pendingIds.value ?? const <String>{};
           return ListView.builder(
             itemCount: items.length,
             itemBuilder: (context, index) {
@@ -44,6 +46,9 @@ class ConversationListScreen extends ConsumerWidget {
                 child: ListTile(
                   title: Text(conversation.title),
                   subtitle: Text(_formatTime(conversation.updatedAt)),
+                  trailing: pending.contains(conversation.id)
+                      ? const _PendingJobIndicator()
+                      : null,
                   onTap: () => Navigator.pop(context, conversation.id),
                 ),
               );
@@ -84,5 +89,27 @@ class ConversationListScreen extends ConsumerWidget {
     if (difference.inDays < 7) return '${difference.inDays}d ago';
     return '${time.year}-${time.month.toString().padLeft(2, '0')}-'
         '${time.day.toString().padLeft(2, '0')}';
+  }
+}
+
+class _PendingJobIndicator extends StatelessWidget {
+  const _PendingJobIndicator();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHigh,
+      borderRadius: BorderRadius.circular(16),
+      child: Padding(
+        padding: const EdgeInsets.all(6),
+        child: Icon(
+          Icons.hourglass_top,
+          size: 18,
+          semanticLabel: 'Pending background job',
+          color: scheme.onSurfaceVariant,
+        ),
+      ),
+    );
   }
 }

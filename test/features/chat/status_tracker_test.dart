@@ -4,7 +4,8 @@ import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show StatusTracker, statusPhraseForError, ackPhrases, stillWorkingPhrases,
     domainPhrases, defaultDomainPhrases, authErrorPhrases, serverErrorPhrases,
-    networkErrorPhrases, pendingErrorPhrases;
+    networkErrorPhrases, pendingErrorPhrases, verifyEmailPhrases,
+    accountDeletedPhrases;
 import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -423,6 +424,37 @@ void main() {
         random: Random(42),
       );
       expect(phrase, anyOf(authErrorPhrases));
+    });
+
+    test('verify-email phrase for email_not_verified (never re-auth)', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.emailNotVerified,
+          statusCode: 403,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(verifyEmailPhrases));
+      expect(phrase, isNot(anyOf(authErrorPhrases)));
+      expect(phrase, isNot(anyOf(serverErrorPhrases)));
+    });
+
+    test('account-deleted phrase for account_deleted', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.accountDeleted,
+          statusCode: 403,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(accountDeletedPhrases));
+    });
+
+    test('safePluginErrorCode preserves account_deleted', () {
+      expect(
+        safePluginErrorCode(const {'error': 'account_deleted'}),
+        ManagedErrorCodes.accountDeleted,
+      );
     });
 
     test('auth phrase for statusCode 401 with a non-auth envelope code '

@@ -1,8 +1,13 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/features/attachments/data/file_cache.dart';
+import 'package:ai_assistant/features/attachments/data/file_model.dart';
+import 'package:ai_assistant/features/attachments/data/file_store.dart';
 import 'package:ai_assistant/features/auth/data/account_lifecycle.dart';
 import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
@@ -12,15 +17,22 @@ import 'package:ai_assistant/features/chat/data/chat_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/memory/data/memory_model.dart';
+import 'package:ai_assistant/features/memory/data/memory_store.dart';
+import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
+import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_repository.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
+import 'package:dio/dio.dart';
 import 'package:drift/native.dart';
 
 import '../../fakes.dart';
 import '../plugins/plugin_credentials_store_test.dart'
     show DelayedSecureStorage;
+import 'auth_credentials_store_test.dart' show InMemorySecureStorage;
 
 class MemoryAuthStore implements AuthCredentialsStore {
   MemoryAuthStore(this.value);
@@ -49,6 +61,11 @@ AuthCredentials credentials(String owner, {String key = 'key'}) =>
       ownerId: owner,
       backendOrigin: 'http://example.com:17600',
     );
+
+AuthAccountScope accountScope(String owner) => AuthAccountScope.fromIdentity(
+  backendOrigin: 'http://example.com:17600',
+  ownerId: owner,
+)!;
 
 void main() {
   late ProviderContainer container;
@@ -169,56 +186,49 @@ void main() {
     expect(store.value, isNull);
   });
 
-  test(
-    'logout drains plugin writes and rejects retained mutation handles',
-    () async {
-      container.dispose();
-      final storage = DelayedSecureStorage();
-      final plugins = PluginCredentialsStore(storage: storage);
-      container = ProviderContainer(
-        overrides: [
-          authCredentialsStoreProvider.overrideWithValue(store),
-          authBackendOriginProvider.overrideWithValue(
-            'http://example.com:17600',
-          ),
-          pluginCredentialsStoreProvider.overrideWithValue(plugins),
-          // The real lifecycle's managed-conversation registration clears the
-          // scoped Drift data on logout; keep that DB out of the host filesystem.
-          managedConversationRepositoryProvider.overrideWithValue(
-            ManagedConversationRepository(AppDatabase(NativeDatabase.memory())),
-          ),
-          settingsStoreProvider.overrideWithValue(
-            FakeSettingsStore(
-              stored: const BackendSettings(host: 'example.com'),
-            ),
-          ),
-        ],
-      );
-      await container.read(authCredentialsProvider.future);
-      await container.read(settingsProvider.future);
-      final subscription = container.listen(
-        scopedPluginCredentialsProvider,
-        (_, _) {},
-      );
-      addTearDown(subscription.close);
-      final handle = container.read(scopedPluginCredentialsProvider);
-      storage.gate = Completer<void>();
-      final write = handle.setCredentials('one', {'token': 'local'});
-      final logout = container.read(authCredentialsProvider.notifier).clear();
-      await expectLater(
-        handle.setEnabled('one', true),
-        throwsA(isA<PluginReauthenticationRequired>()),
-      );
-      storage.gate!.complete();
-      await write;
-      await logout;
-      expect(
-        (await plugins.load(credentials('a').accountScope!)).plugins,
-        isEmpty,
-      );
-      expect(store.value, isNull);
-    },
-  );
+  test('logout drains plugin writes and rejects retained mutation handles', () async {
+    container.dispose();
+    final storage = DelayedSecureStorage();
+    final plugins = PluginCredentialsStore(storage: storage);
+    container = ProviderContainer(
+      overrides: [
+        authCredentialsStoreProvider.overrideWithValue(store),
+        authBackendOriginProvider.overrideWithValue('http://example.com:17600'),
+        pluginCredentialsStoreProvider.overrideWithValue(plugins),
+        // The real lifecycle's managed-conversation registration clears the
+        // scoped Drift data on logout; keep that DB out of the host filesystem.
+        managedConversationRepositoryProvider.overrideWithValue(
+          ManagedConversationRepository(AppDatabase(NativeDatabase.memory())),
+        ),
+        settingsStoreProvider.overrideWithValue(
+          FakeSettingsStore(stored: const BackendSettings(host: 'example.com')),
+        ),
+      ],
+    );
+    await container.read(authCredentialsProvider.future);
+    await container.read(settingsProvider.future);
+    final subscription = container.listen(
+      scopedPluginCredentialsProvider,
+      (_, _) {},
+    );
+    addTearDown(subscription.close);
+    final handle = container.read(scopedPluginCredentialsProvider);
+    storage.gate = Completer<void>();
+    final write = handle.setCredentials('one', {'token': 'local'});
+    final logout = container.read(authCredentialsProvider.notifier).clear();
+    await expectLater(
+      handle.setEnabled('one', true),
+      throwsA(isA<PluginReauthenticationRequired>()),
+    );
+    storage.gate!.complete();
+    await write;
+    await logout;
+    expect(
+      (await plugins.load(credentials('a').accountScope!)).plugins,
+      isEmpty,
+    );
+    expect(store.value, isNull);
+  });
 
   test('registered storage drains late saves before scoped deletion', () async {
     final gate = Completer<void>();
@@ -296,100 +306,535 @@ void main() {
     expect(store.saveStarted.isCompleted, isFalse);
   });
 
+  test('logout clears the scoped managed conversations + pending rows via the '
+      'lifecycle, keeping other scopes and unscoped legacy history', () async {
+    container.dispose();
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    final repo = ManagedConversationRepository(db);
+    final pluginStorage = DelayedSecureStorage();
+    container = ProviderContainer(
+      overrides: [
+        authCredentialsStoreProvider.overrideWithValue(store),
+        authBackendOriginProvider.overrideWithValue('http://example.com:17600'),
+        pluginCredentialsStoreProvider.overrideWithValue(
+          PluginCredentialsStore(storage: pluginStorage),
+        ),
+        managedConversationRepositoryProvider.overrideWithValue(repo),
+        settingsStoreProvider.overrideWithValue(
+          FakeSettingsStore(stored: const BackendSettings(host: 'example.com')),
+        ),
+        // The real accountLifecycleProvider builds the graph, so the chat
+        // store it invalidates must be faked.
+        chatStoreProvider.overrideWithValue(FakeChatStore()),
+      ],
+    );
+    await container.read(authCredentialsProvider.future);
+
+    final scopeA = credentials('a').accountScope!;
+    final scopeB = credentials('b').accountScope!;
+    Future<void> seed(AuthAccountScope scope, String id) async {
+      await repo.access(scope, repo.epoch(scope), () {}, (store) async {
+        await store.saveConversation(
+          Conversation(
+            id: id,
+            title: 'T',
+            createdAt: DateTime(2024),
+            updatedAt: DateTime(2024),
+            messages: const [
+              Message(id: 'm1', role: MessageRole.user, content: 'hi'),
+            ],
+          ),
+        );
+      });
+      await repo.savePending(id, scope, 'msg-$id', {'model': 'openrouter'});
+    }
+
+    await seed(scopeA, 'c-a');
+    await seed(scopeB, 'c-b');
+    // Unscoped legacy history must survive a scoped logout untouched.
+    final legacyStore = DriftChatStore(db);
+    final legacy = Conversation(
+      id: 'legacy',
+      title: 'Legacy',
+      createdAt: DateTime(2024),
+      updatedAt: DateTime(2024),
+      messages: const [
+        Message(id: 'lm1', role: MessageRole.user, content: 'old'),
+      ],
+    );
+    await legacyStore.saveConversation(legacy);
+
+    final epochBefore = repo.epoch(scopeA);
+    await container.read(authCredentialsProvider.notifier).clear();
+
+    expect(repo.epoch(scopeA), greaterThan(epochBefore));
+    expect(await repo.pending(scopeA, 'c-a'), isNull);
+    final listA = await repo.access(
+      scopeA,
+      repo.epoch(scopeA),
+      () {},
+      (s) => s.watchConversations().first,
+    );
+    expect(listA, isEmpty);
+
+    // A different owner's conversation is not collateral.
+    expect(await repo.pending(scopeB, 'c-b'), isNotNull);
+    final listB = await repo.access(
+      scopeB,
+      repo.epoch(scopeB),
+      () {},
+      (s) => s.watchConversations().first,
+    );
+    expect(listB.single.id, 'c-b');
+
+    // Unscoped legacy history is retained.
+    final legacyList = await legacyStore.watchConversations().first;
+    expect(legacyList.single.id, 'legacy');
+  });
+
   test(
-    'logout clears the scoped managed conversations + pending rows via the '
-    'lifecycle, keeping other scopes and unscoped legacy history',
+    'account deletion invalidates the managed poller for the deleted scope',
     () async {
       container.dispose();
       final db = AppDatabase(NativeDatabase.memory());
       addTearDown(db.close);
       final repo = ManagedConversationRepository(db);
-      final pluginStorage = DelayedSecureStorage();
+      final plugins = PluginCredentialsStore(storage: InMemorySecureStorage());
+      final pollers = <LedgerPoller>[];
+      LedgerPoller pollerFactory({
+        required AuthAccountScope scope,
+        required LedgerCredentialsResolver credentials,
+      }) {
+        final dio = Dio();
+        final poller = LedgerPoller(
+          client: LedgerClient(dio: dio, scope: scope),
+          credentials: credentials,
+        );
+        pollers.add(poller);
+        addTearDown(() {
+          poller.dispose();
+          dio.close(force: true);
+        });
+        return poller;
+      }
+
       container = ProviderContainer(
         overrides: [
           authCredentialsStoreProvider.overrideWithValue(store),
           authBackendOriginProvider.overrideWithValue(
             'http://example.com:17600',
           ),
-          pluginCredentialsStoreProvider.overrideWithValue(
-            PluginCredentialsStore(storage: pluginStorage),
-          ),
+          pluginCredentialsStoreProvider.overrideWithValue(plugins),
           managedConversationRepositoryProvider.overrideWithValue(repo),
+          managedChatPollerFactoryProvider.overrideWithValue(pollerFactory),
           settingsStoreProvider.overrideWithValue(
             FakeSettingsStore(
               stored: const BackendSettings(host: 'example.com'),
             ),
           ),
-          // The real accountLifecycleProvider builds the graph, so the chat
-          // store it invalidates must be faked.
           chatStoreProvider.overrideWithValue(FakeChatStore()),
         ],
       );
       await container.read(authCredentialsProvider.future);
+      await container.read(settingsProvider.future);
+      final scope = container.read(pluginAccountScopeProvider);
+      final poller = container.read(managedChatAdapterProvider).poller;
+      final handle = poller.watch(const LedgerLookup.byTaskId('task'));
+      final lifecycle = container.read(accountLifecycleProvider);
 
-      final scopeA = credentials('a').accountScope!;
-      final scopeB = credentials('b').accountScope!;
-      Future<void> seed(
-        AuthAccountScope scope,
-        String id,
-      ) async {
-        await repo.access(scope, repo.epoch(scope), () {}, (store) async {
-          await store.saveConversation(
-            Conversation(
-              id: id,
-              title: 'T',
-              createdAt: DateTime(2024),
-              updatedAt: DateTime(2024),
-              messages: const [
-                Message(id: 'm1', role: MessageRole.user, content: 'hi'),
-              ],
-            ),
-          );
-        });
-        await repo.savePending(id, scope, 'msg-$id', {'model': 'openrouter'});
-      }
-
-      await seed(scopeA, 'c-a');
-      await seed(scopeB, 'c-b');
-      // Unscoped legacy history must survive a scoped logout untouched.
-      final legacyStore = DriftChatStore(db);
-      final legacy = Conversation(
-        id: 'legacy',
-        title: 'Legacy',
-        createdAt: DateTime(2024),
-        updatedAt: DateTime(2024),
-        messages: const [
-          Message(id: 'lm1', role: MessageRole.user, content: 'old'),
-        ],
+      await lifecycle.clearLocal(scope);
+      expect((await handle.done).end, LedgerPollEnd.cancelled);
+      expect(
+        () => poller.watch(const LedgerLookup.byTaskId('after-clear')),
+        returnsNormally,
       );
-      await legacyStore.saveConversation(legacy);
-
-      final epochBefore = repo.epoch(scopeA);
-      await container.read(authCredentialsProvider.notifier).clear();
-
-      expect(repo.epoch(scopeA), greaterThan(epochBefore));
-      expect(await repo.pending(scopeA, 'c-a'), isNull);
-      final listA = await repo.access(
-        scopeA,
-        repo.epoch(scopeA),
-        () {},
-        (s) => s.watchConversations().first,
+      final deletionHandle = poller.watch(
+        const LedgerLookup.byTaskId('during-delete'),
       );
-      expect(listA, isEmpty);
 
-      // A different owner's conversation is not collateral.
-      expect(await repo.pending(scopeB, 'c-b'), isNotNull);
-      final listB = await repo.access(
-        scopeB,
-        repo.epoch(scopeB),
-        () {},
-        (s) => s.watchConversations().first,
+      await wipeLocalAccountData(
+        scope: scope,
+        lifecycle: lifecycle,
+        clearCredentials: () =>
+            container.read(authCredentialsProvider.notifier).clear(),
+        fileStore: FakeFileStore(scopeKey: scope.storageId),
+        memoryStore: FakeMemoryStore(scopeKey: scope.storageId),
+        fileCache: _CountingFileCache(scopeKey: scope.storageId),
       );
-      expect(listB.single.id, 'c-b');
 
-      // Unscoped legacy history is retained.
-      final legacyList = await legacyStore.watchConversations().first;
-      expect(legacyList.single.id, 'legacy');
+      expect((await deletionHandle.done).end, LedgerPollEnd.cancelled);
+      expect(container.read(authCredentialsProvider).value, isNull);
+      expect(
+        () => poller.watch(const LedgerLookup.byTaskId('after-delete')),
+        throwsA(isA<PluginClientException>()),
+      );
     },
   );
+
+  group('wipeLocalAccountData', () {
+    test('drains downloads before wiping files, memories, and cache', () async {
+      final scope = accountScope('a');
+      final order = <String>[];
+      final fileStore = _OrderFileStore(order, scopeKey: scope.storageId);
+      final memoryStore = _OrderMemoryStore(order, scopeKey: scope.storageId);
+      final fileCache = _OrderFileCache(order, scopeKey: scope.storageId);
+      final drainGate = Completer<void>();
+      final drainStarted = Completer<void>();
+      var credentialsCleared = false;
+      final download = lifecycle.runAttachmentDownload(scope.storageId, (
+        registration,
+      ) async {
+        order.add('drain');
+        drainStarted.complete();
+        await drainGate.future;
+        registration.checkCurrent();
+      });
+      final downloadFailure = expectLater(
+        download,
+        throwsA(isA<AttachmentDownloadCancelled>()),
+      );
+      await drainStarted.future;
+
+      final wipe = wipeLocalAccountData(
+        scope: scope,
+        lifecycle: lifecycle,
+        clearCredentials: () async {
+          credentialsCleared = true;
+          order.add('credentials');
+        },
+        fileStore: fileStore,
+        memoryStore: memoryStore,
+        fileCache: fileCache,
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(order, ['drain']);
+      drainGate.complete();
+      await downloadFailure;
+      await wipe;
+
+      expect(order, ['drain', 'files', 'memories', 'cache', 'credentials']);
+      expect(credentialsCleared, isTrue);
+      expect(fileStore.deleteAllCalls, 1);
+      expect(memoryStore.deleteAllCalls, 1);
+      expect(fileCache.evictAllForScopeCalls, 1);
+      expect(fileStore.deletedScopes, [scope.storageId]);
+      expect(memoryStore.deletedScopes, [scope.storageId]);
+      expect(fileCache.evictedScopes, [scope.storageId]);
+    });
+
+    test(
+      'refuses a new attachment registration after scope invalidation',
+      () async {
+        final lifecycle = AccountLifecycle();
+        final scope = accountScope('a');
+
+        await lifecycle.cancelAndDrain(scope.storageId);
+
+        expect(
+          () => lifecycle.registerAttachmentDownload(scope.storageId),
+          throwsA(isA<AttachmentDownloadCancelled>()),
+        );
+      },
+    );
+
+    test(
+      'waits for an in-progress cache write before the scoped sweep',
+      () async {
+        final scope = accountScope('a');
+        final lifecycle = AccountLifecycle();
+        final root = await Directory.systemTemp.createTemp('cache_write_drain');
+        addTearDown(() => root.delete(recursive: true));
+        final writeGate = Completer<void>();
+        final writeStarted = Completer<void>();
+        final cache = _GatedFileCache(
+          cacheDir: root,
+          scopeKey: scope.storageId,
+          gate: writeGate,
+          started: writeStarted,
+        );
+        final download = lifecycle.runAttachmentDownload(scope.storageId, (
+          registration,
+        ) {
+          registration.checkCurrent();
+          return cache.cacheFile('late', '.bin', Uint8List.fromList([9]));
+        });
+        final downloadFailure = expectLater(
+          download,
+          throwsA(isA<AttachmentDownloadCancelled>()),
+        );
+        await writeStarted.future;
+        var wipeCompleted = false;
+        final wipe = wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async {},
+          fileStore: FakeFileStore(scopeKey: scope.storageId),
+          memoryStore: FakeMemoryStore(scopeKey: scope.storageId),
+          fileCache: cache,
+        ).whenComplete(() => wipeCompleted = true);
+
+        await Future<void>.delayed(Duration.zero);
+        expect(wipeCompleted, isFalse);
+        writeGate.complete();
+        await downloadFailure;
+        await wipe;
+        expect(await cache.totalBytes, 0);
+      },
+    );
+
+    test('a data-wipe failure still clears credentials then throws '
+        'PartialAccountWipe', () async {
+      final scope = accountScope('a');
+      final fileStore = FakeFileStore(scopeKey: scope.storageId)
+        ..failDeleteAll = true;
+      final memoryStore = FakeMemoryStore(scopeKey: scope.storageId);
+      final fileCache = _CountingFileCache(scopeKey: scope.storageId);
+      var credentialsCleared = false;
+
+      await expectLater(
+        wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async => credentialsCleared = true,
+          fileStore: fileStore,
+          memoryStore: memoryStore,
+          fileCache: fileCache,
+        ),
+        throwsA(isA<PartialAccountWipe>()),
+      );
+
+      // Fail-closed: the server-side account is already gone, so the
+      // credential clear (and the rest of the data wipe) still runs.
+      expect(credentialsCleared, isTrue);
+      expect(memoryStore.deleteAllCalls, 1);
+      expect(fileCache.evictAllForScopeCalls, 1);
+    });
+
+    test('a failed credential clear throws PartialAccountWipe', () async {
+      final scope = accountScope('a');
+      await expectLater(
+        wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async => throw StateError('clear failed'),
+          fileStore: FakeFileStore(scopeKey: scope.storageId),
+          memoryStore: FakeMemoryStore(scopeKey: scope.storageId),
+          fileCache: _CountingFileCache(scopeKey: scope.storageId),
+        ),
+        throwsA(
+          isA<PartialAccountWipe>().having(
+            (e) => e.cause,
+            'cause',
+            isA<StateError>(),
+          ),
+        ),
+      );
+    });
+
+    test('a file-cache eviction failure surfaces PartialAccountWipe', () async {
+      final scope = accountScope('a');
+      final fileStore = FakeFileStore(scopeKey: scope.storageId);
+      final memoryStore = FakeMemoryStore(scopeKey: scope.storageId);
+      var credentialsCleared = false;
+
+      await expectLater(
+        wipeLocalAccountData(
+          scope: scope,
+          lifecycle: lifecycle,
+          clearCredentials: () async => credentialsCleared = true,
+          fileStore: fileStore,
+          memoryStore: memoryStore,
+          fileCache: _ThrowingFileCache(scopeKey: scope.storageId),
+        ),
+        throwsA(
+          isA<PartialAccountWipe>().having(
+            (e) => e.cause,
+            'cause',
+            isA<StateError>(),
+          ),
+        ),
+      );
+
+      expect(credentialsCleared, isTrue);
+      expect(fileStore.deleteAllCalls, 1);
+      expect(memoryStore.deleteAllCalls, 1);
+    });
+
+    test(
+      'account A deletion leaves account B files, memories, and cache intact',
+      () async {
+        final scopeA = accountScope('a');
+        final scopeB = accountScope('b');
+        final db = AppDatabase(NativeDatabase.memory());
+        addTearDown(db.close);
+        final filesA = DriftFileStore(db, scopeKey: scopeA.storageId);
+        final filesB = DriftFileStore(db, scopeKey: scopeB.storageId);
+        final memoriesA = DriftMemoryStore(db, scopeKey: scopeA.storageId);
+        final memoriesB = DriftMemoryStore(db, scopeKey: scopeB.storageId);
+        final root = await Directory.systemTemp.createTemp(
+          'account_wipe_cache',
+        );
+        addTearDown(() => root.delete(recursive: true));
+        final cacheA = FileCache(cacheDir: root, scopeKey: scopeA.storageId);
+        final cacheB = FileCache(cacheDir: root, scopeKey: scopeB.storageId);
+
+        await filesA.saveFile(
+          const FileInfo(
+            id: 'shared',
+            filename: 'a.jpg',
+            sizeBytes: 1,
+            mimeType: 'image/jpeg',
+          ),
+        );
+        await filesB.saveFile(
+          const FileInfo(
+            id: 'shared',
+            filename: 'b.jpg',
+            sizeBytes: 1,
+            mimeType: 'image/jpeg',
+          ),
+        );
+        await memoriesA.saveMemory(
+          Memory(
+            id: 'shared',
+            content: 'memory A',
+            createdAt: DateTime(2024),
+            updatedAt: DateTime(2024),
+          ),
+        );
+        await memoriesB.saveMemory(
+          Memory(
+            id: 'shared',
+            content: 'memory B',
+            createdAt: DateTime(2024),
+            updatedAt: DateTime(2024),
+          ),
+        );
+        final pathA = await cacheA.cacheFile(
+          'shared',
+          '.jpg',
+          Uint8List.fromList([1]),
+        );
+        final pathB = await cacheB.cacheFile(
+          'shared',
+          '.jpg',
+          Uint8List.fromList([2]),
+        );
+        var credentialsCleared = false;
+
+        await wipeLocalAccountData(
+          scope: scopeA,
+          lifecycle: lifecycle,
+          clearCredentials: () async => credentialsCleared = true,
+          fileStore: filesA,
+          memoryStore: memoriesA,
+          fileCache: cacheA,
+        );
+
+        expect(credentialsCleared, isTrue);
+        expect(await filesA.getFileById('shared'), isNull);
+        expect((await filesB.getFileById('shared'))!.filename, 'b.jpg');
+        expect(await memoriesA.getMemory('shared'), isNull);
+        expect((await memoriesB.getMemory('shared'))!.content, 'memory B');
+        expect(File(pathA).existsSync(), isFalse);
+        expect(File(pathB).readAsBytesSync().toList(), [2]);
+        expect(await cacheB.getCached('shared'), isNotNull);
+      },
+    );
+  });
+}
+
+class _GatedFileCache extends FileCache {
+  _GatedFileCache({
+    required super.cacheDir,
+    required super.scopeKey,
+    required this.gate,
+    required this.started,
+  });
+
+  final Completer<void> gate;
+  final Completer<void> started;
+
+  @override
+  Future<String> cacheFile(
+    String fileId,
+    String extension,
+    Uint8List data,
+  ) async {
+    if (!started.isCompleted) started.complete();
+    await gate.future;
+    return super.cacheFile(fileId, extension, data);
+  }
+}
+
+class _OrderFileCache extends FileCache {
+  _OrderFileCache(this.events, {super.scopeKey = 'test-scope'})
+    : super(cacheDir: Directory.systemTemp);
+
+  final List<String> events;
+  int evictAllForScopeCalls = 0;
+  final List<String> evictedScopes = [];
+
+  @override
+  Future<void> evictAllForScope(String targetScope) async {
+    if (targetScope != scopeKey) {
+      throw StateError('File cache scope mismatch');
+    }
+    evictAllForScopeCalls++;
+    evictedScopes.add(targetScope);
+    events.add('cache');
+  }
+}
+
+/// [FileCache] double whose scoped eviction always throws.
+class _ThrowingFileCache extends FileCache {
+  _ThrowingFileCache({super.scopeKey = 'test-scope'})
+    : super(cacheDir: Directory.systemTemp);
+
+  @override
+  Future<void> evictAllForScope(String targetScope) async =>
+      throw StateError('disk unavailable');
+}
+
+/// [FileCache] double that only counts successful scoped eviction calls.
+class _CountingFileCache extends FileCache {
+  _CountingFileCache({super.scopeKey = 'test-scope'})
+    : super(cacheDir: Directory.systemTemp);
+
+  int evictAllForScopeCalls = 0;
+
+  @override
+  Future<void> evictAllForScope(String targetScope) async {
+    if (targetScope != scopeKey) {
+      throw StateError('File cache scope mismatch');
+    }
+    evictAllForScopeCalls++;
+  }
+}
+
+/// [FakeFileStore] that records wipe order via [events].
+class _OrderFileStore extends FakeFileStore {
+  _OrderFileStore(this.events, {required super.scopeKey});
+
+  final List<String> events;
+
+  @override
+  Future<void> deleteAllForScope(String scopeKey) async {
+    await super.deleteAllForScope(scopeKey);
+    events.add('files');
+  }
+}
+
+/// [FakeMemoryStore] that records wipe order via [events].
+class _OrderMemoryStore extends FakeMemoryStore {
+  _OrderMemoryStore(this.events, {required super.scopeKey});
+
+  final List<String> events;
+
+  @override
+  Future<void> deleteAllMemoriesForScope(String scopeKey) async {
+    await super.deleteAllMemoriesForScope(scopeKey);
+    events.add('memories');
+  }
 }

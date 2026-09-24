@@ -521,6 +521,7 @@ describe("createSessionStore", () => {
     assert.equal(store.count("alice"), 1);
 
     assert.equal(store.deleteSessionsForOwner("alice"), 1);
+    assert.equal(store.deleteSessionsForOwner("alice"), 0, "owner purge is idempotent");
     assert.equal(store.count("alice"), 0);
     assert.equal(store.size, 1);
     assert.ok(store.get("bob", "b1"));

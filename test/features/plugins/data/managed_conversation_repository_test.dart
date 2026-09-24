@@ -161,4 +161,40 @@ void main() {
     expect(await repo.pending(a, 'c-a'), isNull);
     expect(await repo.pending(b, 'c-b'), isNotNull);
   });
+
+  test('pendingConversationIds is empty for a scope with no rows and lists '
+      'only that scope\'s conversations with rows', () async {
+    final a = scope('owner-a');
+    final b = scope('owner-b');
+    expect(await repo.pendingConversationIds(a).first, isEmpty);
+
+    await repo.savePending('c1', a, 'msg-1', {'model': 'openrouter'});
+    await repo.savePending('c2', a, 'msg-2', {'model': 'openrouter'});
+    await repo.savePending('c-b', b, 'msg-3', {'model': 'openrouter'});
+
+    expect(await repo.pendingConversationIds(a).first, {'c1', 'c2'});
+    expect(await repo.pendingConversationIds(b).first, {'c-b'});
+
+    await repo.clearPending(a, 'c1');
+    expect(await repo.pendingConversationIds(a).first, {'c2'});
+    expect(await repo.pendingConversationIds(b).first, {'c-b'});
+  });
+
+  test('pendingConversationIds re-emits when a pending row is written or '
+      'cleared', () async {
+    final a = scope('owner-a');
+    final emissions = <Set<String>>[];
+    final sub = repo.pendingConversationIds(a).listen(emissions.add);
+    await pumpEventQueue();
+    expect(emissions.first, isEmpty);
+
+    await repo.savePending('c1', a, 'msg-1', {'model': 'openrouter'});
+    await pumpEventQueue();
+    expect(emissions.last, {'c1'});
+
+    await repo.clearPending(a, 'c1');
+    await pumpEventQueue();
+    expect(emissions.last, isEmpty);
+    await sub.cancel();
+  });
 }

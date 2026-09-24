@@ -10,10 +10,13 @@ import 'package:ai_assistant/features/attachments/data/files_service.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/plugins/data/agent_config.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_client.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_catalog_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_dto.dart';
+import 'package:ai_assistant/features/plugins/ui/agent_editor_screen.dart';
 import 'package:ai_assistant/features/plugins/ui/plugins_screen.dart';
 import 'package:ai_assistant/features/settings/data/prefs_providers.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
@@ -53,6 +56,38 @@ ResponseBody jsonResponse(Object value, {int status = 200}) =>
       },
     );
 
+/// Builds [finder] by dragging [scrollable] toward the list end and then back
+/// toward its start until the widget exists (ListView children outside the
+/// cache extent are not built), then brings it fully on-screen so taps and
+/// enterText land on it.
+Future<void> reveal(
+  WidgetTester tester,
+  Finder finder, {
+  Finder? scrollable,
+}) async {
+  final target = scrollable ?? find.byType(Scrollable).first;
+  for (var i = 0; i < 40 && finder.evaluate().isEmpty; i++) {
+    await tester.drag(target, const Offset(0, -200));
+    await tester.pump();
+  }
+  for (var i = 0; i < 40 && finder.evaluate().isEmpty; i++) {
+    await tester.drag(target, const Offset(0, 200));
+    await tester.pump();
+  }
+  await tester.ensureVisible(finder);
+  await tester.pumpAndSettle();
+}
+
+/// The agent editor's own ListView scrollable (the plugins screen underneath
+/// has one too, and text fields contribute editable scrollables — so callers
+/// must not rely on a bare `Scrollable.first` here).
+Finder editorScrollable() => find
+    .descendant(
+      of: find.byType(AgentEditorScreen),
+      matching: find.byType(Scrollable),
+    )
+    .first;
+
 Map<String, dynamic> agentJson() => {
   'id': 'test-agent',
   'object': 'agent',
@@ -60,7 +95,11 @@ Map<String, dynamic> agentJson() => {
   'owned_by': 'plugin',
   'name': 'Test Agent',
   'description': 'A test agent',
+  'defaultModel': 'openrouter',
   'visionCapable': false,
+  'toolGrants': [
+    {'pluginId': 'web-search', 'required': false},
+  ],
   'skillCount': 0,
 };
 
@@ -73,6 +112,39 @@ Map<String, dynamic> agentPluginJson() => {
   'schemaVersion': 1,
   'installed': true,
 };
+
+Map<String, dynamic> toolPluginJson() => {
+  'id': 'web-search',
+  'type': 'tool',
+  'name': 'Web Search',
+  'description': 'Search the web',
+  'version': '1.0.0',
+  'schemaVersion': 1,
+  'installed': true,
+  'tools': [
+    {
+      'name': 'search',
+      'description': 'Run a web search',
+      'readOnly': true,
+      'inputSchema': {
+        'type': 'object',
+        'properties': {
+          'query': {'type': 'string'},
+        },
+        'required': ['query'],
+      },
+    },
+  ],
+};
+
+PluginCatalog _loadedCatalog() => PluginCatalog(
+  [
+    PluginDto.fromSummaryJson(pluginJson()),
+    PluginDto.fromSummaryJson(toolPluginJson()),
+  ],
+  [PluginModelDto.fromJson(modelJson())],
+  const [],
+);
 
 void main() {
   late FakePluginAdapter adapter;
@@ -117,6 +189,38 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  Future<void> mountEditor(
+    WidgetTester tester, {
+    required Future<PluginCatalog> catalog,
+    AgentConfig? existing,
+  }) async {
+    store = PluginCredentialsStore(storage: InMemorySecureStorage());
+    auth = TestAuth(account);
+    container = ProviderContainer(
+      overrides: [
+        dioProvider.overrideWithValue(dio),
+        authCredentialsProvider.overrideWith(() => auth),
+        settingsStoreProvider.overrideWithValue(
+          FakeSettingsStore(stored: const BackendSettings(host: 'example.com')),
+        ),
+        pluginCredentialsStoreProvider.overrideWithValue(store),
+        pluginCatalogProvider.overrideWith((ref) => catalog),
+        skillsCatalogProvider.overrideWith((ref) async => const []),
+        mcpsCatalogProvider.overrideWith((ref) async => const []),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(authCredentialsProvider.future);
+    await container.read(settingsProvider.future);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(home: AgentEditorScreen(existing: existing)),
+      ),
+    );
+    await tester.pump();
+  }
+
   setUp(() {
     failed = false;
     empty = false;
@@ -131,7 +235,9 @@ void main() {
       switch (options.uri.path) {
         case '/v1/plugins':
           return jsonResponse({
-            'plugins': empty ? [] : [pluginJson(), agentPluginJson()],
+            'plugins': empty
+                ? []
+                : [pluginJson(), agentPluginJson(), toolPluginJson()],
           });
         case '/v1/models':
           return jsonResponse({
@@ -142,6 +248,18 @@ void main() {
           return jsonResponse({
             'object': 'list',
             'data': empty ? [] : [agentJson()],
+          });
+        case '/v1/skills':
+          return jsonResponse({
+            'data': [
+              {'id': 'skill-a', 'title': 'Skill A', 'description': 'Skill A'},
+            ],
+          });
+        case '/v1/mcps':
+          return jsonResponse({
+            'data': [
+              {'name': 'mcp-a', 'description': 'MCP A'},
+            ],
           });
         case '/v1/chat/completions':
           return ResponseBody.fromString(
@@ -190,10 +308,9 @@ void main() {
       expect(tester.widget<TextField>(field).obscureText, isTrue);
       await tester.enterText(field, 'fake-provider-key');
       await tester.pump();
-      expect(
-        (await store.load(account.accountScope!)).plugins.keys,
-        ['test-agent'],
-      );
+      expect((await store.load(account.accountScope!)).plugins.keys, [
+        'test-agent',
+      ]);
       await tester.tap(find.text('Save API key'));
       await tester.pumpAndSettle();
       expect(tester.widget<TextField>(field).controller!.text, isEmpty);
@@ -376,10 +493,9 @@ void main() {
       find.byKey(const ValueKey('plugin-baseurl-primary')),
       findsOneWidget,
     );
-    expect(
-      (await store.load(account.accountScope!)).plugins.keys,
-      ['test-agent'],
-    );
+    expect((await store.load(account.accountScope!)).plugins.keys, [
+      'test-agent',
+    ]);
     final primary = find.byKey(const ValueKey('plugin-baseurl-primary'));
     await tester.ensureVisible(primary);
     await tester.pumpAndSettle();
@@ -416,9 +532,7 @@ void main() {
     expect(find.text('A test agent'), findsOneWidget);
   });
 
-  testWidgets('agent section shows empty state when no agents', (
-    tester,
-  ) async {
+  testWidgets('agent section shows empty state when no agents', (tester) async {
     empty = true;
     await mount(tester);
     expect(
@@ -442,16 +556,439 @@ void main() {
     await tester.tap(find.text('Deselect agent'));
     await tester.pumpAndSettle();
     expect(find.text('Select agent'), findsOneWidget);
-    expect(
-      (await store.load(account.accountScope!)).selectedAgent,
-      isNull,
-    );
+    expect((await store.load(account.accountScope!)).selectedAgent, isNull);
     await tester.tap(find.text('Select agent'));
     await tester.pumpAndSettle();
     expect(find.text('Deselect agent'), findsOneWidget);
     expect(
       (await store.load(account.accountScope!)).selectedAgent,
       'test-agent',
+    );
+  });
+
+  testWidgets(
+    'agent editor exposes tool grants, model picker, and inference controls',
+    (tester) async {
+      await mount(tester);
+      await tester.tap(find.text('New Agent'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AgentEditorScreen), findsOneWidget);
+      final editor = find.byType(AgentEditorScreen);
+
+      await reveal(
+        tester,
+        find.descendant(of: editor, matching: find.text('Tools')),
+        scrollable: editorScrollable(),
+      );
+      expect(
+        find.descendant(of: editor, matching: find.text('Tools')),
+        findsOneWidget,
+      );
+      await reveal(
+        tester,
+        find.descendant(of: editor, matching: find.text('Model')),
+        scrollable: editorScrollable(),
+      );
+      expect(
+        find.descendant(of: editor, matching: find.text('Model')),
+        findsOneWidget,
+      );
+      await reveal(
+        tester,
+        find.descendant(of: editor, matching: find.text('Inference')),
+        scrollable: editorScrollable(),
+      );
+      expect(
+        find.descendant(of: editor, matching: find.text('Inference')),
+        findsOneWidget,
+      );
+
+      await reveal(
+        tester,
+        find.byKey(const ValueKey('tool-web-search')),
+        scrollable: editorScrollable(),
+      );
+      expect(
+        tester
+            .widget<CheckboxListTile>(
+              find.byKey(const ValueKey('tool-web-search')),
+            )
+            .value,
+        isFalse,
+      );
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-model')),
+        scrollable: editorScrollable(),
+      );
+      await tester.tap(find.byKey(const Key('agent-model')));
+      await tester.pumpAndSettle();
+      // The closed button renders the selected (null) item's label and the
+      // open menu renders it again as an entry — two texts = menu is open.
+      expect(find.text('(Account default)'), findsNWidgets(2));
+      expect(find.text('OpenRouter'), findsAtLeastNWidgets(1));
+      await tester.tap(find.text('(Account default)').last);
+      await tester.pumpAndSettle();
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-temperature')),
+        scrollable: editorScrollable(),
+      );
+      final slider = tester.widget<Slider>(
+        find.byKey(const Key('agent-temperature')),
+      );
+      expect(slider.min, 0);
+      expect(slider.max, 2);
+      expect(slider.divisions, 20);
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-max-tokens')),
+        scrollable: editorScrollable(),
+      );
+      expect(find.byKey(const Key('agent-max-tokens')), findsOneWidget);
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-vision')),
+        scrollable: editorScrollable(),
+      );
+      expect(
+        tester
+            .widget<SwitchListTile>(find.byKey(const Key('agent-vision')))
+            .value,
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets(
+    'agent editor save is disabled while the plugin catalog is loading',
+    (tester) async {
+      final catalog = Completer<PluginCatalog>();
+      await mountEditor(tester, catalog: catalog.future);
+
+      final save = find.widgetWithText(FilledButton, 'Save');
+      expect(tester.widget<FilledButton>(save).onPressed, isNull);
+      expect(find.text('Loading plugins…'), findsOneWidget);
+      expect(find.byKey(const Key('agent-catalog-status')), findsOneWidget);
+
+      catalog.complete(_loadedCatalog());
+    },
+  );
+
+  testWidgets('agent editor save is disabled when the plugin catalog errors', (
+    tester,
+  ) async {
+    final catalog = Completer<PluginCatalog>();
+    await mountEditor(tester, catalog: catalog.future);
+    catalog.completeError(StateError('catalog unavailable'));
+    await tester.pumpAndSettle();
+
+    final save = find.widgetWithText(FilledButton, 'Save');
+    expect(tester.widget<FilledButton>(save).onPressed, isNull);
+    expect(
+      find.text("Plugin catalog unavailable — can't validate this agent yet"),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('agent-catalog-status')), findsOneWidget);
+  });
+
+  testWidgets(
+    'loaded catalog keeps save enabled and rejects an unavailable model',
+    (tester) async {
+      await mountEditor(
+        tester,
+        catalog: Future.value(_loadedCatalog()),
+        existing: AgentConfig(
+          id: 'stale-agent',
+          kind: AgentKind.custom,
+          name: 'Stale Agent',
+          modelRef: 'missing-model',
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final save = find.widgetWithText(FilledButton, 'Save');
+      expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
+      await tester.tap(save);
+      await tester.pump();
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-error')),
+        scrollable: editorScrollable(),
+      );
+
+      expect(
+        find.text('Selected model is not an installed model plugin.'),
+        findsOneWidget,
+      );
+      expect(
+        (await store.load(account.accountScope!)).plugins
+            .containsKey('stale-agent'),
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets(
+    'loaded catalog keeps save enabled and rejects an unavailable tool grant',
+    (tester) async {
+      await mountEditor(
+        tester,
+        catalog: Future.value(_loadedCatalog()),
+        existing: AgentConfig(
+          id: 'stale-agent',
+          kind: AgentKind.custom,
+          name: 'Stale Agent',
+          tools: [AgentToolGrantData(pluginId: 'missing-tool')],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final save = find.widgetWithText(FilledButton, 'Save');
+      expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
+      await tester.tap(save);
+      await tester.pump();
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-error')),
+        scrollable: editorScrollable(),
+      );
+
+      expect(
+        find.text('Tool grants must reference installed tool plugins.'),
+        findsOneWidget,
+      );
+      expect(
+        (await store.load(account.accountScope!)).plugins
+            .containsKey('stale-agent'),
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets(
+    'editor saves tool grants, modelRef, and inference into the agent store',
+    (tester) async {
+      await mount(tester);
+      await tester.tap(find.text('New Agent'));
+      await tester.pumpAndSettle();
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-name')),
+        scrollable: editorScrollable(),
+      );
+      await tester.enterText(
+        find.byKey(const Key('agent-name')),
+        'Field Agent',
+      );
+      await tester.pump();
+
+      await reveal(
+        tester,
+        find.byKey(const ValueKey('tool-web-search')),
+        scrollable: editorScrollable(),
+      );
+      await tester.tap(find.byKey(const ValueKey('tool-web-search')));
+      await tester.pump();
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-model')),
+        scrollable: editorScrollable(),
+      );
+      await tester.tap(find.byKey(const Key('agent-model')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('OpenRouter').last);
+      await tester.pumpAndSettle();
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-temperature')),
+        scrollable: editorScrollable(),
+      );
+      tester
+          .widget<Slider>(find.byKey(const Key('agent-temperature')))
+          .onChanged!(0.5);
+      await tester.pump();
+      expect(find.text('Temperature: 0.5'), findsOneWidget);
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-max-tokens')),
+        scrollable: editorScrollable(),
+      );
+      await tester.enterText(find.byKey(const Key('agent-max-tokens')), '4096');
+      await tester.pump();
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-vision')),
+        scrollable: editorScrollable(),
+      );
+      await tester.tap(find.byKey(const Key('agent-vision')));
+      await tester.pump();
+      expect(
+        tester
+            .widget<SwitchListTile>(find.byKey(const Key('agent-vision')))
+            .value,
+        isTrue,
+      );
+
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AgentEditorScreen), findsNothing);
+
+      final config = await store.load(account.accountScope!);
+      final agent = config.plugins['field-agent']!.agent!;
+      expect(agent.kind, AgentKind.custom);
+      expect(agent.name, 'Field Agent');
+      expect(agent.tools.map((tool) => tool.pluginId), ['web-search']);
+      expect(agent.tools.single.required, isFalse);
+      expect(agent.modelRef, 'openrouter');
+      expect(agent.inference!.temperature, 0.5);
+      expect(agent.inference!.maxTokens, 4096);
+      expect(agent.inference!.visionCapable, isTrue);
+      expect(config.selectedAgent, 'field-agent');
+
+      final tile = find.byKey(const ValueKey('custom-field-agent'));
+      expect(tile, findsOneWidget);
+      expect(
+        find.descendant(
+          of: tile,
+          matching: find.widgetWithText(Chip, '1 tools'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: tile,
+          matching: find.widgetWithText(Chip, 'openrouter'),
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('over-cap system prompt and max tokens block the save', (
+    tester,
+  ) async {
+    await mount(tester);
+    await tester.tap(find.text('New Agent'));
+    await tester.pumpAndSettle();
+
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-name')),
+      scrollable: editorScrollable(),
+    );
+    await tester.enterText(find.byKey(const Key('agent-name')), 'Cap Agent');
+    await tester.pump();
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-system-prompt')),
+      scrollable: editorScrollable(),
+    );
+    await tester.enterText(
+      find.byKey(const Key('agent-system-prompt')),
+      'x' * 8001,
+    );
+    await tester.pump();
+
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-error')),
+      scrollable: editorScrollable(),
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('agent-error')),
+        matching: find.text('System prompt must be 8000 characters or fewer.'),
+      ),
+      findsOneWidget,
+    );
+    expect(find.byType(AgentEditorScreen), findsOneWidget);
+
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-system-prompt')),
+      scrollable: editorScrollable(),
+    );
+    await tester.enterText(find.byKey(const Key('agent-system-prompt')), 'ok');
+    await tester.pump();
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-max-tokens')),
+      scrollable: editorScrollable(),
+    );
+    await tester.enterText(find.byKey(const Key('agent-max-tokens')), '200001');
+    await tester.pump();
+
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-error')),
+      scrollable: editorScrollable(),
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('agent-error')),
+        matching: find.text(
+          'Max tokens must be a whole number between 1 and 200000.',
+        ),
+      ),
+      findsOneWidget,
+    );
+    expect(find.byType(AgentEditorScreen), findsOneWidget);
+
+    final config = await store.load(account.accountScope!);
+    expect(
+      config.plugins.values.any((entry) => entry.agent?.name == 'Cap Agent'),
+      isFalse,
+    );
+  });
+
+  testWidgets('installed agent and template tiles show tool and model chips', (
+    tester,
+  ) async {
+    await mount(tester);
+    final agentTile = find.byKey(const ValueKey('agent-test-agent'));
+    await reveal(tester, agentTile);
+    expect(
+      find.descendant(
+        of: agentTile,
+        matching: find.widgetWithText(Chip, '1 tools'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: agentTile,
+        matching: find.widgetWithText(Chip, 'openrouter'),
+      ),
+      findsOneWidget,
+    );
+    final templateTile = find.byKey(const ValueKey('template-test-agent'));
+    await reveal(tester, templateTile);
+    expect(
+      find.descendant(
+        of: templateTile,
+        matching: find.widgetWithText(Chip, '1 tools'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: templateTile,
+        matching: find.widgetWithText(Chip, 'openrouter'),
+      ),
+      findsOneWidget,
     );
   });
 }

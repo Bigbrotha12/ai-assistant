@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { McpTool } from "../agents/mcp.ts";
 
 /**
  * In-memory tool-result cache (Phase 4, Wave B).
@@ -21,7 +22,7 @@ import { createHash } from "node:crypto";
  *     uses `canRetryTool` (`credentials/idempotency.ts`), the same predicate
  *     that guards checkpoint resume. Mutating tools always execute.
  *   - The cache STORES the raw handler output and NEVER redacts internally.
- *     Callers apply `redactForCheckpoint` at serve time (on hits AND misses),
+ *     Callers apply `redactForOutbound` at serve time (on hits AND misses),
  *     so a credential-shaped backend response can never be served raw.
  *   - The key's `credentialFingerprint` comes from the same
  *     `credentialFingerprint()` used for pin identities — never a derivation
@@ -203,6 +204,147 @@ export function createToolResultCache(
     invalidateForUser(owner) {
       for (const [k, entry] of entries) {
         if (entry.key.owner === owner) entries.delete(k);
+      }
+    },
+
+    get size() {
+      return entries.size;
+    },
+
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      clearInterval(sweepTimer);
+    },
+  };
+}
+
+/**
+ * MCP tool-list cache (open-gaps P1 — "MCP cache").
+ *
+ * A per-process LRU+TTL cache of the JSON tool list returned by a server's
+ * `tools/list` call, so a warm second bind of the same server skips the
+ * `tools/list` round-trip (and, with the lazy client in `bindMcpServers`,
+ * the SSE handshake entirely, until a tool is first invoked). Keyed by
+ * `mcpToolListCacheKey(server)` — server URL + `credentialFingerprint()` of
+ * the resolved auth-header set; raw header values never enter the key.
+ *
+ * Staleness is bounded by `ttlMs` (default 60s): tool additions/renames on
+ * the MCP server may take up to TTL to appear — accepted for P1.
+ *
+ * CONSTRAINTS:
+ *   - Values are the plain JSON tool list (`McpTool[]`) ONLY — never bound
+ *     `DynamicStructuredTool` instances (those close over per-request clients).
+ *     `set` snapshots through `JSON.parse(JSON.stringify(...))` so only
+ *     JSON-serializable data can enter the cache; a non-serializable value
+ *     skips caching instead of throwing.
+ *   - Entries are read-only snapshots: `get` returns the stored array; the
+ *     caller must not mutate it.
+ *
+ * TTL is insertion-based (same shape as `createToolResultCache`): lazy
+ * expiry on `get` plus a periodic sweep (interval = `ttlMs`); a `get`
+ * refreshes LRU recency only. Single-instance only — `mcp.ts` owns one
+ * module-level singleton with set/reset test seams.
+ */
+export type McpToolListCache = {
+  /** Cached tool list for `key`, or undefined on miss/expiry (read-only). */
+  get(key: string): McpTool[] | undefined;
+  /** Snapshot the plain-JSON tool list under `key`. LRU-evicts at capacity. */
+  set(key: string, tools: McpTool[]): void;
+  /** Live entry count (tests + diagnostics). */
+  size: number;
+  /** Stops the periodic sweep. No-op after the first call. */
+  dispose(): void;
+};
+
+export type CreateMcpToolListCacheOptions = {
+  /** Entry lifetime; default 60s. Fixes the periodic sweep interval. */
+  ttlMs?: number;
+  /** LRU capacity; default 100 entries. */
+  maxEntries?: number;
+  /** Injectable monotonic clock; defaults to Date.now. */
+  now?: () => number;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+};
+
+export const DEFAULT_MCP_TOOL_LIST_TTL_MS = 60_000;
+export const DEFAULT_MCP_TOOL_LIST_MAX_ENTRIES = 100;
+
+type McpToolListEntry = {
+  tools: McpTool[];
+  insertedAt: number;
+};
+
+export function createMcpToolListCache(
+  opts: CreateMcpToolListCacheOptions = {},
+): McpToolListCache {
+  const ttlMs = opts.ttlMs ?? DEFAULT_MCP_TOOL_LIST_TTL_MS;
+  const maxEntries = opts.maxEntries ?? DEFAULT_MCP_TOOL_LIST_MAX_ENTRIES;
+  if (!(ttlMs > 0)) {
+    throw new Error(
+      `createMcpToolListCache: ttlMs must be a positive number, got ${ttlMs}`,
+    );
+  }
+  if (!(maxEntries > 0)) {
+    throw new Error(
+      `createMcpToolListCache: maxEntries must be a positive number, got ${maxEntries}`,
+    );
+  }
+  const now = opts.now ?? Date.now;
+  // Insertion order IS the LRU order: every hit re-inserts (delete + set).
+  const entries = new Map<string, McpToolListEntry>();
+  let disposed = false;
+
+  const sweep = (): void => {
+    const t = now();
+    for (const [k, entry] of entries) {
+      if (t - entry.insertedAt >= ttlMs) entries.delete(k);
+    }
+  };
+
+  const setInterval = opts.setInterval ?? globalThis.setInterval.bind(globalThis);
+  const clearInterval =
+    opts.clearInterval ?? globalThis.clearInterval.bind(globalThis);
+  const sweepTimer = setInterval(() => {
+    try {
+      sweep();
+    } catch (err) {
+      console.warn("[cache] mcp tool-list sweep failed:", err);
+    }
+  }, ttlMs);
+  if (typeof sweepTimer.unref === "function") sweepTimer.unref();
+
+  return {
+    get(key) {
+      const entry = entries.get(key);
+      if (!entry) return undefined;
+      if (now() - entry.insertedAt >= ttlMs) {
+        entries.delete(key);
+        return undefined;
+      }
+      // Refresh MRU recency without touching the insertion TTL.
+      entries.delete(key);
+      entries.set(key, entry);
+      return entry.tools;
+    },
+
+    set(key, tools) {
+      // Snapshot: only plain JSON tool lists may enter the cache — a
+      // DynamicStructuredTool (or any non-serializable value) never survives
+      // this round-trip as a live instance, and a failure skips caching
+      // rather than failing the bind.
+      let snapshot: McpTool[];
+      try {
+        snapshot = JSON.parse(JSON.stringify(tools)) as McpTool[];
+      } catch {
+        return;
+      }
+      entries.set(key, { tools: snapshot, insertedAt: now() });
+      while (entries.size > maxEntries) {
+        const oldest = entries.keys().next().value;
+        if (oldest === undefined) break;
+        entries.delete(oldest);
       }
     },
 

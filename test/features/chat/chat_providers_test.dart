@@ -1,8 +1,13 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data' show Uint8List;
 
+import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/app/global_messenger.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/features/attachments/data/files_service.dart';
@@ -15,6 +20,8 @@ import 'package:ai_assistant/features/chat/data/status_tracker.dart'
 import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
+import 'package:ai_assistant/features/vision/data/vision_client.dart';
+import 'package:ai_assistant/features/vision/data/vision_provider.dart';
 
 import '../../fakes.dart';
 
@@ -24,6 +31,7 @@ ProviderContainer _container({
   FakeFilesClient? filesService,
   FakeFileStore? fileStore,
   FakeManagedChatAdapter? adapter,
+  List<Override> extraOverrides = const [],
 }) {
   final s = store ?? FakeChatStore();
   final c = client ?? FakeChatClient();
@@ -35,6 +43,7 @@ ProviderContainer _container({
       managedChatAdapterProvider.overrideWithValue(
         adapter ?? FakeManagedChatAdapter(store: s, script: c),
       ),
+      ...extraOverrides,
     ],
   );
   addTearDown(container.dispose);
@@ -89,11 +98,78 @@ Conversation _existingConversation({List<Message> messages = const []}) =>
       updatedAt: DateTime(2024, 1, 1),
     );
 
+/// Scripted [VisionClient]: returns a fixed description (success / blank).
+class _FakeVisionClient implements VisionClient {
+  const _FakeVisionClient(this.description);
+
+  final String description;
+
+  @override
+  Future<String> describeImage({
+    required Uint8List bytes,
+    required String mimeType,
+    String prompt = 'Describe this image in detail.',
+    CancelToken? cancelToken,
+  }) async => description;
+}
+
+/// Scripted [VisionClient]: every describe throws (vision-fail path).
+class _ThrowingVisionClient implements VisionClient {
+  const _ThrowingVisionClient();
+
+  @override
+  Future<String> describeImage({
+    required Uint8List bytes,
+    required String mimeType,
+    String prompt = 'Describe this image in detail.',
+    CancelToken? cancelToken,
+  }) async {
+    throw const VisionServerError('vision backend down', statusCode: 500);
+  }
+}
+
+/// Notifier override that skips the real build (VRAM gate / gateway probe)
+/// and hands [visionClientProvider] the scripted client.
+class _FakeVisionNotifier extends VisionClientNotifier {
+  _FakeVisionNotifier(this.client);
+
+  final VisionClient client;
+
+  @override
+  Future<VisionClient> build() async => client;
+}
+
+/// [FakeChatStore] whose [deleteMessage] parks on [deleteGate] until the test
+/// completes it — opens the await window inside [ConversationNotifier.retry]
+/// so a concurrent queue update can land mid-retry.
+class _GatedDeleteStore extends FakeChatStore {
+  _GatedDeleteStore({super.initial});
+
+  Completer<void>? deleteGate;
+  Object? deleteError;
+  int deleteCalls = 0;
+
+  @override
+  Future<void> deleteMessage(String conversationId, String messageId) async {
+    deleteCalls++;
+    final gate = deleteGate;
+    if (gate != null) await gate.future;
+    final error = deleteError;
+    if (error != null) {
+      deleteError = null;
+      throw error;
+    }
+    return super.deleteMessage(conversationId, messageId);
+  }
+}
+
 void main() {
   group('conversationProvider', () {
     test('initial build loads messages from store', () async {
-      final store = FakeChatStore(initial: [
-        _existingConversation(messages: [
+      final store = FakeChatStore(
+        initial: [
+          _existingConversation(
+            messages: [
           const Message(
             id: 'u1',
             role: MessageRole.user,
@@ -106,8 +182,10 @@ void main() {
             content: 'hi there',
             createdAt: null,
           ),
-        ]),
-      ]);
+            ],
+          ),
+        ],
+      );
       final container = _container(store: store);
       _keepAlive(container, 'c1');
 
@@ -120,12 +198,17 @@ void main() {
       expect(state.messages.last.content, 'hi there');
     });
 
-    test('sendMessage streams content, persists, and toggles isStreaming',
+    test(
+      'sendMessage streams content, persists, and toggles isStreaming',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
         results: const [
-          ChatResult(content: 'Hello there', toolCalls: [], finishReason: 'stop'),
+            ChatResult(
+              content: 'Hello there',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
         ],
         streamDeltas: const [
           ['Hello', ' there'],
@@ -150,7 +233,8 @@ void main() {
       expect(persisted!.messages, hasLength(2));
       expect(persisted.messages.last.content, 'Hello there');
       expect(client.lastSystemPrompt, isNull);
-    });
+      },
+    );
 
     test('error path keeps partial content and sets failedMessageId', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
@@ -202,8 +286,10 @@ void main() {
       // First send errors.
       client.error = const ChatNetworkError('boom');
       await notifier.sendMessage('Hi');
-      final failedId =
-          container.read(conversationProvider('c1')).value!.failedMessageId;
+      final failedId = container
+          .read(conversationProvider('c1'))
+          .value!
+          .failedMessageId;
       expect(failedId, isNotNull);
 
       // Now succeed on retry.
@@ -215,10 +301,7 @@ void main() {
       expect(state.failedMessageId, isNull);
       expect(state.isStreaming, isFalse);
       // The failed placeholder is gone; a fresh assistant message replaced it.
-      expect(
-        state.messages.where((m) => m.id == failedId),
-        isEmpty,
-      );
+      expect(state.messages.where((m) => m.id == failedId), isEmpty);
       expect(state.messages.last.content, 'Recovered');
       expect(state.messages.first.content, 'Hi');
 
@@ -235,6 +318,187 @@ void main() {
       expect(persisted!.messages.where((m) => m.id == failedId), isEmpty);
       expect(persisted.messages.last.content, 'Recovered');
       expect(persisted.messages, hasLength(2));
+    });
+
+    test('concurrent retry calls delete and dispatch only once', () async {
+      final store = _GatedDeleteStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'Recovered', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final adapter = FakeManagedChatAdapter(store: store, script: client);
+      final container = _container(
+        store: store,
+        client: client,
+        adapter: adapter,
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      client.error = const ChatNetworkError('boom');
+      await notifier.sendMessage('Hi');
+      expect(
+        container.read(conversationProvider('c1')).value!.failedMessageId,
+        isNotNull,
+      );
+      client.error = null;
+
+      store.deleteGate = Completer<void>();
+      final firstRetry = notifier.retry();
+      final secondRetry = notifier.retry();
+      await secondRetry;
+
+      expect(store.deleteCalls, 1);
+      expect(
+        container.read(conversationProvider('c1')).value!.isRetryInFlight,
+        isTrue,
+      );
+      expect(adapter.retries, isEmpty);
+
+      store.deleteGate!.complete();
+      await firstRetry;
+
+      expect(store.deleteCalls, 1);
+      expect(adapter.retries, ['c1']);
+    });
+
+    test(
+      'a failed retry delete clears the latch and allows a later retry',
+      () async {
+        final store = _GatedDeleteStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          results: const [
+            ChatResult(
+              content: 'Recovered',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
+          ],
+        );
+        final adapter = FakeManagedChatAdapter(store: store, script: client);
+        final container = _container(
+          store: store,
+          client: client,
+          adapter: adapter,
+        );
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
+
+        client.error = const ChatNetworkError('boom');
+        await notifier.sendMessage('Hi');
+        final before = container.read(conversationProvider('c1')).value!;
+        final failedId = before.failedMessageId;
+        expect(failedId, isNotNull);
+        final originalError = before.error;
+        client.error = null;
+        store.deleteError = StateError('delete failed');
+
+        await expectLater(notifier.retry(), throwsA(isA<StateError>()));
+
+        final afterFailure = container.read(conversationProvider('c1')).value!;
+        expect(afterFailure.error, originalError);
+        expect(afterFailure.failedMessageId, failedId);
+        expect(afterFailure.isRetryInFlight, isFalse);
+        expect(store.deleteCalls, 1);
+        expect(adapter.retries, isEmpty);
+
+        await notifier.retry();
+
+        final afterRetry = container.read(conversationProvider('c1')).value!;
+        expect(afterRetry.error, isNull);
+        expect(afterRetry.failedMessageId, isNull);
+        expect(afterRetry.isRetryInFlight, isFalse);
+        expect(store.deleteCalls, 2);
+        expect(adapter.retries, ['c1']);
+      },
+    );
+
+    test('retry does not revert upload progress that lands during its '
+        'store-delete await (stale read → write race)', () async {
+      final store = _GatedDeleteStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'Recovered', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final holdUpload = Completer<FileInfo>();
+      final files = FakeFilesClient(uploadCompleter: holdUpload);
+      final adapter = FakeManagedChatAdapter(store: store, script: client);
+      final container = _container(
+        store: store,
+        client: client,
+        adapter: adapter,
+        filesService: files,
+        fileStore: FakeFileStore(),
+        extraOverrides: [visionEnabledProvider.overrideWithValue(false)],
+      );
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      // Send #1 succeeds; its attachment upload stays in-flight (held).
+      await notifier.sendMessage(
+        'First',
+        attachments: const [
+          AttachmentDraft(
+            path: '/tmp/a.jpg',
+            filename: 'a.jpg',
+            sizeBytes: 100,
+            mimeType: 'image/jpeg',
+          ),
+        ],
+      );
+      var state = container.read(conversationProvider('c1')).value!;
+      final jobId = state.attachmentUploads.keys.single;
+      expect(state.attachmentUploads[jobId]!.status, UploadStatus.uploading);
+
+      // Send #2 fails → failedMessageId set, input eligible for retry.
+      client.error = const ChatNetworkError('boom');
+      await notifier.sendMessage('Second');
+      expect(
+        container.read(conversationProvider('c1')).value!.failedMessageId,
+        isNotNull,
+      );
+      client.error = null;
+
+      // Park retry() inside its store-delete await.
+      store.deleteGate = Completer<void>();
+      final retryFuture = notifier.retry();
+
+      // The held upload completes while retry is parked: the queue listener
+      // writes status=done (+ file ref) into state.
+      holdUpload.complete(
+        FileInfo(
+          id: 'fid-123',
+          filename: 'a.jpg',
+          sizeBytes: 100,
+          mimeType: 'image/jpeg',
+          uploadedAt: DateTime(2024, 1, 1),
+        ),
+      );
+      await _settle();
+      state = container.read(conversationProvider('c1')).value!;
+      expect(state.attachmentUploads[jobId]!.status, UploadStatus.done);
+
+      // Release retry: it must merge onto the latest state, not the snapshot
+      // it read before the await, or the done status reverts to uploading.
+      store.deleteGate!.complete();
+      await retryFuture;
+
+      state = container.read(conversationProvider('c1')).value!;
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNull);
+      expect(state.messages.last.content, 'Recovered');
+      expect(
+        state.attachmentUploads[jobId]!.status,
+        UploadStatus.done,
+        reason:
+            'retry() must not clobber upload progress that landed while '
+            'its deleteMessage await was parked',
+      );
     });
 
     test('retryTurn with no staged pending row finalizes without an error '
@@ -258,8 +522,10 @@ void main() {
 
       client.error = const ChatNetworkError('boom');
       await notifier.sendMessage('Hi');
-      final failedId =
-          container.read(conversationProvider('c1')).value!.failedMessageId;
+      final failedId = container
+          .read(conversationProvider('c1'))
+          .value!
+          .failedMessageId;
       expect(failedId, isNotNull);
 
       // Simulate the staged row already having been cleared externally.
@@ -395,7 +661,8 @@ void main() {
       expect(state.failedMessageId, isNotNull);
     });
 
-    test('a PluginReauthenticationRequired from an unavailable scope surfaces '
+    test(
+      'a PluginReauthenticationRequired from an unavailable scope surfaces '
         'the re-auth card (authRequired), never an unexpected-error banner',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
@@ -419,7 +686,8 @@ void main() {
       expect(state.authRequired, isTrue);
       expect(state.error, isNull);
       expect(state.failedMessageId, isNotNull);
-    });
+      },
+    );
 
     test('a pending_turn_exists failure abandons the escape hatch and '
         'surfaces the stopped-reply message', () async {
@@ -478,7 +746,11 @@ void main() {
 
       await notifier.stop();
       hang.complete(
-        const ChatResult(content: 'partial ', toolCalls: [], finishReason: 'stop'),
+        const ChatResult(
+          content: 'partial ',
+          toolCalls: [],
+          finishReason: 'stop',
+        ),
       );
       await send;
 
@@ -493,12 +765,17 @@ void main() {
       expect(wired.adapter.abandons.single.partialText, 'partial ');
     });
 
-    test('stop suppresses a cancellation error and keeps flushed partial',
+    test(
+      'stop suppresses a cancellation error and keeps flushed partial',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
         results: const [
-          ChatResult(content: 'partial ', toolCalls: [], finishReason: 'stop'),
+            ChatResult(
+              content: 'partial ',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
         ],
         streamDeltas: const [
           ['partial '],
@@ -525,10 +802,10 @@ void main() {
       expect(state.error, isNull);
       expect(state.failedMessageId, isNull);
       expect(state.messages.last.content, 'partial ');
-    });
+      },
+    );
 
-    test('stale cancellation from a stopped turn is not attributed to a newer turn',
-        () async {
+    test('stale cancellation from a stopped turn is not attributed to a newer turn', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
         results: const [
@@ -620,8 +897,7 @@ void main() {
       expect(send, completes);
     });
 
-    test('error path keeps partial content and sets failedMessageId',
-        () async {
+    test('error path keeps partial content and sets failedMessageId', () async {
       final store = FakeChatStore();
       final client = FakeChatClient(
         results: const [
@@ -641,12 +917,17 @@ void main() {
       expect(conv.messages, hasLength(2));
     });
 
-    test('sendMessage enqueues attachments after the turn and tracks progress',
+    test(
+      'sendMessage enqueues attachments after the turn and tracks progress',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
         results: const [
-          ChatResult(content: 'Here you go', toolCalls: [], finishReason: 'stop'),
+            ChatResult(
+              content: 'Here you go',
+              toolCalls: [],
+              finishReason: 'stop',
+            ),
         ],
       );
       final upload = Completer<FileInfo>();
@@ -662,14 +943,17 @@ void main() {
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Check this', attachments: const [
+        await notifier.sendMessage(
+          'Check this',
+          attachments: const [
         AttachmentDraft(
           path: '/tmp/a.jpg',
           filename: 'a.jpg',
           sizeBytes: 100,
           mimeType: 'image/jpeg',
         ),
-      ]);
+          ],
+        );
 
       // The turn completed before the upload resolved.
       var state = container.read(conversationProvider('c1')).value!;
@@ -684,13 +968,15 @@ void main() {
       expect(state.messages.first.content, 'Check this');
 
       // Completing the upload appends the file ref and persists FileInfo.
-      upload.complete(FileInfo(
+        upload.complete(
+          FileInfo(
         id: 'fid-123',
         filename: 'a.jpg',
         sizeBytes: 100,
         mimeType: 'image/jpeg',
         uploadedAt: DateTime(2024, 1, 1),
-      ));
+          ),
+        );
       await _settle();
 
       state = container.read(conversationProvider('c1')).value!;
@@ -705,9 +991,11 @@ void main() {
       expect(fileStore.saved, hasLength(1));
       expect(fileStore.saved.single.id, 'fid-123');
       expect(fileStore.saved.single.uploadedAt, isNotNull);
-    });
+      },
+    );
 
-    test('multiple completed uploads append file refs and persist FileInfo',
+    test(
+      'multiple completed uploads append file refs and persist FileInfo',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
@@ -727,7 +1015,9 @@ void main() {
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Two files', attachments: const [
+        await notifier.sendMessage(
+          'Two files',
+          attachments: const [
         AttachmentDraft(
           path: '/a.jpg',
           filename: 'a.jpg',
@@ -740,20 +1030,20 @@ void main() {
           sizeBytes: 2,
           mimeType: 'image/png',
         ),
-      ]);
+          ],
+        );
       await _settle();
 
       final state = container.read(conversationProvider('c1')).value!;
       final uploads = state.attachmentUploads;
       expect(uploads, hasLength(2));
-      expect(
-        uploads.values.map((u) => u.status).toSet(),
-        {UploadStatus.done},
-      );
-      expect(
-        uploads.values.map((u) => u.serverFileId).toSet(),
-        {'server-1', 'server-2'},
-      );
+        expect(uploads.values.map((u) => u.status).toSet(), {
+          UploadStatus.done,
+        });
+        expect(uploads.values.map((u) => u.serverFileId).toSet(), {
+          'server-1',
+          'server-2',
+        });
 
       final userContent = state.messages.first.content;
       expect(userContent.startsWith('Two files'), isTrue);
@@ -761,9 +1051,11 @@ void main() {
       expect(userContent, contains('[file:server-2]'));
 
       expect(fileStore.saved, hasLength(2));
-    });
+      },
+    );
 
-    test('failed uploads surface a failed status with error and no file ref',
+    test(
+      'failed uploads surface a failed status with error and no file ref',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
@@ -785,14 +1077,17 @@ void main() {
       final notifier = container.read(conversationProvider('c1').notifier);
       await container.read(conversationProvider('c1').future);
 
-      await notifier.sendMessage('Send file', attachments: const [
+        await notifier.sendMessage(
+          'Send file',
+          attachments: const [
         AttachmentDraft(
           path: '/a.jpg',
           filename: 'a.jpg',
           sizeBytes: 1,
           mimeType: 'image/jpeg',
         ),
-      ]);
+          ],
+        );
       await _settle();
 
       final state = container.read(conversationProvider('c1')).value!;
@@ -804,9 +1099,11 @@ void main() {
       // No ref appended; nothing persisted.
       expect(state.messages.first.content, 'Send file');
       expect(fileStore.saved, isEmpty);
-    });
+      },
+    );
 
-    test('sendMessage without attachments leaves attachmentUploads empty',
+    test(
+      'sendMessage without attachments leaves attachmentUploads empty',
         () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
@@ -830,10 +1127,10 @@ void main() {
       expect(state.attachmentUploads, isEmpty);
       expect(files.uploadCalls, isEmpty);
       expect(state.messages.last.content, 'ok');
-    });
+      },
+    );
 
-    test(
-        'a failed turn does not enqueue attachments so a retry uploads '
+    test('a failed turn does not enqueue attachments so a retry uploads '
         'exactly once', () async {
       final store = FakeChatStore(initial: [_existingConversation()])
         ..failUpdateMessage = true;
@@ -887,8 +1184,9 @@ void main() {
       expect(uploads, hasLength(1));
       expect(uploads.single.status, UploadStatus.done);
       // Exactly one [file:<id>] ref appended to the second user message.
-      final userMessages =
-          state.messages.where((m) => m.role == MessageRole.user).toList();
+      final userMessages = state.messages
+          .where((m) => m.role == MessageRole.user)
+          .toList();
       expect(userMessages, hasLength(2));
       expect(userMessages.first.content, 'Send file');
       expect(userMessages.last.content, 'Send file [file:server-1]');
@@ -897,10 +1195,18 @@ void main() {
 
   group('conversationsProvider', () {
     test('emits loaded conversations', () async {
-      final store = FakeChatStore(initial: [
-        _existingConversation(messages: const [
-          Message(id: 'u1', role: MessageRole.user, content: 'a', createdAt: null),
-        ]),
+      final store = FakeChatStore(
+        initial: [
+          _existingConversation(
+            messages: const [
+              Message(
+                id: 'u1',
+                role: MessageRole.user,
+                content: 'a',
+                createdAt: null,
+              ),
+            ],
+          ),
         Conversation(
           id: 'c2',
           title: 'Second',
@@ -915,7 +1221,8 @@ void main() {
           createdAt: DateTime(2024, 1, 2),
           updatedAt: DateTime(2024, 1, 2),
         ),
-      ]);
+        ],
+      );
       final container = _container(store: store);
       _keepAlive(container, 'c1');
 
@@ -927,6 +1234,169 @@ void main() {
       expect(value.first.id, 'c2'); // most recently updated first
 
       sub.close();
+    });
+  });
+
+  group('vision-fail notice (U2)', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('u2-vision');
+    });
+
+    tearDown(() {
+      tempDir.deleteSync(recursive: true);
+    });
+
+    File writeImage(String name) =>
+        File('${tempDir.path}/$name')..writeAsBytesSync([1, 2, 3]);
+
+    /// Container + shared adapter + a snack recorder wired through the
+    /// [globalSnackProvider] seam, with vision forced on and [vision]
+    /// scripted into [visionClientProvider].
+    ({
+      ProviderContainer container,
+      FakeManagedChatAdapter adapter,
+      List<String> snacks,
+    })
+    visionHarness(VisionClient vision) {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        results: const [
+          ChatResult(content: 'ok', toolCalls: [], finishReason: 'stop'),
+        ],
+      );
+      final adapter = FakeManagedChatAdapter(store: store, script: client);
+      final snacks = <String>[];
+      final container = _container(
+        store: store,
+        client: client,
+        adapter: adapter,
+        extraOverrides: [
+          visionEnabledProvider.overrideWithValue(true),
+          visionClientProvider.overrideWith(() => _FakeVisionNotifier(vision)),
+          globalSnackProvider.overrideWithValue(snacks.add),
+        ],
+      );
+      return (container: container, adapter: adapter, snacks: snacks);
+    }
+
+    Future<({FakeManagedChatAdapter adapter, List<String> snacks})> sendWith(
+      VisionClient vision,
+      List<AttachmentDraft> attachments, {
+      String text = 'Look at this',
+    }) async {
+      final wired = visionHarness(vision);
+      _keepAlive(wired.container, 'c1');
+      // Prime the AsyncNotifier so _describeDrafts sees AsyncData (a cold
+      // AsyncLoading would fall back to NoOpVisionClient and fail open).
+      await wired.container.read(visionClientProvider.future);
+      final notifier = wired.container.read(
+        conversationProvider('c1').notifier,
+      );
+      await wired.container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage(text, attachments: attachments);
+      return (adapter: wired.adapter, snacks: wired.snacks);
+    }
+
+    test('total describe failure shows exactly one snack per send and the '
+        'send still dispatches', () async {
+      final image = writeImage('photo.png');
+      final result = await sendWith(const _ThrowingVisionClient(), [
+        AttachmentDraft(
+          path: image.path,
+          filename: 'photo.png',
+          sizeBytes: 3,
+          mimeType: 'image/png',
+        ),
+      ]);
+
+      expect(result.snacks, [kVisionFailedSnackMessage]);
+      expect(
+        result.adapter.sends,
+        hasLength(1),
+        reason: 'send must proceed fail-open even when vision fails',
+      );
+      expect(result.adapter.sends.single.userText, 'Look at this');
+      expect(result.adapter.sends.single.userText, isNot(contains('[Image:')));
+    });
+
+    test(
+      'multiple failed images latch to a single snack for the send',
+      () async {
+        final a = writeImage('a.png');
+        final b = writeImage('b.png');
+        final result = await sendWith(const _ThrowingVisionClient(), [
+          AttachmentDraft(
+            path: a.path,
+            filename: 'a.png',
+            sizeBytes: 3,
+            mimeType: 'image/png',
+          ),
+          AttachmentDraft(
+            path: b.path,
+            filename: 'b.png',
+            sizeBytes: 3,
+            mimeType: 'image/png',
+          ),
+        ]);
+
+        expect(
+          result.snacks,
+          hasLength(1),
+          reason: 'latch is per send, not per failing image',
+        );
+        expect(result.adapter.sends, hasLength(1));
+      },
+    );
+
+    test('a successful describe does not trigger the snack', () async {
+      final image = writeImage('photo.png');
+      final result = await sendWith(const _FakeVisionClient('a red bicycle'), [
+        AttachmentDraft(
+          path: image.path,
+          filename: 'photo.png',
+          sizeBytes: 3,
+          mimeType: 'image/png',
+        ),
+      ]);
+
+      expect(result.snacks, isEmpty);
+      expect(result.adapter.sends.single.userText, contains('a red bicycle'));
+    });
+
+    test(
+      'legitimately empty describe results do not trigger the snack',
+      () async {
+        final image = writeImage('photo.png');
+        final result = await sendWith(const _FakeVisionClient('   '), [
+          AttachmentDraft(
+            path: image.path,
+            filename: 'photo.png',
+            sizeBytes: 3,
+            mimeType: 'image/png',
+          ),
+        ]);
+
+        expect(
+          result.snacks,
+          isEmpty,
+          reason: 'empty-but-successful is not a vision failure',
+        );
+        expect(result.adapter.sends.single.userText, 'Look at this');
+        expect(
+          result.adapter.sends.single.userText,
+          isNot(contains('[Image:')),
+        );
+      },
+    );
+
+    test('a send without attachments does not trigger the snack', () async {
+      final result = await sendWith(const _ThrowingVisionClient(), const []);
+
+      expect(result.snacks, isEmpty);
+      expect(result.adapter.sends, hasLength(1));
     });
   });
 }

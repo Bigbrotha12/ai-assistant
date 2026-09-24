@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_file/open_file.dart';
 
 import '../../../core/config.dart';
+import '../../auth/data/account_lifecycle.dart';
 import '../data/files_providers.dart';
 import '../data/files_service.dart';
 import '../../settings/data/settings_providers.dart';
@@ -109,17 +110,21 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
     for (final server in serverFiles) {
       final fromStore = storeById[server.id];
       final cached = cachedById[server.id];
-      merged.add(server.copyWith(
-        uploadedAt: server.uploadedAt ?? fromStore?.uploadedAt,
-        cachedAt: cached?.cachedAt ?? fromStore?.cachedAt,
-        localPath: cached?.localPath ?? fromStore?.localPath ?? server.localPath,
-      ));
+      merged.add(
+        server.copyWith(
+          uploadedAt: server.uploadedAt ?? fromStore?.uploadedAt,
+          cachedAt: cached?.cachedAt ?? fromStore?.cachedAt,
+          localPath:
+              cached?.localPath ?? fromStore?.localPath ?? server.localPath,
+        ),
+      );
     }
     merged.sort((a, b) {
       final dateA = a.uploadedAt ?? a.cachedAt;
       final dateB = b.uploadedAt ?? b.cachedAt;
-      return (dateB ?? DateTime.fromMillisecondsSinceEpoch(0))
-          .compareTo(dateA ?? DateTime.fromMillisecondsSinceEpoch(0));
+      return (dateB ?? DateTime.fromMillisecondsSinceEpoch(0)).compareTo(
+        dateA ?? DateTime.fromMillisecondsSinceEpoch(0),
+      );
     });
     return merged;
   }
@@ -129,9 +134,8 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
       await ref.read(filesServiceProvider).deleteFile(file.id);
     } catch (_) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not delete file')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Could not delete file')));
       return;
     }
     try {
@@ -150,9 +154,8 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
         '${BackendConfig.files(host, environment: settings?.environment).toString()}/fetch/${file.id}';
     await Clipboard.setData(ClipboardData(text: url));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Link copied')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Link copied')));
   }
 
   Future<void> _clearCache() async {
@@ -184,9 +187,8 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
     }
     await _refresh();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Cache cleared')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Cache cleared')));
   }
 
   @override
@@ -280,9 +282,8 @@ class _NotConfiguredView extends StatelessWidget {
             const SizedBox(height: 8),
             Text(
               'Set the files secret in Settings to browse uploaded files.',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                  ),
+              style: Theme.of(context).textTheme.bodyMedium
+                  ?.copyWith(color: scheme.onSurfaceVariant),
               textAlign: TextAlign.center,
             ),
           ],
@@ -399,22 +400,37 @@ class _FileTileState extends ConsumerState<_FileTile> {
       await _launch(path);
       return;
     }
+
+    final files = ref.read(filesServiceProvider);
+    final cache = ref.read(fileCacheProvider);
+    final lifecycle = ref.read(accountLifecycleProvider);
     setState(() => _downloading = true);
     try {
-      final data =
-          await ref.read(filesServiceProvider).fetchFile(widget.file.id);
-      final cache = ref.read(fileCacheProvider);
-      final absPath = await cache.cacheFile(
-        widget.file.id,
-        cache.extensionForMime(widget.file.mimeType),
-        data,
-      );
+      String? absPath;
+      await lifecycle.runAttachmentDownload(cache.scopeKey, (
+        registration,
+      ) async {
+        final data = await files.fetchFile(
+          widget.file.id,
+          cancelToken: registration.cancelToken,
+        );
+        registration.checkCurrent();
+        final extension = cache.extensionForMime(widget.file.mimeType);
+        registration.checkCurrent();
+        final cachedPath = await cache.cacheFile(
+          widget.file.id,
+          extension,
+          data,
+        );
+        registration.checkCurrent();
+        absPath = cachedPath;
+      });
       if (!mounted) return;
       setState(() {
         _downloadedPath = absPath;
         _downloading = false;
       });
-      await _launch(absPath);
+      await _launch(absPath!);
     } catch (_) {
       if (!mounted) return;
       setState(() => _downloading = false);
@@ -555,8 +571,18 @@ class _FileTileState extends ConsumerState<_FileTile> {
 }
 
 const List<String> _kMonths = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
 ];
 
 String _formatDate(DateTime date) {

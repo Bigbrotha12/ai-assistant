@@ -21,6 +21,15 @@ import 'plugin_credentials_store.dart';
 import 'plugin_http.dart';
 import 'staged_inference_adapters.dart';
 
+typedef ManagedChatPollerFactory = LedgerPoller Function({
+  required AuthAccountScope scope,
+  required LedgerCredentialsResolver credentials,
+});
+
+final managedChatPollerFactoryProvider = Provider<ManagedChatPollerFactory?>(
+  (ref) => null,
+);
+
 /// Gateway [LangChainClient] for managed chat turns — the account-scoped
 /// sibling of `pluginRegistryClientProvider`: same `${scope.backendOrigin}/v1`
 /// base URL (identical to the settings-derived gateway origin whenever
@@ -56,11 +65,12 @@ final managedChatAdapterProvider = Provider<ManagedChatAdapter>((ref) {
   // a selection the gateway no longer lists. Deferred: a per-element cache
   // changes resolution semantics (breaks 'registry.models = []' test contract
   // and the configuration_changed guard would go stale).
-  return ManagedChatAdapter(
+  final adapter = ManagedChatAdapter(
     scope: scope,
     client: ref.watch(managedLangChainClientProvider),
     repo: ref.watch(managedConversationRepositoryProvider),
     trimmer: ref.watch(contextTrimmerProvider),
+    pollerFactory: ref.watch(managedChatPollerFactoryProvider),
     resolveSelection: () => resolveManagedSelection(
       scope: scope,
       authStore: authStore,
@@ -71,6 +81,8 @@ final managedChatAdapterProvider = Provider<ManagedChatAdapter>((ref) {
           registry.listAgents(gatewayKey: gatewayKey, cancelToken: cancelToken),
     ),
   );
+  ref.onDispose(adapter.dispose);
+  return adapter;
 });
 
 /// Account-scoped staged adapters (plan §3/P2): managed voice turns
@@ -115,21 +127,48 @@ final stagedInferenceAdaptersProvider = Provider<StagedInferenceAdapters>((
 /// service with `modelPluginId`/`enabledPlugins` frozen for this turn while
 /// its `credentials` closure re-resolves on each dispatch, then forward.
 class ManagedChatAdapter {
-  ManagedChatAdapter({
-    required this.scope,
-    required this.client,
-    required this.repo,
-    required this.trimmer,
-    required this.resolveSelection,
+  factory ManagedChatAdapter({
+    required AuthAccountScope scope,
+    required LangChainClient client,
+    required ManagedConversationRepository repo,
+    required ContextTrimmer trimmer,
+    required Future<ManagedSelection> Function() resolveSelection,
+    LedgerPoller? poller,
+    bool ownsPoller = false,
+    ManagedChatPollerFactory? pollerFactory,
+  }) => ManagedChatAdapter._(
+    scope,
+    client,
+    repo,
+    trimmer,
+    resolveSelection,
+    poller,
+    ownsPoller,
+    pollerFactory,
+  );
+
+  ManagedChatAdapter._(
+    this.scope,
+    this.client,
+    this.repo,
+    this.trimmer,
+    this.resolveSelection,
     this._poller,
-  });
+    this._ownsPoller,
+    this._pollerFactory,
+  );
 
   final AuthAccountScope scope;
+
   final LangChainClient client;
   final ManagedConversationRepository repo;
   final ContextTrimmer trimmer;
   final Future<ManagedSelection> Function() resolveSelection;
+  final ManagedChatPollerFactory? _pollerFactory;
   LedgerPoller? _poller;
+  bool _ownsPoller;
+  Dio? _ownedDio;
+  bool _disposed = false;
 
   /// Per-send construction: resolves model + enabled plugins + credentials
   /// now, then builds the turn's [ManagedConversationService] with those
@@ -155,13 +194,24 @@ class ManagedChatAdapter {
   /// can inject a controllable instance. Built lazily when none was injected
   /// (mirrors [ManagedConversationService]'s own lazy default).
   LedgerPoller get poller {
+    if (_disposed) throw const PluginClientException('cancelled');
     final existing = _poller;
     if (existing != null) return existing;
+    final factory = _pollerFactory;
+    if (factory != null) {
+      final created = factory(scope: scope, credentials: _pollCredentials);
+      _poller = created;
+      _ownsPoller = true;
+      return created;
+    }
+    final dio = Dio();
+    _ownedDio = dio;
     final created = LedgerPoller(
-      client: LedgerClient(dio: Dio(), scope: scope),
+      client: LedgerClient(dio: dio, scope: scope),
       credentials: _pollCredentials,
     );
     _poller = created;
+    _ownsPoller = true;
     return created;
   }
 
@@ -361,6 +411,25 @@ class ManagedChatAdapter {
   Future<List<Message>> reconcileFromServer(String conversationId) async {
     final service = await buildService();
     return service.reconcileFromServer(conversationId);
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    try {
+      final poller = _poller;
+      if (poller != null && _ownsPoller) {
+        try {
+          poller.invalidateScope();
+        } finally {
+          poller.dispose();
+        }
+      }
+    } finally {
+      _ownedDio?.close(force: true);
+      _ownedDio = null;
+      _poller = null;
+    }
   }
 }
 

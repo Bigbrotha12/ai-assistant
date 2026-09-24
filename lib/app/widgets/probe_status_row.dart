@@ -26,9 +26,13 @@ class ProbeStatusRow extends StatelessWidget {
       ProbeStatus.ok => (Icons.check_circle, Colors.green.shade600),
       ProbeStatus.unauthorized =>
         (Icons.gpp_bad_outlined, Colors.red.shade700),
+      ProbeStatus.emailNotVerified =>
+        (Icons.mark_email_read_outlined, Colors.orange.shade800),
       ProbeStatus.noCredentials => (Icons.lock_outline, Colors.orange.shade800),
       ProbeStatus.error => (Icons.error, Colors.orange.shade800),
       ProbeStatus.unreachable => (Icons.cloud_off, Colors.grey.shade600),
+      ProbeStatus.gatewayDegraded =>
+        (Icons.warning_amber_outlined, Colors.amber.shade800),
     };
     return Padding(
       padding: EdgeInsets.symmetric(vertical: dense ? 4 : 6),

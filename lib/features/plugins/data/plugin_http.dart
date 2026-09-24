@@ -26,6 +26,8 @@ const _safeCodes = {
   'invalid_request_error',
   'invalid_credentials',
   'credentials_expired',
+  'email_not_verified',
+  'account_deleted',
   'inference_unavailable',
   'background_unavailable',
   'internal',

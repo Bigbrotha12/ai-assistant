@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -10,13 +11,14 @@ import './file_utils.dart' as file_utils;
 
 /// On-disk cache for downloaded files under an app-managed directory.
 ///
-/// Files are stored as `<cacheDir>/<fileId><extension>` where the extension is
-/// derived from the MIME type (`.jpg`, `.png`, `.webp`), which lets the OS open
-/// previews without sniffing. Entries older than [ttl] are evicted, and the
-/// total size is capped at [maxBytes].
+/// Files are stored under `<cacheDir>/<encodedScopeKey>/<fileId><extension>`.
+/// The extension is derived from the MIME type (`.jpg`, `.png`, `.webp`),
+/// which lets the OS open previews without sniffing. Entries older than [ttl]
+/// are evicted, and the total size is capped at [maxBytes].
 class FileCache {
   FileCache({
     required Directory cacheDir,
+    required this.scopeKey,
     this.ttl = const Duration(days: 7),
     this.maxBytes = 50 * 1024 * 1024,
   }) : _resolveDir = _constantDir(cacheDir);
@@ -28,6 +30,7 @@ class FileCache {
   /// use, which suits providers backed by async path_provider lookups.
   FileCache.async({
     required Future<Directory> Function() resolveDir,
+    required this.scopeKey,
     this.ttl = const Duration(days: 7),
     this.maxBytes = 50 * 1024 * 1024,
   }) : _resolveDir = resolveDir;
@@ -35,10 +38,14 @@ class FileCache {
   final Future<Directory> Function() _resolveDir;
   Future<Directory>? _dirFuture;
 
+  final String scopeKey;
   final Duration ttl;
   final int maxBytes;
 
-  Future<Directory> _dir() => _dirFuture ??= _resolveDir();
+  Future<Directory> _dir() => _dirFuture ??= _resolveDir().then(
+    (root) =>
+        Directory('${root.path}/${base64Url.encode(utf8.encode(scopeKey))}'),
+  );
 
   /// Writes [data] as `<fileId><extension>` and returns the absolute path.
   Future<String> cacheFile(
@@ -113,6 +120,29 @@ class FileCache {
       await file.delete();
     } catch (_) {
       // Best-effort: a concurrently-deleted file is fine to ignore.
+    }
+  }
+
+  /// Deletes every cached file for this store's account only.
+  Future<void> evictAllForScope(String targetScope) async {
+    if (targetScope != scopeKey) {
+      throw StateError('File cache scope mismatch');
+    }
+    final dir = await _dir();
+    if (await dir.exists()) {
+      await dir.delete(recursive: true);
+    }
+  }
+
+  /// Deletes cached files for every account. Reserved for full app-data clears.
+  Future<void> evictAll() async {
+    final root = await _resolveDir();
+    if (!await root.exists()) return;
+    await for (final entity in root.list(recursive: true)) {
+      if (entity is! File) continue;
+      try {
+        await entity.delete();
+      } catch (_) {}
     }
   }
 

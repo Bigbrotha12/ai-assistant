@@ -593,6 +593,29 @@ test(
     },
   );
 
+  test('repeated dispose and a late response remain safe', () async {
+    final response = Completer<ResponseBody>();
+    final rig = Rig((_) => response.future);
+    final updates = <LedgerTask>[];
+    final handle = rig.poller.watch(
+      const LedgerLookup.byTaskId('task'),
+      onUpdate: updates.add,
+    );
+    rig.poller.setForeground(true);
+    await rig.clock.advance(Duration.zero);
+    expect(rig.adapter.requests, hasLength(1));
+
+    rig.poller.dispose();
+    rig.poller.dispose();
+
+    expect((await handle.done).end, LedgerPollEnd.cancelled);
+    response.complete(jsonResponse(taskJson(status: 'succeeded')));
+    await flush();
+    await rig.clock.advance(const Duration(seconds: 30));
+    expect(updates, isEmpty);
+    expect(rig.adapter.requests, hasLength(1));
+  });
+
   test(
     'key invalidation leaves other lookups and other scopes alone',
     () async {

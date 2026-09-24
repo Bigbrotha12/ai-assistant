@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import './app/global_messenger.dart';
 import './app/onboarding_gate.dart';
 import './app/theme.dart';
 import './app/theme_providers.dart';
@@ -24,6 +25,8 @@ class AiAssistantApp extends ConsumerWidget {
 
     return MaterialApp(
       title: 'Voice Assist',
+      // Root messenger handle for context-less snackbars (showGlobalSnack).
+      scaffoldMessengerKey: scaffoldMessengerKey,
       theme: premium ? buildPremiumTheme() : buildCoreTheme(),
       // The premium tier paints the warm-ivory paper base plus grain behind
       // every screen (the scaffold chrome is transparent so both show

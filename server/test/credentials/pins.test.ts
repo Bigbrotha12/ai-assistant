@@ -126,6 +126,19 @@ describe("credential pin store", () => {
     assert.throws(() => store.get("user-1", "vikunja"), isNotFound);
   });
 
+  test("releaseOwner drops every pin for one owner and leaves other owners intact", () => {
+    const { store } = makeStore();
+    store.pin("alice", "vikunja", { apiKey: "a1" });
+    store.pin("alice", "mealie", { apiKey: "a2" });
+    store.pin("bob", "vikunja", { apiKey: "b1" });
+
+    assert.equal(store.releaseOwner("alice"), 2);
+    assert.equal(store.releaseOwner("alice"), 0);
+    assert.throws(() => store.get("alice", "vikunja"), isNotFound);
+    assert.throws(() => store.get("alice", "mealie"), isNotFound);
+    assert.equal(store.get("bob", "vikunja").credentials.apiKey, "b1");
+  });
+
   test("get for an unknown (owner, pluginId) -> pin_not_found", () => {
     const { store } = makeStore();
     store.pin("user-1", "vikunja", { apiKey: "tok" });

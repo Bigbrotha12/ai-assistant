@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/plugins/data/agent_config.dart';
+import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_registry_client.dart';
 
 import 'data/langchain_client_test.dart' show FakePluginAdapter;
@@ -126,9 +127,84 @@ void main() {
       expect(spec['mcpServers'], [{'name': 'mcp-a'}]);
       expect(spec['tools'], [{'pluginId': 'tool-a', 'required': false}]);
     });
+
+    test('toWireObject carries tools, modelRef, and inference for the gateway', () {
+      final config = AgentConfig(
+        id: 'wire-agent',
+        kind: AgentKind.custom,
+        name: 'Wire Agent',
+        description: 'desc',
+        systemPrompt: 'sys',
+        skills: ['skill-a'],
+        mcpServers: ['mcp-a'],
+        tools: [AgentToolGrantData(pluginId: 'web-search', required: true)],
+        modelRef: 'openrouter',
+        inference: AgentInferenceData(
+          temperature: 0.7,
+          maxTokens: 4096,
+          visionCapable: true,
+        ),
+      );
+      final wire = config.toWireObject();
+      expect(wire['name'], 'Wire Agent');
+      expect(wire['description'], 'desc');
+      expect(wire['systemPrompt'], 'sys');
+      expect(wire['skills'], ['skill-a']);
+      expect(wire['mcpServers'], [
+        {'name': 'mcp-a'},
+      ]);
+      expect(wire['tools'], [
+        {'pluginId': 'web-search', 'required': true},
+      ]);
+      expect(wire['modelRef'], 'openrouter');
+      expect(wire['inference'], {
+        'temperature': 0.7,
+        'maxTokens': 4096,
+        'visionCapable': true,
+      });
+      expect(wire.containsKey('id'), isFalse);
+      expect(wire.containsKey('kind'), isFalse);
+    });
+
+    test('inference omits unset temperature/maxTokens but keeps visionCapable', () {
+      final json = AgentInferenceData(visionCapable: false).toJson();
+      expect(json.containsKey('temperature'), isFalse);
+      expect(json.containsKey('maxTokens'), isFalse);
+      expect(json['visionCapable'], isFalse);
+
+      final restored = AgentInferenceData.fromJson(json);
+      expect(restored.temperature, isNull);
+      expect(restored.maxTokens, isNull);
+      expect(restored.visionCapable, isFalse);
+    });
   });
 
   group('PluginRegistryClient catalog methods', () {
+    List<Future<List<Map<String, dynamic>>> Function()> catalogRequests(
+      PluginRegistryClient client,
+    ) => [
+      () => client.fetchSkills(gatewayKey: 'test-key'),
+      () => client.fetchMcps(gatewayKey: 'test-key'),
+      () => client.fetchAgentTemplates(gatewayKey: 'test-key'),
+    ];
+
+    Future<void> expectCatalogError(
+      Future<List<Map<String, dynamic>>> Function() request, {
+      required String code,
+      required int? statusCode,
+      Duration? retryAfter,
+    }) async {
+      await expectLater(
+        request(),
+        throwsA(
+          isA<PluginClientException>()
+              .having((error) => error.code, 'code', code)
+              .having((error) => error.statusCode, 'status', statusCode)
+              .having((error) => error.retryAfter, 'retryAfter', retryAfter),
+        ),
+      );
+    }
+
     test('fetchSkills calls /v1/skills and returns data', () async {
       final dio = Dio()..httpClientAdapter = FakePluginAdapter((options) {
         expect(options.uri.path, '/v1/skills');
@@ -153,6 +229,7 @@ void main() {
     test('fetchMcps calls /v1/mcps and returns data', () async {
       final dio = Dio()..httpClientAdapter = FakePluginAdapter((options) {
         expect(options.uri.path, '/v1/mcps');
+        expect(options.headers['Authorization'], 'Bearer test-key');
         return ResponseBody.fromString(
           jsonEncode({'data': [
             {'name': 'filesystem', 'description': 'Filesystem access'},
@@ -173,6 +250,7 @@ void main() {
     test('fetchAgentTemplates calls /v1/agents and returns data', () async {
       final dio = Dio()..httpClientAdapter = FakePluginAdapter((options) {
         expect(options.uri.path, '/v1/agents');
+        expect(options.headers['Authorization'], 'Bearer test-key');
         return ResponseBody.fromString(
           jsonEncode({'data': [
             {'id': 'template-1', 'name': 'Default Agent', 'skillCount': 2},
@@ -190,20 +268,172 @@ void main() {
       dio.close(force: true);
     });
 
-    test('fetchSkills throws on error response', () async {
-      final dio = Dio()..httpClientAdapter = FakePluginAdapter((_) =>
-        ResponseBody.fromString(
-          jsonEncode({'error': 'internal'}),
-          500,
-          headers: {'content-type': ['application/json']},
-        ),
+    test('fetchSkills maps error responses to typed exceptions', () async {
+      final dio = Dio()
+        ..httpClientAdapter = FakePluginAdapter(
+          (_) => ResponseBody.fromString(
+            jsonEncode({'error': 'internal'}),
+            500,
+            headers: {
+              'content-type': ['application/json'],
+            },
+          ),
+        );
+      final client = PluginRegistryClient(
+        dio: dio,
+        baseUrl: 'http://test:17600/v1',
       );
-      final client = PluginRegistryClient(dio: dio, baseUrl: 'http://test:17600/v1');
-      expect(
+      await expectCatalogError(
         () => client.fetchSkills(gatewayKey: 'test-key'),
-        throwsA(isA<DioException>()),
+        code: 'internal',
+        statusCode: 500,
       );
       dio.close(force: true);
+    });
+
+    test('catalog 401 responses map to typed unauthorized errors', () async {
+      final dio = Dio()
+        ..httpClientAdapter = FakePluginAdapter(
+          (_) => ResponseBody.fromString(
+            jsonEncode({'error': 'unauthorized'}),
+            401,
+            headers: {
+              'content-type': ['application/json'],
+            },
+          ),
+        );
+      final client = PluginRegistryClient(
+        dio: dio,
+        baseUrl: 'http://test:17600/v1',
+      );
+      for (final request in catalogRequests(client)) {
+        await expectCatalogError(
+          request,
+          code: 'unauthorized',
+          statusCode: 401,
+        );
+      }
+      dio.close(force: true);
+    });
+
+    test('catalog 403 email verification errors map to typed errors', () async {
+      final dio = Dio()
+        ..httpClientAdapter = FakePluginAdapter(
+          (_) => ResponseBody.fromString(
+            jsonEncode({'error': 'email_not_verified'}),
+            403,
+            headers: {
+              'content-type': ['application/json'],
+            },
+          ),
+        );
+      final client = PluginRegistryClient(
+        dio: dio,
+        baseUrl: 'http://test:17600/v1',
+      );
+      for (final request in catalogRequests(client)) {
+        await expectCatalogError(
+          request,
+          code: 'email_not_verified',
+          statusCode: 403,
+        );
+      }
+      dio.close(force: true);
+    });
+
+    test('catalog 429 responses preserve Retry-After', () async {
+      final dio = Dio()
+        ..httpClientAdapter = FakePluginAdapter(
+          (_) => ResponseBody.fromString(
+            jsonEncode({'error': 'rate_limited'}),
+            429,
+            headers: {
+              'content-type': ['application/json'],
+              'retry-after': ['12'],
+            },
+          ),
+        );
+      final client = PluginRegistryClient(
+        dio: dio,
+        baseUrl: 'http://test:17600/v1',
+      );
+      for (final request in catalogRequests(client)) {
+        await expectCatalogError(
+          request,
+          code: 'rate_limited',
+          statusCode: 429,
+          retryAfter: const Duration(seconds: 12),
+        );
+      }
+      dio.close(force: true);
+    });
+
+    test(
+      'catalog transport failures map to typed timeout and network errors',
+      () async {
+        for (final type in [
+          DioExceptionType.connectionTimeout,
+          DioExceptionType.connectionError,
+        ]) {
+          final dio = Dio()
+            ..httpClientAdapter = FakePluginAdapter((options) {
+              throw DioException(
+                requestOptions: options,
+                type: type,
+                message: 'private transport detail',
+              );
+            });
+          final client = PluginRegistryClient(
+            dio: dio,
+            baseUrl: 'http://test:17600/v1',
+          );
+          for (final request in catalogRequests(client)) {
+            await expectCatalogError(
+              request,
+              code: type == DioExceptionType.connectionTimeout
+                  ? 'timeout'
+                  : 'network_error',
+              statusCode: null,
+            );
+          }
+          dio.close(force: true);
+        }
+      },
+    );
+
+    test('malformed catalog envelopes map to invalid_response', () async {
+      for (final body in [
+        'not-json',
+        '{}',
+        jsonEncode({'data': null}),
+        jsonEncode({'data': {}}),
+        jsonEncode({
+          'data': [1],
+        }),
+      ]) {
+        final dio = Dio()
+          ..httpClientAdapter = FakePluginAdapter(
+            (_) => ResponseBody.fromString(
+              body,
+              200,
+              headers: {
+                'content-type': ['application/json'],
+              },
+            ),
+          );
+        final client = PluginRegistryClient(
+          dio: dio,
+          baseUrl: 'http://test:17600/v1',
+        );
+        for (final request in catalogRequests(client)) {
+          await expectCatalogError(
+            request,
+            code: 'invalid_response',
+            statusCode: null,
+          );
+        }
+        dio.close(force: true);
+      }
     });
   });
 }

@@ -453,13 +453,17 @@ describe("transport — errors (§5.2)", () => {
     });
     const graph = createAgentGraph({
       model,
-      tools: [throwingTool("auth failed: Bearer sk-abc123xyz789")],
+      tools: [throwingTool("auth failed: Bearer skAbCdEfGhIjKlMnOpQrStUvWxYz012345")],
     });
     const frames = await collectFrames(graph);
 
     const errorFrameIndex = frames.findIndex((frame) => frame.includes('"error"'));
     const error = JSON.parse(frames[errorFrameIndex]!.slice("data: ".length)).error;
-    assert.equal(error.message.includes("sk-abc123xyz789"), false, "key material masked");
+    assert.equal(
+      error.message.includes("skAbCdEfGhIjKlMnOpQrStUvWxYz012345"),
+      false,
+      "key material masked",
+    );
     assert.equal(error.message.includes("Bearer ***"), true, "redaction marker applied");
   });
 });

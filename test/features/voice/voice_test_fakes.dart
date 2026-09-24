@@ -275,6 +275,15 @@ class FakeSttEngine implements SttEngine {
   final List<List<int>> transcribed = [];
   final List<int> sampleRates = [];
 
+  /// Language last pushed by the settings layer (see [SttEngine]).
+  @override
+  String preferredLanguage = 'en';
+
+  /// English-only base list — enough for fakes that don't curate languages.
+  @override
+  List<({String code, String label})> get supportedLanguages =>
+      kBaseSttSupportedLanguages;
+
   /// Non-null makes [transcribe] throw.
   Object? error;
 

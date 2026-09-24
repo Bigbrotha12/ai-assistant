@@ -8,7 +8,9 @@ import 'package:uuid/uuid.dart';
 
 import '../data/chat_client.dart';
 import '../data/status_tracker.dart';
+import '../../auth/data/account_lifecycle.dart';
 import '../../attachments/data/files_providers.dart';
+import '../../../app/global_messenger.dart';
 import '../../../core/network_banner.dart';
 import '../../vision/data/vision_client.dart';
 import '../../vision/data/vision_provider.dart';
@@ -21,12 +23,20 @@ import '../data/database_providers.dart';
 import '../data/message_model.dart';
 import '../../plugins/data/ledger_client.dart';
 import '../../plugins/data/managed_chat_providers.dart';
+import '../../plugins/data/managed_conversation_repository.dart';
 import '../../plugins/data/managed_conversation_service.dart';
 import '../../plugins/data/managed_error_codes.dart';
+import '../../plugins/data/plugin_catalog_providers.dart';
+import '../../plugins/data/plugin_credentials_providers.dart';
 import '../../plugins/data/plugin_http.dart';
 
-
 export 'active_conversation_provider.dart';
+
+/// SnackBar copy for open-gaps P2 "Vision-fail UX notice": shown once per
+/// send whose image-describe attempts failed and produced nothing. The send
+/// itself proceeds fail-open — this is notice-only.
+const kVisionFailedSnackMessage =
+    "Couldn't analyze the image — sending without description.";
 
 /// Snapshot of a single conversation's chat state, consumed by the UI.
 class ConversationState {
@@ -40,6 +50,8 @@ class ConversationState {
 
   /// Id of the assistant placeholder that errored (drives the retry UI).
   final String? failedMessageId;
+
+  final bool isRetryInFlight;
 
   /// True once the conversation has been loaded from the store.
   final bool isDbReady;
@@ -70,6 +82,7 @@ class ConversationState {
     this.error,
     this.pendingUserMessageId,
     this.failedMessageId,
+    this.isRetryInFlight = false,
     this.isDbReady = false,
     this.attachmentUploads = const {},
     this.authRequired = false,
@@ -83,6 +96,7 @@ class ConversationState {
     Object? error = _sentinel,
     Object? pendingUserMessageId = _sentinel,
     Object? failedMessageId = _sentinel,
+    bool? isRetryInFlight,
     Object? attachmentUploads = _sentinel,
     bool? isDbReady,
     Object? authRequired = _sentinel,
@@ -99,6 +113,7 @@ class ConversationState {
       failedMessageId: identical(failedMessageId, _sentinel)
           ? this.failedMessageId
           : failedMessageId as String?,
+      isRetryInFlight: isRetryInFlight ?? this.isRetryInFlight,
       attachmentUploads: identical(attachmentUploads, _sentinel)
           ? this.attachmentUploads
           : attachmentUploads as Map<String, UploadJobStatus>,
@@ -107,7 +122,9 @@ class ConversationState {
           ? this.authRequired
           : authRequired as bool,
       hasPendingJob: hasPendingJob ?? this.hasPendingJob,
-      jobError: identical(jobError, _sentinel) ? this.jobError : jobError as String?,
+      jobError: identical(jobError, _sentinel)
+          ? this.jobError
+          : jobError as String?,
     );
   }
 }
@@ -126,6 +143,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
 
   /// Cancel token for the in-flight request.
   CancelToken? _active;
+  bool _retryInFlight = false;
 
   /// Cancellation state of the in-flight turn is derived from the active
   /// [CancelToken] (see [stop] / [_onError]) rather than a bare bool, so a
@@ -140,6 +158,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   ChatStore? _store;
   ContextTrimmer? _trimmer;
   FileStore? _fileStore;
+  String? _fileScopeKey;
 
   /// Owned by this notifier and disposed with it (§3.3). Created in [build]
   /// from [filesServiceProvider]; a [NoOpFilesClient] (no files secret
@@ -171,6 +190,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _store = ref.watch(chatStoreProvider);
     _trimmer = ref.watch(contextTrimmerProvider);
     _fileStore = ref.watch(filesStoreProvider);
+    _fileScopeKey = ref.read(fileCacheProvider).scopeKey;
     final queue = UploadQueue(filesService: ref.read(filesServiceProvider));
     _queue = queue;
 
@@ -183,6 +203,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     ref.onDispose(() {
       queue.jobs.removeListener(_onQueueChanged);
       queue.dispose();
+      _retryInFlight = false;
       _active?.cancel();
       _throttle?.cancel();
     });
@@ -283,29 +304,42 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       createdAt: DateTime.now(),
     );
 
-    _setState(current.copyWith(
-      messages: [...current.messages, userMsg],
-      pendingUserMessageId: userMsg.id,
-      isStreaming: true,
-      error: null,
-      failedMessageId: null,
-      authRequired: false,
-    ));
+    _setState(
+      current.copyWith(
+        messages: [...current.messages, userMsg],
+        pendingUserMessageId: userMsg.id,
+        isStreaming: true,
+        error: null,
+        failedMessageId: null,
+        authRequired: false,
+      ),
+    );
 
     // No pre-persist: the managed service admits the user message (and the
     // pending envelope) atomically inside sendTurn — exactly one writer.
 
     // Pre-send describe: attach image descriptions so the current turn
     // benefits from vision. Fail-open on failure — never blocks the send.
-    // The expanded text stays in-memory only; admission persists it as the
-    // userText passed to sendTurn (no post-send store round-trip).
+    // A total describe failure (attempts failed AND nothing produced) also
+    // fires one non-blocking notice via the global messenger; the dispatch
+    // below runs either way. The expanded text stays in-memory only;
+    // admission persists it as the userText passed to sendTurn (no
+    // post-send store round-trip).
     if (attachments.isNotEmpty) {
       final visionEnabled = ref.read(visionEnabledProvider) ?? true;
       if (visionEnabled) {
-        final descriptions = await _describeDrafts(attachments);
+        final vision = await _describeDrafts(attachments);
         if (!ref.mounted) return;
-        if (descriptions.isNotEmpty) {
-          final expanded = _injectImageDescriptions(userMsg.content, descriptions);
+        if (vision.failed) {
+          // Latched per send: one check over this send's aggregate result,
+          // so N failing images still yield exactly one notice.
+          ref.read(globalSnackProvider)(kVisionFailedSnackMessage);
+        }
+        if (vision.drafts.isNotEmpty) {
+          final expanded = _injectImageDescriptions(
+            userMsg.content,
+            vision.drafts,
+          );
           final updatedUserMsg = userMsg.copyWith(content: expanded);
           final cur = state.value!;
           final updatedMessages = [
@@ -334,10 +368,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       // text + attachment selection intact.
       final cur = state.value;
       if (cur != null && ref.mounted) {
-        _setState(cur.copyWith(
-          isStreaming: false,
-          pendingUserMessageId: null,
-        ));
+        _setState(cur.copyWith(isStreaming: false, pendingUserMessageId: null));
       }
       rethrow;
     }
@@ -359,7 +390,10 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _enqueueAttachments(attachments, persistedUserId);
   }
 
-  void _enqueueAttachments(List<AttachmentDraft> attachments, String userMsgId) {
+  void _enqueueAttachments(
+    List<AttachmentDraft> attachments,
+    String userMsgId,
+  ) {
     final queue = _queue;
     if (queue == null || attachments.isEmpty) return;
     for (final draft in attachments) {
@@ -432,16 +466,22 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       Message? updated;
       for (final m in cur.messages) {
         if (m.id == userMsgId) {
-          updated = m.copyWith(content: _appendFileRef(m.content, serverFileId));
+          updated = m.copyWith(
+            content: _appendFileRef(m.content, serverFileId),
+          );
           break;
         }
       }
       if (updated == null) continue;
 
-      _setState(cur.copyWith(messages: [
-        for (final m in cur.messages)
-          if (m.id == userMsgId) updated else m,
-      ]));
+      _setState(
+        cur.copyWith(
+          messages: [
+            for (final m in cur.messages)
+              if (m.id == userMsgId) updated else m,
+          ],
+        ),
+      );
       // Serialize persistence in completion order so two uploads finishing
       // concurrently can't overwrite each other's [file:<id>] ref in the DB.
       _persistChain = _persistChain.then(
@@ -474,17 +514,25 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       // Best-effort: the reference is already reflected in in-memory state.
     }
     if (!ref.mounted) return;
+    final scopeKey = _fileScopeKey;
+    if (scopeKey == null) return;
     try {
-      await _fileStore!.saveFile(
-        FileInfo(
-          id: serverFileId,
-          filename: job.filename,
-          sizeBytes: job.sizeBytes,
-          mimeType: job.mimeType,
-          uploadedAt: DateTime.now(),
-        ),
-        conversationId: conversationId,
-      );
+      await ref.read(accountLifecycleProvider).runAttachmentDownload(scopeKey, (
+        registration,
+      ) async {
+        registration.checkCurrent();
+        await _fileStore!.saveFile(
+          FileInfo(
+            id: serverFileId,
+            filename: job.filename,
+            sizeBytes: job.sizeBytes,
+            mimeType: job.mimeType,
+            uploadedAt: DateTime.now(),
+          ),
+          conversationId: conversationId,
+        );
+        registration.checkCurrent();
+      });
     } catch (_) {
       // Best-effort: a persistence failure must not crash the turn.
     }
@@ -512,24 +560,38 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _serviceUserMessageId = serviceId;
     final cur = state.value;
     if (cur == null) return;
-    final index = cur.messages.lastIndexWhere((m) => m.role == MessageRole.user);
+    final index = cur.messages.lastIndexWhere(
+      (m) => m.role == MessageRole.user,
+    );
     if (index < 0) return;
     final existing = cur.messages[index];
     if (existing.id == serviceId) return;
-    _setState(cur.copyWith(
-      messages: [
-        for (var i = 0; i < cur.messages.length; i++)
-          if (i == index) existing.copyWith(id: serviceId) else cur.messages[i],
-      ],
-      pendingUserMessageId: cur.pendingUserMessageId == existing.id
-          ? serviceId
-          : _sentinel,
-    ));
+    _setState(
+      cur.copyWith(
+        messages: [
+          for (var i = 0; i < cur.messages.length; i++)
+            if (i == index)
+              existing.copyWith(id: serviceId)
+            else
+              cur.messages[i],
+        ],
+        pendingUserMessageId: cur.pendingUserMessageId == existing.id
+            ? serviceId
+            : _sentinel,
+      ),
+    );
   }
 
   /// Resolves a description for each local draft in parallel, with a 5s
-  /// timeout per image. Fail-open: failures/timeouts skip that image.
-  Future<Map<String, String>> _describeDrafts(
+  /// timeout per image. Fail-open: failures/timeouts skip that image and the
+  /// caller always proceeds with whatever drafts were produced.
+  ///
+  /// `failed` is the distinct "vision failed" signal (open-gaps P2): at
+  /// least one draft attempt errored — describe threw/timed out, or its
+  /// bytes were unreadable — AND nothing was produced. That total failure is
+  /// distinguished from legitimately empty describe results, which return
+  /// `failed: false` with empty [drafts].
+  Future<({Map<String, String> drafts, bool failed})> _describeDrafts(
     List<AttachmentDraft> attachments,
   ) async {
     final visionAsync = ref.read(visionClientProvider);
@@ -538,38 +600,38 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       orElse: () => const NoOpVisionClient(),
     );
     final descriptions = <String, String>{};
+    var anyFailed = false;
     final futures = attachments.map((draft) async {
       final bytes = await _readDraftBytes(draft.path);
-      if (bytes == null) return;
+      if (bytes == null) {
+        anyFailed = true;
+        return;
+      }
       try {
         final description = await client
-            .describeImage(
-              bytes: bytes,
-              mimeType: draft.mimeType,
-            )
+            .describeImage(bytes: bytes, mimeType: draft.mimeType)
             .timeout(const Duration(seconds: 5));
         if (description.trim().isNotEmpty) {
           descriptions[draft.filename] = description;
         }
       } catch (e) {
         if (e is Error || e is Exception) {
-          // Fail-open: skip this image.
+          // Fail-open: skip this image, remember that it failed.
+          anyFailed = true;
         } else {
-          rethrow;  // Preserve fatal errors
+          rethrow; // Preserve fatal errors
         }
       }
     });
     await Future.wait(futures);
-    return descriptions;
+    return (drafts: descriptions, failed: anyFailed && descriptions.isEmpty);
   }
 
   Future<Uint8List?> _readDraftBytes(String path) async {
     try {
       final file = File(path);
       if (await file.exists()) {
-        return await file
-            .readAsBytes()
-            .timeout(const Duration(seconds: 5));
+        return await file.readAsBytes().timeout(const Duration(seconds: 5));
       }
     } catch (_) {
       return null;
@@ -612,32 +674,53 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   }
 
   Future<void> retry() async {
+    if (_retryInFlight) return;
     final current = state.value;
-    if (current == null || current.isStreaming) return;
+    if (current == null || current.isStreaming || current.isRetryInFlight) {
+      return;
+    }
     final failedId = current.failedMessageId;
     if (failedId == null) return;
 
-    // Drop the failed assistant placeholder from the store too, so the retried
-    // turn doesn't leave a stale partial assistant message persisted next to
-    // the successful one.
-    await _store!.deleteMessage(conversationId, failedId);
-    if (!ref.mounted) return;
+    _retryInFlight = true;
+    try {
+      _setState(current.copyWith(isRetryInFlight: true));
 
-    // Drop the failed assistant placeholder from in-memory state and replay
-    // the staged turn via retryTurn (same messageId/sessionId/envelope — plan
-    // §5.4 retry = replay, never a resend).
-    _setState(current.copyWith(
-      messages: [
-        for (final m in current.messages)
-          if (m.id != failedId) m,
-      ],
-      isStreaming: true,
-      error: null,
-      failedMessageId: null,
-      authRequired: false,
-    ));
+      // Drop the failed assistant placeholder from the store too, so the retried
+      // turn doesn't leave a stale partial assistant message persisted next to
+      // the successful one.
+      await _store!.deleteMessage(conversationId, failedId);
+      if (!ref.mounted) return;
 
-    await _runTurn(replay: true);
+      // Re-read after the await: a queue/store-watch update may have landed
+      // while the delete was in flight. Merge onto that latest snapshot — not
+      // `current` — so this write cannot revert concurrent progress (the
+      // read → await → stale-write race phase5-bugs #13).
+      final latest = state.value;
+      if (latest == null) return;
+      _setState(
+        latest.copyWith(
+          messages: [
+            for (final m in latest.messages)
+              if (m.id != failedId) m,
+          ],
+          isStreaming: true,
+          error: null,
+          failedMessageId: null,
+          authRequired: false,
+        ),
+      );
+
+      await _runTurn(replay: true);
+    } finally {
+      _retryInFlight = false;
+      if (ref.mounted) {
+        final latest = state.value;
+        if (latest != null) {
+          _setState(latest.copyWith(isRetryInFlight: false));
+        }
+      }
+    }
   }
 
   Future<void> stop() async {
@@ -649,14 +732,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _flushThrottle();
     final current = state.value;
     if (current == null) return;
-    _setState(current.copyWith(
-      isStreaming: false,
-      pendingUserMessageId: null,
-    ));
+    _setState(current.copyWith(isStreaming: false, pendingUserMessageId: null));
     final pendingId = _pendingAssistantId;
-    final partialText = pendingId != null
-        ? _assistantContent(pendingId)
-        : '';
+    final partialText = pendingId != null ? _assistantContent(pendingId) : '';
     _pendingAssistantId = null;
     _pendingContent = null;
     _cancelThrottle();
@@ -666,10 +744,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     if (pendingId != null && ref.mounted) {
       try {
         final adapter = ref.read(managedChatAdapterProvider);
-        await adapter.abandonTurn(
-          conversationId,
-          partialText: partialText,
-        );
+        await adapter.abandonTurn(conversationId, partialText: partialText);
       } catch (_) {
         // Best-effort — the partial is already in memory; the next send will
         // surface pending_turn_exists only if the clear genuinely failed.
@@ -704,25 +779,29 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       createdAt: DateTime.now(),
     );
 
-    _setState(current.copyWith(
-      messages: [...current.messages, userMsg],
-      pendingUserMessageId: userMsg.id,
-      isStreaming: true,
-      error: null,
-      failedMessageId: null,
-      authRequired: false,
-      hasPendingJob: true,
-      jobError: null,
-    ));
+    _setState(
+      current.copyWith(
+        messages: [...current.messages, userMsg],
+        pendingUserMessageId: userMsg.id,
+        isStreaming: true,
+        error: null,
+        failedMessageId: null,
+        authRequired: false,
+        hasPendingJob: true,
+        jobError: null,
+      ),
+    );
 
     final all = state.value?.messages ?? const <Message>[];
     final userIndex = all.lastIndexWhere((m) => m.role == MessageRole.user);
     if (userIndex < 0) {
-      _setState(state.value!.copyWith(
-        isStreaming: false,
-        pendingUserMessageId: null,
-        hasPendingJob: false,
-      ));
+      _setState(
+        state.value!.copyWith(
+          isStreaming: false,
+          pendingUserMessageId: null,
+          hasPendingJob: false,
+        ),
+      );
       return;
     }
     final priorMessages = [for (var i = 0; i < userIndex; i++) all[i]];
@@ -743,10 +822,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       if (!ref.mounted) return;
       // The submission is accepted; nothing streams. Clear the streaming flags
       // (the chip + handle.done drive the rest).
-      _setState(state.value!.copyWith(
-        isStreaming: false,
-        pendingUserMessageId: null,
-      ));
+      _setState(
+        state.value!.copyWith(isStreaming: false, pendingUserMessageId: null),
+      );
       _watchBackgroundHandle(handle);
     } catch (e) {
       if (e is Error) {
@@ -755,15 +833,17 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         // rethrow so the caller keeps its text for a fresh attempt.
         final cur = state.value;
         if (cur != null && ref.mounted) {
-          _setState(cur.copyWith(
-            isStreaming: false,
-            pendingUserMessageId: null,
-            hasPendingJob: false,
-            messages: [
-              for (final m in cur.messages)
-                if (m.id != userMsg.id) m,
-            ],
-          ));
+          _setState(
+            cur.copyWith(
+              isStreaming: false,
+              pendingUserMessageId: null,
+              hasPendingJob: false,
+              messages: [
+                for (final m in cur.messages)
+                  if (m.id != userMsg.id) m,
+              ],
+            ),
+          );
         }
         rethrow;
       }
@@ -793,10 +873,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       if (!ref.mounted) return;
       if (e.code == ManagedErrorCodes.noPendingTurn) {
         // The retry identity is gone — drop the chip and offer a fresh send.
-        _setState(state.value!.copyWith(
-          hasPendingJob: false,
-          jobError: null,
-        ));
+        _setState(state.value!.copyWith(hasPendingJob: false, jobError: null));
         return;
       }
       await _onBackgroundError(e);
@@ -814,18 +891,13 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     final current = state.value;
     if (current == null || !current.hasPendingJob) return;
     try {
-      await ref
-          .read(managedChatAdapterProvider)
-          .abandonTurn(conversationId);
+      await ref.read(managedChatAdapterProvider).abandonTurn(conversationId);
     } catch (_) {
       // Best-effort — the next submit surfaces pending_turn_exists if the
       // clear genuinely failed (or the scope is unavailable).
     }
     if (!ref.mounted) return;
-    _setState(state.value!.copyWith(
-      hasPendingJob: false,
-      jobError: null,
-    ));
+    _setState(state.value!.copyWith(hasPendingJob: false, jobError: null));
   }
 
   /// Watches a background-job [handle]: on an observed terminal status the
@@ -833,29 +905,36 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   /// so the store is re-read and the chip is cleared; a `failed`/`cancelled`
   /// terminal surfaces the retry affordance via [ConversationState.jobError].
   void _watchBackgroundHandle(LedgerPollHandle handle) {
-    unawaited(handle.done.then((result) async {
-      if (!ref.mounted) return;
-      final terminal =
-          result.end == LedgerPollEnd.observed &&
-          (result.task?.status.isTerminal ?? false);
-      if (!terminal) {
-        // Exhausted/errored poll: the job is still pending (the marker is kept
-        // for an explicit retry) — keep the chip.
-        return;
-      }
-      await _reloadFromStore();
-      if (!ref.mounted) return;
-      final failed = result.task?.status == LedgerTaskStatus.failed ||
-          result.task?.status == LedgerTaskStatus.cancelled;
-      _setState(state.value!.copyWith(
-        hasPendingJob: false,
-        jobError: failed ? 'Background job failed' : null,
-        // A "wait for the job" banner is stale the moment the job is terminal.
-        error: null,
-      ));
-    }).catchError((Object _) {
-      // Never surface an unhandled async error from a background watch.
-    }));
+    unawaited(
+      handle.done
+          .then((result) async {
+            if (!ref.mounted) return;
+            final terminal =
+                result.end == LedgerPollEnd.observed &&
+                (result.task?.status.isTerminal ?? false);
+            if (!terminal) {
+              // Exhausted/errored poll: the job is still pending (the marker is kept
+              // for an explicit retry) — keep the chip.
+              return;
+            }
+            await _reloadFromStore();
+            if (!ref.mounted) return;
+            final failed =
+                result.task?.status == LedgerTaskStatus.failed ||
+                result.task?.status == LedgerTaskStatus.cancelled;
+            _setState(
+              state.value!.copyWith(
+                hasPendingJob: false,
+                jobError: failed ? 'Background job failed' : null,
+                // A "wait for the job" banner is stale the moment the job is terminal.
+                error: null,
+              ),
+            );
+          })
+          .catchError((Object _) {
+            // Never surface an unhandled async error from a background watch.
+          }),
+    );
   }
 
   /// Maps a background-submission failure into state (no assistant placeholder
@@ -905,21 +984,25 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     if (!ref.mounted) return;
     final cur = state.value;
     if (cur == null) return;
-    _setState(cur.copyWith(
-      isStreaming: false,
-      pendingUserMessageId: null,
-      hasPendingJob: keepChip,
-      // A neutral phrase (e.g. `cancelled`) is never shown as a banner.
-      error: authRequired || message.isEmpty ? null : message,
-      jobError: authRequired || message.isEmpty ? null : 'Background job failed',
-      authRequired: authRequired,
-      messages: dropOptimistic && optimisticUserId != null
-          ? [
-              for (final m in cur.messages)
-                if (m.id != optimisticUserId) m,
-            ]
-          : null,
-    ));
+    _setState(
+      cur.copyWith(
+        isStreaming: false,
+        pendingUserMessageId: null,
+        hasPendingJob: keepChip,
+        // A neutral phrase (e.g. `cancelled`) is never shown as a banner.
+        error: authRequired || message.isEmpty ? null : message,
+        jobError: authRequired || message.isEmpty
+            ? null
+            : 'Background job failed',
+        authRequired: authRequired,
+        messages: dropOptimistic && optimisticUserId != null
+            ? [
+                for (final m in cur.messages)
+                  if (m.id != optimisticUserId) m,
+              ]
+            : null,
+      ),
+    );
   }
 
   /// Runs a single streaming turn (tools run server-side in the agent graph).
@@ -931,9 +1014,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     try {
       await _streamOnce(token, replay: replay);
     } finally {
-      _active = null;
-      _cancelThrottle();
-      _flushThrottle();
+      if (identical(_active, token)) {
+        _active = null;
+        _cancelThrottle();
+        _flushThrottle();
+      }
     }
   }
 
@@ -962,10 +1047,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     if (userIndex < 0) {
       // clear() dropped the user message (or a rebuild raced): bail rather
       // than wedge isStreaming with nothing to send.
-      _setState(current.copyWith(
-        isStreaming: false,
-        pendingUserMessageId: null,
-      ));
+      _setState(
+        current.copyWith(isStreaming: false, pendingUserMessageId: null),
+      );
       return;
     }
     final userMsg = all[userIndex];
@@ -987,9 +1071,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     );
     _pendingAssistantId = assistant.id;
     _pendingContent = StringBuffer();
-    _setState(state.value!.copyWith(
-      messages: [...state.value!.messages, assistant],
-    ));
+    _setState(
+      state.value!.copyWith(messages: [...state.value!.messages, assistant]),
+    );
 
     final id = conversationId;
 
@@ -1038,34 +1122,40 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
           // would strand a reconcileOnly marker).
           final conversation = await _store!.loadConversation(id);
           if (!ref.mounted) return;
-          _setState(state.value!.copyWith(
-            messages: conversation?.messages ?? state.value!.messages,
-            isStreaming: false,
-            pendingUserMessageId: null,
-            error: null,
-            failedMessageId: null,
-            authRequired: false,
-          ));
+          _setState(
+            state.value!.copyWith(
+              messages: conversation?.messages ?? state.value!.messages,
+              isStreaming: false,
+              pendingUserMessageId: null,
+              error: null,
+              failedMessageId: null,
+              authRequired: false,
+            ),
+          );
         case ManagedStreamedTurn():
           // The service persisted the assistant reply; reload the
           // authoritative conversation (service-minted ids) and swap it in.
           final conversation = await _store!.loadConversation(id);
           if (!ref.mounted) return;
-          _setState(state.value!.copyWith(
-            messages: conversation?.messages ?? state.value!.messages,
-            isStreaming: false,
-            pendingUserMessageId: null,
-            error: null,
-            failedMessageId: null,
-            authRequired: false,
-          ));
+          _setState(
+            state.value!.copyWith(
+              messages: conversation?.messages ?? state.value!.messages,
+              isStreaming: false,
+              pendingUserMessageId: null,
+              error: null,
+              failedMessageId: null,
+              authRequired: false,
+            ),
+          );
         case ManagedBackgroundResubmitted():
           // sendTurn never produces a background outcome (P1c owns the
           // text/background flag); clear streaming so the UI cannot wedge.
-          _setState(state.value!.copyWith(
-            isStreaming: false,
-            pendingUserMessageId: null,
-          ));
+          _setState(
+            state.value!.copyWith(
+              isStreaming: false,
+              pendingUserMessageId: null,
+            ),
+          );
       }
     } on PluginClientException catch (e) {
       if (e.code == ManagedErrorCodes.noPendingTurn) {
@@ -1080,17 +1170,20 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         try {
           // Re-read inside the nested try: a scope-unavailable rethrow routes
           // through _onError as the re-auth state.
-          final serverHistory =
-              await ref.read(managedChatAdapterProvider).reconcileFromServer(id);
+          final serverHistory = await ref
+              .read(managedChatAdapterProvider)
+              .reconcileFromServer(id);
           if (!ref.mounted) return;
-          _setState(state.value!.copyWith(
-            messages: serverHistory,
-            isStreaming: false,
-            pendingUserMessageId: null,
-            error: null,
-            failedMessageId: null,
-            authRequired: false,
-          ));
+          _setState(
+            state.value!.copyWith(
+              messages: serverHistory,
+              isStreaming: false,
+              pendingUserMessageId: null,
+              error: null,
+              failedMessageId: null,
+              authRequired: false,
+            ),
+          );
           _clearPendingStream();
           return;
         } catch (reconcileError) {
@@ -1116,17 +1209,19 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
   void _finalizeWithoutError(String assistantId) {
     final cur = state.value;
     if (cur == null) return;
-    _setState(cur.copyWith(
-      messages: [
-        for (final m in cur.messages)
-          if (m.id != assistantId) m,
-      ],
-      isStreaming: false,
-      pendingUserMessageId: null,
-      error: null,
-      failedMessageId: null,
-      authRequired: false,
-    ));
+    _setState(
+      cur.copyWith(
+        messages: [
+          for (final m in cur.messages)
+            if (m.id != assistantId) m,
+        ],
+        isStreaming: false,
+        pendingUserMessageId: null,
+        error: null,
+        failedMessageId: null,
+        authRequired: false,
+      ),
+    );
     _clearPendingStream();
   }
 
@@ -1175,7 +1270,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(current.copyWith(authRequired: false));
   }
 
-  Future<void> _onError(Object error, String assistantId, CancelToken token) async {
+  Future<void> _onError(
+    Object error,
+    String assistantId,
+    CancelToken token,
+  ) async {
     if (!ref.mounted) return;
     final cur = state.value;
     if (cur == null) return;
@@ -1193,15 +1292,18 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // local token still live (e.g. a mid-stream abandon that raced the
     // stream, or a scope epoch bump) is a silent finalization, not an error:
     // stop() already settled the streaming flags and kept the partial.
-    if (error is PluginClientException && error.code == ManagedErrorCodes.cancelled) {
+    if (error is PluginClientException &&
+        error.code == ManagedErrorCodes.cancelled) {
       _upsertPartial(assistantId, _assistantContent(assistantId));
-      _setState(state.value!.copyWith(
-        isStreaming: false,
-        pendingUserMessageId: null,
-        error: null,
-        failedMessageId: null,
-        authRequired: false,
-      ));
+      _setState(
+        state.value!.copyWith(
+          isStreaming: false,
+          pendingUserMessageId: null,
+          error: null,
+          failedMessageId: null,
+          authRequired: false,
+        ),
+      );
       _clearPendingStream();
       return;
     }
@@ -1209,7 +1311,8 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // `no_pending_turn` from a replay against an already-cleared staged row:
     // finalize silently — the retry affordance must not linger with no row
     // behind it (plan §5 P1: hide retry, offer a fresh send).
-    if (error is PluginClientException && error.code == ManagedErrorCodes.noPendingTurn) {
+    if (error is PluginClientException &&
+        error.code == ManagedErrorCodes.noPendingTurn) {
       _finalizeWithoutError(assistantId);
       return;
     }
@@ -1227,7 +1330,8 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // its poller watch hits the `pending == null` guard and silently loses the
     // reply. In that case the marker (chip) is kept, the optimistic user row +
     // placeholder are dropped, and the error tells the user to wait.
-    if (error is PluginClientException && error.code == ManagedErrorCodes.pendingTurnExists) {
+    if (error is PluginClientException &&
+        error.code == ManagedErrorCodes.pendingTurnExists) {
       try {
         final adapter = ref.read(managedChatAdapterProvider);
         final cleared = await adapter.abandonTurnKeepingBackground(
@@ -1236,50 +1340,56 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         if (!ref.mounted) return;
         if (cleared) {
           _upsertPartial(assistantId, _assistantContent(assistantId));
-          _setState(state.value!.copyWith(
-            isStreaming: false,
-            // Same copy surface as the mapper: the pending turn was
-            // abandoned, so this is the only special case the branch keeps —
-            // the abandonTurn action itself.
-            error: statusPhraseForError(error),
-            pendingUserMessageId: null,
-            failedMessageId: assistantId,
-            authRequired: false,
-          ));
+          _setState(
+            state.value!.copyWith(
+              isStreaming: false,
+              // Same copy surface as the mapper: the pending turn was
+              // abandoned, so this is the only special case the branch keeps —
+              // the abandonTurn action itself.
+              error: statusPhraseForError(error),
+              pendingUserMessageId: null,
+              failedMessageId: assistantId,
+              authRequired: false,
+            ),
+          );
         } else {
           // A background job is genuinely pending: keep the chip, drop the
           // never-admitted optimistic user row + empty placeholder, and tell
           // the user to wait for the job instead of claiming it was stopped.
           final cur = state.value;
           if (cur != null) {
-            final lastUserIndex =
-                cur.messages.lastIndexWhere((m) => m.role == MessageRole.user);
-            _setState(cur.copyWith(
-              messages: [
-                for (var i = 0; i < cur.messages.length; i++)
-                  if (i != lastUserIndex && cur.messages[i].id != assistantId)
-                    cur.messages[i],
-              ],
-              isStreaming: false,
-              error:
-                  'A background job is still running — wait for it to finish.',
-              pendingUserMessageId: null,
-              failedMessageId: null,
-              authRequired: false,
-              hasPendingJob: true,
-            ));
+            final lastUserIndex = cur.messages.lastIndexWhere(
+              (m) => m.role == MessageRole.user,
+            );
+            _setState(
+              cur.copyWith(
+                messages: [
+                  for (var i = 0; i < cur.messages.length; i++)
+                    if (i != lastUserIndex && cur.messages[i].id != assistantId)
+                      cur.messages[i],
+                ],
+                isStreaming: false,
+                error: 'A background job is still running — wait for it to finish.',
+                pendingUserMessageId: null,
+                failedMessageId: null,
+                authRequired: false,
+                hasPendingJob: true,
+              ),
+            );
           }
         }
       } catch (_) {
         // Best-effort escape hatch; still surface the message.
         _upsertPartial(assistantId, _assistantContent(assistantId));
-        _setState(state.value!.copyWith(
-          isStreaming: false,
-          error: statusPhraseForError(error),
-          pendingUserMessageId: null,
-          failedMessageId: assistantId,
-          authRequired: false,
-        ));
+        _setState(
+          state.value!.copyWith(
+            isStreaming: false,
+            error: statusPhraseForError(error),
+            pendingUserMessageId: null,
+            failedMessageId: assistantId,
+            authRequired: false,
+          ),
+        );
       }
       _clearPendingStream();
       return;
@@ -1307,13 +1417,15 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // update here. stop() hands the partial to abandonTurn for persistence.
     _upsertPartial(assistantId, _assistantContent(assistantId));
 
-    _setState(state.value!.copyWith(
-      isStreaming: false,
-      error: authRequired ? null : message,
-      pendingUserMessageId: null,
-      failedMessageId: assistantId,
-      authRequired: authRequired,
-    ));
+    _setState(
+      state.value!.copyWith(
+        isStreaming: false,
+        error: authRequired ? null : message,
+        pendingUserMessageId: null,
+        failedMessageId: assistantId,
+        authRequired: authRequired,
+      ),
+    );
     _clearPendingStream();
   }
 
@@ -1335,12 +1447,14 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       }
     }
     if (!hasAssistant) {
-      updated.add(Message(
-        id: assistantId,
-        role: MessageRole.assistant,
-        content: partialContent,
-        createdAt: DateTime.now(),
-      ));
+      updated.add(
+        Message(
+          id: assistantId,
+          role: MessageRole.assistant,
+          content: partialContent,
+          createdAt: DateTime.now(),
+        ),
+      );
     }
     _setState(cur.copyWith(messages: updated));
   }
@@ -1372,20 +1486,36 @@ final contextTrimmerProvider = Provider<ContextTrimmer>(
 );
 
 /// Fires when the underlying database is ready (via the chat store provider).
-final databaseReadyProvider = Provider<Future<void>>(
-  (ref) async {
-    await ref.watch(chatStoreProvider).watchConversations().first;
-  },
-);
+final databaseReadyProvider = Provider<Future<void>>((ref) async {
+  await ref.watch(chatStoreProvider).watchConversations().first;
+});
 
 /// State notifier for a single conversation, keyed by conversation id.
-final conversationProvider =
-    AsyncNotifierProvider.autoDispose
-        .family<ConversationNotifier, ConversationState, String>(
-          ConversationNotifier.new,
-        );
+final conversationProvider = AsyncNotifierProvider.autoDispose
+    .family<ConversationNotifier, ConversationState, String>(
+      ConversationNotifier.new,
+    );
 
 /// Stream of all conversations, ordered most-recently-updated first.
 final conversationsProvider = StreamProvider.autoDispose<List<Conversation>>(
   (ref) => ref.watch(chatStoreProvider).watchConversations(),
 );
+
+/// Conversation ids in the active account scope that currently own a
+/// pending-turn row — drives the conversation list's pending-job indicator
+/// (open-gaps P2). Live via the repository's drift watch, so a job submitted
+/// or cleared while the list stays mounted under the open chat refreshes the
+/// set in place. Pre-ready plugin access yields an empty set rather than
+/// `pluginAccountScopeProvider`'s re-auth throw (same gate as
+/// [chatStoreProvider]).
+final pendingConversationIdsProvider = StreamProvider.autoDispose<Set<String>>((
+  ref,
+) {
+  if (ref.watch(pluginAccessProvider) != PluginAccess.ready) {
+    return Stream.value(const <String>{});
+  }
+  final scope = ref.watch(pluginAccountScopeProvider);
+  return ref
+      .watch(managedConversationRepositoryProvider)
+      .pendingConversationIds(scope);
+});

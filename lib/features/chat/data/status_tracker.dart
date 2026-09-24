@@ -54,6 +54,15 @@ const authErrorPhrases = [
   'I\'m having trouble authenticating — could you re-sign in?',
 ];
 
+const verifyEmailPhrases = [
+  'Verify your email to keep using the assistant.',
+  'Your email isn\'t verified yet — check your inbox to continue.',
+];
+
+const accountDeletedPhrases = [
+  'This account has been deleted.',
+];
+
 const serverErrorPhrases = [
   'There seems to be an issue on my side — please try again.',
   'My server hit a snag — can you try again?',
@@ -213,6 +222,9 @@ String statusPhraseForError(Object error, {Random? random}) {
       return _pick(authErrorPhrases, rng);
     }
     return switch (error.code) {
+      // C2: valid key, unverified email — offer verification, never re-auth.
+      ManagedErrorCodes.emailNotVerified => _pick(verifyEmailPhrases, rng),
+      ManagedErrorCodes.accountDeleted => _pick(accountDeletedPhrases, rng),
       ManagedErrorCodes.unauthorized ||
       ManagedErrorCodes.credentialsExpired ||
       ManagedErrorCodes.noCredentials =>

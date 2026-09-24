@@ -6,6 +6,7 @@ import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/engine_registry.dart';
 import '../data/model_downloader.dart';
+import '../data/stt_engine.dart';
 import '../data/voice_settings.dart';
 import './voice_settings_providers.dart';
 
@@ -21,14 +22,6 @@ class VoiceSettingsScreen extends ConsumerStatefulWidget {
 }
 
 class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
-  static const _languages = <(String, String)>[
-    ('en', 'English'),
-    ('es', 'Spanish'),
-    ('fr', 'French'),
-    ('de', 'German'),
-    ('zh', 'Chinese'),
-  ];
-
   late String _sttEngine;
   late String _ttsEngine;
   late double _vadSensitivity;
@@ -98,12 +91,57 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
     return ids.contains(_ttsEngine) ? ids : [...ids, _ttsEngine];
   }
 
+  /// Language options for [engineId]: the registered engine's curated
+  /// [SttEngine.supportedLanguages], falling back to the English-only base
+  /// list when the engine id is unknown/not registered (or declares none).
+  List<({String code, String label})> _sttLanguagesFor(String engineId) {
+    final supported = EngineRegistry.instance
+        .getSttEngine(engineId)
+        ?.supportedLanguages;
+    return (supported == null || supported.isEmpty)
+        ? kBaseSttSupportedLanguages
+        : supported;
+  }
+
+  /// The "Preferred language" field: options come from the selected engine's
+  /// curated list; the value is resolved against it so a persisted code the
+  /// engine does not support renders (and saves) as the fallback.
+  Widget _languageField() {
+    final languages = _sttLanguagesFor(_sttEngine);
+    final languageValue = resolveSttLanguage(_language, languages);
+    return InputDecorator(
+      decoration: const InputDecoration(
+        labelText: 'Preferred language',
+        helperText: 'Language spoken during voice conversations',
+        border: OutlineInputBorder(),
+      ),
+      child: DropdownButton<String>(
+        value: languageValue,
+        isExpanded: true,
+        isDense: true,
+        underline: const SizedBox.shrink(),
+        items: [
+          for (final lang in languages)
+            DropdownMenuItem(value: lang.code, child: Text(lang.label)),
+        ],
+        onChanged: (value) {
+          if (value != null) setState(() => _language = value);
+        },
+      ),
+    );
+  }
+
   Future<void> _save() async {
     final settings = VoiceSettings(
       sttEngine: _sttEngine,
       ttsEngine: _ttsEngine,
       vadSensitivity: _vadSensitivity,
-      preferredLanguage: _language,
+      // Re-resolve at persist time so an engine switch can never save a
+      // language code the selected engine does not support.
+      preferredLanguage: resolveSttLanguage(
+        _language,
+        _sttLanguagesFor(_sttEngine),
+      ),
       minTurnSeconds: _minTurnSeconds,
       visionEnabled: _visionEnabled,
     );
@@ -180,7 +218,17 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
                   DropdownMenuItem(value: id, child: Text(id)),
               ],
               onChanged: (value) {
-                if (value != null) setState(() => _sttEngine = value);
+                if (value == null) return;
+                setState(() {
+                  _sttEngine = value;
+                  // The persisted language may not be offered by the
+                  // newly-selected engine — fall back deterministically at
+                  // switch time so Save never persists an unsupported code.
+                  _language = resolveSttLanguage(
+                    _language,
+                    _sttLanguagesFor(value),
+                  );
+                });
               },
             ),
           ),
@@ -224,26 +272,7 @@ class _VoiceSettingsScreenState extends ConsumerState<VoiceSettingsScreen> {
             onChanged: (value) => setState(() => _vadSensitivity = value),
           ),
           const SizedBox(height: 16),
-          InputDecorator(
-            decoration: const InputDecoration(
-              labelText: 'Preferred language',
-              helperText: 'Language spoken during voice conversations',
-              border: OutlineInputBorder(),
-            ),
-            child: DropdownButton<String>(
-              value: _language,
-              isExpanded: true,
-              isDense: true,
-              underline: const SizedBox.shrink(),
-              items: [
-                for (final (code, name) in _languages)
-                  DropdownMenuItem(value: code, child: Text(name)),
-              ],
-              onChanged: (value) {
-                if (value != null) setState(() => _language = value);
-              },
-            ),
-          ),
+          _languageField(),
           const SizedBox(height: 24),
           Text('Vision', style: theme.textTheme.titleSmall),
           const SizedBox(height: 4),

@@ -13,7 +13,8 @@ import type { StreamEvent } from "./openai.ts";
 
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
-import { requireApiKey, unauthorized } from "../inference.ts";
+import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_key.ts";
+import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { bindPluginTools, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import { bindMcpServers } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
@@ -30,7 +31,7 @@ import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
 import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
-import { redactForCheckpoint } from "../checkpoints/store.ts";
+import { redactForOutbound } from "../redact.ts";
 import {
   credentialFingerprint,
   extractCredentialsFromBody,
@@ -64,6 +65,16 @@ import type { BuildModelInput } from "./model.ts";
 import type { SessionStore, SessionMissingReason } from "../sessions/store.ts";
 import type { AppendDeltaResult, ReestablishResult } from "../sessions/store.ts";
 
+/**
+ * Server-side caps on the CUSTOM agent spec (`body.agent` as an object) —
+ * open-gaps P0 "residue" (Agent editor C.4b, server half): systemPrompt
+ * ≤8000, skills ≤50, mcpServers ≤20, tools ≤100 (env-overridable),
+ * inference.maxTokens ≤200000, inference.temperature clamped to [0,2]
+ * (clamp — never rejected). A TEMPLATE agent (string id resolved from the
+ * server catalog) is NOT subject to these field caps. Over-cap specs fail
+ * the schema parse below → 400 `invalid_request` with the block's existing
+ * `invalid agent spec: …` message.
+ */
 const agentSpecCaps = {
   systemPrompt: env.AGENT_SPEC_MAX_SYSTEM_PROMPT,
   skills: env.AGENT_SPEC_MAX_SKILLS,
@@ -83,7 +94,8 @@ const customAgentSpecSchema = z.object({
   }).strict()).max(agentSpecCaps.tools).optional(),
   modelRef: pluginIdSchema.optional(),
   inference: z.object({
-    temperature: z.number().optional(),
+    // Clamp to [0,2] rather than reject ("temperature clamp 0–2", P0).
+    temperature: z.number().transform((t) => Math.min(2, Math.max(0, t))).optional(),
     maxTokens: z.number().int().positive().max(200000).optional(),
     visionCapable: z.boolean().default(false),
   }).strict().optional(),
@@ -103,7 +115,7 @@ const customAgentSpecSchema = z.object({
  *     polls `GET /ledger/tasks/by-key/:messageId` for the job's status.
  *
  * FLOW (sync, per request):
- *   1. gateway auth (`verifyKey`) -> 401
+ *   1. gateway auth (`verifyKey` via `keyGateResponse`) -> 401 / 403
  *   2. per-owner token bucket (`rateLimiter`) -> 429 rate_limited + Retry-After
  *   3. parse JSON body -> 400 on invalid JSON / missing model / empty messages
  *   4. resolve the model plugin from `body.model` (see MODEL SELECTION)
@@ -179,6 +191,7 @@ const customAgentSpecSchema = z.object({
  * ERROR MAPPING (pre-stream; flat `{"error": <code>}` for consistency with the
  * sibling plugin/checkpoint surfaces — the wire-spec §5.1 categories are noted):
  *   401 unauthorized              no/invalid gateway key (auth_error)
+ *   403 email_not_verified        valid key, owner's email unconfirmed (C2)
  *   429 rate_limited              per-owner rate limiter rejected (rate_limited)
  *   429 busy                      per-user budget pool full — sync path
  *                                 (concurrent-capacity, retryable)
@@ -296,7 +309,7 @@ export type ChatRoutesOptions = {
    * model + tool credentials here; the runner reads them by (owner, pluginId).
    */
   pins?: CredentialPinStore;
-  /** Test seam; defaults to the real `requireApiKey` from inference.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
   verifyKey?: VerifyApiKeyFn;
   /**
    * Per-owner rate limiter (Phase 4, Wave A). Returns a structured
@@ -338,7 +351,7 @@ export type ChatRoutesOptions = {
    * pluginVersion, credentialFingerprint, tool, argsHash) — is served without
    * re-executing the backend. Mutating tools are never cached. The cache
    * stores raw handler output; this transport redacts at serve time with
-   * `redactForCheckpoint` (idempotent), the same discipline the runner uses.
+   * `redactForOutbound` (idempotent), the same discipline the runner uses.
    * Construct ONE instance in index.ts and share it with the job runner so a
    * sync stream and a background job dedupe against the same cache.
    */
@@ -468,8 +481,10 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
   );
 
   routes.post("/chat/completions", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const rate = rateLimiter.check(owner);
     if (!rate.allowed) {
       const res = c.json({ error: "rate_limited" }, 429);
@@ -768,7 +783,14 @@ export function resolveChatRequest(
         }
       }
 
-      // Resolve tools: validate installed + credentials
+      // Resolve tools: validate against the SERVER's plugin registry.
+      // "Installed" here means present in this gateway's registry/catalog —
+      // what `requirePlugin` resolves. The server cannot see the client's
+      // app-local plugin state, so there is deliberately NO client-side
+      // "installed on the device" notion. Every REQUIRED grant must resolve
+      // to a registered plugin of type `tool`; unknown / wrong-type required
+      // grants → 400 invalid_credentials (never 500). Optional grants that do
+      // not resolve are skipped with a warning (existing contract).
       let resolvedTools: { pluginId: string; required: boolean }[] | undefined;
       if (spec.tools !== undefined) {
         resolvedTools = [];
@@ -811,7 +833,10 @@ export function resolveChatRequest(
       return { ok: false, response: c.json({ error: "invalid_request", message: "agent must be a string (template id) or an object (custom spec)" }, 400) };
     }
 
-    // Override model if agent has modelRef
+    // Override model if agent has modelRef: the ref must resolve via
+    // `requirePlugin` to a registered MODEL plugin (streaming-capable) —
+    // unknown or wrong-type (e.g. a tool plugin) → 400 invalid_request.
+    // Same registry-based "installed" interpretation as tool grants above.
     if (resolvedAgentDef.modelRef) {
       modelPluginId = resolvedAgentDef.modelRef;
       requestModel = undefined;
@@ -932,6 +957,7 @@ async function handleSyncStream(
 ): Promise<Response> {
   const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   const { managed } = resolved.value;
 
   // Managed-session path (plan §5): a managed request carries a validated
@@ -958,6 +984,7 @@ async function handleSyncStream(
     requestParameters,
   } = resolved.value;
 
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   const buildModelFn = opts.buildModel ?? buildModel;
   let model;
   try {
@@ -973,6 +1000,7 @@ async function handleSyncStream(
   } catch (err) {
     return preStreamError(c, err);
   }
+  if (isDeleting(owner)) return accountDeletedResponse(c);
 
   const toolHandler =
     opts.toolHandler ??
@@ -1045,6 +1073,7 @@ async function handleSyncStream(
       systemPrompt: resolved.value.agentOverride?.systemPrompt,
       beforeModelCall: () => {
         execution.signal.throwIfAborted();
+        if (isDeleting(owner)) throw new AccountDeletedError(owner);
         budget.beforeModelCall(owner, "sync");
       },
     });
@@ -1056,9 +1085,14 @@ async function handleSyncStream(
     // `onRelease`). The reserve/release wrapper releases BEFORE rethrowing if
     // stream construction throws, so a construction failure can never leak a
     // reservation.
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const reservation = budget.reserveSync(owner);
     if (!reservation.ok) {
       return busy(c, 429, reservation.retryAfterSeconds);
+    }
+    if (isDeleting(owner)) {
+      reservation.release();
+      return accountDeletedResponse(c);
     }
     try {
       scheduleWarmups(opts, owner, toolCredentialsByPlugin);
@@ -1123,6 +1157,7 @@ async function handleManagedSessionStream(
   const sessionStore = opts.sessionStore!;
   const sessionId = resolved.sessionId!; // dispatch gate guarantees non-null
   const messageId = resolved.managedMessageId!; // validated in resolveChatRequest
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   const { rawMessages } = resolved;
 
   let state: "seeded" | "resumed";
@@ -1150,12 +1185,28 @@ async function handleManagedSessionStream(
       // WITHOUT the trailing user turn, then append it as a delta so
       // `outcomes[messageId]` is recorded (a concurrent/retried establish is
       // deduped, and a failed establish rolls the user turn back).
+      if (isDeleting(owner)) {
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       const seeded = await sessionStore.establish(owner, sessionId, messages.slice(0, -1));
+      if (isDeleting(owner)) {
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       if (seeded.status === "session_missing") {
         return sessionMissingResponse(c, sessionId, seeded.reason);
       }
       const userMsg = lastUserMessage(rawMessages)!;
+      if (isDeleting(owner)) {
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       const appended = await sessionStore.appendDelta(owner, sessionId, messageId, userMsg);
+      if (isDeleting(owner)) {
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       if (appended.status !== "resumed") {
         return mapSessionAppend(c, sessionId, messageId, appended);
       }
@@ -1165,7 +1216,15 @@ async function handleManagedSessionStream(
       sessionMessages = messages;
     } else {
       // No trailing user turn to anchor (protocol edge): plain seed, no dedupe.
+      if (isDeleting(owner)) {
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       const seeded = await sessionStore.establish(owner, sessionId, messages);
+      if (isDeleting(owner)) {
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       if (seeded.status === "session_missing") {
         return sessionMissingResponse(c, sessionId, seeded.reason);
       }
@@ -1188,7 +1247,15 @@ async function handleManagedSessionStream(
         400,
       );
     }
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return accountDeletedResponse(c);
+    }
     const reestablished = await sessionStore.reestablish(owner, sessionId, messageId, messages);
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return accountDeletedResponse(c);
+    }
     switch (reestablished.status) {
       case "reestablished":
         turnGeneration = reestablished.generation;
@@ -1210,7 +1277,15 @@ async function handleManagedSessionStream(
       );
     }
     const userMsg = lastUserMessage(rawMessages)!;
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return accountDeletedResponse(c);
+    }
     const appended = await sessionStore.appendDelta(owner, sessionId, messageId, userMsg);
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return accountDeletedResponse(c);
+    }
     if (appended.status !== "resumed") {
       return mapSessionAppend(c, sessionId, messageId, appended);
     }
@@ -1236,6 +1311,7 @@ async function handleManagedSessionStream(
   // so no path double-marks.
   const buildModelFn = opts.buildModel ?? buildModel;
   const { modelPluginId, requestModel, plugin, credentials, requestParameters } = resolved;
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   // The generation captured at append time (in scope on every path that reaches
   // this section — all four append/seed branches above set it) keeps the rollback
   // from stamping a re-seeded incarnation (F4).
@@ -1255,6 +1331,11 @@ async function handleManagedSessionStream(
   } catch (err) {
     await rollbackTurn();
     return preStreamError(c, err);
+  }
+  if (isDeleting(owner)) {
+    await rollbackTurn();
+    sessionStore.deleteSessionsForOwner(owner);
+    return accountDeletedResponse(c);
   }
 
   try {
@@ -1326,6 +1407,11 @@ async function handleManagedSessionStream(
       // The final assistant reply, captured from the root `on_chain_end`.
       let reply: BaseMessage | undefined;
 
+      if (isDeleting(owner)) {
+        await rollbackTurn();
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
+      }
       const reservation = budget.reserveSync(owner);
       if (!reservation.ok) {
         // Budget-busy is a DESIGNED condition under load, not a bug — but the
@@ -1333,6 +1419,12 @@ async function handleManagedSessionStream(
         // then a clean re-run once a slot frees).
         await rollbackTurn();
         return busy(c, 429, reservation.retryAfterSeconds);
+      }
+      if (isDeleting(owner)) {
+        reservation.release();
+        await rollbackTurn();
+        sessionStore.deleteSessionsForOwner(owner);
+        return accountDeletedResponse(c);
       }
       try {
         scheduleWarmups(opts, owner, toolCredentialsByPlugin);
@@ -1404,6 +1496,10 @@ async function finalizeSessionTurn(
   reply: BaseMessage | undefined,
   generation?: number,
 ): Promise<void> {
+  if (isDeleting(owner)) {
+    sessionStore.deleteSessionsForOwner(owner);
+    return;
+  }
   if (outcome === "succeeded") {
     const finalReply = reply ?? new AIMessage({ content: "" });
     const replyAppend = await sessionStore.appendDelta(
@@ -1413,6 +1509,10 @@ async function finalizeSessionTurn(
       finalReply,
       { expectedGeneration: generation, evictOnOverflow: false },
     );
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return;
+    }
     if (
       replyAppend.status === "session_missing" ||
       replyAppend.status === "generation_changed"
@@ -1422,12 +1522,24 @@ async function finalizeSessionTurn(
       );
       return;
     }
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return;
+    }
     await sessionStore.markCompleted(owner, sessionId, `${messageId}:assistant`, finalReply, generation);
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return;
+    }
     const completed = await sessionStore.markCompleted(owner, sessionId, messageId, finalReply, generation);
     if (completed.evicted) {
       console.warn(`chat: session ${sessionId} evicted mid-turn; completed outcome dropped`);
     }
   } else {
+    if (isDeleting(owner)) {
+      sessionStore.deleteSessionsForOwner(owner);
+      return;
+    }
     const failed = await sessionStore.markFailed(owner, sessionId, messageId, generation);
     if (failed.evicted) {
       console.warn(`chat: session ${sessionId} evicted mid-turn; failure outcome dropped`);
@@ -1509,7 +1621,7 @@ function mapSessionAppend(
  * so the registry is not re-read for every tool invocation.
  *
  * The cache stores the RAW handler output; both hits and misses are redacted
- * here with `redactForCheckpoint` (idempotent) before the result reaches the
+ * here with `redactForOutbound` (idempotent) before the result reaches the
  * graph, matching the async runner's discipline.
  */
 function withToolResultCache(opts: {
@@ -1528,6 +1640,7 @@ function withToolResultCache(opts: {
   return {
     async execute(pluginId, toolName, args, credentials?, signal?) {
       signal?.throwIfAborted();
+      if (isDeleting(owner)) throw new AccountDeletedError(owner);
       const lookup = `${pluginId}\u0000${toolName}`;
       let meta: ToolCallMeta | null | undefined = resolved.get(lookup);
       if (meta === undefined) {
@@ -1556,11 +1669,13 @@ function withToolResultCache(opts: {
         argsHash: cache.argsHash(args),
       };
       const hit = cache.get(key);
-      if (hit !== undefined) return redactForCheckpoint(hit);
-      const result = String(await direct());
-      signal?.throwIfAborted();
-      cache.set(key, result);
-      return redactForCheckpoint(result);
+      if (hit !== undefined) return redactForOutbound(hit);
+       const result = String(await direct());
+       signal?.throwIfAborted();
+       if (isDeleting(owner)) throw new AccountDeletedError(owner);
+       cache.set(key, result);
+
+      return redactForOutbound(result);
     },
   };
 }
@@ -1603,6 +1718,7 @@ async function handleBackground(
   if (!jobRunner || !ledger || !pins) {
     return c.json({ error: "background_unavailable" }, 503);
   }
+  if (isDeleting(owner)) return accountDeletedResponse(c);
 
   const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
@@ -1614,6 +1730,7 @@ async function handleBackground(
     requestParameters,
     clientThreadId,
   } = resolved.value;
+  if (isDeleting(owner)) return accountDeletedResponse(c);
 
   // Idempotency key: the client generates `messageId` once per send and reuses
   // it across retries. Missing -> 400 before any admission/pinning.
@@ -1640,7 +1757,9 @@ async function handleBackground(
   // `conversation_in_flight`, a terminal task -> 200 `already_completed`
   // (via `inspectManagedTurn` / `managedDuplicateResponse`). A queued task
   // falls through — the runner owns the claim race (in_flight vs. claim).
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   const existing = ledger.getTaskByIntentKey(owner, messageId);
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   if (existing) {
     const duplicate = inspectManagedTurn(existing, clientThread);
     if (duplicate) return managedDuplicateResponse(c, duplicate);
@@ -1656,17 +1775,33 @@ async function handleBackground(
   // model credential. Any validation failure -> 400 before admission, and no
   // pin is left behind. `enabled_plugins` (when present) limits BOTH the
   // pinned set and the bound tool set to the selected plugins.
+  if (isDeleting(owner)) return accountDeletedResponse(c);
   const pinnedTools = pinToolPlugins(c, body, opts.registry, pins, owner, resolved.value.enabledPlugins);
   if (!pinnedTools.ok) return pinnedTools.response;
   const toolPlugins = pinnedTools.toolPlugins;
   const pinHandles = pinnedTools.pinHandles;
-  pinHandles[modelPluginId] = pins.pin(owner, modelPluginId, credentials).handle;
-
   const releasePins = (): void => {
     for (const [pluginId, handle] of Object.entries(pinHandles)) {
       pins.release(owner, pluginId, handle);
     }
   };
+  if (isDeleting(owner)) {
+    releasePins();
+    return accountDeletedResponse(c);
+  }
+  try {
+    pinHandles[modelPluginId] = pins.pin(owner, modelPluginId, credentials).handle;
+  } catch (error) {
+    releasePins();
+    if (error instanceof AccountDeletedError || isDeleting(owner)) {
+      return accountDeletedResponse(c);
+    }
+    throw error;
+  }
+  if (isDeleting(owner)) {
+    releasePins();
+    return accountDeletedResponse(c);
+  }
 
   // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
   // so a queue-full 503 leaves no phantom task row. A queued admission parks
@@ -1680,8 +1815,18 @@ async function handleBackground(
     releasePins();
     return busy(c, 503, reservation.retryAfterSeconds);
   }
+  if (isDeleting(owner)) {
+    reservation.release();
+    releasePins();
+    return accountDeletedResponse(c);
+  }
 
   let task: TaskRow;
+  if (isDeleting(owner)) {
+    reservation.release();
+    releasePins();
+    return accountDeletedResponse(c);
+  }
   try {
     task = await getOrCreateTask(ledger, {
       owner,
@@ -1693,13 +1838,28 @@ async function handleBackground(
       worker: clientThread,
     });
   } catch (err) {
+    if (err instanceof AccountDeletedError || isDeleting(owner)) {
+      releasePins();
+      reservation.release();
+      return accountDeletedResponse(c);
+    }
     console.error("chat: background task admission failed", err);
     releasePins();
     reservation.release();
     return c.json({ error: "internal" }, 500);
   }
+  if (isDeleting(owner)) {
+    reservation.release();
+    releasePins();
+    return accountDeletedResponse(c);
+  }
 
   let result: RunJobResult;
+  if (isDeleting(owner)) {
+    reservation.release();
+    releasePins();
+    return accountDeletedResponse(c);
+  }
   try {
     result = await jobRunner.runJob({
       owner,
@@ -1719,6 +1879,11 @@ async function handleBackground(
       input: { messages: snapshot },
     });
   } catch (err) {
+    if (err instanceof AccountDeletedError || isDeleting(owner)) {
+      releasePins();
+      reservation.release();
+      return accountDeletedResponse(c);
+    }
     console.error("chat: background runJob threw", err);
     // The runner releases pins in its own finally for the claimed path; a
     // throw before claim (ledger edge) leaves them — release here as a safety
@@ -1728,7 +1893,17 @@ async function handleBackground(
     return c.json({ error: "internal" }, 500);
   }
 
-  if (result.status === "in_flight" || result.status === "already_terminal") releasePins();
+  if (isDeleting(owner)) {
+    releasePins();
+    reservation.release();
+    return accountDeletedResponse(c);
+  }
+
+  if (
+    result.status === "in_flight" ||
+    result.status === "already_terminal" ||
+    result.status === "account_deleted"
+  ) releasePins();
   reservation.release();
   if (result.status === "succeeded") {
     scheduleWarmups(opts, owner, resolved.value.toolCredentialsByPlugin);
@@ -1794,14 +1969,39 @@ function pinToolPlugins(
     ? Object.keys(validated)
     : Object.keys(validated).filter((pluginId) => enabledPlugins.includes(pluginId));
   const pinHandles: Record<string, CredentialPinHandle> = {};
+  const releasePins = (): void => {
+    for (const [pluginId, handle] of Object.entries(pinHandles)) {
+      pins.release(owner, pluginId, handle);
+    }
+  };
+  if (isDeleting(owner)) {
+    return { ok: false, response: accountDeletedResponse(c) };
+  }
   for (const pluginId of selected) {
-    pinHandles[pluginId] = pins.pin(owner, pluginId, validated[pluginId]!).handle;
+    if (isDeleting(owner)) {
+      releasePins();
+      return { ok: false, response: accountDeletedResponse(c) };
+    }
+    try {
+      pinHandles[pluginId] = pins.pin(owner, pluginId, validated[pluginId]!).handle;
+    } catch (error) {
+      releasePins();
+      if (error instanceof AccountDeletedError || isDeleting(owner)) {
+        return { ok: false, response: accountDeletedResponse(c) };
+      }
+      throw error;
+    }
+  }
+  if (isDeleting(owner)) {
+    releasePins();
+    return { ok: false, response: accountDeletedResponse(c) };
   }
   return { ok: true, toolPlugins: selected, pinHandles };
 }
 
 /** `JobErrorCode` -> HTTP status for a failed background job. */
-const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 400 | 401 | 409 | 429 | 502 | 500> = {
+const JOB_ERROR_HTTP_STATUS: Record<JobErrorCode, 400 | 401 | 403 | 409 | 429 | 502 | 500> = {
+  account_deleted: 403,
   budget_exhausted: 429,
   context_length_exceeded: 400,
   credentials_expired: 401,
@@ -1850,6 +2050,8 @@ function mapRunJobResult(c: Context, result: RunJobResult, publicThreadId: strin
         { error: result.code, message: result.error },
         JOB_ERROR_HTTP_STATUS[result.code],
       );
+    case "account_deleted":
+      return c.json({ error: "account_deleted", message: result.error }, 403);
   }
 }
 

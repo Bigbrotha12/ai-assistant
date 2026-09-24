@@ -18,6 +18,9 @@ class _FakeTranscriber implements WhisperTranscriber {
   /// The recognition to return for each `transcribe` call.
   String result = 'hello world';
 
+  /// Language argument of every `transcribe` call, in order.
+  final List<String> languages = [];
+
   /// Set to throw inside `transcribe` to exercise the inference-error path.
   Object? error;
 
@@ -25,7 +28,8 @@ class _FakeTranscriber implements WhisperTranscriber {
   int get modelInitCount => _created;
 
   @override
-  Future<String> transcribe(String wavPath) async {
+  Future<String> transcribe(String wavPath, {required String language}) async {
+    languages.add(language);
     _active++;
     if (_active > _maxActive) _maxActive = _active;
     // Let the scheduler interleave so concurrent callers genuinely overlap.
@@ -149,6 +153,67 @@ void main() {
       final text = await engine.transcribe(<int>[2], sampleRate: 16000);
       expect(text, 'hello world');
 
+      _cleanup(dir);
+    });
+  });
+
+  group('WhisperSttEngine language support', () {
+    test('declares a curated multilingual supportedLanguages set', () {
+      final engine = WhisperSttEngine(modelPath: '/nonexistent/ggml-tiny.bin');
+      final languages = engine.supportedLanguages;
+
+      expect(languages, isNotEmpty);
+      expect(languages.length, greaterThanOrEqualTo(10));
+      expect(languages.length, lessThanOrEqualTo(15));
+
+      final codes = languages.map((lang) => lang.code).toList();
+      expect(codes.toSet(), hasLength(codes.length),
+          reason: 'no duplicate codes');
+      for (final code in codes) {
+        expect(code, matches(RegExp(r'^[a-z]{2}$')), reason: 'ISO 639-1');
+      }
+      // Curated majors, including every code the old hardcoded list offered.
+      expect(codes, containsAll(['en', 'es', 'fr', 'de', 'zh', 'ja']));
+
+      for (final lang in languages) {
+        expect(lang.label, isNotEmpty);
+        expect(lang.label, isNot(lang.code),
+            reason: 'labels must be human-readable, not raw codes');
+      }
+    });
+
+    test('defaults the recognition language to en and threads it into STT',
+        () async {
+      final fake = _FakeTranscriber();
+      final dir = await _tempModelFile();
+      final engine = WhisperSttEngine(
+        modelPath: '${dir.path}/ggml-tiny.bin',
+        transcriberFactory: (_) => fake,
+      );
+
+      expect(engine.preferredLanguage, 'en');
+      await engine.transcribe(<int>[1], sampleRate: 16000);
+
+      expect(fake.languages, ['en']);
+      _cleanup(dir);
+    });
+
+    test('constructor language and setter are threaded into every STT call',
+        () async {
+      final fake = _FakeTranscriber();
+      final dir = await _tempModelFile();
+      final engine = WhisperSttEngine(
+        modelPath: '${dir.path}/ggml-tiny.bin',
+        transcriberFactory: (_) => fake,
+        language: 'fr',
+      );
+
+      await engine.transcribe(<int>[1], sampleRate: 16000);
+      engine.preferredLanguage = 'ja';
+      await engine.transcribe(<int>[2], sampleRate: 16000);
+
+      expect(engine.preferredLanguage, 'ja');
+      expect(fake.languages, ['fr', 'ja']);
       _cleanup(dir);
     });
   });

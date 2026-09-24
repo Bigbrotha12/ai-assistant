@@ -23,8 +23,8 @@ abstract interface class MemoryStore {
   /// Deletes a single memory row.
   Future<void> deleteMemory(String id);
 
-  /// Removes every memory row.
-  Future<void> deleteAllMemories();
+  /// Removes every memory row owned by [scopeKey].
+  Future<void> deleteAllMemoriesForScope(String scopeKey);
 
   /// Compaction query: deletes memories whose [Memory.updatedAt] is older than
   /// `now - olderThan` and returns the number of rows removed. An
@@ -37,9 +37,18 @@ abstract interface class MemoryStore {
 
 /// Drift-backed [MemoryStore].
 class DriftMemoryStore implements MemoryStore {
-  DriftMemoryStore(this._db);
+  DriftMemoryStore(this._db, {required this.scopeKey});
 
   final AppDatabase _db;
+  final String scopeKey;
+
+  Expression<bool> _scope(Memories t) => t.scopeKey.equals(scopeKey);
+
+  void _checkScope(String targetScope) {
+    if (targetScope != scopeKey) {
+      throw StateError('Memory store scope mismatch');
+    }
+  }
 
   /// Scale factor for the days-since-updated recency term in the FTS5 search
   /// ranking.
@@ -57,7 +66,9 @@ class DriftMemoryStore implements MemoryStore {
     final row = _toRow(memory);
     // DoUpdate only writes content/source/updatedAt, leaving the original
     // createdAt (and id) untouched on conflict.
-    await _db.into(_db.memories).insert(
+    await _db
+        .into(_db.memories)
+        .insert(
           row,
           onConflict: DoUpdate(
             (_) => MemoriesCompanion(
@@ -71,17 +82,20 @@ class DriftMemoryStore implements MemoryStore {
 
   @override
   Future<Memory?> getMemory(String id) async {
-    final row = await (_db.select(_db.memories)..where((t) => t.id.equals(id)))
-        .getSingleOrNull();
+    final row = await (_db.select(
+      _db.memories,
+    )..where((t) => t.id.equals(id) & _scope(t))).getSingleOrNull();
     return row == null ? null : _fromRow(row);
   }
 
   @override
   Future<List<Memory>> listMemories({int limit = 50}) async {
-    final rows = await (_db.select(_db.memories)
-          ..orderBy([(t) => OrderingTerm.desc(t.updatedAt)])
-          ..limit(limit))
-        .get();
+    final rows =
+        await (_db.select(_db.memories)
+              ..where(_scope)
+              ..orderBy([(t) => OrderingTerm.desc(t.updatedAt)])
+              ..limit(limit))
+            .get();
     return rows.map(_fromRow).toList();
   }
 
@@ -93,10 +107,10 @@ class DriftMemoryStore implements MemoryStore {
     // Unicode-aware tokenization: FTS5's default unicode61 tokenizer indexes
     // letters in any script, so an ASCII-only \w+ would silently miss accented
     // words ("café" -> "caf") and yield zero terms for CJK text.
-    final terms = RegExp(r'[\p{L}\p{N}_]+', unicode: true)
-        .allMatches(query.trim())
-        .map((m) => m.group(0)!)
-        .toList();
+    final terms = RegExp(
+      r'[\p{L}\p{N}_]+',
+      unicode: true,
+    ).allMatches(query.trim()).map((m) => m.group(0)!).toList();
     // FTS5 MATCH throws on an empty expression, so bail out early.
     if (terms.isEmpty) {
       return const [];
@@ -111,10 +125,11 @@ class DriftMemoryStore implements MemoryStore {
           // DateTime as unix epoch seconds, so the age is
           // `unixepoch() - m.updated_at` (unixepoch() needs SQLite >= 3.38,
           // bundled via sqlite3_flutter_libs).
-          'SELECT m.id, m.content, m.source, m.created_at, m.updated_at '
+          'SELECT m.scope_key, m.id, m.content, m.source, m.created_at, '
+          'm.updated_at '
           'FROM memories AS m '
           'JOIN memories_fts ON memories_fts.rowid = m.rowid '
-          'WHERE memories_fts MATCH ?1 '
+          'WHERE memories_fts MATCH ?1 AND m.scope_key = ?4 '
           'ORDER BY (bm25(memories_fts) '
           ' + MAX(MIN((unixepoch() - m.updated_at) / 86400.0, 30.0), 0.0) '
           ' * ?2) ASC '
@@ -123,6 +138,7 @@ class DriftMemoryStore implements MemoryStore {
             Variable<String>(ftsQuery),
             Variable<double>(recencyWeight),
             Variable<int>(limit),
+            Variable<String>(scopeKey),
           ],
         )
         .get();
@@ -135,12 +151,15 @@ class DriftMemoryStore implements MemoryStore {
 
   @override
   Future<void> deleteMemory(String id) async {
-    await (_db.delete(_db.memories)..where((t) => t.id.equals(id))).go();
+    await (_db.delete(
+      _db.memories,
+    )..where((t) => t.id.equals(id) & _scope(t))).go();
   }
 
   @override
-  Future<void> deleteAllMemories() async {
-    await _db.delete(_db.memories).go();
+  Future<void> deleteAllMemoriesForScope(String targetScope) async {
+    _checkScope(targetScope);
+    await (_db.delete(_db.memories)..where(_scope)).go();
   }
 
   @override
@@ -149,32 +168,35 @@ class DriftMemoryStore implements MemoryStore {
       return 0;
     }
     final cutoff = DateTime.now().subtract(olderThan);
-    return (_db.delete(_db.memories)
-          ..where((t) => t.updatedAt.isSmallerThanValue(cutoff)))
-        .go();
+    return (_db.delete(
+      _db.memories,
+    )..where((t) => _scope(t) & t.updatedAt.isSmallerThanValue(cutoff))).go();
   }
 
   @override
   Future<int> countMemories() async {
-    final row = await (_db.selectOnly(_db.memories)
-          ..addColumns([_db.memories.id.count()]))
-        .getSingle();
+    final row =
+        await (_db.selectOnly(_db.memories)
+              ..addColumns([_db.memories.id.count()])
+              ..where(_db.memories.scopeKey.equals(scopeKey)))
+            .getSingle();
     return row.read(_db.memories.id.count()) ?? 0;
   }
 
   MemoriesCompanion _toRow(Memory memory) => MemoriesCompanion(
-        id: Value(memory.id),
-        content: Value(memory.content),
-        source: Value(memory.source),
-        createdAt: Value(memory.createdAt),
-        updatedAt: Value(memory.updatedAt),
-      );
+    scopeKey: Value(scopeKey),
+    id: Value(memory.id),
+    content: Value(memory.content),
+    source: Value(memory.source),
+    createdAt: Value(memory.createdAt),
+    updatedAt: Value(memory.updatedAt),
+  );
 
   Memory _fromRow(MemoryRow row) => Memory(
-        id: row.id,
-        content: row.content,
-        source: row.source,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
-      );
+    id: row.id,
+    content: row.content,
+    source: row.source,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  );
 }

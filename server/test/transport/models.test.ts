@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { inferenceRoutes } from "../../src/inference.ts";
+import { inferenceRoutes } from "../../src/api_key.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import {
@@ -128,7 +128,7 @@ async function makeApp(
     "/v1",
     createModelsRoutes({
       registry,
-      verifyKey: verifyKey ?? (async () => "test-user"),
+      verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
     }),
   );
   return { app, registry };
@@ -277,7 +277,7 @@ describe("GET /v1/models (HTTP)", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createModelsRoutes({ registry, verifyKey: async () => "test-user" }),
+      createModelsRoutes({ registry, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
     );
 
     const res = await app.request("/v1/models", { headers: auth });
@@ -299,7 +299,7 @@ describe("GET /v1/models (HTTP)", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createModelsRoutes({ registry, verifyKey: async () => "test-user" }),
+      createModelsRoutes({ registry, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
     );
 
     const res = await app.request("/v1/models", { headers: auth });
@@ -307,11 +307,21 @@ describe("GET /v1/models (HTTP)", () => {
     assert.deepEqual(await res.json(), { error: "inference_unavailable" });
   });
 
-  test("401 { error: unauthorized } when the verifier returns null", async (t) => {
-    const { app } = await makeApp(t, async () => null);
+  test("401 { error: unauthorized } when the verifier returns bad_key", async (t) => {
+    const { app } = await makeApp(t, async () => ({ ok: false as const, reason: "bad_key" as const }));
     const res = await app.request("/v1/models", { headers: auth });
     assert.equal(res.status, 401);
     assert.deepEqual(await res.json(), { error: "unauthorized" });
+  });
+
+  test("403 { error: email_not_verified } when the owner's email is unverified", async (t) => {
+    const { app } = await makeApp(t, async () => ({
+      ok: false as const,
+      reason: "email_not_verified" as const,
+    }));
+    const res = await app.request("/v1/models", { headers: auth });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "email_not_verified" });
   });
 });
 
@@ -328,7 +338,7 @@ describe("GET /v1/models — mount order / single owner", () => {
     app.route("/v1", inferenceRoutes);
     app.route(
       "/v1",
-      createModelsRoutes({ registry, verifyKey: async () => "test-user" }),
+      createModelsRoutes({ registry, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
     );
 
     const res = await app.request("/v1/models", { headers: auth });

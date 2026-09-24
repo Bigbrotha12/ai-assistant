@@ -1,0 +1,38 @@
+# k8s liveness/readiness probes for the AI Assistant gateway (M5 watchdog).
+#
+# INTENDED FOR THE OPS-SIDE k3s PATCH — NOT applied by this repo's CI.
+# This repository ships no deployment manifests (confirmed) and its CI does
+# not apply this file; ops folds it into the existing k3s Deployment patch.
+#
+# - Gateway image, container name, port and service/namespace names come from
+#   the ops config — placeholders below assume container `gateway` on the
+#   gateway's PORT (default 17600). Adjust to match.
+# - Probes hit `GET /health` (unauthenticated): HTTP 200 when both DB checks
+#   pass, 503 `degraded` otherwise, so HTTP status alone drives the probe.
+# - No secrets; generic snippet only.
+#
+# Apply as a strategic-merge patch (containers merge by name), e.g.:
+#   kubectl -n <namespace> patch deployment gateway --type strategic \
+#     --patch-file deploy/k8s/health-probes.yaml
+
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 17600
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 17600
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3

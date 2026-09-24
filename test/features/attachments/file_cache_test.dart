@@ -10,7 +10,7 @@ void main() {
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('file_cache_test');
-    cache = FileCache(cacheDir: tempDir);
+    cache = FileCache(cacheDir: tempDir, scopeKey: 'scope-a');
   });
 
   tearDown(() async {
@@ -21,7 +21,11 @@ void main() {
 
   group('cacheFile / getCached', () {
     test('writes bytes and returns the absolute path', () async {
-      final path = await cache.cacheFile('f1', '.jpg', Uint8List.fromList([1, 2, 3]));
+      final path = await cache.cacheFile(
+        'f1',
+        '.jpg',
+        Uint8List.fromList([1, 2, 3]),
+      );
 
       expect(File(path).isAbsolute, isTrue);
       expect(File(path).existsSync(), isTrue);
@@ -48,6 +52,7 @@ void main() {
     test('getCached returns null when expired', () async {
       final shortTtl = FileCache(
         cacheDir: tempDir,
+        scopeKey: 'scope-a',
         ttl: const Duration(milliseconds: 10),
       );
       await shortTtl.cacheFile('f1', '.jpg', Uint8List.fromList([1]));
@@ -58,6 +63,38 @@ void main() {
   });
 
   group('evict', () {
+    test('namespaces identical file ids and evicts only one account', () async {
+      final cacheB = FileCache(cacheDir: tempDir, scopeKey: 'scope-b');
+      final pathA = await cache.cacheFile(
+        'shared',
+        '.jpg',
+        Uint8List.fromList([1]),
+      );
+      final pathB = await cacheB.cacheFile(
+        'shared',
+        '.jpg',
+        Uint8List.fromList([2]),
+      );
+
+      expect(pathA, isNot(pathB));
+      expect(File(pathA).readAsBytesSync().toList(), [1]);
+      expect(File(pathB).readAsBytesSync().toList(), [2]);
+      expect((await cache.getCached('shared'))!.localPath, pathA);
+      expect((await cacheB.getCached('shared'))!.localPath, pathB);
+
+      await cache.evictAllForScope('scope-a');
+      expect(await cache.getCached('shared'), isNull);
+      expect(await cacheB.getCached('shared'), isNotNull);
+      expect(File(pathB).readAsBytesSync().toList(), [2]);
+      await expectLater(
+        cacheB.evictAllForScope('scope-a'),
+        throwsA(isA<StateError>()),
+      );
+
+      await cacheB.evictAll();
+      expect(await cacheB.getCached('shared'), isNull);
+    });
+
     test('removes the file', () async {
       await cache.cacheFile('f1', '.jpg', Uint8List.fromList([1]));
 
@@ -85,32 +122,51 @@ void main() {
     test('evicts expired entries then oldest until under the cap', () async {
       final smallCache = FileCache(
         cacheDir: tempDir,
+        scopeKey: 'scope-a',
         ttl: const Duration(days: 7),
         maxBytes: 5,
       );
-      await smallCache.cacheFile('old', '.jpg', Uint8List.fromList([1, 2, 3]));
-      final oldFile = File('${tempDir.path}/old.jpg');
+      final oldPath = await smallCache.cacheFile(
+        'old',
+        '.jpg',
+        Uint8List.fromList([1, 2, 3]),
+      );
+      final oldFile = File(oldPath);
       final oldMod = DateTime.now().subtract(const Duration(days: 8));
       await oldFile.setLastModified(oldMod);
-      await smallCache.cacheFile('new', '.jpg', Uint8List.fromList([9, 9, 9, 9, 9, 9]));
+      await smallCache.cacheFile(
+        'new',
+        '.jpg',
+        Uint8List.fromList([9, 9, 9, 9, 9, 9]),
+      );
 
       await smallCache.evictExpired();
 
-      expect(await smallCache.getCached('old'), isNull,
-          reason: 'expired entry should be evicted');
+      expect(
+        await smallCache.getCached('old'),
+        isNull,
+        reason: 'expired entry should be evicted',
+      );
       expect(await smallCache.totalBytes, lessThanOrEqualTo(5));
     });
 
     test('evicts the oldest first when over the cap', () async {
-      final smallCache = FileCache(cacheDir: tempDir, maxBytes: 6);
+      final smallCache = FileCache(
+        cacheDir: tempDir,
+        scopeKey: 'scope-a',
+        maxBytes: 6,
+      );
       await smallCache.cacheFile('a', '.jpg', Uint8List.fromList([1, 1, 1, 1]));
       await Future<void>.delayed(const Duration(milliseconds: 20));
       await smallCache.cacheFile('b', '.jpg', Uint8List.fromList([2, 2, 2, 2]));
 
       await smallCache.evictExpired();
 
-      expect(await smallCache.getCached('a'), isNull,
-          reason: 'oldest should be evicted first');
+      expect(
+        await smallCache.getCached('a'),
+        isNull,
+        reason: 'oldest should be evicted first',
+      );
       expect(await smallCache.getCached('b'), isNotNull);
     });
   });

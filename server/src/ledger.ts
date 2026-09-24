@@ -46,6 +46,15 @@ export const DEFAULT_LEASE_EXPIRY_MS = 60_000;
 
 export const LEDGER_GENESIS_PREFIX = "ledger-genesis:";
 
+/** Result of {@link Ledger.purgeOwnerData} (M12 account deletion). */
+export type OwnerPurgeResult = {
+  /** Non-terminal tasks transitioned to `cancelled` before the delete, with
+   *  the status each held when the purge started. */
+  cancelled: { id: string; from: TaskStatus }[];
+  /** Number of `ledger_task` rows removed for the owner (all statuses). */
+  deletedTasks: number;
+};
+
 export type LedgerConfig = {
   stuckTimeoutMs?: number;
   leaseExpiryMs?: number;
@@ -324,6 +333,12 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
   (db) => {
     db.exec(`
       ALTER TABLE ledger_task ADD COLUMN payload TEXT;
+    `);
+  },
+  (db) => {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
+        ON ledger_task(status, updated_ts);
     `);
   },
 ];
@@ -903,6 +918,79 @@ export class Ledger {
     });
     purge(rows.map((r) => r.id));
     return rows.length;
+  }
+
+  /**
+   * M12 account-deletion purge: removes EVERY row owned by [owner] — tasks,
+   * steps and chain — and returns what happened so the caller (the better-auth
+   * `deleteUser` cascade in auth.ts) can observe the cleanup.
+   *
+   * Before any delete, every NON-terminal task of the owner is transitioned to
+   * `cancelled` through the legal state machine (`queued`/`running` go
+   * directly; `stuck` rides `running` first), so a doomed job never sits in a
+   * live status while its rows are removed. Terminal tasks, including
+   * `awaiting_review`, are left as-is on the status column and deleted with the
+   * rest. The transitioned ids are reported in `cancelled` (with their prior
+   * status) — the rows are gone by the time the transaction commits, so this
+   * result is the only observable evidence that the cancel-before-delete
+   * ordering held.
+   *
+   * The 4 append-only triggers would abort the child deletes, so — following
+   * `purgeTerminalTasks` exactly — the two DELETE guards are dropped, the
+   * chain/step/task rows deleted (children first), and the guards recreated,
+   * all inside ONE transaction: a failure rolls the trigger recreation back
+   * with the deletes. Self-scoped: every statement is keyed by [owner], so a
+   * purge never touches another owner's rows. Idempotent: purging an owner
+   * with no rows is a no-op (triggers are not even touched).
+   */
+  purgeOwnerData(owner: string): OwnerPurgeResult {
+    const tasks = this.db
+      .prepare(
+        `SELECT id, status FROM ledger_task
+         WHERE owner = ? ORDER BY created_ts, id`,
+      )
+      .all(owner) as { id: string; status: TaskStatus }[];
+    const result: OwnerPurgeResult = {
+      cancelled: [],
+      deletedTasks: tasks.length,
+    };
+    if (tasks.length === 0) return result;
+
+    const purge = this.db.transaction(() => {
+      for (const task of tasks) {
+        if (TERMINAL_TASK_STATUSES.includes(task.status)) continue;
+        if (task.status === "stuck") {
+          this.setStatus(task.id, task.status, "running");
+          this.setStatus(task.id, "running", "cancelled");
+        } else {
+          this.setStatus(task.id, task.status, "cancelled");
+        }
+        result.cancelled.push({ id: task.id, from: task.status });
+      }
+      this.db.exec("DROP TRIGGER IF EXISTS ledger_step_append_only_delete");
+      this.db.exec("DROP TRIGGER IF EXISTS ledger_chain_append_only_delete");
+      const ids = tasks.map((t) => t.id);
+      const placeholders = ids.map(() => "?").join(", ");
+      this.db
+        .prepare(`DELETE FROM ledger_chain WHERE task_id IN (${placeholders})`)
+        .run(...ids);
+      this.db
+        .prepare(`DELETE FROM ledger_step WHERE task_id IN (${placeholders})`)
+        .run(...ids);
+      this.db.prepare("DELETE FROM ledger_task WHERE owner = ?").run(owner);
+      this.db.exec(`
+        CREATE TRIGGER ledger_step_append_only_delete
+        BEFORE DELETE ON ledger_step
+        BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
+      `);
+      this.db.exec(`
+        CREATE TRIGGER ledger_chain_append_only_delete
+        BEFORE DELETE ON ledger_chain
+        BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
+      `);
+    });
+    purge();
+    return result;
   }
 
   /**

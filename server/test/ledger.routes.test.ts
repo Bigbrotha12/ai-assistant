@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { Ledger, migrateLedger } from "../src/ledger.ts";
 import { createLedgerRoutes } from "../src/ledger.routes.ts";
 import type { VerifyApiKeyFn } from "../src/plugins/routes.ts";
+import { clearDeleting, markDeleting } from "../src/account_deletion.ts";
 
 /**
  * Build the ledger app the way src/index.ts does (`app.route("/ledger", ...)`)
@@ -24,7 +25,7 @@ function makeApp(verifyKey?: VerifyApiKeyFn): {
   app.route(
     "/ledger",
     createLedgerRoutes(ledger, {
-      verifyKey: verifyKey ?? (async () => "user-1"),
+      verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "user-1" })),
     }),
   );
   return { app, db, ledger };
@@ -76,7 +77,7 @@ describe("ledger routes — status by idempotency key", () => {
     const intruder = new Hono();
     intruder.route(
       "/ledger",
-      createLedgerRoutes(ledger, { verifyKey: async () => "intruder" }),
+      createLedgerRoutes(ledger, { verifyKey: async () => ({ ok: true as const, owner: "intruder" }) }),
     );
     const res = await intruder.request("/ledger/tasks/by-key/msg-secret", {
       headers: auth,
@@ -95,12 +96,24 @@ describe("ledger routes — status by idempotency key", () => {
   });
 
   test("401 without a valid key", async () => {
-    const { app } = makeApp(async () => null);
+    const { app } = makeApp(async () => ({ ok: false as const, reason: "bad_key" as const }));
     const res = await app.request("/ledger/tasks/by-key/msg-abc", {
       headers: auth,
     });
     assert.equal(res.status, 401);
     assert.deepEqual(await res.json(), { error: "unauthorized" });
+  });
+
+  test("valid key but the owner's email is unverified -> 403 email_not_verified", async () => {
+    const { app } = makeApp(async () => ({
+      ok: false as const,
+      reason: "email_not_verified" as const,
+    }));
+    const res = await app.request("/ledger/tasks/by-key/msg-abc", {
+      headers: auth,
+    });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "email_not_verified" });
   });
 
   test("the existing /ledger/tasks/:id surface still works alongside by-key", async () => {
@@ -141,7 +154,7 @@ describe("ledger routes — status by idempotency key", () => {
     const other = new Hono();
     other.route(
       "/ledger",
-      createLedgerRoutes(ledger, { verifyKey: async () => "user-2" }),
+      createLedgerRoutes(ledger, { verifyKey: async () => ({ ok: true as const, owner: "user-2" }) }),
     );
     const res = await other.request("/ledger/tasks", {
       method: "POST",
@@ -149,6 +162,41 @@ describe("ledger routes — status by idempotency key", () => {
       body: JSON.stringify({ intentKey: "scope-key", spec: {} }),
     });
     assert.equal(res.status, 201, "a different owner gets their own task");
+  });
+});
+
+describe("ledger routes — deletion tombstones", () => {
+  test("a tombstoned owner cannot create, claim, or resume tasks", async () => {
+    const owner = "ledger-deleted-owner";
+    const { app, ledger } = makeApp(async () => ({ ok: true as const, owner }));
+    const existing = ledger.createTask({ owner, intentKey: "existing", spec: "s" });
+    markDeleting(owner);
+    try {
+      const created = await app.request("/ledger/tasks", {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({ intentKey: "late", spec: {} }),
+      });
+      assert.equal(created.status, 403);
+      assert.deepEqual(await created.json(), { error: "account_deleted" });
+      assert.equal(ledger.getTaskByIntentKey(owner, "late"), null);
+
+      const claimed = await app.request(`/ledger/tasks/${existing.id}/claim`, {
+        method: "POST",
+        headers: auth,
+      });
+      assert.equal(claimed.status, 403);
+      assert.deepEqual(await claimed.json(), { error: "account_deleted" });
+      const resumed = await app.request(`/ledger/tasks/${existing.id}/resume`, {
+        method: "POST",
+        headers: auth,
+      });
+      assert.equal(resumed.status, 403);
+      assert.deepEqual(await resumed.json(), { error: "account_deleted" });
+      assert.equal(ledger.getTask(existing.id, owner)?.status, "queued");
+    } finally {
+      clearDeleting(owner);
+    }
   });
 });
 

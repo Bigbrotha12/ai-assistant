@@ -365,7 +365,17 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                             child: Column(
                               children: [
                                 _TurnStatusLine(
-                                  notice: state.notice,
+                                  // A dedicated notice (e.g. dropped
+                                  // utterance) wins; otherwise a latched
+                                  // mic-buffer truncation (W1.4) surfaces in
+                                  // the same reserved, non-blocking slot —
+                                  // shown while recording, cleared by the
+                                  // controller when the buffer flushes.
+                                  notice: state.notice ??
+                                      (state.micBufferTruncated
+                                          ? 'Utterance truncated — kept the '
+                                              'last 3 minutes.'
+                                          : null),
                                 ),
                                 const SizedBox(height: 10),
                                 _PhaseLabel(

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { requireApiKey, unauthorized } from "../inference.ts";
+import { keyGateResponse, requireApiKey } from "../api_key.ts";
 import type { Catalogs } from "../catalog/index.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 
@@ -14,8 +14,8 @@ export function createMcpRoutes(opts: McpRoutesOptions): Hono {
   const routes = new Hono();
 
   routes.get("/mcps", async (c) => {
-    const owner = await verifyKey(c);
-    if (!owner) return unauthorized(c);
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
 
     const data = catalogs.mcps.map(s => ({
       name: s.name,

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { redactForCheckpoint } from "../checkpoints/store.ts";
+import { redactForOutbound } from "../redact.ts";
 import { BudgetExhaustedError } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 
@@ -525,5 +525,5 @@ function errorMessage(error: unknown): string {
 
 /** Error messages must never carry credential material (§5.2 / Appendix A). */
 function redact(message: string): string {
-  return redactForCheckpoint(message);
+  return redactForOutbound(message);
 }

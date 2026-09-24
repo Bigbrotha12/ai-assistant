@@ -38,9 +38,13 @@ class Messages extends Table {
 /// conversation (the file browser lists files across all conversations).
 /// The local `id` is the server-assigned id; `serverFileId` stores the same
 /// value for future-proofing (see `DriftFileStore` mapping notes).
-@TableIndex(name: 'files_conversation_id_idx', columns: {#conversationId})
+@TableIndex(
+  name: 'files_scope_key_conversation_id_idx',
+  columns: {#scopeKey, #conversationId},
+)
 @DataClassName('FileRow')
 class Files extends Table {
+  TextColumn get scopeKey => text()();
   TextColumn get id => text()();
   TextColumn get conversationId => text().nullable().references(
     Conversations,
@@ -57,21 +61,22 @@ class Files extends Table {
   TextColumn get description => text().nullable()();
 
   @override
-  Set<Column> get primaryKey => {id};
+  Set<Column> get primaryKey => {scopeKey, id};
 }
-
-/// Index for the per-conversation file listing / cascade. The table grows with
-/// every upload, so scanning without an index gets progressively slower.
 
 /// A single deferred memory: free-form text with optional provenance and
 /// date-weighted retrieval via the FTS5 index (`memories_fts`).
 ///
-/// The `updated_at` index backs `listMemories` (ORDER BY updated_at DESC) and
-/// `compact` (WHERE updated_at < cutoff); without it both scan the whole table.
-@TableIndex(name: 'memories_updated_at_idx', columns: {#updatedAt})
+/// The `(scope_key, updated_at)` index backs scoped list/compaction queries;
+/// without it both scan the whole table.
+@TableIndex(
+  name: 'memories_scope_key_updated_at_idx',
+  columns: {#scopeKey, #updatedAt},
+)
 @DataClassName('MemoryRow')
 class Memories extends Table {
-  TextColumn get id => text()(); // UUID PK
+  TextColumn get scopeKey => text()();
+  TextColumn get id => text()();
   TextColumn get content => text()(); // the memory text
   TextColumn get source =>
       text().nullable()(); // provenance (conversation id, 'manual')
@@ -79,9 +84,10 @@ class Memories extends Table {
   DateTimeColumn get updatedAt => dateTime()();
 
   @override
-  Set<Column> get primaryKey => {id};
+  Set<Column> get primaryKey => {scopeKey, id};
 }
 
+@TableIndex(name: 'managed_pending_turns_scope_key_idx', columns: {#scopeKey})
 @DataClassName('ManagedPendingTurnRow')
 class ManagedPendingTurns extends Table {
   // No FK to conversations: a FIRST send persists the pending turn before the
@@ -105,7 +111,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 7;
+  int get schemaVersion => 9;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -116,16 +122,16 @@ class AppDatabase extends _$AppDatabase {
     onUpgrade: (m, from, to) async {
       if (from < 2) {
         await m.createTable(files);
-        await m.createIndex(filesConversationIdIdx);
+        await m.createIndex(filesScopeKeyConversationIdIdx);
       }
-      if (from < 3) {
+      if (from == 2) {
         await m.alterTable(
           TableMigration(files, newColumns: [files.description]),
         );
       }
       if (from < 4) {
         await m.createTable(memories);
-        await m.createIndex(memoriesUpdatedAtIdx);
+        await m.createIndex(memoriesScopeKeyUpdatedAtIdx);
         await _createMemoryFts(m);
       }
       if (from < 5) {
@@ -148,11 +154,23 @@ class AppDatabase extends _$AppDatabase {
           );
         }
       }
+      if (from < 8) {
+        await m.createIndex(managedPendingTurnsScopeKeyIdx);
+      }
+      if (from >= 2 && from < 9) {
+        await _rebuildScopedFiles(m);
+      }
+      if (from >= 4 && from < 9) {
+        await _rebuildScopedMemories(m);
+      }
+
       // v4: memories table + FTS5 full-text search (see DriftMemoryStore).
       // v5: index on messages.conversationId (per-conversation message
       // loads and watchConversations scan no longer table-scan).
       // v6: scopeKey + session_id on conversations and managed_pending_turns.
       // v7: legacy public_thread_id renamed to session_id in place.
+      // v8: pending-turn scope index.
+      // v9: account-scoped composite-key files and memories.
     },
     beforeOpen: (details) async {
       // SQLite does NOT enable FK enforcement by default — without this
@@ -160,6 +178,65 @@ class AppDatabase extends _$AppDatabase {
       await customStatement('PRAGMA foreign_keys = ON');
     },
   );
+
+  Future<void> _rebuildScopedFiles(Migrator m) async {
+    final db = m.database;
+    const replacement = 'files__f8_scoped';
+    await db.customStatement('DROP TABLE IF EXISTS $replacement');
+    await db.customStatement('''
+      CREATE TABLE $replacement (
+        scope_key TEXT NOT NULL,
+        id TEXT NOT NULL,
+        conversation_id TEXT
+          REFERENCES conversations (id) ON DELETE CASCADE,
+        server_file_id TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        mime_type TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        description TEXT,
+        PRIMARY KEY (scope_key, id)
+      )
+    ''');
+
+    // F8 legacy policy: DELETE, DO NOT BACKFILL. Only a file whose existing
+    // conversation has a non-null scope is unambiguous. Null links, null-scope
+    // parents, and orphan links are deliberately excluded and therefore lost.
+    await db.customStatement('''
+      INSERT INTO $replacement (
+        scope_key, id, conversation_id, server_file_id, local_path, filename,
+        size_bytes, mime_type, created_at, updated_at, description
+      )
+      SELECT c.scope_key, f.id, f.conversation_id, f.server_file_id,
+             f.local_path, f.filename, f.size_bytes, f.mime_type,
+             f.created_at, f.updated_at, f.description
+      FROM files AS f
+      INNER JOIN conversations AS c ON c.id = f.conversation_id
+      WHERE c.scope_key IS NOT NULL
+    ''');
+    await db.customStatement('DROP TABLE files');
+    await db.customStatement('ALTER TABLE $replacement RENAME TO files');
+    await m.createIndex(filesScopeKeyConversationIdIdx);
+  }
+
+  Future<void> _rebuildScopedMemories(Migrator m) async {
+    final db = m.database;
+    await db.customStatement('DROP TRIGGER IF EXISTS memories_ai');
+    await db.customStatement('DROP TRIGGER IF EXISTS memories_ad');
+    await db.customStatement('DROP TRIGGER IF EXISTS memories_au');
+    await db.customStatement('DROP TABLE IF EXISTS memories_fts');
+
+    // F8 legacy policy: DELETE, DO NOT BACKFILL. Memory.source is free-form
+    // provenance, not a trustworthy conversation link, so every legacy memory
+    // is deleted. Recreating FTS from an empty table prevents deleted content
+    // from surviving in the external-content index.
+    await db.customStatement('DROP TABLE memories');
+    await m.createTable(memories);
+    await m.createIndex(memoriesScopeKeyUpdatedAtIdx);
+    await _createMemoryFts(m);
+  }
 
   /// Creates the external-content FTS5 index (`memories_fts`) over the
   /// `memories` table plus the triggers that keep it in sync.

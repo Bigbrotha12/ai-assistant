@@ -26,7 +26,7 @@ import { isRecord } from "../util.ts";
  *
  * `extractCredentialsFromBody` resolves the per-plugin object; the
  * `Authorization: Bearer` header (used for model-plugin keys) is parsed by the
- * transport's `requireApiKey`/`extractBearerToken` in `inference.ts`.
+ * transport's `requireApiKey`/`extractBearerToken` in `api_key.ts`.
  *
  * Non-leak guardrails:
  *  - No credential value is ever logged, echoed, or included in error messages
@@ -203,18 +203,25 @@ export function extractCredentialsFromBody(
 }
 
 /**
- * Stable, non-reversible sha256 over sorted `key=value` pairs of a validated
- * credential set (Phase 4's tool-result cache key:
+ * Stable, non-reversible SHA-256 over a versioned, canonical JSON encoding of
+ * sorted `[key, value]` pairs from a validated credential set (Phase 4's
+ * tool-result cache key:
  * `(userId, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)`).
- * A hash, never a store of the values: NEVER log this alongside (or instead
- * of) its source credentials, and never use it to look values back up.
+ * JSON escaping makes the encoding collision-free for arbitrary string keys
+ * and values; the version prefix separates it from the previous delimiter-
+ * joined encoding. A hash, never a store of the values: NEVER log this
+ * alongside (or instead of) its source credentials, and never use it to look
+ * values back up.
  */
 export function credentialFingerprint(creds: Record<string, string>): string {
-  const joined = Object.keys(creds)
-    .sort()
-    .map((reference) => `${reference}=${creds[reference]}`)
-    .join("|");
-  return createHash("sha256").update(joined, "utf8").digest("hex");
+  const canonicalJson = JSON.stringify(
+    Object.keys(creds)
+      .sort()
+      .map((reference) => [reference, creds[reference]]),
+  );
+  return createHash("sha256")
+    .update(`v2\0${canonicalJson}`, "utf8")
+    .digest("hex");
 }
 
 /** Marker substituted for credential values in logs/errors — never the value. */

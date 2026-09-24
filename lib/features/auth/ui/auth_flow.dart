@@ -52,6 +52,15 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
   /// is already registered; surfaces the "Sign in instead" affordance.
   bool _emailTaken = false;
 
+  /// True while the email-verification "check your inbox" state is shown
+  /// instead of the credentials form: either the sign-up came back without a
+  /// session (C2 tokenless sign-up) or sign-in was rejected with
+  /// EMAIL_NOT_VERIFIED. Offers resend + a way back to sign-in.
+  bool _verifyMode = false;
+
+  /// True when a resend attempt succeeded (shows the confirmation line).
+  bool _verifySent = false;
+
   @override
   void dispose() {
     _nameController.dispose();
@@ -88,6 +97,20 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
               password: password,
             )
           : await auth.signIn(email: email, password: password);
+      if (session.token.isEmpty) {
+        // C2 tokenless sign-up: the account exists but the server created no
+        // session (email verification gates sign-in). No key can be minted —
+        // enter the check-your-inbox state instead.
+        if (!mounted) return;
+        setState(() {
+          _submitting = false;
+          _error = null;
+          _emailTaken = false;
+          _verifyMode = true;
+          _verifySent = false;
+        });
+        return;
+      }
       // The minted key is the single source of truth going forward: persist it
       // (updating the notifier state so the gate sees the app as configured)
       // before reporting success to the caller. The key record id and session
@@ -102,12 +125,24 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
           sessionToken: session.token,
           ownerId: session.ownerId,
           backendOrigin: session.backendOrigin,
+          mintedAt: DateTime.now(),
         ),
         expectedEpoch: authEpoch,
       );
       if (!mounted) return;
       widget.onSuccess(session);
       setState(() => _submitting = false);
+    } on AuthEmailNotVerified catch (_) {
+      // Sign-in of an unverified account: route to the check-inbox state
+      // with the typed email already in the controller for resend.
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _error = null;
+        _emailTaken = false;
+        _verifyMode = true;
+        _verifySent = false;
+      });
     } on AuthApiError catch (e) {
       if (!mounted) return;
       setState(() {
@@ -163,22 +198,72 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
       _forgotMode = false;
       _forgotSent = false;
       _emailTaken = false;
+      _verifyMode = false;
+      _verifySent = false;
       _error = null;
     });
+  }
+
+  Future<void> _resendVerification() async {
+    if (_submitting) return;
+    final email = _emailController.text.trim();
+    if (email.isEmpty) {
+      setState(() => _error = 'Enter your email address');
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+      _verifySent = false;
+    });
+    try {
+      await ref.read(authClientProvider).sendVerificationEmail(email: email);
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _verifySent = true;
+      });
+    } on AuthRateLimited catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _verifySent = false;
+        _error = e.retryAfterSeconds != null
+            ? 'Too many requests — try again in ${e.retryAfterSeconds} seconds.'
+            : 'Too many requests — try again in a minute.';
+      });
+    } on AuthApiError catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _verifySent = false;
+        _error = _authErrorText(e);
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _verifySent = false;
+        _error = 'Could not send the verification email. Try again.';
+      });
+    }
   }
 
   static String _authErrorText(AuthApiError e) => switch (e) {
     AuthInvalidCredentials(code: final code?)
         when code == 'PASSWORD_TOO_SHORT' =>
-          'Password must be at least 8 characters',
+      'Password must be at least 8 characters',
     AuthInvalidCredentials(code: final code?)
         when code == 'PASSWORD_TOO_LONG' =>
-          'Password is too long',
-    AuthInvalidCredentials(code: final code?)
-        when code == 'INVALID_EMAIL' =>
-          'Enter a valid email address',
+      'Password is too long',
+    AuthInvalidCredentials(code: final code?) when code == 'INVALID_EMAIL' =>
+      'Enter a valid email address',
     AuthInvalidCredentials() => 'Incorrect email or password',
     AuthEmailTaken() => 'An account already exists for this email',
+    AuthEmailNotVerified() => 'Verify your email — check your inbox.',
+    AuthRateLimited(retryAfterSeconds: final seconds?) =>
+      'Too many requests — try again in $seconds seconds.',
+    AuthRateLimited() => 'Too many requests — try again in a minute.',
     AuthUnauthorized() => 'This session was rejected. Try signing in again.',
     AuthNetworkError() => 'Could not reach the server. Check your connection.',
     AuthServerError(statusCode: final status)
@@ -189,6 +274,9 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
 
   @override
   Widget build(BuildContext context) {
+    if (_verifyMode) {
+      return _buildVerifyForm(context);
+    }
     if (_forgotMode) {
       return _buildForgotForm(context);
     }
@@ -219,6 +307,8 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
             setState(() {
               _createAccount = selection.first;
               _emailTaken = false;
+              _verifyMode = false;
+              _verifySent = false;
               _error = null;
             });
           },
@@ -312,6 +402,79 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
     );
   }
 
+  /// The "verify your email — check your inbox" state: shown after a
+  /// tokenless sign-up or an EMAIL_NOT_VERIFIED sign-in. Displays the
+  /// addressed email, a resend action (429 surfaces the retry-after wait)
+  /// and a way back to the sign-in form.
+  Widget _buildVerifyForm(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final email = _emailController.text.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Icon(Icons.mark_email_read_outlined, size: 40),
+        const SizedBox(height: 12),
+        Text(
+          'Verify your email — check your inbox',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.titleMedium,
+        ),
+        const SizedBox(height: 8),
+        Text(
+          email,
+          key: const Key('auth-verify-email'),
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'We sent a verification link to this address. Open it to activate '
+          'your account, then come back and sign in.',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: scheme.onSurfaceVariant,
+          ),
+        ),
+        if (_verifySent) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Verification email sent again to $email.',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodySmall?.copyWith(color: scheme.primary),
+          ),
+        ],
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _error!,
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodySmall?.copyWith(color: scheme.error),
+          ),
+        ],
+        const SizedBox(height: 20),
+        FilledButton(
+          key: const Key('auth-resend'),
+          onPressed: _submitting ? null : _resendVerification,
+          child: _submitting
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('Resend email'),
+        ),
+        TextButton(
+          key: const Key('auth-verify-back'),
+          onPressed: _submitting ? null : _switchToSignIn,
+          child: const Text('Back to sign in'),
+        ),
+      ],
+    );
+  }
+
   Widget _buildForgotForm(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
@@ -339,10 +502,7 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(
-          'Reset your password',
-          style: theme.textTheme.titleMedium,
-        ),
+        Text('Reset your password', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
           'Enter the email address on your account and we will send you a '

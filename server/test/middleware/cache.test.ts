@@ -1,7 +1,13 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { DynamicStructuredTool } from "@langchain/core/tools";
+import type { McpTool } from "../../src/agents/mcp.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
-import { createToolResultCache } from "../../src/middleware/cache.ts";
+import {
+  createMcpToolListCache,
+  createToolResultCache,
+  DEFAULT_MCP_TOOL_LIST_TTL_MS,
+} from "../../src/middleware/cache.ts";
 import type { ToolCacheKey } from "../../src/middleware/cache.ts";
 
 /**
@@ -185,6 +191,7 @@ describe("createToolResultCache", () => {
     assert.equal(cache.size, 2);
 
     cache.invalidateForUser("alice");
+    cache.invalidateForUser("alice");
     assert.equal(cache.size, 1);
     assert.equal(cache.get(ka), undefined);
     assert.equal(cache.get(kb), "bob-result");
@@ -262,5 +269,153 @@ describe("createToolResultCache", () => {
     const hc = cache.argsHash({ a: null });
     const hd = cache.argsHash({ a: undefined });
     assert.notEqual(hc, hd, "null vs undefined are different");
+  });
+});
+
+/**
+ * MCP tool-list cache (open-gaps P1). Same fake-clock harness as
+ * createToolResultCache — TTL and sweep are fully deterministic.
+ */
+describe("createMcpToolListCache", () => {
+  const toolA: McpTool = {
+    name: "alpha",
+    description: "first",
+    inputSchema: { type: "object", properties: { x: { type: "string" } } },
+  };
+  const toolB: McpTool = { name: "beta", description: "second" };
+
+  test("set/get round-trips the plain JSON list; default TTL is 60s", (t) => {
+    const clock = makeClock();
+    const cache = createMcpToolListCache({
+      now: clock.now,
+      setInterval: clock.setInterval,
+      clearInterval: clock.clearInterval,
+    });
+    t.after(() => cache.dispose());
+
+    assert.equal(DEFAULT_MCP_TOOL_LIST_TTL_MS, 60_000);
+    assert.equal(cache.get("k"), undefined);
+    cache.set("k", [toolA, toolB]);
+    assert.deepEqual(cache.get("k"), [toolA, toolB]);
+    assert.equal(cache.size, 1);
+
+    // Fresh within TTL (get refreshes recency, not the insertion TTL).
+    clock.advance(DEFAULT_MCP_TOOL_LIST_TTL_MS - 1);
+    assert.deepEqual(cache.get("k"), [toolA, toolB]);
+
+    // Past TTL → lazy-expiry miss.
+    clock.advance(2);
+    assert.equal(cache.get("k"), undefined);
+    assert.equal(cache.size, 0);
+  });
+
+  test("set snapshots through JSON: mutating the source later does not leak in", (t) => {
+    const cache = createMcpToolListCache({ now: () => 1_000_000 });
+    t.after(() => cache.dispose());
+    const source: McpTool[] = [{ name: "a", description: "orig" }];
+    cache.set("k", source);
+    source[0]!.name = "mutated";
+    source.push({ name: "sneaky" });
+    assert.deepEqual(cache.get("k"), [{ name: "a", description: "orig" }]);
+  });
+
+  test("a bound DynamicStructuredTool never survives as a live instance in the cache", (t) => {
+    const cache = createMcpToolListCache({ now: () => 1_000_000 });
+    t.after(() => cache.dispose());
+    const bound = new DynamicStructuredTool({
+      name: "echo",
+      description: "d",
+      schema: (new Object()) as never,
+      func: async () => "x",
+    });
+    // A bound tool slipped in as a McpTool-shaped value: what lands in the
+    // cache must be a plain-JSON snapshot — never the instance itself, and
+    // never its live `func` closure (which closes over a client).
+    cache.set("k", [bound as unknown as McpTool]);
+    const got = cache.get("k");
+    assert.ok(got, "entry stored");
+    assert.ok(!(got[0] instanceof DynamicStructuredTool), "only JSON data stored");
+    assert.notEqual(got[0], bound as unknown as McpTool, "snapshot, not the live instance");
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(got)),
+      got,
+      "stored value is plain JSON data",
+    );
+  });
+
+  test("non-serializable value skips caching instead of throwing", (t) => {
+    const cache = createMcpToolListCache({ now: () => 1_000_000 });
+    t.after(() => cache.dispose());
+    const cyclic: Record<string, unknown> = { name: "c" };
+    cyclic.self = cyclic;
+    assert.doesNotThrow(() => cache.set("k", [cyclic as unknown as McpTool]));
+    assert.equal(cache.get("k"), undefined, "unserializable value was not stored");
+    assert.equal(cache.size, 0);
+  });
+
+  test("LRU eviction: oldest evicted first; get refreshes recency", (t) => {
+    const clock = makeClock();
+    const cache = createMcpToolListCache({
+      ttlMs: 60_000,
+      maxEntries: 2,
+      now: clock.now,
+      setInterval: clock.setInterval,
+      clearInterval: clock.clearInterval,
+    });
+    t.after(() => cache.dispose());
+
+    cache.set("a", [toolA]);
+    clock.advance(10);
+    cache.set("b", [toolB]);
+    assert.equal(cache.size, 2);
+
+    cache.get("a"); // refresh a → b is now oldest
+    clock.advance(10);
+    cache.set("c", [toolA, toolB]);
+    assert.equal(cache.size, 2, "capacity enforced");
+    assert.equal(cache.get("b"), undefined, "b was LRU and got evicted");
+    assert.deepEqual(cache.get("a"), [toolA], "a survived (refreshed)");
+    assert.deepEqual(cache.get("c"), [toolA, toolB]);
+  });
+
+  test("periodic sweep removes expired entries; dispose stops the timer (idempotent)", (t) => {
+    const clock = makeClock();
+    const cache = createMcpToolListCache({
+      ttlMs: 500,
+      now: clock.now,
+      setInterval: clock.setInterval,
+      clearInterval: clock.clearInterval,
+    });
+
+    assert.equal(clock.pending(), 1, "one sweep timer registered");
+    cache.set("a", [toolA]);
+    cache.set("b", [toolB]);
+    clock.advance(501);
+    clock.fireIntervals();
+    assert.equal(cache.size, 0, "sweep dropped both expired entries");
+
+    cache.set("c", [toolA]);
+    cache.dispose();
+    assert.equal(clock.pending(), 0, "dispose clears the sweep timer");
+    cache.dispose(); // no-op, no throw
+    assert.equal(clock.pending(), 0);
+    t.after(() => cache.dispose());
+  });
+
+  test("constructor rejects invalid options", () => {
+    const clock = makeClock();
+    const { setInterval, clearInterval } = clock;
+    assert.throws(
+      () => createMcpToolListCache({ ttlMs: 0, setInterval, clearInterval }),
+      /ttlMs/,
+    );
+    assert.throws(
+      () => createMcpToolListCache({ maxEntries: 0, setInterval, clearInterval }),
+      /maxEntries/,
+    );
+    assert.throws(
+      () => createMcpToolListCache({ ttlMs: -1, setInterval, clearInterval }),
+      /ttlMs/,
+    );
   });
 });

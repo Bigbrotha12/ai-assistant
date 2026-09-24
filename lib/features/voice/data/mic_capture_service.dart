@@ -26,6 +26,57 @@ abstract interface class MicCaptureService {
   Future<bool> requestPermission();
 }
 
+/// W1.5 post-reopen discard window (docs/open-gaps.md P2 →
+/// docs/production-voice-ux-plan.md): the first frames after a mic open or
+/// reopen are device warm-up/glitch audio and must not reach VAD or STT.
+/// Single source of truth — [MicReopenDiscardGate] enforces it at the
+/// service boundary for every subscriber; `VoiceCapturePipeline` references
+/// the same constant for its own defensive check. Distinct from the VAD's
+/// 200ms min-burst (`vad_processor.dart` `_minSpeechDuration`) and from
+/// pcm_analysis's `keepTrailingMs` playback trim.
+const Duration micReopenDiscardWindow = Duration(milliseconds: 150);
+
+/// [MicCaptureService] decorator enforcing the W1.5 post-reopen discard
+/// window at the capture boundary: frames arriving before
+/// `start attempt + [micReopenDiscardWindow]` are filtered from
+/// [audioStream], so EVERY subscriber (the pipeline's VAD leg and the
+/// controller's STT buffer) sees the same gated frames.
+///
+/// The window is armed before every [start] attempt — initial open, self-heal
+/// restart, and interruption resume all funnel through it — and each call
+/// recomputes the deadline, so rapid restarts extend the window. If the
+/// underlying start throws, the window remains armed; a subsequent attempt
+/// simply recomputes the deadline.
+class MicReopenDiscardGate implements MicCaptureService {
+  MicReopenDiscardGate(this._inner);
+
+  final MicCaptureService _inner;
+
+  /// Deadline of the current post-reopen discard window. Epoch-zero default
+  /// = no active window (frames pass until the first start attempt).
+  DateTime _discardUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  Stream<List<int>> get audioStream => _inner.audioStream.where(
+        (chunk) => !DateTime.now().isBefore(_discardUntil),
+      );
+
+  @override
+  Future<void> start({int sampleRate = 16000}) async {
+    _discardUntil = DateTime.now().add(micReopenDiscardWindow);
+    await _inner.start(sampleRate: sampleRate);
+  }
+
+  @override
+  Future<void> stop() => _inner.stop();
+
+  @override
+  bool get isRecording => _inner.isRecording;
+
+  @override
+  Future<bool> requestPermission() => _inner.requestPermission();
+}
+
 /// Implementation of [MicCaptureService] backed by the [record] package,
 /// streaming uncompressed 16-bit PCM.
 class RecordMicCaptureService implements MicCaptureService {

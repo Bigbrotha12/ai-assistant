@@ -1,15 +1,22 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:open_file/open_file.dart';
 
+import '../../auth/data/account_lifecycle.dart';
 import '../../auth/data/auth_client.dart';
 import '../../auth/data/auth_client_provider.dart';
 import '../../auth/data/auth_credentials_providers.dart';
+import '../../auth/data/auth_credentials_store.dart';
 import '../../../core/backend_probe.dart';
 import '../../../core/backend_settings.dart';
 import '../../../core/backend_validation.dart';
 import '../../../core/config.dart';
 import '../../attachments/data/files_providers.dart';
 import '../../attachments/data/files_service.dart';
+import '../../chat/data/database_providers.dart';
+import '../data/account_export.dart';
 import '../data/prefs_options.dart';
 import '../data/prefs_providers.dart';
 import '../data/prefs_store.dart';
@@ -45,6 +52,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   bool _obscureFilesSecret = true;
   bool _probing = false;
   bool _didAutoProbe = false;
+  bool _exporting = false;
   BackendStatus? _status;
 
   /// Dev vs production environment; saved together with the backend form and
@@ -119,19 +127,49 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   Future<void> _runProbe(BackendSettings settings) async {
-    // Any user-initiated probe (Test or Save) suppresses the follow-up
-    // auto-probe that the settings listener would otherwise schedule.
     _didAutoProbe = true;
+    if (!mounted) return;
     setState(() {
       _probing = true;
       _status = null;
     });
-    final status = await ref.read(backendProbeProvider).probe(settings);
-    if (!mounted) return;
-    setState(() {
-      _probing = false;
-      _status = status;
-    });
+    const failureStatus = BackendStatus(
+      checks: [
+        CheckResult(
+          check: BackendCheck.auth,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+        CheckResult(
+          check: BackendCheck.inference,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+        CheckResult(
+          check: BackendCheck.vision,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+        CheckResult(
+          check: BackendCheck.health,
+          status: ProbeStatus.error,
+          detail: 'probe failed',
+        ),
+      ],
+    );
+    var status = failureStatus;
+    try {
+      status = await ref.read(backendProbeProvider).probe(settings);
+    } catch (_) {
+      status = failureStatus;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _probing = false;
+          _status = status;
+        });
+      }
+    }
   }
 
   Future<void> _testConnection() async {
@@ -139,12 +177,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   BackendSettings _settingsFromForm() => BackendSettings(
-      host: _hostController.text,
-      environment: _environment,
-      mcpSecret: _mcpSecretController.text,
-      filesSecret: _filesSecretController.text,
-      storageUrl: _storageUrlController.text,
-    );
+    host: _hostController.text,
+    environment: _environment,
+    mcpSecret: _mcpSecretController.text,
+    filesSecret: _filesSecretController.text,
+    storageUrl: _storageUrlController.text,
+  );
 
   Future<void> _save() async {
     final settings = _settingsFromForm();
@@ -155,15 +193,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       await ref.read(settingsProvider.notifier).save(settings);
     } catch (_) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not save settings')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Could not save settings')));
       return;
     }
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Settings saved')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Settings saved')));
     await _runProbe(settings);
   }
 
@@ -173,7 +210,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Clear settings'),
-        content: const Text('Clear saved host, MCP token, files token, and storage URL?'),
+        content: const Text(
+          'Clear saved host, MCP token, files token, and storage URL?',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -209,9 +248,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       _storageUrlController.clear();
     });
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Settings cleared')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Settings cleared')));
   }
 
   /// Reacts to the persisted-settings provider: prefills the form from saved
@@ -242,14 +280,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  /// Opens the dedicated [SignInScreen] and hands its returned [AuthSession]
-  /// (or null when the user backed out) to [_onAuthSuccess]. For rotation, the
-  /// superseded key id + session token are captured here, before the screen is
-  /// pushed, so they can be revoked once the fresh session arrives.
   Future<void> _openAccount({required bool rotation}) async {
-    final oldKeyId = rotation ? ref.read(authCredentialsProvider).value?.keyId : null;
-    final oldSessionToken =
-        rotation ? ref.read(authCredentialsProvider).value?.sessionToken : null;
+    final oldCredentials = rotation
+        ? ref.read(authCredentialsProvider).value
+        : null;
     final session = await Navigator.of(context).push<AuthSession>(
       MaterialPageRoute(builder: (_) => SignInScreen(rotation: rotation)),
     );
@@ -257,43 +291,71 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     await _onAuthSuccess(
       session,
       wasRotation: rotation,
-      oldKeyId: oldKeyId,
-      oldSessionToken: oldSessionToken,
+      oldCredentials: oldCredentials,
     );
   }
 
-  /// Completion handler for a successful sign-in or key rotation. The key was
-  /// already minted and persisted by [AuthFlow] inside [SignInScreen]; here we
-  /// only revoke the superseded key (rotation) and confirm.
   Future<void> _onAuthSuccess(
     AuthSession session, {
     required bool wasRotation,
-    String? oldKeyId,
-    String? oldSessionToken,
+    AuthCredentials? oldCredentials,
   }) async {
+    var warning = false;
     if (wasRotation) {
-      // Best-effort server cleanup: revoke the superseded key (using the
-      // fresh session, which belongs to the same account) and sign the old
-      // session out. The new key is already persisted and usable, so a
-      // failure here must not surface.
       final auth = ref.read(authClientProvider);
+      final oldSessionToken = oldCredentials?.sessionToken;
       try {
-        if (oldKeyId != null) {
+        final oldKeyId = await _resolveRotationKeyId(
+          auth,
+          sessionToken: session.token,
+          oldCredentials: oldCredentials,
+        );
+        if (oldKeyId == null ||
+            oldKeyId == ref.read(authCredentialsProvider).value?.keyId) {
+          warning = true;
+        } else {
           await auth.revokeApiKey(sessionToken: session.token, keyId: oldKeyId);
         }
+      } catch (_) {
+        warning = true;
+      }
+      try {
         if (oldSessionToken != null) {
           await auth.signOut(sessionToken: oldSessionToken);
         }
-      } catch (_) {
-        // Swallow: the old key stays server-side but is no longer used.
-      }
+      } catch (_) {}
     }
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(wasRotation ? 'New API key minted' : 'Signed in'),
+        content: Text(
+          warning
+              ? 'New API key minted, but the old key could not be identified '
+                    'or revoked.'
+              : wasRotation
+              ? 'New API key minted'
+              : 'Signed in',
+        ),
       ),
     );
+  }
+
+  Future<String?> _resolveRotationKeyId(
+    AuthClient auth, {
+    required String sessionToken,
+    required AuthCredentials? oldCredentials,
+  }) async {
+    if (oldCredentials == null) return null;
+    final storedKeyId = oldCredentials.keyId;
+    if (storedKeyId != null && storedKeyId.isNotEmpty) return storedKeyId;
+    final keys = await auth.listApiKeys(sessionToken: sessionToken);
+    final match = matchStoredApiKey(oldCredentials, keys);
+    if (match.ambiguous) {
+      debugPrint(
+        'Settings: legacy API key match is ambiguous; old key not revoked.',
+      );
+    }
+    return match.entry?.id;
   }
 
   /// Client-side sign-out. Revokes the stored API key and signs the session
@@ -333,8 +395,83 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       return;
     }
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Signed out')),
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Signed out')));
+  }
+
+  /// Client-side conversation export (M12): serializes the active account's
+  /// conversations to a timestamped JSON document under
+  /// `<documents>/exports/`, then opens it with the platform opener. The
+  /// snackbar reports the path either way so the file is never lost behind a
+  /// failed open.
+  Future<void> _exportData() async {
+    if (_exporting) return;
+    setState(() => _exporting = true);
+    try {
+      final creds = ref.read(authCredentialsProvider).value;
+      final conversations = await ref
+          .read(chatStoreProvider)
+          .watchConversations()
+          .first;
+      if (!mounted) return;
+      final exporter = ref.read(accountExporterProvider);
+      final result = await exporter.export(
+        conversations: conversations,
+        backendOrigin:
+            creds?.backendOrigin ?? ref.read(authBackendOriginProvider),
+        userId: creds?.ownerId,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Export saved to ${result.path}')));
+      // Best-effort: never block the snackbar (or the busy flag) on the
+      // platform opener — a hung/missing channel must not hide the path.
+      unawaited(OpenFile.open(result.path).then((_) {}, onError: (_) {}));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not export conversations')),
+      );
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
+  /// Opens the password-confirmation dialog for account deletion. The dialog
+  /// returns the message to show in a snackbar (null = cancelled).
+  Future<void> _confirmDeleteAccount() async {
+    final message = await showDialog<String>(
+      context: context,
+      builder: (_) => _DeleteAccountDialog(onDelete: _deleteAccount),
+    );
+    if (message == null || !mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Runs after the server confirmed deletion (invoked by the dialog).
+  ///
+  /// Fail-closed: local wipe only runs AFTER a confirmed 200 — a network
+  /// failure must not destroy local data while the account still exists
+  /// server-side.
+  Future<void> _deleteAccount(String password) async {
+    final creds = ref.read(authCredentialsProvider).value;
+    final scope = creds?.accountScope;
+    if (scope == null) {
+      throw StateError('Authenticated account scope unavailable');
+    }
+    final auth = ref.read(authClientProvider);
+    final sessionToken = creds?.sessionToken ?? '';
+    await auth.deleteAccount(sessionToken: sessionToken, password: password);
+    await wipeLocalAccountData(
+      scope: scope,
+      lifecycle: ref.read(accountLifecycleProvider),
+      clearCredentials: () =>
+          ref.read(authCredentialsProvider.notifier).clear(),
+      fileStore: ref.read(filesStoreProvider),
+      memoryStore: ref.read(memoryStoreProvider),
+      fileCache: ref.read(fileCacheProvider),
     );
   }
 
@@ -348,7 +485,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final hostError = validateHost(hostText);
     final storageUrlError = validateStorageUrl(_storageUrlController.text);
     // Test and Save both require a structurally valid host and storage URL.
-    final canTest = !isLoading && !_probing && hostError == null && storageUrlError == null;
+    final canTest =
+        !isLoading && !_probing && hostError == null && storageUrlError == null;
     final canSave = canTest;
 
     return Scaffold(
@@ -372,7 +510,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
-                Text('Environment', style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'Environment',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
                 const SizedBox(height: 8),
                 SegmentedButton<BackendEnvironment>(
                   segments: const [
@@ -396,8 +537,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 Text(
                   'Controls the http/https scheme used by backend endpoints.',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
                 const SizedBox(height: 16),
                 TextField(
@@ -420,8 +561,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                       tooltip: _obscureMcpSecret
                           ? 'Show MCP token'
                           : 'Hide MCP token',
-                      onPressed: () =>
-                          setState(() => _obscureMcpSecret = !_obscureMcpSecret),
+                      onPressed: () => setState(
+                        () => _obscureMcpSecret = !_obscureMcpSecret,
+                      ),
                     ),
                   ),
                 ),
@@ -447,7 +589,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                           ? 'Show files token'
                           : 'Hide files token',
                       onPressed: () => setState(
-                          () => _obscureFilesSecret = !_obscureFilesSecret),
+                        () => _obscureFilesSecret = !_obscureFilesSecret,
+                      ),
                     ),
                   ),
                 ),
@@ -585,10 +728,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     ? 'Files service connected'
                     : 'Files service not configured',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: connected
-                          ? Colors.green.shade700
-                          : Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
+                  color: connected
+                      ? Colors.green.shade700
+                      : Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
             ),
           ],
@@ -619,9 +762,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   /// Pushes the [FilesScreen] file browser.
   void _openFileBrowser() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const FilesScreen()),
-    );
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => const FilesScreen()));
   }
 
   /// Confirms and evicts expired cached files, then reports the result.
@@ -646,14 +788,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     if (confirmed != true || !mounted) return;
     await ref.read(fileCacheProvider).evictExpired();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Cache cleared')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Cache cleared')));
   }
 
-  /// "Danger Zone" section: clears all saved settings after confirmation.
+  /// "Danger Zone" section: clears all saved settings after confirmation,
+  /// and (when signed in) deletes the account after a password confirmation.
   Widget _buildDangerZone(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final signedIn =
+        (ref.watch(authCredentialsProvider).value?.apiKey.isNotEmpty ?? false);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -664,6 +808,18 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           icon: Icon(Icons.delete_outline, color: scheme.error),
           label: Text('Clear settings', style: TextStyle(color: scheme.error)),
         ),
+        if (signedIn) ...[
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const Key('settings-delete-account'),
+            onPressed: _confirmDeleteAccount,
+            icon: Icon(Icons.no_accounts_outlined, color: scheme.error),
+            label: Text(
+              'Delete account',
+              style: TextStyle(color: scheme.error),
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -715,7 +871,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Widget _buildGeneral(BuildContext context) {
     final theme = Theme.of(context);
     final voice =
-         ref.watch(voiceSettingsProvider).value ?? VoiceSettings.defaults;
+        ref.watch(voiceSettingsProvider).value ?? VoiceSettings.defaults;
     final prefs = ref.watch(appPrefsProvider).value ?? const AppPrefs();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -735,14 +891,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             isDense: true,
             underline: const SizedBox.shrink(),
             items: [
-              for (final (code, name) in languageOptions(voice.preferredLanguage))
+              for (final (code, name) in languageOptions(
+                voice.preferredLanguage,
+              ))
                 DropdownMenuItem(value: code, child: Text(name)),
             ],
             onChanged: (value) {
               if (value == null) return;
-              ref.read(voiceSettingsProvider.notifier).save(
-                    voice.copyWith(preferredLanguage: value),
-                  );
+              ref
+                  .read(voiceSettingsProvider.notifier)
+                  .save(voice.copyWith(preferredLanguage: value));
             },
           ),
         ),
@@ -764,9 +922,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ],
             onChanged: (value) {
               if (value == null) return;
-              ref.read(appPrefsProvider.notifier).save(
-                    prefs.copyWith(dateFormat: value),
-                  );
+              ref
+                  .read(appPrefsProvider.notifier)
+                  .save(prefs.copyWith(dateFormat: value));
             },
           ),
         ),
@@ -794,6 +952,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             creds.email != null ? 'Signed in as ${creds.email}' : 'Signed in',
             style: theme.textTheme.bodyMedium,
           ),
+          if (ref.watch(keyExpiryWarningProvider)) ...[
+            const SizedBox(height: 8),
+            Text(
+              'API key expiring soon — sign in again to rotate it.',
+              key: const Key('settings-key-expiry-warning'),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.error,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             children: [
@@ -811,6 +980,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const Key('settings-export-data'),
+            onPressed: _exporting ? null : _exportData,
+            icon: const Icon(Icons.download_outlined),
+            label: Text(_exporting ? 'Exporting…' : 'Export my data'),
           ),
         ] else ...[
           Text(
@@ -850,6 +1026,138 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           onTap: () => Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => const VoiceSettingsScreen()),
           ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Password-confirmation dialog for account deletion (M12): collects the
+/// password, runs [onDelete] (server delete + local wipe), and surfaces an
+/// INVALID_PASSWORD rejection inline so the dialog stays open for a retry.
+/// Every other failure — network, session, partial local wipe — is returned
+/// to the caller as the snackbar message.
+class _DeleteAccountDialog extends StatefulWidget {
+  const _DeleteAccountDialog({required this.onDelete});
+
+  /// Runs the server delete + local wipe for [password]; throws on failure.
+  final Future<void> Function(String password) onDelete;
+
+  @override
+  State<_DeleteAccountDialog> createState() => _DeleteAccountDialogState();
+}
+
+class _DeleteAccountDialogState extends State<_DeleteAccountDialog> {
+  final _passwordController = TextEditingController();
+  bool _busy = false;
+  String? _fieldError;
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final password = _passwordController.text;
+    if (password.isEmpty) {
+      setState(() => _fieldError = 'Enter your password');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _fieldError = null;
+    });
+    try {
+      await widget.onDelete(password);
+      if (!mounted) return;
+      Navigator.of(context).pop('Account deleted');
+    } on AuthApiError catch (e) {
+      if (!mounted) return;
+      if (e.code == 'INVALID_PASSWORD') {
+        setState(() {
+          _busy = false;
+          _fieldError = 'Incorrect password';
+        });
+        return;
+      }
+      Navigator.of(context).pop(_failureMessage(e));
+    } on PartialAccountWipe {
+      if (!mounted) return;
+      Navigator.of(context)
+          .pop('Account deleted, but some local data could not be cleared.');
+    } catch (_) {
+      if (!mounted) return;
+      Navigator.of(context).pop('Could not delete the account. Try again.');
+    }
+  }
+
+  static String _failureMessage(AuthApiError e) {
+    if (e is AuthUnauthorized || e.code == 'SESSION_EXPIRED') {
+      return 'Your session has expired. Sign in again to delete your account.';
+    }
+    if (e is AuthNetworkError) {
+      return 'Could not reach the server. The account was not deleted — try again.';
+    }
+    return 'Could not delete the account. Try again.';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return AlertDialog(
+      title: const Text('Delete account'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Permanently deletes this account and its data on the server, '
+            'plus conversations, files, and memories on this device. '
+            'This cannot be undone.',
+          ),
+          const Text(
+            'Only this account’s conversations, attachments, memories, and '
+            'cached files are removed. Data belonging to other accounts on '
+            'this device is kept.',
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            key: const Key('delete-account-password'),
+            controller: _passwordController,
+            obscureText: true,
+            autofocus: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            keyboardType: TextInputType.visiblePassword,
+            enabled: !_busy,
+            decoration: InputDecoration(
+              labelText: 'Password',
+              border: const OutlineInputBorder(),
+              errorText: _fieldError,
+            ),
+            onSubmitted: (_) => _submit(),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          key: const Key('delete-account-submit'),
+          onPressed: _busy ? null : _submit,
+          child: _busy
+              ? SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: scheme.error,
+                  ),
+                )
+              : const Text('Delete'),
         ),
       ],
     );

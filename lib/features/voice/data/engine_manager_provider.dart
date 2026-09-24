@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import './engine_config.dart';
@@ -6,6 +8,7 @@ import './engine_registry.dart';
 import './model_downloader.dart';
 import './stt_engine.dart';
 import './tts_engine.dart';
+import '../ui/voice_settings_providers.dart';
 
 /// Singleton [EngineManager] instance.
 final engineManagerProvider = Provider<EngineManager>((ref) {
@@ -15,8 +18,27 @@ final engineManagerProvider = Provider<EngineManager>((ref) {
   // The future is memoised on the manager (`initialize()` is idempotent), so
   // providers can await `manager.initialized` before reading engines.
   manager.initialize();
+  // Engine registration races the async settings load at boot: once both are
+  // ready (either order), push the persisted STT language into the registered
+  // engine so the selection actually reaches the recognizer. Subsequent
+  // language/engine changes re-apply from VoiceSettingsNotifier.save.
+  unawaited(_applyPersistedLanguage(ref, manager));
   return manager;
 });
+
+/// Awaits engine registration and the settings load, then applies the
+/// persisted language. Best-effort: an unavailable store or a failing model
+/// dir must never break engine creation — the engine keeps its default
+/// language until the next settings save.
+Future<void> _applyPersistedLanguage(Ref ref, EngineManager manager) async {
+  try {
+    await manager.initialized;
+    final settings = await ref.read(voiceSettingsProvider.future);
+    if (settings != null) applyVoiceSettingsToEngines(settings);
+  } catch (_) {
+    // Settings or engines unavailable — defaults stand.
+  }
+}
 
 /// Reactive map of model ID → [VoiceEngineStatus].
 ///

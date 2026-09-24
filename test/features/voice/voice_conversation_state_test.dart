@@ -15,6 +15,7 @@ void main() {
       expect(s.notice, isNull);
       expect(s.lastTranscript, isNull);
       expect(s.onDeviceTranscript, isNull);
+      expect(s.micBufferTruncated, isFalse);
     });
 
     test('copyWith updates only the provided fields', () {
@@ -31,6 +32,7 @@ void main() {
         status: 'Thinking…',
         lastTranscript: 'hello',
         onDeviceTranscript: 'hello',
+        micBufferTruncated: true,
       );
 
       expect(next.isConnected, isTrue);
@@ -44,6 +46,7 @@ void main() {
       expect(next.status, 'Thinking…');
       expect(next.lastTranscript, 'hello');
       expect(next.onDeviceTranscript, 'hello');
+      expect(next.micBufferTruncated, isTrue);
     });
 
     test('copyWith leaves unset fields untouched', () {
@@ -79,18 +82,32 @@ void main() {
       expect(cleared.onDeviceTranscript, isNull);
     });
 
+    test('micBufferTruncated latches and clears explicitly via copyWith', () {
+      final latched = VoiceConversationState.initial()
+          .copyWith(micBufferTruncated: true);
+      expect(latched.micBufferTruncated, isTrue);
+
+      final reset = latched.copyWith(micBufferTruncated: false);
+      expect(reset.micBufferTruncated, isFalse);
+
+      // Unrelated copyWith calls leave the latch untouched.
+      expect(latched.copyWith(isRecording: true).micBufferTruncated, isTrue);
+    });
+
     test('equality and hashCode reflect every field', () {
       final a = VoiceConversationState.initial().copyWith(
         isPaused: true,
         isGenerating: true,
         notice: 'n',
         status: 'Thinking…',
+        micBufferTruncated: true,
       );
       final b = VoiceConversationState.initial().copyWith(
         isPaused: true,
         isGenerating: true,
         notice: 'n',
         status: 'Thinking…',
+        micBufferTruncated: true,
       );
       final c = VoiceConversationState.initial();
 
@@ -114,6 +131,7 @@ void main() {
         base.copyWith(status: 'Thinking…'),
         base.copyWith(lastTranscript: 'x'),
         base.copyWith(onDeviceTranscript: 'x'),
+        base.copyWith(micBufferTruncated: true),
       ];
       for (final v in variants) {
         expect(v, isNot(base));

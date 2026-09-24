@@ -5,12 +5,13 @@ import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  const scopeA = 'scope-a';
   late AppDatabase db;
   late DriftMemoryStore store;
 
   setUp(() {
     db = AppDatabase(NativeDatabase.memory());
-    store = DriftMemoryStore(db);
+    store = DriftMemoryStore(db, scopeKey: scopeA);
   });
 
   tearDown(() async {
@@ -23,14 +24,13 @@ void main() {
     String? source,
     DateTime? createdAt,
     DateTime? updatedAt,
-  }) =>
-      Memory(
-        id: id,
-        content: content,
-        source: source,
-        createdAt: createdAt ?? DateTime(2024, 1, 1),
-        updatedAt: updatedAt ?? DateTime(2024, 1, 1, 0, 0, 1),
-      );
+  }) => Memory(
+    id: id,
+    content: content,
+    source: source,
+    createdAt: createdAt ?? DateTime(2024, 1, 1),
+    updatedAt: updatedAt ?? DateTime(2024, 1, 1, 0, 0, 1),
+  );
 
   test('saveMemory + getMemory round-trips all fields', () async {
     await store.saveMemory(
@@ -96,12 +96,8 @@ void main() {
   });
 
   test('listMemories returns most-recently-updated first', () async {
-    await store.saveMemory(
-      memory(id: 'old', updatedAt: DateTime(2023, 1, 1)),
-    );
-    await store.saveMemory(
-      memory(id: 'new', updatedAt: DateTime(2024, 1, 1)),
-    );
+    await store.saveMemory(memory(id: 'old', updatedAt: DateTime(2023, 1, 1)));
+    await store.saveMemory(memory(id: 'new', updatedAt: DateTime(2024, 1, 1)));
     await store.saveMemory(
       memory(id: 'middle', updatedAt: DateTime(2023, 6, 1)),
     );
@@ -180,25 +176,22 @@ void main() {
       ),
     );
     await store.saveMemory(
-      memory(
-        id: 'fresh',
-        content: 'shared keyword',
-        updatedAt: DateTime.now(),
-      ),
+      memory(id: 'fresh', content: 'shared keyword', updatedAt: DateTime.now()),
     );
 
     final results = await store.searchMemories('shared');
     expect(results.map((m) => m.id).toList(), ['fresh', 'stale']);
   });
 
-  test('recency penalty is capped: stale exact match outranks fresh weak match',
-      () async {
+  test('recency penalty is capped: stale exact match outranks fresh weak match', () async {
     // Filler rows keep the matched terms rare (low document frequency), making
     // the bm25 gap between a short exact match and a long padded one large
     // enough to beat a 30-day cap but smaller than an unbounded ~400-day
     // penalty.
     for (var i = 0; i < 4; i++) {
-      await store.saveMemory(memory(id: 'filler$i', content: 'unrelated entry'));
+      await store.saveMemory(
+        memory(id: 'filler$i', content: 'unrelated entry'),
+      );
     }
     await store.saveMemory(
       memory(
@@ -210,7 +203,8 @@ void main() {
     await store.saveMemory(
       memory(
         id: 'fresh',
-        content: 'concurrent threads'
+        content:
+            'concurrent threads'
             ' padded padding extra words padding padding padding'
             ' padding padding padding padding padding padding padding'
             ' padding padding padding padding padding padding padding'
@@ -242,11 +236,7 @@ void main() {
       ),
     );
     await store.saveMemory(
-      memory(
-        id: 'recent',
-        content: 'recent entry',
-        updatedAt: DateTime.now(),
-      ),
+      memory(id: 'recent', content: 'recent entry', updatedAt: DateTime.now()),
     );
 
     final deleted = await store.compact(olderThan: const Duration(days: 365));
@@ -265,11 +255,7 @@ void main() {
       ),
     );
     await store.saveMemory(
-      memory(
-        id: 'recent',
-        content: 'fox runs',
-        updatedAt: DateTime.now(),
-      ),
+      memory(id: 'recent', content: 'fox runs', updatedAt: DateTime.now()),
     );
 
     await store.compact(olderThan: const Duration(days: 365));
@@ -294,11 +280,11 @@ void main() {
     expect(await store.searchMemories('fox'), isEmpty);
   });
 
-  test('deleteAllMemories clears everything', () async {
+  test('deleteAllMemoriesForScope clears this account', () async {
     await store.saveMemory(memory(id: 'm1', content: 'fox hunt'));
     await store.saveMemory(memory(id: 'm2', content: 'dog walk'));
 
-    await store.deleteAllMemories();
+    await store.deleteAllMemoriesForScope(scopeA);
 
     expect(await store.countMemories(), 0);
     expect(await store.listMemories(), isEmpty);
@@ -312,4 +298,89 @@ void main() {
     await store.saveMemory(memory(id: 'm2'));
     expect(await store.countMemories(), 2);
   });
+
+  test(
+    'two accounts isolate every memory operation with the same id',
+    () async {
+      const scopeB = 'scope-b';
+      final storeB = DriftMemoryStore(db, scopeKey: scopeB);
+
+      await store.saveMemory(
+        memory(
+          id: 'shared',
+          content: 'alpha for account A',
+          updatedAt: DateTime.now(),
+        ),
+      );
+      await storeB.saveMemory(
+        memory(
+          id: 'shared',
+          content: 'alpha for account B',
+          updatedAt: DateTime.now(),
+        ),
+      );
+
+      expect((await store.getMemory('shared'))!.content, 'alpha for account A');
+      expect(
+        (await storeB.getMemory('shared'))!.content,
+        'alpha for account B',
+      );
+      expect(
+        (await store.listMemories()).single.content,
+        'alpha for account A',
+      );
+      expect(
+        (await storeB.listMemories()).single.content,
+        'alpha for account B',
+      );
+      expect(await store.countMemories(), 1);
+      expect(await storeB.countMemories(), 1);
+      expect((await store.searchMemories('alpha')).single.id, 'shared');
+      expect((await storeB.searchMemories('alpha')).single.id, 'shared');
+
+      await store.saveMemory(
+        memory(
+          id: 'shared',
+          content: 'updated only for account A',
+          updatedAt: DateTime.now(),
+        ),
+      );
+      expect(
+        (await store.getMemory('shared'))!.content,
+        'updated only for account A',
+      );
+      expect(
+        (await storeB.getMemory('shared'))!.content,
+        'alpha for account B',
+      );
+
+      final old = DateTime.now().subtract(const Duration(days: 400));
+      await store.saveMemory(
+        memory(id: 'old-a', content: 'stale alpha', updatedAt: old),
+      );
+      await storeB.saveMemory(
+        memory(id: 'old-b', content: 'stale alpha', updatedAt: old),
+      );
+      expect(await store.compact(olderThan: const Duration(days: 365)), 1);
+      expect(await store.getMemory('old-a'), isNull);
+      expect(await storeB.getMemory('old-b'), isNotNull);
+
+      await store.deleteMemory('shared');
+      expect(await store.getMemory('shared'), isNull);
+      expect(await storeB.getMemory('shared'), isNotNull);
+
+      await store.saveMemory(memory(id: 'delete-all', content: 'alpha'));
+      await store.deleteAllMemoriesForScope(scopeA);
+      expect(await store.countMemories(), 0);
+      expect(await storeB.countMemories(), 2);
+      expect((await storeB.searchMemories('alpha')).map((m) => m.id).toSet(), {
+        'shared',
+        'old-b',
+      });
+      await expectLater(
+        storeB.deleteAllMemoriesForScope(scopeA),
+        throwsA(isA<StateError>()),
+      );
+    },
+  );
 }

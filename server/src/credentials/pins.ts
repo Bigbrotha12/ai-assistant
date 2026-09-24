@@ -130,6 +130,14 @@ export class CredentialPinStore {
     if (byHandle?.size === 0) this.pins.delete(owner);
   }
 
+  releaseOwner(owner: string): number {
+    const byHandle = this.pins.get(owner);
+    if (!byHandle) return 0;
+    const released = byHandle.size;
+    this.pins.delete(owner);
+    return released;
+  }
+
   sweep(now?: number): number {
     const t = now ?? this.now();
     let removed = 0;

@@ -295,4 +295,54 @@ test(
       expect(config.selectedAgent, isNull);
     },
   );
+
+  test(
+    'setAgentConfig persists tools, modelRef, and inference; setSelectedAgent activates it',
+    () async {
+      final subscription = container.listen(
+        pluginCredentialsProvider,
+        (_, _) {},
+      );
+      addTearDown(subscription.close);
+      await container.read(pluginCredentialsProvider.future);
+      final config = AgentConfig(
+        id: 'custom-full',
+        kind: AgentKind.custom,
+        name: 'Full Custom',
+        systemPrompt: 'Be terse.',
+        skills: ['skill-a'],
+        mcpServers: ['mcp-a'],
+        tools: [AgentToolGrantData(pluginId: 'web-search', required: true)],
+        modelRef: 'openrouter',
+        inference: AgentInferenceData(
+          temperature: 1.5,
+          maxTokens: 123456,
+          visionCapable: true,
+        ),
+      );
+      await container
+          .read(scopedPluginCredentialsProvider)
+          .setAgentConfig('custom-full', config);
+      // Each write bumps the credentials epoch: re-read a fresh scoped handle
+      // (the agent editor does the same around setAgentConfig +
+      // setSelectedAgent), otherwise the stale handle rejects the second write.
+      await container
+          .read(scopedPluginCredentialsProvider)
+          .setSelectedAgent('custom-full');
+      final published = await container.read(pluginCredentialsProvider.future);
+      expect(published.selectedAgent, 'custom-full');
+      final saved = published.plugins['custom-full']!.agent!;
+      expect(saved.kind, AgentKind.custom);
+      expect(saved.name, 'Full Custom');
+      expect(saved.systemPrompt, 'Be terse.');
+      expect(saved.skills, ['skill-a']);
+      expect(saved.mcpServers, ['mcp-a']);
+      expect(saved.tools.single.pluginId, 'web-search');
+      expect(saved.tools.single.required, isTrue);
+      expect(saved.modelRef, 'openrouter');
+      expect(saved.inference!.temperature, 1.5);
+      expect(saved.inference!.maxTokens, 123456);
+      expect(saved.inference!.visionCapable, isTrue);
+    },
+  );
 }

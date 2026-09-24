@@ -8,6 +8,7 @@ import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show domainPhrases;
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:ai_assistant/features/voice/data/engine_errors.dart';
+import 'package:ai_assistant/features/voice/data/mic_capture_service.dart';
 import 'package:ai_assistant/features/voice/ui/voice_conversation_state.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
 
@@ -2558,6 +2559,268 @@ void main() {
       await controller.dispose();
       await mic.dispose();
       await playback.dispose();
+    });
+  });
+
+  group('mic buffer cap (W1.4)', () {
+    // 3 minutes @ 16 kHz mono: 16000 × 180 = 2,880,000 samples —
+    // mirrors VoiceController.micBufferCapSamples.
+    const cap = VoiceController.micBufferCapSamples;
+
+    test(
+      'over-cap mic audio is trimmed to the tail (last 3 minutes kept)',
+      () async {
+        final chat = FakeChatClient();
+        final mic = FakeMicCaptureService();
+        final playback = FakeAudioPlayback();
+        // Whitespace transcript: the flush runs STT (recording the audio this
+        // test asserts on) but dispatches no LLM turn — this is about the
+        // buffer, not the conversation.
+        final stt = FakeSttEngine(transcript: '   ');
+        final controller = VoiceController(
+          sendTurn: _scriptedTurnSender(chat),
+          micCapture: mic,
+          playback: playback,
+          sttEngine: stt,
+        );
+        await controller.startConversation();
+
+        // One incoming chunk is bigger than the cap, with sentinel samples at
+        // its head and a distinct newest sample at its tail.
+        var chunk = List<int>.filled(cap + 3, 9);
+        chunk[0] = 0xDE;
+        chunk[1] = 0xAD;
+        chunk[2] = 0xBE;
+        chunk[cap + 2] = 7;
+        mic.emitChunk(chunk);
+        await pumpEventQueue();
+        chunk = const <int>[]; // release the test's own copy before flushing
+        expect(controller.state.micBufferTruncated, isTrue);
+
+        await controller.flushTranscriptionBuffer();
+        await pumpEventQueue();
+
+        final audio = stt.transcribed.single;
+        expect(audio.length, cap, reason: 'size bounded at the 3-minute cap');
+        expect(audio.first, 9, reason: 'head sentinel samples were dropped');
+        expect(audio.last, 7, reason: 'newest sample survives (keep-tail)');
+        expect(audio, isNot(contains(0xDE)));
+        expect(audio, isNot(contains(0xAD)));
+        // Flush behaviour otherwise unchanged: no turn on an empty transcript…
+        expect(chat.calls, isEmpty);
+        // …and the buffer clear resets the truncation latch.
+        expect(controller.state.micBufferTruncated, isFalse);
+
+        await controller.dispose();
+        await mic.dispose();
+        await playback.dispose();
+      },
+    );
+
+    test('adds at or below the cap are buffered unchanged (no trim, no '
+        'notice)', () async {
+      final chat = FakeChatClient();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine(transcript: '   ');
+      final controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+      );
+      await controller.startConversation();
+
+      // Exactly the cap is NOT over the cap: nothing trims, no notice.
+      var chunk = List<int>.filled(cap, 7);
+      mic.emitChunk(chunk);
+      await pumpEventQueue();
+      chunk = const <int>[];
+      expect(controller.state.micBufferTruncated, isFalse);
+
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+
+      final audio = stt.transcribed.single;
+      expect(audio.length, cap);
+      expect(audio, everyElement(7), reason: 'under-cap samples pass through');
+      expect(chat.calls, isEmpty);
+      expect(controller.state.micBufferTruncated, isFalse);
+
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    test('the truncation notice latches once per buffer generation and '
+        'resets on flush', () async {
+      final chat = FakeChatClient();
+      final mic = FakeMicCaptureService();
+      final playback = FakeAudioPlayback();
+      final stt = FakeSttEngine(transcript: '   ');
+      final controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: mic,
+        playback: playback,
+        sttEngine: stt,
+      );
+      await controller.startConversation();
+
+      mic.emitChunk(List<int>.filled(cap, 1));
+      await pumpEventQueue();
+
+      final emissions = <VoiceConversationState>[];
+      final sub = controller.stateStream.listen(emissions.add);
+
+      // Repeated over-cap chunks: every add trims the head, but the latch
+      // must fire exactly once — no per-chunk state spam.
+      for (var i = 0; i < 5; i++) {
+        mic.emitChunk(List<int>.filled(64, i + 2));
+        await pumpEventQueue();
+      }
+      expect(controller.state.micBufferTruncated, isTrue);
+      expect(
+        emissions.where((s) => s.micBufferTruncated).length,
+        1,
+        reason: 'latched once despite five consecutive trims',
+      );
+
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      // The flush clears the buffer generation → the latch resets…
+      expect(controller.state.micBufferTruncated, isFalse);
+      // …and flushes whatever tail remains, still ≤ the cap.
+      expect(stt.transcribed.single.length, cap);
+
+      await sub.cancel();
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+  });
+
+  group('W1.5 STT post-reopen discard', () {
+    // The mic capture is wrapped in the production service-boundary gate so
+    // these tests exercise the same 150ms rule that protects the STT buffer
+    // in production (the pipeline's parallel filter cannot see this buffer).
+    late FakeChatClient chat;
+    late FakeMicCaptureService mic;
+    late MicReopenDiscardGate gatedMic;
+    late FakeAudioPlayback playback;
+    late FakeSttEngine stt;
+    late VoiceController controller;
+
+    /// Comfortably past [micReopenDiscardWindow] (150ms + margin).
+    const pastWindow = Duration(milliseconds: 200);
+
+    setUp(() {
+      chat = FakeChatClient();
+      mic = FakeMicCaptureService();
+      gatedMic = MicReopenDiscardGate(mic);
+      playback = FakeAudioPlayback();
+      // Whitespace transcript: the flush records the buffered audio this
+      // test asserts on, then dispatches no LLM turn — this is about the
+      // buffer, not the conversation. (Same pattern as the W1.4 cap tests.)
+      stt = FakeSttEngine(transcript: '   ');
+      controller = VoiceController(
+        sendTurn: _scriptedTurnSender(chat),
+        micCapture: gatedMic,
+        playback: playback,
+        sttEngine: stt,
+        ttsEngine: FakeTtsEngine(),
+        echoGateDuration: Duration.zero,
+      );
+    });
+
+    tearDown(() async {
+      await controller.dispose();
+      await mic.dispose();
+      await playback.dispose();
+    });
+
+    Future<void> flushBuffered() async {
+      await controller.flushTranscriptionBuffer();
+      await pumpEventQueue();
+      await pumpEventQueue();
+    }
+
+    test('frames within 150ms of the open never reach the STT buffer; frames '
+        'after the window do', () async {
+      await controller.startConversation();
+      await controller.startRecording(); // arms the window via the gate
+
+      mic.emitChunk(List<int>.filled(16, 9));
+      await pumpEventQueue();
+      await flushBuffered();
+      // Warm-up frame was dropped at the boundary: the flush saw an empty
+      // buffer, so STT never ran and no turn started.
+      expect(stt.transcribed, isEmpty);
+      expect(chat.calls, isEmpty);
+
+      await Future<void>.delayed(pastWindow);
+      mic.emitChunk(List<int>.filled(16, 7));
+      await pumpEventQueue();
+      await flushBuffered();
+      expect(stt.transcribed, hasLength(1));
+      expect(stt.transcribed.single, everyElement(7));
+      expect(chat.calls, isEmpty); // whitespace transcript → no turn
+    });
+
+    test('a reopen re-arms the window for the STT path', () async {
+      await controller.startConversation();
+      await controller.startRecording();
+      await Future<void>.delayed(pastWindow);
+
+      // Prime the buffer past the initial window.
+      mic.emitChunk(List<int>.filled(16, 1));
+      await pumpEventQueue();
+      await flushBuffered();
+      expect(stt.transcribed, hasLength(1));
+
+      // Reopen (stop → start): a fresh window arms; the start also clears
+      // the buffer generation.
+      await controller.stopRecording();
+      await controller.startRecording();
+
+      mic.emitChunk(List<int>.filled(16, 2));
+      await pumpEventQueue();
+      await flushBuffered();
+      // Reopen warm-up frame dropped: no new transcribe ran.
+      expect(stt.transcribed, hasLength(1));
+
+      await Future<void>.delayed(pastWindow);
+      mic.emitChunk(List<int>.filled(16, 3));
+      await pumpEventQueue();
+      await flushBuffered();
+      expect(stt.transcribed, hasLength(2));
+      expect(stt.transcribed.last, everyElement(3));
+    });
+
+    test('a rapid restart extends the window (deadline recomputed on the '
+        'restart, not the original open)', () async {
+      await controller.startConversation();
+      await controller.startRecording(); // window [0, 150]
+
+      // Restart inside the original window so the deadline is re-armed from
+      // the restart moment. (Offsets assume the shared 150ms constant.)
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await controller.stopRecording();
+      await controller.startRecording(); // window [~100, ~250]
+
+      // Past the ORIGINAL window (t≈180 > 150) but inside the re-armed one
+      // (t≈180 < 250): only a recomputed deadline drops this frame.
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      mic.emitChunk(List<int>.filled(16, 5));
+      await pumpEventQueue();
+      await flushBuffered();
+      expect(stt.transcribed, isEmpty);
+
+      await Future<void>.delayed(pastWindow);
+      mic.emitChunk(List<int>.filled(16, 6));
+      await pumpEventQueue();
+      await flushBuffered();
+      expect(stt.transcribed, hasLength(1));
+      expect(stt.transcribed.single, everyElement(6));
     });
   });
 }

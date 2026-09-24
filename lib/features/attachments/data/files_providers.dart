@@ -6,6 +6,9 @@ import 'package:path_provider/path_provider.dart';
 import '../../../core/config.dart';
 import '../../../core/http/dio_provider.dart';
 import '../../../app/app_startup.dart';
+import '../../chat/data/database_providers.dart';
+import '../../plugins/data/plugin_catalog_providers.dart';
+import '../../plugins/data/plugin_credentials_providers.dart';
 import './file_cache.dart';
 import './files_service.dart';
 import '../../settings/data/settings_providers.dart';
@@ -34,7 +37,11 @@ final filesServiceProvider = Provider<FilesClient>((ref) {
 /// On-disk file cache rooted at `<documents>/files_cache`. The directory is
 /// resolved lazily on first use because path_provider is async.
 final fileCacheProvider = Provider<FileCache>((ref) {
+  final scopeKey = ref.watch(pluginAccessProvider) != PluginAccess.ready
+      ? pendingScopeKey
+      : ref.watch(pluginAccountScopeProvider).storageId;
   return FileCache.async(
+    scopeKey: scopeKey,
     resolveDir: () async {
       final docs = await getApplicationDocumentsDirectory();
       return Directory('${docs.path}/files_cache');

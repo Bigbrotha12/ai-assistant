@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { Hono } from "hono";
 import { createSkillsRoutes } from "../../src/transport/skills.ts";
 import type { Catalogs } from "../../src/catalog/index.ts";
+import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
 
-function testApp(catalogs: Catalogs) {
+function testApp(catalogs: Catalogs, verifyKey?: VerifyApiKeyFn) {
   const app = new Hono();
   app.route("/v1", createSkillsRoutes({
     catalogs,
-    verifyKey: () => Promise.resolve("test-user"),
+    verifyKey: verifyKey ?? (() => Promise.resolve({ ok: true as const, owner: "test-user" })),
   }));
   return app;
 }
@@ -54,11 +55,21 @@ describe("GET /v1/skills", () => {
     const app = new Hono();
     app.route("/v1", createSkillsRoutes({
       catalogs: { skills: [], mcps: [], agents: [] },
-      verifyKey: () => Promise.resolve(null),
+      verifyKey: () => Promise.resolve({ ok: false as const, reason: "bad_key" as const }),
     }));
     const res = await app.request("/v1/skills", { headers: auth });
     assert.equal(res.status, 401);
     assert.deepEqual(await res.json(), { error: "unauthorized" });
+  });
+
+  test("403 { error: email_not_verified } when the owner's email is unverified", async () => {
+    const app = testApp(
+      { skills: [], mcps: [], agents: [] },
+      () => Promise.resolve({ ok: false as const, reason: "email_not_verified" as const }),
+    );
+    const res = await app.request("/v1/skills", { headers: auth });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await res.json(), { error: "email_not_verified" });
   });
 
   test("sorted by id", async () => {

@@ -59,7 +59,7 @@ abstract interface class FilesClient {
   Future<List<FileInfo>> listFiles();
 
   /// Fetches a file's raw bytes (the caller caches them locally).
-  Future<Uint8List> fetchFile(String fileId);
+  Future<Uint8List> fetchFile(String fileId, {CancelToken? cancelToken});
 
   /// Deletes a file from the service.
   Future<void> deleteFile(String fileId);
@@ -72,9 +72,9 @@ class FilesClientImpl implements FilesClient {
     required Dio dio,
     required String baseUrl,
     required String bearerToken,
-  })  : _dio = dio,
-        _baseUrl = baseUrl,
-        _bearerToken = bearerToken;
+  }) : _dio = dio,
+       _baseUrl = baseUrl,
+       _bearerToken = bearerToken;
 
   final Dio _dio;
   final String _baseUrl;
@@ -93,11 +93,11 @@ class FilesClientImpl implements FilesClient {
   static const Duration _timeout = Duration(seconds: 120);
 
   Options _auth() => Options(
-        headers: {'Authorization': 'Bearer $_bearerToken'},
-        followRedirects: false,
-        sendTimeout: _timeout,
-        receiveTimeout: _timeout,
-      );
+    headers: {'Authorization': 'Bearer $_bearerToken'},
+    followRedirects: false,
+    sendTimeout: _timeout,
+    receiveTimeout: _timeout,
+  );
 
   @override
   Future<FileInfo> uploadFile({
@@ -146,7 +146,7 @@ class FilesClientImpl implements FilesClient {
   }
 
   @override
-  Future<Uint8List> fetchFile(String fileId) async {
+  Future<Uint8List> fetchFile(String fileId, {CancelToken? cancelToken}) async {
     _assertSafeId(fileId);
     try {
       final response = await _dio.get<List<int>>(
@@ -157,6 +157,7 @@ class FilesClientImpl implements FilesClient {
           receiveTimeout: _timeout,
           responseType: ResponseType.bytes,
         ),
+        cancelToken: cancelToken,
       );
       final data = response.data;
       if (data == null) {
@@ -172,10 +173,7 @@ class FilesClientImpl implements FilesClient {
   Future<void> deleteFile(String fileId) async {
     _assertSafeId(fileId);
     try {
-      await _dio.delete<void>(
-        '$_baseUrl/files/$fileId',
-        options: _auth(),
-      );
+      await _dio.delete<void>('$_baseUrl/files/$fileId', options: _auth());
     } on DioException catch (e) {
       throw _mapError(e);
     }
@@ -231,14 +229,13 @@ class NoOpFilesClient implements FilesClient {
     required String mimeType,
     CancelToken? cancelToken,
     void Function(int sent, int total)? onProgress,
-  }) =>
-      throw StateError('Files service not configured');
+  }) => throw StateError('Files service not configured');
 
   @override
   Future<List<FileInfo>> listFiles() => Future.value(const []);
 
   @override
-  Future<Uint8List> fetchFile(String fileId) =>
+  Future<Uint8List> fetchFile(String fileId, {CancelToken? cancelToken}) =>
       throw StateError('Files service not configured');
 
   @override
