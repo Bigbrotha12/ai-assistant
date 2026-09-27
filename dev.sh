@@ -286,10 +286,13 @@ else
   echo "Running flutter on '$FLUTTER_DEVICE' against host '$HOST_FQDN' (dev http)…"
 fi
 
-# Self-heal wireless adb after a phone reboot: `adb tcpip` does not survive
-# reboots without root. When the configured device is an adb TCP target that
-# is no longer connected and a USB device IS attached, flip the USB device
-# back into TCP mode and reconnect it at the configured address.
+# Self-heal wireless adb after a phone reboot. `adb tcpip` does not survive
+# reboots without root, and a Wireless-Debugging device (Android 11+) does not
+# appear in `adb devices` until `adb connect` runs — its listen port is
+# ephemeral and changes on every reboot/toggle. Order of attempts: re-enable
+# TCP mode over USB when attached, reach an already-active session, then
+# discover the current endpoint over mDNS (keeping the configured host, so a
+# Tailscale target stays on Tailscale while the port is refreshed).
 resolve_adb() {
   if [ -n "${ADB:-}" ] && [ -x "$ADB" ]; then echo "$ADB"; return; fi
   if command -v adb >/dev/null 2>&1; then command -v adb; return; fi
@@ -300,29 +303,56 @@ resolve_adb() {
   fi
 }
 ADB_BIN="$(resolve_adb)"
-case "$FLUTTER_DEVICE" in
-  *.*:[0-9]*)
-    if [ -n "$ADB_BIN" ] && ! "$ADB_BIN" devices 2>/dev/null | grep -q "^$FLUTTER_DEVICE[[:space:]]"; then
-      USB_SERIAL="$("$ADB_BIN" devices -l 2>/dev/null | awk '/usb:/ && $2=="device" {print $1; exit}')"
-      if [ -n "$USB_SERIAL" ]; then
-        echo "Wireless adb target $FLUTTER_DEVICE not connected; re-enabling TCP mode on USB device $USB_SERIAL…"
-        "$ADB_BIN" -s "$USB_SERIAL" tcpip "${FLUTTER_DEVICE##*:}" >/dev/null
-        sleep 2
-        "$ADB_BIN" connect "$FLUTTER_DEVICE" || true
-      else
-        # Wireless-only (no USB attached): nothing to re-enable TCP mode on, so
-        # try to reach the already-active wireless adb session directly.
-        "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
-        if "$ADB_BIN" devices 2>/dev/null | grep -q "^$FLUTTER_DEVICE[[:space:]]"; then
-          echo "Connected to wireless adb target $FLUTTER_DEVICE."
-        else
-          echo "warning: wireless adb target $FLUTTER_DEVICE is not connected and no USB device is attached."
-          echo "         After a phone reboot, plug in USB once — this script will re-enable TCP mode."
-          echo "         Or re-enable Wireless debugging on the phone and update FLUTTER_DEVICE."
-        fi
-      fi
+
+# True when the given `adb devices` serial is attached.
+device_connected() {
+  [ -n "$ADB_BIN" ] || return 1
+  "$ADB_BIN" devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}' | grep -qxF "$1"
+}
+
+# Android 11+ advertises an `_adb-tls-connect._tcp` service; print its `ip:port`.
+discover_wireless_endpoint() {
+  [ -n "$ADB_BIN" ] || return 1
+  "$ADB_BIN" mdns services 2>/dev/null \
+    | awk '$2=="_adb-tls-connect._tcp" {print $NF; exit}'
+}
+
+ensure_wireless_target() {
+  device_connected "$FLUTTER_DEVICE" && return 0
+
+  local usb_serial endpoint
+  usb_serial="$("$ADB_BIN" devices -l 2>/dev/null | awk '/usb:/ && $2=="device" {print $1; exit}')"
+  if [ -n "$usb_serial" ]; then
+    echo "Wireless adb target $FLUTTER_DEVICE not connected; re-enabling TCP mode on USB device $usb_serial…"
+    "$ADB_BIN" -s "$usb_serial" tcpip "${FLUTTER_DEVICE##*:}" >/dev/null
+    sleep 2
+    "$ADB_BIN" connect "$FLUTTER_DEVICE" || true
+    device_connected "$FLUTTER_DEVICE" && return 0
+  fi
+
+  # No USB (or TCP mode did not take): try the active session, then discovery.
+  "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
+  device_connected "$FLUTTER_DEVICE" && return 0
+
+  endpoint="$(discover_wireless_endpoint)" || true
+  if [ -n "$endpoint" ]; then
+    endpoint="${FLUTTER_DEVICE%%:*}:${endpoint##*:}"
+    "$ADB_BIN" connect "$endpoint" >/dev/null 2>&1 || true
+    if device_connected "$endpoint"; then
+      echo "Connected to wireless adb target $endpoint."
+      FLUTTER_DEVICE="$endpoint"
+      return 0
     fi
-    ;;
+  fi
+
+  echo "warning: wireless adb target $FLUTTER_DEVICE is not connected and no wireless device was discovered." >&2
+  echo "         After a phone reboot, plug in USB once — this script will re-enable TCP mode." >&2
+  echo "         Or re-enable Wireless Debugging on the phone." >&2
+  return 1
+}
+
+case "$FLUTTER_DEVICE" in
+  *.*:[0-9]*) [ -n "$ADB_BIN" ] && ensure_wireless_target || true ;;
 esac
 
 "$FLUTTER_BIN" run \
