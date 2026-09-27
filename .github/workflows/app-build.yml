@@ -1,0 +1,75 @@
+name: app-build
+
+# On-demand Android app build. Produces a single arm64 APK and uploads it as a
+# workflow artifact so it can be pulled to a device with
+# `scripts/install-latest-apk.sh` (see scripts/README.md).
+#
+# Deliberately workflow_dispatch-only: ci-cd.yml already runs analyze/tests on
+# every main push and rolls the gateway; installing an app on every push would
+# be surprising. Trigger from the Actions tab or:
+#   gh workflow run app-build -f build_mode=debug
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Flutter build mode
+        type: choice
+        options:
+          - debug
+          - profile
+          - release
+        default: debug
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        type: string
+        required: false
+        default: main
+
+concurrency:
+  group: app-build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Self-hosted runner Android SDK. Override with a repo variable named
+  # ANDROID_SDK_ROOT (Settings -> Variables) if the runner's path changes.
+  ANDROID_SDK_ROOT: ${{ vars.ANDROID_SDK_ROOT || '/home/bigbrotha/Projects/mobile/android-sdk' }}
+  ANDROID_HOME: ${{ vars.ANDROID_SDK_ROOT || '/home/bigbrotha/Projects/mobile/android-sdk' }}
+
+jobs:
+  build-apk:
+    name: Build ${{ inputs.build_mode }} APK
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Toolchain check
+        # Non-fatal diagnostics: surface the resolved SDK/Java so a failed build
+        # is diagnosable from the log. `flutter doctor` exits non-zero for
+        # unrelated categories (e.g. no Chrome), so never gate on it.
+        run: |
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+          command -v adb || true
+          "$ANDROID_SDK_ROOT/platform-tools/adb" version 2>/dev/null || true
+          java -version 2>&1 | head -3 || true
+          flutter doctor || true
+
+      - name: Build APK
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build apk --${{ inputs.build_mode }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: build/app/outputs/flutter-apk/app-${{ inputs.build_mode }}.apk
+          if-no-files-found: error
+          retention-days: 14

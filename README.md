@@ -114,6 +114,21 @@ var is unset, so `FLUTTER_DEVICE=<id> ./dev.sh` overrides for a single run.
 3. If sign-up is rejected after a host change, update `BETTER_AUTH_URL` in
    `server/.env` to match (`http://<backend-ip>:17600`) and restart.
 
+### CI app builds
+
+`ci-cd.yml` deploys the gateway, not the app. For an on-demand app build, run
+the `app-build` workflow (builds a single arm64 APK and uploads it as the
+`app-apk` artifact), then install it:
+
+```sh
+gh workflow run app-build -f build_mode=debug
+scripts/install-latest-apk.sh
+```
+
+The install script pulls the newest successful run and `adb install -r`s it
+onto the connected device. Signing/version caveats and the Firebase/CI-install
+alternatives are in `scripts/README.md`.
+
 ### Configuring inference
 
 Inference routes through the LangChain gateway. After signing in, install and
