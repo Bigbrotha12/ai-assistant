@@ -190,8 +190,8 @@ void main() {
       await pumpGate(tester);
 
       expect(find.byType(OnboardingScreen), findsOneWidget);
-      // The first Stepper step title is a stable marker for the real flow.
-      expect(find.text('Account'), findsOneWidget);
+      // The first step card's eyebrow is a stable marker for the real flow.
+      expect(find.text('STEP 1 OF 4'), findsOneWidget);
       expect(find.byType(SpeakButton), findsNothing);
     });
 
@@ -210,7 +210,7 @@ void main() {
       await pumpGate(tester);
 
       expect(find.byType(OnboardingScreen), findsOneWidget);
-      expect(find.text('Account'), findsOneWidget);
+      expect(find.text('STEP 1 OF 4'), findsOneWidget);
       expect(find.byType(SpeakButton), findsNothing);
     });
   });
@@ -235,7 +235,7 @@ void main() {
 
     expect(find.byType(OnboardingScreen), findsOneWidget);
     expect(find.text(accountDeletedNotice), findsOneWidget);
-    expect(find.text('Sign in or create your account'), findsNothing);
+    expect(find.byKey(const Key('auth-email')), findsNothing);
     expect(
       find.byKey(const Key('account-deleted-new-account')),
       findsOneWidget,
@@ -245,8 +245,11 @@ void main() {
     await pumpGate(tester);
 
     expect(container.read(accountDeletedProvider), isFalse);
-    expect(find.text('Sign in or create your account'), findsOneWidget);
-    expect(find.byKey(const Key('auth-submit')), findsOneWidget);
+    expect(find.byKey(const Key('auth-email')), findsOneWidget);
+    // The sticky action bar owns the primary action, so the form renders
+    // without its own submit button.
+    expect(find.byKey(const Key('onboarding-primary')), findsOneWidget);
+    expect(find.byKey(const Key('auth-submit')), findsNothing);
   });
 
   testWidgets('terminal latch collapses pushed routes to onboarding', (
@@ -322,7 +325,7 @@ void main() {
       await pumpGate(tester);
 
       expect(find.byType(OnboardingScreen), findsOneWidget);
-      expect(find.text('Account'), findsOneWidget);
+      expect(find.text('STEP 1 OF 4'), findsOneWidget);
       expect(find.byType(SpeakButton), findsNothing);
       // The unconfigured banner only renders on the voice/chat homes, never
       // on the onboarding screen.

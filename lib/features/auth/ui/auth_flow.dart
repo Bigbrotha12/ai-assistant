@@ -23,17 +23,33 @@ import '../data/auth_credentials_store.dart';
 /// in-conversation re-auth card. Renders a bare form (no [Scaffold]); the host
 /// screen supplies the surrounding layout.
 class AuthFlow extends ConsumerStatefulWidget {
-  const AuthFlow({super.key, required this.onSuccess});
+  const AuthFlow({
+    super.key,
+    required this.onSuccess,
+    this.showSubmit = true,
+  });
 
   /// Invoked after a session was obtained AND its API key was minted and
   /// persisted. Receives the authenticated session (token + email).
   final ValueChanged<AuthSession> onSuccess;
 
+  /// Whether to render the built-in submit button on the credentials form.
+  ///
+  /// Set to `false` when the host supplies its own primary action (the
+  /// onboarding Account step puts a full-width CTA in a sticky action bar, and
+  /// two stacked filled buttons read as competing primaries). The host then
+  /// drives submission with [AuthFlowState.submit] via a [GlobalKey]. The
+  /// forgot-password and verify sub-forms always keep their own buttons, since
+  /// they are secondary states the host has no action for.
+  final bool showSubmit;
+
   @override
-  ConsumerState<AuthFlow> createState() => _AuthFlowState();
+  ConsumerState<AuthFlow> createState() => AuthFlowState();
 }
 
-class _AuthFlowState extends ConsumerState<AuthFlow> {
+/// Public state handle so a host can drive submission when it owns the
+/// primary action (see [AuthFlow.showSubmit]).
+class AuthFlowState extends ConsumerState<AuthFlow> {
   final _nameController = TextEditingController();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -70,6 +86,21 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
     _passwordController.dispose();
     super.dispose();
   }
+
+  /// Drives the credentials-form submit from a host-owned primary action.
+  ///
+  /// No-op while already submitting, and while a sub-form (forgot-password /
+  /// verify) is showing — those own their own buttons. Callers that hide the
+  /// built-in button should disable their action while a submit is in flight;
+  /// [isSubmitting] exposes that.
+  Future<void> submit() async {
+    if (_forgotMode || _verifyMode) return;
+    await _submit();
+  }
+
+  /// Whether a submit is currently in flight, so a host-owned action can show
+  /// a spinner and disable itself.
+  bool get isSubmitting => _submitting;
 
   Future<void> _submit() async {
     if (_submitting) return;
@@ -418,18 +449,20 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
             child: const Text('Sign in instead'),
           ),
         ],
-        const SizedBox(height: 20),
-        FilledButton(
-          key: const Key('auth-submit'),
-          onPressed: _submitting ? null : _submit,
-          child: _submitting
-              ? const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : Text(_createAccount ? 'Create account' : 'Sign in'),
-        ),
+        if (widget.showSubmit) ...[
+          const SizedBox(height: 20),
+          FilledButton(
+            key: const Key('auth-submit'),
+            onPressed: _submitting ? null : _submit,
+            child: _submitting
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Text(_createAccount ? 'Create account' : 'Sign in'),
+          ),
+        ],
       ],
     );
   }

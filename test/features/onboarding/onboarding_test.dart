@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ai_assistant/app/theme.dart';
+import 'package:ai_assistant/app/widgets/step_dots.dart';
 import 'package:ai_assistant/features/auth/data/auth_client.dart';
 import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
@@ -79,6 +81,8 @@ class _RecordingSettingsStore extends FakeSettingsStore {
 }
 
 void main() {
+  const primary = Key('onboarding-primary');
+
   Widget onboardingApp({
     required FakeSettingsStore settings,
     required FakeAuthCredentialsStore auth,
@@ -101,7 +105,8 @@ void main() {
   }
 
   /// Mounts [OnboardingScreen] with a fully faked provider graph. A tall
-  /// viewport keeps every step's content and the Next/Back controls laid out.
+  /// viewport keeps every step's card content and the sticky action bar laid
+  /// out without scrolling.
   Future<void> pumpOnboarding(
     WidgetTester tester, {
     FakeSettingsStore? settings,
@@ -110,8 +115,9 @@ void main() {
     FakeAuthClient? authClient,
     FakeVoiceSettingsStore? voiceSettings,
     EngineManager? engine,
+    Size size = const Size(800, 1800),
   }) async {
-    tester.view.physicalSize = const Size(800, 1800);
+    tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
     await tester.pumpWidget(onboardingApp(
@@ -125,35 +131,45 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  Future<void> tapNext(WidgetTester tester) async {
-    await tester.tap(find.widgetWithText(FilledButton, 'Next').hitTestable());
+  /// The step the flow is currently showing, as the dot indicator reports it.
+  int currentStep(WidgetTester tester) =>
+      tester.widget<StepDots>(find.byType(StepDots)).index;
+
+  /// Taps the sticky bar's single primary action.
+  Future<void> tapPrimary(WidgetTester tester) async {
+    await tester.tap(find.byKey(primary).hitTestable());
     await tester.pumpAndSettle();
   }
+
+  /// Advances one step (Region -> Voice, Voice -> Finish).
+  Future<void> tapNext(WidgetTester tester) => tapPrimary(tester);
 
   Future<void> tapBack(WidgetTester tester) async {
     await tester.tap(find.widgetWithText(TextButton, 'Back').hitTestable());
     await tester.pumpAndSettle();
   }
 
+  /// Fills the credentials form and fires the CTA. The Account step's primary
+  /// action submits the form, so a successful sign-in advances to the Region
+  /// step by itself.
   Future<void> signIn(WidgetTester tester) async {
     await tester.enterText(
         find.byKey(const Key('auth-email')), 'user@example.com');
     await tester.enterText(
         find.byKey(const Key('auth-password')), 'secret123');
-    await tester.tap(find.byKey(const Key('auth-submit')));
-    await tester.pumpAndSettle();
+    await tapPrimary(tester);
   }
 
+  /// Signs in, then walks Region -> Voice -> Finish.
   Future<void> completeFlow(WidgetTester tester) async {
     await signIn(tester);
-    await tapNext(tester); // Account → Region
     await tapNext(tester); // Region → Voice
     await tapNext(tester); // Voice → Finish
   }
 
+  /// Signs in, then walks Region -> Voice.
   Future<void> completeFlowToVoice(WidgetTester tester) async {
     await signIn(tester);
-    await tapNext(tester); // Account → Region
     await tapNext(tester); // Region → Voice
   }
 
@@ -161,8 +177,13 @@ void main() {
     testWidgets('defaults are pre-filled (language, date)', (tester) async {
       await pumpOnboarding(tester);
 
-      final stepper = tester.widget<Stepper>(find.byType(Stepper));
-      expect(stepper.currentStep, 0);
+      expect(currentStep(tester), 0);
+      expect(find.text('STEP 1 OF 4'), findsOneWidget);
+
+      // Region is not built until it is first shown (a PageView only builds
+      // the page it needs), so walk to it before reading the dropdowns.
+      await signIn(tester);
+      expect(find.text('STEP 2 OF 4'), findsOneWidget);
 
       final language = tester.widget<DropdownButton<String>>(
           find.byKey(const Key('ob-language')));
@@ -176,7 +197,7 @@ void main() {
     testWidgets('entered state survives Back and Next', (tester) async {
       await pumpOnboarding(tester);
       await signIn(tester);
-      await tapNext(tester); // → Region
+      expect(currentStep(tester), 1);
 
       await tester.tap(find.byKey(const Key('ob-language')));
       await tester.pumpAndSettle();
@@ -184,7 +205,8 @@ void main() {
       await tester.pumpAndSettle();
 
       await tapBack(tester); // → Account
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 0);
+      expect(currentStep(tester), 0);
+      expect(find.text('STEP 1 OF 4'), findsOneWidget);
       final email = tester.widget<TextField>(find.byKey(const Key('auth-email')));
       expect(email.controller!.text, 'user@example.com');
 
@@ -195,8 +217,129 @@ void main() {
     });
   });
 
+  group('card-per-step layout', () {
+    testWidgets('the dot indicator tracks the visible step', (tester) async {
+      await pumpOnboarding(tester);
+
+      final dots = find.byType(StepDots);
+      expect(dots, findsOneWidget);
+      expect(tester.widget<StepDots>(dots).count, 4);
+
+      await signIn(tester);
+      expect(tester.widget<StepDots>(dots).index, 1);
+      await tapNext(tester);
+      expect(tester.widget<StepDots>(dots).index, 2);
+      await tapNext(tester);
+      expect(tester.widget<StepDots>(dots).index, 3);
+    });
+
+    testWidgets('only one step card is visible at a time', (tester) async {
+      await pumpOnboarding(tester);
+
+      // The Region step's fields are not in the tree while Account is showing.
+      expect(find.byKey(const Key('ob-language')), findsNothing);
+
+      await signIn(tester);
+      expect(find.byKey(const Key('ob-language')), findsOneWidget);
+      // ...and the Account form is gone once Region is showing.
+      expect(find.byKey(const Key('auth-email')), findsNothing);
+    });
+
+    testWidgets('the primary action is inset from the screen edges',
+        (tester) async {
+      // Regression guard: the old vertical Stepper rendered its controls in a
+      // bare Row with no padding, so buttons sat flush against the edge.
+      await pumpOnboarding(tester);
+
+      final button = tester.getRect(find.byKey(primary));
+      expect(button.left, greaterThanOrEqualTo(AppSpacing.lg));
+      expect(button.right, lessThanOrEqualTo(800 - AppSpacing.lg));
+    });
+
+    testWidgets('the sticky bar clears the card above it', (tester) async {
+      await pumpOnboarding(tester);
+
+      // The action bar is the last thing in the column; assert there is real
+      // space between the card's bottom edge and the top of the button.
+      final card = tester.getRect(find.byType(Card).last);
+      final button = tester.getRect(find.byKey(primary));
+      expect(button.top - card.bottom, greaterThanOrEqualTo(AppSpacing.lg));
+    });
+
+    testWidgets('the Account step shows exactly one filled primary button',
+        (tester) async {
+      // Two stacked filled buttons read as competing primaries, so AuthFlow's
+      // own submit is suppressed in favour of the sticky CTA.
+      await pumpOnboarding(tester);
+
+      expect(find.byKey(const Key('auth-submit')), findsNothing);
+      expect(find.widgetWithText(FilledButton, 'Sign in'), findsOneWidget);
+    });
+
+    testWidgets('dots are tappable backwards but cannot skip ahead',
+        (tester) async {
+      await pumpOnboarding(tester);
+      await signIn(tester);
+      await tapNext(tester);
+      expect(currentStep(tester), 2);
+
+      // Forward taps are refused: the flow must not jump past a step.
+      final dots = find.byType(StepDots);
+      tester.widget<StepDots>(dots).onDotTapped!(3);
+      await tester.pumpAndSettle();
+      expect(currentStep(tester), 2);
+
+      // Backward taps are allowed.
+      tester.widget<StepDots>(dots).onDotTapped!(0);
+      await tester.pumpAndSettle();
+      expect(currentStep(tester), 0);
+    });
+
+    testWidgets('swiping does not change step', (tester) async {
+      await pumpOnboarding(tester);
+
+      // The cards host a keyboard, a SegmentedButton and dropdowns; a
+      // horizontal drag must not fight them.
+      final view = find.byType(PageView);
+      expect(
+          tester.widget<PageView>(view).physics, isA<NeverScrollableScrollPhysics>());
+
+      await tester.drag(view, const Offset(-400, 0));
+      await tester.pumpAndSettle();
+      expect(currentStep(tester), 0);
+    });
+
+    testWidgets('every step lays out on a small phone', (tester) async {
+      // A RenderFlex overflow is reported through FlutterError, so simply
+      // walking the flow at a realistic size fails this test if any step's
+      // card, dots or action bar cannot fit. The other tests use a very tall
+      // viewport, which would hide exactly this.
+      //
+      // A stored key lets the CTA advance straight away, so this measures
+      // layout rather than re-testing the auth gate.
+      await pumpOnboarding(
+        tester,
+        size: const Size(390, 844),
+        auth: FakeAuthCredentialsStore(
+          stored: const AuthCredentials(apiKey: 'k', email: 'a@b.com'),
+        ),
+      );
+
+      for (final expected in const [
+        'STEP 1 OF 4',
+        'STEP 2 OF 4',
+        'STEP 3 OF 4',
+        'STEP 4 OF 4',
+      ]) {
+        expect(find.text(expected), findsOneWidget);
+        await tester.tap(find.byKey(primary).hitTestable());
+        await tester.pumpAndSettle();
+      }
+    });
+  });
+
   group('account step', () {
-    testWidgets('create-account mints and stores the key; Next gated until then',
+    testWidgets('create-account mints and stores the key, then advances',
         (tester) async {
       final authStore = FakeAuthCredentialsStore();
       final authClient = FakeAuthClient(
@@ -206,11 +349,6 @@ void main() {
             const MintedApiKey(key: 'minted-key-2', id: 'minted-key-id-2'),
       );
       await pumpOnboarding(tester, auth: authStore, authClient: authClient);
-
-      // Next disabled until the key is minted and stored.
-      var next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNull);
 
       await tester.tap(find.descendant(
         of: find.byType(SegmentedButton<bool>),
@@ -222,8 +360,7 @@ void main() {
           find.byKey(const Key('auth-email')), 'ada@example.com');
       await tester.enterText(
           find.byKey(const Key('auth-password')), 'pw-123456');
-      await tester.tap(find.byKey(const Key('auth-submit')));
-      await tester.pumpAndSettle();
+      await tapPrimary(tester);
 
       expect(authStore.stored, isNotNull);
       expect(authStore.stored!.apiKey, 'minted-key-2');
@@ -231,9 +368,24 @@ void main() {
       expect(authStore.stored!.keyId, 'minted-key-id-2');
       expect(authStore.stored!.sessionToken, 'tok-2');
 
-      next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNotNull);
+      // The CTA drove the submit, so success is what moved us on.
+      expect(currentStep(tester), 1);
+    });
+
+    testWidgets('tapping the CTA with empty fields validates without a key',
+        (tester) async {
+      final authStore = FakeAuthCredentialsStore();
+      await pumpOnboarding(tester, auth: authStore);
+
+      // The CTA stays enabled (it submits); an empty submit is rejected
+      // in-place rather than advancing.
+      expect(tester.widget<FilledButton>(find.byKey(primary)).onPressed,
+          isNotNull);
+      await tapPrimary(tester);
+
+      expect(find.text('Enter your email and password'), findsOneWidget);
+      expect(authStore.stored, isNull);
+      expect(currentStep(tester), 0);
     });
 
     testWidgets('auth failure shows an error and stores no key',
@@ -248,14 +400,11 @@ void main() {
       await tester.enterText(
           find.byKey(const Key('auth-email')), 'user@example.com');
       await tester.enterText(find.byKey(const Key('auth-password')), 'wrong');
-      await tester.tap(find.byKey(const Key('auth-submit')));
-      await tester.pumpAndSettle();
+      await tapPrimary(tester);
 
       expect(find.text('Incorrect email or password'), findsOneWidget);
       expect(authStore.stored, isNull);
-      final next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNull);
+      expect(currentStep(tester), 0);
     });
   });
 
@@ -274,8 +423,7 @@ void main() {
         voiceSettings: voiceStore,
       );
 
-      await signIn(tester);
-      await tapNext(tester); // → Region
+      await signIn(tester); // → Region
       // Pick a non-default language so the persisted value is observable.
       await tester.tap(find.byKey(const Key('ob-language')));
       await tester.pumpAndSettle();
@@ -284,9 +432,8 @@ void main() {
       await tapNext(tester); // → Voice
       await tapNext(tester); // → Finish
 
-      await tester
-          .tap(find.widgetWithText(FilledButton, 'Get started').hitTestable());
-      await tester.pumpAndSettle();
+      expect(find.widgetWithText(FilledButton, 'Get started'), findsOneWidget);
+      await tapPrimary(tester);
 
       expect(log, ['voice', 'prefs', 'settings']);
       expect(voiceStore.saved!.preferredLanguage, 'es');
@@ -308,9 +455,7 @@ void main() {
       );
       await completeFlow(tester);
 
-      await tester
-          .tap(find.widgetWithText(FilledButton, 'Get started').hitTestable());
-      await tester.pumpAndSettle();
+      await tapPrimary(tester); // Get started
 
       // Backend was never written and the user stays in onboarding.
       expect(settingsStore.stored, isNull);
@@ -336,23 +481,17 @@ void main() {
       final settingsStore = FakeSettingsStore();
       await pumpOnboarding(tester, auth: authStore, settings: settingsStore);
 
-      // With the Backend step removed, a stored key no longer re-enters
-      // at step 1 — the stepper starts at Account (step 0).
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 0);
+      // With the Backend step removed, a stored key no longer re-enters at
+      // step 1 — the flow starts at Account (step 0).
+      expect(currentStep(tester), 0);
 
-      // But the account is pre-marked ready so Next can advance immediately.
-      final next = tester.widget<FilledButton>(
-          find.widgetWithText(FilledButton, 'Next').hitTestable());
-      expect(next.onPressed, isNotNull);
-
-      // Completing from the re-entry point persists the backend settings
-      // last, which is what flips the gate to "configured".
+      // But the account is pre-marked ready, so the CTA advances immediately
+      // rather than re-submitting the form.
       await tapNext(tester); // Account → Region
+      expect(currentStep(tester), 1);
       await tapNext(tester); // Region → Voice
       await tapNext(tester); // Voice → Finish
-      await tester
-          .tap(find.widgetWithText(FilledButton, 'Get started').hitTestable());
-      await tester.pumpAndSettle();
+      await tapPrimary(tester); // Get started
 
       expect(settingsStore.stored, isNotNull);
       expect(settingsStore.stored!.host, BackendConfig.defaultHost);
@@ -361,7 +500,7 @@ void main() {
   });
 
   group('voice & models step', () {
-    testWidgets('Do it later continues without downloading', (tester) async {
+    testWidgets('Next continues without downloading', (tester) async {
       final engine = _TrackingEngineManager();
       await pumpOnboarding(tester, engine: engine);
       await completeFlowToVoice(tester);
@@ -372,10 +511,12 @@ void main() {
       expect(find.text('Supertonic 3').hitTestable(), findsOneWidget);
       expect(find.text('not downloaded').hitTestable(), findsOneWidget);
 
-      await tester.tap(find.text('Do it later').hitTestable());
-      await tester.pumpAndSettle();
+      // The old "Do it later" button duplicated the primary action, so the CTA
+      // is the single way forward and it downloads nothing.
+      expect(find.text('Do it later'), findsNothing);
+      await tapNext(tester);
 
-      expect(tester.widget<Stepper>(find.byType(Stepper)).currentStep, 3);
+      expect(currentStep(tester), 3);
       expect(engine.downloadCalls, 0);
     });
   });
@@ -384,8 +525,7 @@ void main() {
     testWidgets('MCP and files tokens are not present in the onboarding flow',
         (tester) async {
       await pumpOnboarding(tester);
-      await signIn(tester);
-      await tapNext(tester); // → Region
+      await signIn(tester); // → Region
       // No Backend step means no secret fields exist in the tree.
       expect(find.byKey(const Key('ob-mcp')), findsNothing);
       expect(find.byKey(const Key('ob-files')), findsNothing);

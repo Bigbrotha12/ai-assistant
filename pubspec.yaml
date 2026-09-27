@@ -66,6 +66,7 @@ dependencies:
   # long LLM wait / TTS reply does not let the screen fall asleep (the app has
   # no background-audio permission to finish speaking unseen).
   wakelock_plus: ^1.2.10
+  smooth_page_indicator: ^3.0.0
 
 dev_dependencies:
   flutter_test:
@@ -99,7 +100,7 @@ flutter:
   assets:
     - assets/branding/
 
-  # Design system fonts (see docs/design-system.md). Both are variable fonts;
+  # Design system fonts (see DESIGN.md). Both are variable fonts;
   # each declared weight maps to the same file so the named weight is applied.
   fonts:
     - family: Manrope

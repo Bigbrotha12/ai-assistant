@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// Design system for the app (see `docs/design-system.md`, status: LOCKED).
+/// Design system for the app (see `DESIGN.md`, status: LOCKED).
 ///
 /// Two tiers share the same structure and tokens; only surfaces, accents and
 /// headline type differ:
@@ -310,6 +310,20 @@ ThemeData _baseTheme(ColorScheme scheme, {required bool premium}) {
           borderRadius: BorderRadius.circular(AppRadii.lg),
         ),
         minimumSize: const Size(64, 48),
+        textStyle: _textTheme(premium: premium).labelMedium,
+      ),
+    ),
+    // Quiet actions (Back, "Do it later") get a real 48px tap target rather
+    // than the label's own bounds, and no fill — the design system keeps
+    // secondary actions to a hairline or nothing at all.
+    textButtonTheme: TextButtonThemeData(
+      style: TextButton.styleFrom(
+        foregroundColor: scheme.primary,
+        minimumSize: const Size(64, 48),
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadii.lg),
+        ),
         textStyle: _textTheme(premium: premium).labelMedium,
       ),
     ),

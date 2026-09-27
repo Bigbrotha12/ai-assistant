@@ -1,7 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Visual tier of the app (see `docs/design-system.md`).
+/// Visual tier of the app (see `DESIGN.md`).
 enum AppTier { standard, premium }
 
 /// Persistence for the app-tier preference (non-sensitive — plain prefs).
