@@ -63,6 +63,11 @@ const accountDeletedPhrases = [
   'This account has been deleted.',
 ];
 
+const noModelPhrases = [
+  'I need a model before I can reply — pick one in Settings, under Plugins.',
+  'No model is set up for this account yet — choose one in Plugins, then try again.',
+];
+
 const serverErrorPhrases = [
   'There seems to be an issue on my side — please try again.',
   'My server hit a snag — can you try again?',
@@ -225,6 +230,11 @@ String statusPhraseForError(Object error, {Random? random}) {
       // C2: valid key, unverified email — offer verification, never re-auth.
       ManagedErrorCodes.emailNotVerified => _pick(verifyEmailPhrases, rng),
       ManagedErrorCodes.accountDeleted => _pick(accountDeletedPhrases, rng),
+      // A valid gateway key but no model selected/serving for this account:
+      // an actionable setup step, not a server failure.
+      ManagedErrorCodes.noSelectedModel ||
+      ManagedErrorCodes.noCapableModel =>
+        _pick(noModelPhrases, rng),
       ManagedErrorCodes.unauthorized ||
       ManagedErrorCodes.credentialsExpired ||
       ManagedErrorCodes.noCredentials =>

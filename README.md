@@ -131,10 +131,13 @@ alternatives are in `scripts/README.md`.
 
 ### Configuring inference
 
-Inference routes through the LangChain gateway. After signing in, install and
-configure model and tool plugins through the **Plugins** screen in the app:
+Inference routes through the LangChain gateway. Model plugins are installed
+globally on the gateway by an administrator; per account you **select one and
+enter your provider API key** — chat cannot send until a model is selected with
+a key. After signing in, open **Settings → Plugins**:
 
-- Select a model plugin (e.g. OpenRouter) and enter your provider API key.
+- Select a model plugin (the built-in OpenRouter by default) and enter your
+  provider API key.
 - Enable tool plugins (Vikunja, Mealie, calendar, etc.) with their credentials.
 - The gateway uses these credentials per-request — they flow in the request
   body and are never persisted server-side.
