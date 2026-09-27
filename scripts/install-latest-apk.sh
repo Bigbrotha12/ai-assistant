@@ -6,9 +6,16 @@
 #   scripts/install-latest-apk.sh              # latest successful app-build run
 #   scripts/install-latest-apk.sh 1234567890   # a specific run id
 #
+# Device selection: an already-connected device (USB or `adb connect`) is used
+# as-is. When nothing is connected, a Wireless-Debugging device is discovered
+# over mDNS (`adb mdns services`) and connected automatically.
+#
 # Environment overrides:
 #   RUN_ID         run id to install (same as the positional argument)
 #   SERIAL         target device serial (adb -s); defaults to the only device
+#   WIRELESS_HOST  host to pair with the mDNS-discovered port when connecting a
+#                  wireless device (e.g. the phone's Tailscale IP); defaults to
+#                  the mDNS LAN address
 #   ADB            path to adb (defaults to PATH, then ANDROID_SDK_ROOT)
 #   WORKFLOW       workflow file to read runs from (default: app-build.yml)
 #   ARTIFACT       artifact name (default: app-apk)
@@ -23,7 +30,9 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the leading comment block (line 2 up to the `set -euo pipefail` line)
+  # so it never drifts from the header above.
+  sed -n '2,/^set -euo pipefail$/p' "$0" | sed '/^set -euo pipefail$/d; s/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -88,14 +97,46 @@ APK="$(find "$TMP_DIR" -name '*.apk' -type f | head -n 1)"
 [[ -n "$APK" ]] || { echo "error: no .apk in artifact '$ARTIFACT'" >&2; exit 1; }
 echo "APK: $APK ($(du -h "$APK" | cut -f1))"
 
-# Resolve the target device.
-mapfile -t DEVICES < <("$ADB_BIN" devices | awk 'NR>1 && $2=="device" {print $1}')
+# Resolve the target device. A Wireless-Debugging device is not attached to
+# `adb devices` until `adb connect` runs, so when nothing is connected, discover
+# it over mDNS first.
+device_serials() {
+  "$ADB_BIN" devices | awk 'NR>1 && $2=="device" {print $1}'
+}
+
+connect_wireless() {
+  mapfile -t SERVICES < <("$ADB_BIN" mdns services 2>/dev/null \
+    | awk '$2=="_adb-tls-connect._tcp" {print $NF}')
+  [[ "${#SERVICES[@]}" -gt 0 ]] || return 1
+  local discovered endpoint
+  for discovered in "${SERVICES[@]}"; do
+    # Android 11+ wireless debugging advertises an ephemeral port that changes
+    # on every phone reboot/toggle, so never hardcode it. WIRELESS_HOST keeps
+    # that discovered port but reaches the phone on another interface (e.g. its
+    # Tailscale IP) instead of the mDNS LAN address.
+    endpoint="$discovered"
+    if [[ -n "${WIRELESS_HOST:-}" ]]; then
+      endpoint="${WIRELESS_HOST}:${discovered##*:}"
+    fi
+    echo "No device connected; connecting wireless adb at $endpoint…"
+    "$ADB_BIN" connect "$endpoint" >/dev/null 2>&1 || true
+  done
+  [[ -n "$(device_serials)" ]]
+}
+
+mapfile -t DEVICES < <(device_serials)
+if [[ -z "${SERIAL:-}" && "${#DEVICES[@]}" -eq 0 ]]; then
+  connect_wireless || true
+  mapfile -t DEVICES < <(device_serials)
+fi
+
 if [[ -n "${SERIAL:-}" ]]; then
   :
 elif [[ "${#DEVICES[@]}" -eq 1 ]]; then
   SERIAL="${DEVICES[0]}"
 elif [[ "${#DEVICES[@]}" -eq 0 ]]; then
-  echo "error: no device connected. Plug in the phone (or 'adb connect <ip>:<port>' first)." >&2
+  echo "error: no device connected and none discovered over wireless adb." >&2
+  echo "       Plug in the phone, or set WIRELESS_HOST / run 'adb connect <ip>:<port>' first." >&2
   exit 1
 else
   echo "error: multiple devices; set SERIAL to one of:" >&2
