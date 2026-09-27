@@ -378,6 +378,13 @@ export type EgressPolicy = {
   readonly subject: string;
   readonly mode: Mode;
   readonly trustedHosts: readonly string[];
+  /**
+   * Admin-vouched hosts permitted to use http: in production (mirrors
+   * `UrlValidateOptions.httpAllowedHosts`). Empty for plugin/model egress,
+   * which stays https-only; populated for MCP egress, where in-cluster SSE
+   * servers are plain http.
+   */
+  readonly httpAllowedHosts: readonly string[];
   readonly redirect: "manual";
   readonly destinations: readonly EgressDestinationPolicy[];
 };
@@ -396,6 +403,8 @@ export type CreateEgressPolicyInput = {
   destinations: readonly EgressPolicyDestinationInput[];
   mode?: Mode;
   trustedHosts?: readonly string[];
+  /** Hosts permitted to use http: in production (MCP egress). */
+  httpAllowedHosts?: readonly string[];
 };
 
 function normalizedPolicyPath(path: string): string {
@@ -440,8 +449,13 @@ export function createEgressPolicy(input: CreateEgressPolicyInput): EgressPolicy
   }
   const mode = input.mode ?? NODE_ENV;
   const trustedHosts = [...(input.trustedHosts ?? [])];
+  const httpAllowedHosts = [...(input.httpAllowedHosts ?? [])];
   const destinations = input.destinations.map((destination) => {
-    const parsed = validateStaticUrl(destination.baseUrl, { mode, trustedHosts });
+    const parsed = validateStaticUrl(destination.baseUrl, {
+      mode,
+      trustedHosts,
+      httpAllowedHosts,
+    });
     if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
       throw new SsrfValidationError(
         "EGRESS_DENIED",
@@ -502,6 +516,7 @@ export function createEgressPolicy(input: CreateEgressPolicyInput): EgressPolicy
     subject,
     mode,
     trustedHosts: Object.freeze(trustedHosts),
+    httpAllowedHosts: Object.freeze(httpAllowedHosts),
     redirect: "manual",
     destinations: Object.freeze(destinations.map((destination) => Object.freeze({
       ...destination,
@@ -520,6 +535,7 @@ export async function authorizeEgressRequest(
   const parsed = validateStaticUrl(urlValue, {
     mode: policy.mode,
     trustedHosts: policy.trustedHosts,
+    httpAllowedHosts: policy.httpAllowedHosts,
   });
   const method = methodValue.toUpperCase();
   if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {

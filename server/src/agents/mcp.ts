@@ -1557,6 +1557,7 @@ async function validateMcpRetainedPins(
       exactPaths: [validationUrl.pathname],
     }],
     trustedHosts,
+    httpAllowedHosts: trustedHosts,
     mode,
   });
   const authorized = await authorizeEgressRequest(policy, validationUrl.href, "GET");

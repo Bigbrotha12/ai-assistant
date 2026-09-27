@@ -13,6 +13,8 @@ import {
   isTrustedHost,
   REDIRECT_POLICY,
   isRedirectStatus,
+  createEgressPolicy,
+  authorizeEgressRequest,
 } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 
@@ -590,5 +592,53 @@ describe("httpAllowedHosts production carve-out", () => {
       httpAllowedHosts: ["10.43.0.12"],
     });
     assert.equal(url.hostname, "10.43.0.12");
+  });
+});
+
+describe("egress policy http carve-out (MCP)", () => {
+  const trusted = ["*.productivity.svc.cluster.local"];
+  const baseUrl = "http://mealie-mcp-sse.productivity.svc.cluster.local:8001/sse";
+
+  test("a trusted http destination passes policy creation and authorization in production", async () => {
+    const policy = createEgressPolicy({
+      subject: "mcp",
+      destinations: [
+        {
+          baseUrl,
+          pinnedIps: ["10.43.0.13"],
+          methods: ["GET", "POST"],
+          exactPaths: ["/sse"],
+        },
+      ],
+      trustedHosts: trusted,
+      httpAllowedHosts: trusted,
+      mode: "production",
+    });
+    const authorized = await authorizeEgressRequest(policy, baseUrl, "GET");
+    assert.equal(
+      authorized.parsed.hostname,
+      "mealie-mcp-sse.productivity.svc.cluster.local",
+    );
+  });
+
+  test("without httpAllowedHosts the same trusted http destination is UNSUPPORTED_SCHEME", () => {
+    assert.throws(
+      () =>
+        createEgressPolicy({
+          subject: "mcp",
+          destinations: [
+            {
+              baseUrl,
+              pinnedIps: ["10.43.0.13"],
+              methods: ["GET"],
+              exactPaths: ["/sse"],
+            },
+          ],
+          trustedHosts: trusted,
+          mode: "production",
+        }),
+      (e: unknown) =>
+        e instanceof SsrfValidationError && e.code === "UNSUPPORTED_SCHEME",
+    );
   });
 });
