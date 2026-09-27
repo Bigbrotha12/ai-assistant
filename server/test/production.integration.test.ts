@@ -1,3 +1,4 @@
+import "./ledger_test_env.ts";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { spawnSync } from "node:child_process";

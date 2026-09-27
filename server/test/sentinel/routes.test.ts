@@ -1,3 +1,4 @@
+import "../ledger_test_env.ts";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { Hono } from "hono";
