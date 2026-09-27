@@ -1,4 +1,4 @@
-import "./ledger_test_env.ts";
+import "./test_env.ts";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
