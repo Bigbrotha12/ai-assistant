@@ -22,12 +22,22 @@ import '../../voice/data/engine_manager_provider.dart';
 import '../../voice/data/model_downloader.dart';
 import '../../voice/data/voice_settings.dart';
 import '../../voice/ui/voice_settings_providers.dart';
+import '../../../app/widgets/app_buttons.dart';
+import '../../../app/widgets/step_dots.dart';
 
-/// Onboarding flow (plan §3.5): a themed vertical [Stepper] that walks the
-/// user through Account → Language & region → Voice & models → Finish, then
-/// persists everything in the §3.6 order (voice settings, prefs, backend
-/// settings last — the backend settings are derived from compile-time defaults
-/// since the Backend step was removed: --dart-define values carry the host).
+/// Onboarding flow (plan §3.5): a dot-stepped flow that walks the user through
+/// Account → Language & region → Voice & models → Finish, then persists
+/// everything in the §3.6 order (voice settings, prefs, backend settings last —
+/// the backend settings are derived from compile-time defaults since the
+/// Backend step was removed: --dart-define values carry the host).
+///
+/// **Layout:** one step per card in a [PageView], a [StepDots] indicator under
+/// the app bar, and a single full-width CTA in a sticky action bar. This
+/// replaced Material's `Stepper`, which renders each step's controls *inline
+/// inside its own body* — step 1's buttons ended up flush against step 2's
+/// header, and the bare `Row` of buttons carried no surrounding padding and so
+/// bled into whatever sat beside it. Card-per-step removes both failure modes
+/// and guarantees exactly one primary action per step.
 ///
 /// All form state — controllers, per-step selections — is hoisted on this
 /// screen and disposed here (no `ref` in `dispose`, Riverpod v3 convention).
@@ -49,6 +59,16 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // -------------------------------------------------------------------------
   // Hoisted step state
   // -------------------------------------------------------------------------
+
+  /// Drives the [PageView] of step cards and the [StepDots] indicator. The
+  /// visible page is the source of truth for the current index; this only
+  /// animates between pages.
+  final PageController _pageController = PageController();
+
+  /// Lets the sticky CTA drive auth when the Account step hides [AuthFlow]'s
+  /// own submit button (two stacked filled buttons read as competing
+  /// primaries).
+  final GlobalKey<AuthFlowState> _authKey = GlobalKey<AuthFlowState>();
 
   int _currentStep = 0;
 
@@ -79,6 +99,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
 
   @override
   void dispose() {
+    _pageController.dispose();
     super.dispose();
   }
 
@@ -139,11 +160,34 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // Step navigation
   // -------------------------------------------------------------------------
 
+  /// Animates to [next] and mirrors it into [_currentStep].
+  ///
+  /// [_currentStep] is only used for the action bar's enabled/label state,
+  /// which must flip the instant the button is tapped rather than waiting for
+  /// the page animation to settle.
   void _goToStep(int next) {
-    setState(() => _currentStep = next);
+    final target = next.clamp(0, _stepsLength - 1);
+    if (target == _currentStep) return;
+    setState(() => _currentStep = target);
+    _pageController.animateToPage(
+      target,
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   void _onStepContinue() {
+    if (_currentStep == _accountStepIndex) {
+      // Already authenticated (a stored key): there is nothing to submit, so
+      // the CTA just advances. Otherwise it drives the form, and
+      // [_onAuthSuccess] advances once the key is persisted.
+      if (_accountReady) {
+        _goToStep(_accountStepIndex + 1);
+      } else {
+        _authKey.currentState?.submit();
+      }
+      return;
+    }
     if (_currentStep >= _stepsLength - 1) {
       _getStarted();
     } else {
@@ -155,13 +199,15 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     if (_currentStep > 0) _goToStep(_currentStep - 1);
   }
 
-  static const int _stepsLength = 4;
+  /// Dots are tappable, but only *backwards* (or to the current step). Jumping
+  /// forward past a step whose validation has not run — e.g. skipping the
+  /// account sign-in — would let the user reach Finish unauthenticated.
+  void _onDotTapped(int index) {
+    if (index <= _currentStep) _goToStep(index);
+  }
 
-  /// True when the "Next" button for [index] may advance.
-  bool _canContinue(int index) => switch (index) {
-    0 => _accountReady,
-    _ => true,
-  };
+  static const int _accountStepIndex = 0;
+  static const int _stepsLength = 4;
 
   // -------------------------------------------------------------------------
   // Account (via the shared AuthFlow)
@@ -172,6 +218,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       _accountReady = true;
       _accountEmail = session.email;
     });
+    // The CTA drove this submit, so success is what advances the flow.
+    if (_currentStep == _accountStepIndex) _goToStep(_accountStepIndex + 1);
   }
 
   Widget _buildDeletedAccountStep() {
@@ -227,23 +275,17 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       return;
     }
     if (!mounted) return;
-    setState(() => _currentStep = 0);
+    _goToStep(_accountStepIndex);
   }
 
   Widget _buildAccountStep() {
     if (widget.accountDeleted) return _buildDeletedAccountStep();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'The app talks to your gateway with a per-user API key. '
-          'Sign in to an existing account or create one.',
-          style: Theme.of(context).textTheme.bodyMedium
-              ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
-        ),
-        const SizedBox(height: 16),
-        AuthFlow(onSuccess: _onAuthSuccess),
-      ],
+    return AuthFlow(
+      key: _authKey,
+      // The sticky action bar owns the primary button, so the form renders
+      // without one and [_onStepContinue] drives submit instead.
+      showSubmit: false,
+      onSuccess: _onAuthSuccess,
     );
   }
 
@@ -281,7 +323,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
             },
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: AppSpacing.lg),
         InputDecorator(
           decoration: const InputDecoration(
             labelText: 'Date format',
@@ -386,13 +428,13 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       children: [
         Text(
           'Chat works without models; Whisper adds on-device speech input '
-          'and Supertonic speech output. Download Whisper to recognise '
-          'speech offline.',
+          'and Supertonic speech output. You can download these later from '
+          'Voice settings.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: AppSpacing.xl),
         _ModelRow(
           label: 'Whisper tiny',
           size: '~75 MB',
@@ -400,7 +442,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
           progress: progress,
           onAction: _downloading ? null : _downloadModels,
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: AppSpacing.sm),
         _ModelRow(
           label: 'Supertonic 3',
           status: supertonic,
@@ -408,14 +450,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
           // Without a retry action a failed Supertonic download would render
           // a permanently disabled Retry button.
           onAction: _downloading ? null : _retrySupertonicDownload,
-        ),
-        const SizedBox(height: 16),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton(
-            onPressed: () => _goToStep(_currentStep + 1),
-            child: const Text('Do it later'),
-          ),
         ),
       ],
     );
@@ -491,13 +525,13 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text('Review your setup', style: theme.textTheme.titleMedium),
-        const SizedBox(height: 12),
+        const SizedBox(height: AppSpacing.md),
         _SummaryRow(label: 'Account email', value: _accountEmail ?? '—'),
         _SummaryRow(label: 'Language', value: _language),
         _SummaryRow(label: 'Date format', value: _dateFormat),
         _SummaryRow(label: 'Models', value: _modelsSummary),
         if (_saveError != null) ...[
-          const SizedBox(height: 16),
+          const SizedBox(height: AppSpacing.lg),
           Material(
             color: scheme.errorContainer,
             borderRadius: BorderRadius.circular(AppRadii.lg),
@@ -530,41 +564,94 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   }
 
   // -------------------------------------------------------------------------
-  // Stepper assembly
+  // Card-per-step assembly
   // -------------------------------------------------------------------------
 
-  StepState _stepState(int index, int currentStep) =>
-      index < currentStep ? StepState.complete : StepState.indexed;
+  /// Per-step heading copy. Kept beside the step builders so the card header
+  /// and the dot indicator can never drift out of sync with the content.
+  List<({String title, String subtitle})> get _stepMeta => [
+        (
+          title: widget.accountDeleted ? 'Account deleted' : 'Sign in',
+          subtitle: widget.accountDeleted
+              ? 'This account is no longer available.'
+              : 'The app talks to your gateway with a per-user API key.',
+        ),
+        (
+          title: 'Language & region',
+          subtitle: 'Set the spoken language and how dates are shown.',
+        ),
+        (
+          title: 'Voice & models',
+          subtitle: 'Download the on-device models for offline speech.',
+        ),
+        (
+          title: 'Review & finish',
+          subtitle: 'Check your setup, then start using the app.',
+        ),
+      ];
 
-  Widget _controlsBuilder(
-    BuildContext context,
-    ControlsDetails details,
-    int stepCount,
-  ) {
+  /// The step card bodies, in order.
+  List<Widget> get _stepBodies => [
+        _buildAccountStep(),
+        _buildRegionStep(),
+        _buildVoiceStep(),
+        _buildFinishStep(),
+      ];
+
+  /// The sticky bar under the card: one full-width primary action, plus Back
+  /// when there is somewhere to go back to.
+  ///
+  /// Every edge here is inset by [AppSpacing.lg] and separated from the card by
+  /// a hairline, so nothing is flush against the screen or the card above it.
+  Widget _buildActionBar(int step) {
     if (widget.accountDeleted) {
-      if (details.stepIndex != 0) return const SizedBox.shrink();
       return FilledButton.icon(
         key: const Key('account-deleted-new-account'),
+        style: AppButtons.cta,
         onPressed: _startNewAccount,
         icon: const Icon(Icons.person_add_alt_1),
         label: const Text('Create a new account'),
       );
     }
-    final isLast = details.stepIndex == stepCount - 1;
-    final canContinue = isLast ? !_saving : _canContinue(details.stepIndex);
+    final isLast = step == _stepsLength - 1;
+    // Gating differs by role, so it is spelled out rather than funnelled
+    // through one predicate:
+    //  - Account: the CTA *is* the submit, and [AuthFlow] owns validation
+    //    (empty fields show an inline error). Disabling it would hide that.
+    //  - Finish: gated on the save not already being in flight, so a double
+    //    tap cannot start two write sequences.
+    //  - Middle steps: nothing to validate, always live.
+    final submitting =
+        step == _accountStepIndex &&
+            (_authKey.currentState?.isSubmitting ?? false);
+    final enabled = isLast ? !_saving : true;
     return Row(
       children: [
-        FilledButton(
-          onPressed: canContinue ? details.onStepContinue : null,
-          child: Text(isLast ? 'Get started' : 'Next'),
-        ),
-        if (details.stepIndex > 0) ...[
-          const SizedBox(width: 8),
+        if (step > 0) ...[
           TextButton(
-            onPressed: details.onStepCancel,
+            onPressed: _onStepCancel,
+            style: AppButtons.text,
             child: const Text('Back'),
           ),
+          const SizedBox(width: AppSpacing.sm),
         ],
+        Expanded(
+          child: FilledButton(
+            key: const Key('onboarding-primary'),
+            style: AppButtons.cta,
+            onPressed: enabled && !submitting ? _onStepContinue : null,
+            child: Text(
+              // Step 0's CTA submits the form rather than advancing, so it is
+              // labelled for what it does — unless a stored key already made
+              // the account ready, in which case it does advance.
+              step == _accountStepIndex && !_accountReady
+                  ? 'Sign in'
+                  : isLast
+                      ? 'Get started'
+                      : 'Next',
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -574,53 +661,138 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     ref.listen(appPrefsProvider, _onPrefsChanged);
     ref.listen(voiceSettingsProvider, _onVoiceSettingsChanged);
 
-    final currentStep = widget.accountDeleted ? 0 : _currentStep;
-    final steps = <Step>[
-      Step(
-        title: Text(widget.accountDeleted ? 'Account deleted' : 'Account'),
-        subtitle: Text(
-          widget.accountDeleted
-              ? 'This account is no longer available'
-              : 'Sign in or create your account',
-        ),
-        isActive: _currentStep >= 0,
-        state: _stepState(0, currentStep),
-        content: _buildAccountStep(),
-      ),
-      Step(
-        title: const Text('Language & region'),
-        subtitle: const Text('Preferred language and date format'),
-        isActive: _currentStep >= 1,
-        state: _stepState(1, currentStep),
-        content: _buildRegionStep(),
-      ),
-      Step(
-        title: const Text('Voice & models'),
-        subtitle: const Text('On-device model download'),
-        isActive: _currentStep >= 2,
-        state: _stepState(2, currentStep),
-        content: _buildVoiceStep(),
-      ),
-      Step(
-        title: const Text('Finish'),
-        subtitle: const Text('Review and get started'),
-        isActive: _currentStep >= 3,
-        state: _stepState(3, currentStep),
-        content: _buildFinishStep(),
-      ),
-    ];
+    // A deleted account pins the flow to the first card until cleared.
+    final step = widget.accountDeleted ? _accountStepIndex : _currentStep;
+    final meta = _stepMeta;
+    final bodies = _stepBodies;
 
     return Scaffold(
       appBar: AppBar(title: const BrandAppBarTitle()),
       body: SafeArea(
-        child: Stepper(
-          type: StepperType.vertical,
-          currentStep: currentStep,
-          onStepContinue: _onStepContinue,
-          onStepCancel: _onStepCancel,
-          controlsBuilder: (context, details) =>
-              _controlsBuilder(context, details, steps.length),
-          steps: steps,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: AppSpacing.lg),
+              child: StepDots(
+                controller: _pageController,
+                count: _stepsLength,
+                index: step,
+                onDotTapped: _onDotTapped,
+              ),
+            ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpacing.lg,
+                  0,
+                  AppSpacing.lg,
+                  AppSpacing.lg,
+                ),
+                child: PageView.builder(
+                  controller: _pageController,
+                  itemCount: _stepsLength,
+                  // Swiping is disabled: these cards host a keyboard, a
+                  // SegmentedButton and dropdowns, and a horizontal drag
+                  // competes with all three (and can dismiss the keyboard
+                  // mid-edit). Next/Back and the dots drive navigation.
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemBuilder: (context, index) => _StepCard(
+                    eyebrow: 'Step ${index + 1} of $_stepsLength',
+                    title: meta[index].title,
+                    subtitle: meta[index].subtitle,
+                    child: bodies[index],
+                  ),
+                ),
+              ),
+            ),
+            // Hairline + inset padding: the action bar never touches the card
+            // above it or the screen edges.
+            DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border(
+                  top: BorderSide(
+                    color: Theme.of(context).colorScheme.outline,
+                  ),
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(AppSpacing.lg),
+                child: _buildActionBar(step),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One step's card: eyebrow, heading, sub-heading, then the step's own body.
+///
+/// The body is scrollable because the Account step's form (plus the soft
+/// keyboard) can exceed the available height on a small phone; the card
+/// borders stay pinned so the layout never breaks.
+///
+/// Keeps itself alive once visited ([AutomaticKeepAliveClientMixin]). A
+/// [PageView] disposes off-screen pages by default, which would tear down the
+/// Account step's `AuthFlow` — and with it the text the user already typed —
+/// the moment they advanced. Hoisting the controllers to the screen is the
+/// alternative, but they belong to the form that owns them; keeping the page
+/// alive is both smaller and truer to the widget that owns the state.
+class _StepCard extends StatefulWidget {
+  const _StepCard({
+    required this.eyebrow,
+    required this.title,
+    required this.subtitle,
+    required this.child,
+  });
+
+  final String eyebrow;
+  final String title;
+  final String subtitle;
+  final Widget child;
+
+  @override
+  State<_StepCard> createState() => _StepCardState();
+}
+
+class _StepCardState extends State<_StepCard>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xl),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              widget.eyebrow.toUpperCase(),
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+                letterSpacing: 0.8,
+              ),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            Text(widget.title, style: theme.textTheme.titleLarge),
+            const SizedBox(height: AppSpacing.xs),
+            Text(
+              widget.subtitle,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: AppSpacing.xl),
+            Expanded(
+              child: SingleChildScrollView(child: widget.child),
+            ),
+          ],
         ),
       ),
     );
