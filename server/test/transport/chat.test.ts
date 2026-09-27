@@ -512,6 +512,30 @@ describe("POST /v1/chat/completions — pre-stream errors (§5.1)", () => {
     assert.equal(nonRecord.status, 400);
     assert.deepEqual(await nonRecord.json(), { error: "invalid_request" });
   });
+
+  test("502 { error: tools_unavailable } when requested tools cannot bind", async (t) => {
+    // An agent that grants an MCP server whose host is rejected (loopback
+    // literal, untrusted) → bindMcpServers yields zero tools. The turn must
+    // fail loudly rather than silently run chat-only and invite fabrication.
+    const agent = {
+      id: "mealie-agent",
+      version: "1.0.0",
+      schemaVersion: 1,
+      type: "agent",
+      name: "Mealie Agent",
+      description: "test agent",
+      systemPrompt: "You are a test agent",
+      mcpServers: [{ name: "mealie", url: "http://127.0.0.1:9/sse" }],
+    } as unknown as PluginDefinition;
+    const fake = makeFakeBuildModel([[]]);
+    const { app } = await makeApp(t, { buildModel: fake.buildModelFn }, [agent]);
+    const res = await postChat(app, chatBody({ agent: "mealie-agent" }));
+    assert.equal(res.status, 502);
+    assert.deepEqual(await res.json(), {
+      error: "tools_unavailable",
+      message: "The tools this request needs could not be loaded.",
+    });
+  });
 });
 
 describe("POST /v1/chat/completions — async delegation (background: true, Wave C2)", () => {

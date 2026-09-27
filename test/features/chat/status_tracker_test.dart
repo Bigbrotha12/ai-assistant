@@ -5,7 +5,7 @@ import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show StatusTracker, statusPhraseForError, ackPhrases, stillWorkingPhrases,
     domainPhrases, defaultDomainPhrases, authErrorPhrases, serverErrorPhrases,
     networkErrorPhrases, pendingErrorPhrases, verifyEmailPhrases,
-    accountDeletedPhrases, noModelPhrases;
+    accountDeletedPhrases, noModelPhrases, toolsUnavailablePhrases;
 import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -543,6 +543,15 @@ void main() {
         random: Random(42),
       );
       expect(phrase, anyOf(noModelPhrases));
+    });
+
+    test('tools-unavailable phrase for tools_unavailable (never a server error)', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(ManagedErrorCodes.toolsUnavailable),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(toolsUnavailablePhrases));
+      expect(phrase, isNot(anyOf(serverErrorPhrases)));
     });
 
     test('server phrase for reconcile_required (fallback)', () {

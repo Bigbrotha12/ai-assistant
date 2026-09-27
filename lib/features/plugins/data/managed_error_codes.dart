@@ -27,6 +27,10 @@ abstract final class ManagedErrorCodes {
   static const noCredentials = 'no_credentials';
   static const noSelectedModel = 'no_selected_model';
   static const noCapableModel = 'no_capable_model';
+  /// Tools/MCP were requested for the turn but none could be loaded (gateway
+  /// 502). Distinct from a generic server error: the fix is plugin/MCP config,
+  /// not a retry.
+  static const toolsUnavailable = 'tools_unavailable';
   static const conversationInFlight = 'conversation_in_flight';
   static const configurationChanged = 'configuration_changed';
   static const networkError = 'network_error';

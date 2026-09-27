@@ -20,7 +20,7 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import { MemorySaver, Overwrite } from "@langchain/langgraph";
-import { SUPERVISOR_PROMPT } from "../../src/agents/prompts.ts";
+import { SUPERVISOR_PROMPT, SYSTEM_PROMPT } from "../../src/agents/prompts.ts";
 import { ContextBudgetError } from "../../src/middleware/context.ts";
 import {
   createAgentGraph,
@@ -287,7 +287,14 @@ describe("agent graph — supervisor loop", () => {
     assert.ok(firstCall, "first call messages must exist");
     const firstSystem = firstCall[0];
     assert.ok(firstSystem instanceof SystemMessage);
-    assert.equal(firstSystem.content, customPrompt);
+    assert.ok(
+      String(firstSystem.content).startsWith(SYSTEM_PROMPT),
+      "base grounding prompt must be applied first",
+    );
+    assert.ok(
+      String(firstSystem.content).endsWith(customPrompt),
+      "custom agent prompt must still reach the model",
+    );
     assert.notEqual(firstSystem.content, SUPERVISOR_PROMPT);
   });
 

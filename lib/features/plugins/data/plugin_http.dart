@@ -47,6 +47,7 @@ const _safeCodes = {
   'model_error',
   'tool_error',
   'tool_execution_failed',
+  'tools_unavailable',
   'server_error',
   'auth_error',
   'session_missing',

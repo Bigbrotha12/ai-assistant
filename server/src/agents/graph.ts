@@ -9,7 +9,7 @@ import type { RunnableConfig } from "@langchain/core/runnables";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { Annotation, END, Overwrite, START, StateGraph } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
-import { SUPERVISOR_PROMPT } from "./prompts.ts";
+import { SUPERVISOR_PROMPT, SYSTEM_PROMPT } from "./prompts.ts";
 import { boundToolResultContent } from "../tool_bounds.ts";
 
 export const MAX_TOOL_ROUNDS = 5;
@@ -93,6 +93,12 @@ export function createAgentGraph({
   }
   const modelWithTools = hasTools ? model.bindTools(tools) : model;
   const toolNode = new ToolNode(tools, { handleToolErrors: false });
+  // The grounding persona is ALWAYS applied; an agent's own prompt (or the
+  // supervisor framing) is appended after it, so a custom agent augments
+  // rather than replaces the "never fabricate / report missing data" rules.
+  const effectiveSystemPrompt = `${SYSTEM_PROMPT}\n\n${
+    systemPrompt ?? SUPERVISOR_PROMPT
+  }`;
   let toolResultSequence = 0;
 
   const orchestrator = async (
@@ -103,7 +109,7 @@ export function createAgentGraph({
     if (state.toolRounds >= maxIterations) {
       return { messages: [new AIMessage("Tool round limit reached. No further tools were run.")] };
     }
-    const input = [new SystemMessage(systemPrompt ?? SUPERVISOR_PROMPT), ...state.messages];
+    const input = [new SystemMessage(effectiveSystemPrompt), ...state.messages];
     const messages = prepareMessages ? await prepareMessages(input, config) : input;
     config.signal?.throwIfAborted();
     await beforeModelCall?.(messages, config);

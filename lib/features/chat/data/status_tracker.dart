@@ -68,6 +68,11 @@ const noModelPhrases = [
   'No model is set up for this account yet — choose one in Plugins, then try again.',
 ];
 
+const toolsUnavailablePhrases = [
+  'I couldn\'t load the tools I need for that — check the plugin setup in Settings.',
+  'The tools for that aren\'t available right now, so I can\'t fetch it reliably.',
+];
+
 const serverErrorPhrases = [
   'There seems to be an issue on my side — please try again.',
   'My server hit a snag — can you try again?',
@@ -235,6 +240,9 @@ String statusPhraseForError(Object error, {Random? random}) {
       ManagedErrorCodes.noSelectedModel ||
       ManagedErrorCodes.noCapableModel =>
         _pick(noModelPhrases, rng),
+      // Tools/MCP were requested but none bound — surface the failure instead
+      // of a generic server error.
+      ManagedErrorCodes.toolsUnavailable => _pick(toolsUnavailablePhrases, rng),
       ManagedErrorCodes.unauthorized ||
       ManagedErrorCodes.credentialsExpired ||
       ManagedErrorCodes.noCredentials =>

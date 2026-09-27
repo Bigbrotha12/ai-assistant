@@ -1181,6 +1181,11 @@ async function handleSyncStream(
   try {
     const mcpTools = mcpBinding?.tools ?? [];
     const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
+    if (tools.length === 0 && requestedToolCount(resolved.value) > 0) {
+      // Nothing bound though tools were requested: fail loudly (the `finally`
+      // below disposes the empty MCP binding).
+      return toolsUnavailableResponse(c);
+    }
     const graph = createAgentGraph({
       model,
       tools,
@@ -1545,6 +1550,13 @@ async function handleManagedSessionStream(
     try {
       const mcpTools = mcpBinding?.tools ?? [];
       const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
+      if (tools.length === 0 && requestedToolCount(resolved) > 0) {
+        // Tools were requested but none bound (e.g. every MCP server denied by
+        // policy). Roll the appended turn back and surface the failure — never
+        // fall through to a chat-only answer that looks authoritative.
+        await rollbackTurn();
+        return toolsUnavailableResponse(c);
+      }
       const graph = createAgentGraph({
         model,
         tools,
@@ -2437,6 +2449,32 @@ function busy(c: Context, status: 429 | 503, retryAfterSeconds: number): Respons
 }
 
 /** Pre-stream failures return JSON per §5.1 (never SSE). */
+/**
+ * How many tools the request asked for: enabled tool plugins plus an agent's
+ * tool/MCP grants. When this is > 0 but zero tools actually bind (a policy
+ * denial, an unreachable MCP server, or a broken tool plugin), the turn is
+ * misconfigured. Surface it instead of silently running chat-only — a
+ * chat-only answer to a data request is indistinguishable from a real one and
+ * invites fabrication.
+ */
+function requestedToolCount(resolved: ResolvedChat): number {
+  return (
+    (resolved.enabledPlugins?.length ?? 0) +
+    (resolved.agentOverride?.toolGrants?.length ?? 0) +
+    (resolved.agentOverride?.mcpServers?.length ?? 0)
+  );
+}
+
+function toolsUnavailableResponse(c: Context): Response {
+  return c.json(
+    {
+      error: "tools_unavailable",
+      message: "The tools this request needs could not be loaded.",
+    },
+    502,
+  );
+}
+
 function preStreamError(c: Context, err: unknown): Response {
   if (err instanceof ContextBudgetError) {
     return c.json({ error: err.code, message: err.message }, 400);
