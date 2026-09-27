@@ -15,7 +15,7 @@
     "migrate:ledger": "tsx src/migrate-ledger.ts",
     "sentinel:eval": "tsx src/sentinel/eval-cli.ts",
     "eval:sentinel": "tsx src/sentinel/eval-cli.ts",
-    "test": "tsx --test test/*.test.ts test/**/*.test.ts"
+    "test": "node --import tsx --import ./test/test_env.ts --test test/*.test.ts test/**/*.test.ts"
   },
   "dependencies": {
     "@better-auth/api-key": "^1.7.2",
