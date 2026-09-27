@@ -380,6 +380,42 @@ void main() {
       expect(probe.calls, 1);
     });
 
+    testWidgets('an unverified-email probe result shows the resend card', (
+      tester,
+    ) async {
+      final probe = FakeProbe(
+        status: const BackendStatus(
+          checks: [
+            CheckResult(
+              check: BackendCheck.auth,
+              status: ProbeStatus.emailNotVerified,
+              detail: 'verify your email (403)',
+            ),
+          ],
+        ),
+      );
+      await tester.pumpWidget(
+        settingsApp(
+          tester,
+          store: FakeSettingsStore(),
+          filesClient: NoOpFilesClient(),
+          fileCache: FakeFileCache(),
+          probe: probe,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).at(0), 'myhost');
+      await tester.tap(find.text('Test connection'));
+      await tester.pumpAndSettle();
+
+      // The card renders outside the collapsed probe ExpansionTile, so no
+      // expansion is needed. The stored credentials carry no email in this
+      // fixture, so the card falls back to asking for the address.
+      expect(find.text('Verify your email'), findsOneWidget);
+      expect(find.byKey(const Key('verify-email-resend')), findsOneWidget);
+    });
+
     testWidgets('probe failure resets busy state and leaves retry usable', (
       tester,
     ) async {

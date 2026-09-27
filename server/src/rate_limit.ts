@@ -9,6 +9,17 @@ export type TokenBucketLimiterOptions = {
   now?: () => number;
 };
 
+/** A token-bucket limiter with a one-token [refund] escape hatch. */
+export type TokenBucketLimiter = ((key: string) => boolean) & {
+  /**
+   * Returns one previously consumed token to [key] (capped at the burst
+   * ceiling). Used when an action gated by [key] fails after consuming its
+   * token, so a transient downstream failure does not lock the caller out for
+   * the whole refill window.
+   */
+  refund: (key: string) => void;
+};
+
 /**
  * In-memory per-key token-bucket rate limiter.
  *
@@ -20,7 +31,7 @@ export function createTokenBucketLimiter(
   ratePerMinute: number,
   burst: number,
   options: TokenBucketLimiterOptions = {},
-): (key: string) => boolean {
+): TokenBucketLimiter {
   const refillPerSecond = ratePerMinute / 60;
   const buckets = new Map<string, Bucket>();
   const clock = options.now ?? (() => Date.now());
@@ -35,7 +46,7 @@ export function createTokenBucketLimiter(
     }
   };
 
-  return (key) => {
+  const limiter = ((key: string): boolean => {
     const now = clock();
     let bucket = buckets.get(key);
     if (bucket && staleAfterMs !== undefined && now - bucket.lastRefill >= staleAfterMs) {
@@ -63,7 +74,14 @@ export function createTokenBucketLimiter(
     if (bucket.tokens < 1) return false;
     bucket.tokens -= 1;
     return true;
+  }) as TokenBucketLimiter;
+  limiter.refund = (key) => {
+    const bucket = buckets.get(key);
+    if (!bucket) return;
+    bucket.tokens = Math.min(burst, bucket.tokens + 1);
+    bucket.lastRefill = clock();
   };
+  return limiter;
 }
 
 export type AddressLimitResult = {
@@ -96,16 +114,25 @@ export type SendVerificationRateLimiterOptions = {
  * other limiter in this file: a multi-replica deployment would need shared
  * storage for the buckets).
  */
+export type SendVerificationRateLimiter = ((
+  email: string,
+) => AddressLimitResult) & {
+  /** Refunds the consumed token after a failed send (see [TokenBucketLimiter.refund]). */
+  refund: (email: string) => void;
+};
+
 export function createSendVerificationRateLimiter(
   options: SendVerificationRateLimiterOptions = {},
-): (email: string) => AddressLimitResult {
+): SendVerificationRateLimiter {
   const bucket = createTokenBucketLimiter(1, 1, {
     maxEntries: options.maxEntries ?? SEND_VERIFICATION_MAX_BUCKETS,
     staleAfterMs: options.staleAfterMs ?? SEND_VERIFICATION_BUCKET_TTL_MS,
     now: options.now,
   });
-  return (email) => ({
+  const limiter = ((email: string): AddressLimitResult => ({
     allowed: bucket(email.trim().toLowerCase()),
     retryAfterSeconds: 60,
-  });
+  })) as SendVerificationRateLimiter;
+  limiter.refund = (email) => bucket.refund(email.trim().toLowerCase());
+  return limiter;
 }

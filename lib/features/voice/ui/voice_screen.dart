@@ -15,6 +15,7 @@ import '../../auth/data/account_deleted_handler.dart';
 import '../../auth/data/account_deleted_state.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../auth/ui/auth_flow.dart';
+import '../../auth/ui/verify_email_card.dart';
 import '../../chat/data/chat_client.dart';
 import '../../chat/ui/chat_providers.dart';
 import '../../chat/ui/chat_screen.dart';
@@ -270,6 +271,8 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     final error = state.error ?? _localError;
     final authRequired =
         error != null && !accountDeleted && isAuthRequiredError(error);
+    final emailNotVerified =
+        error != null && !accountDeleted && isEmailNotVerifiedError(error);
     // Mirrors the onboarding gate's configured rule (API key + explicitly
     // stored, valid host), so the banner never disagrees with the gate.
     final configured = isConfigured(
@@ -328,6 +331,22 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                       child: SingleChildScrollView(
                         child: ReauthCard(
                           onSuccess: (_) => _retryConnection(),
+                          onDismiss: () {
+                            ref.read(voiceControllerProvider).clearError();
+                            setState(() => _localError = null);
+                          },
+                        ),
+                      ),
+                    )
+                  : emailNotVerified
+                  ? Flexible(
+                      fit: FlexFit.loose,
+                      child: SingleChildScrollView(
+                        child: VerifyEmailCard(
+                          email: ref
+                              .watch(authCredentialsProvider)
+                              .value
+                              ?.email,
                           onDismiss: () {
                             ref.read(voiceControllerProvider).clearError();
                             setState(() => _localError = null);

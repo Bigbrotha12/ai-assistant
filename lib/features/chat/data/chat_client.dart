@@ -77,6 +77,13 @@ bool isAuthRequiredError(Object error) =>
             error.code == ManagedErrorCodes.credentialsExpired ||
             error.code == ManagedErrorCodes.noCredentials);
 
+/// True only for the managed `email_not_verified` envelope (C2): the stored
+/// API key is valid but the account's email is unconfirmed, so the UI must
+/// offer a verification resend — never the re-auth card.
+bool isEmailNotVerifiedError(Object? error) =>
+    error is PluginClientException &&
+    error.code == ManagedErrorCodes.emailNotVerified;
+
 /// True only for the managed error envelope that explicitly says the owner is
 /// tombstoned. A missing status is accepted for typed test/adapter paths; a
 /// present status must be the server's 403.

@@ -32,6 +32,7 @@ import '../../voice/ui/voice_settings_providers.dart';
 import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
 import '../../auth/ui/sign_in_screen.dart';
+import '../../auth/ui/verify_email_card.dart';
 import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_http.dart';
 import '../../plugins/ui/plugins_screen.dart';
@@ -717,6 +718,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ProbeStatusRow(result: result, label: check.label),
           ],
         ),
+        if (status.overall == ProbeStatus.emailNotVerified)
+          VerifyEmailCard(
+            email: ref.watch(authCredentialsProvider).value?.email,
+          ),
       ],
     );
   }

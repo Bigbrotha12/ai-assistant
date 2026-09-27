@@ -543,6 +543,46 @@ void main() {
         expect(client.verificationEmailRequests, ['user@example.com']);
       },
     );
+
+    testWidgets('sign-in form offers a direct resend-verification link', (
+      tester,
+    ) async {
+      final store = FakeAuthCredentialsStore();
+      final client = FakeAuthClient();
+      await pumpAuthFlow(
+        tester,
+        store: store,
+        client: client,
+        onSuccess: _noop,
+      );
+
+      // No address yet: the link surfaces the same validation as the button.
+      await tester.tap(
+        find.byKey(const Key('auth-resend-verification-link')),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Enter your email address'), findsOneWidget);
+      expect(client.verificationEmailRequests, isEmpty);
+
+      await tester.enterText(
+        find.byKey(const Key('auth-email')),
+        'user@example.com',
+      );
+      await tester.tap(
+        find.byKey(const Key('auth-resend-verification-link')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(client.verificationEmailRequests, ['user@example.com']);
+      expect(
+        find.text('Verify your email — check your inbox'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Verification email sent again to user@example.com.'),
+        findsOneWidget,
+      );
+    });
   });
 }
 

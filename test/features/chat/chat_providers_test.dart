@@ -713,6 +713,36 @@ void main() {
       expect(state.failedMessageId, isNotNull);
     });
 
+    test('a managed email_not_verified error surfaces emailNotVerified, never '
+        'the re-auth card', () async {
+      final store = FakeChatStore(initial: [_existingConversation()]);
+      final client = FakeChatClient(
+        error: const PluginClientException(
+          ManagedErrorCodes.emailNotVerified,
+          statusCode: 403,
+        ),
+      );
+      final container = _container(store: store, client: client);
+      _keepAlive(container, 'c1');
+      final notifier = container.read(conversationProvider('c1').notifier);
+      await container.read(conversationProvider('c1').future);
+
+      await notifier.sendMessage('Hi');
+
+      final state = container.read(conversationProvider('c1')).value!;
+      expect(state.isStreaming, isFalse);
+      expect(state.emailNotVerified, isTrue);
+      expect(state.authRequired, isFalse);
+      expect(state.error, isNull);
+      expect(state.failedMessageId, isNotNull);
+
+      notifier.dismissEmailNotVerified();
+      expect(
+        container.read(conversationProvider('c1')).value!.emailNotVerified,
+        isFalse,
+      );
+    });
+
     test('account_deleted enters the terminal path and never shows re-auth or a generic error', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(

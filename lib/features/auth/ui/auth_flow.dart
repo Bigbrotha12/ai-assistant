@@ -166,7 +166,9 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
       if (!mounted) return;
       setState(() {
         _submitting = false;
-        _error = 'Could not finish signing in. Try again.';
+        _error = _createAccount
+            ? 'Could not create your account. Try again.'
+            : 'Could not finish signing in. Try again.';
       });
     }
   }
@@ -259,6 +261,16 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
         _error = 'Could not send the verification email. Try again.';
       });
     }
+  }
+
+  /// Resends the verification mail straight from the sign-in form, then
+  /// routes into the check-inbox state on success. Mirrors the verify form's
+  /// action so a user who already knows their email is unverified does not
+  /// have to submit credentials (and wait for a 403) first.
+  Future<void> _resendFromSignIn() async {
+    await _resendVerification();
+    if (!mounted || !_verifySent) return;
+    setState(() => _verifyMode = true);
   }
 
   static String _authErrorText(AuthApiError e) => switch (e) {
@@ -373,16 +385,23 @@ class _AuthFlowState extends ConsumerState<AuthFlow> {
           ),
         ),
         if (!_createAccount)
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton(
-              key: const Key('auth-forgot-link'),
-              onPressed: () => setState(() {
-                _forgotMode = true;
-                _error = null;
-              }),
-              child: const Text('Forgot password?'),
-            ),
+          Wrap(
+            spacing: 8,
+            children: [
+              TextButton(
+                key: const Key('auth-forgot-link'),
+                onPressed: () => setState(() {
+                  _forgotMode = true;
+                  _error = null;
+                }),
+                child: const Text('Forgot password?'),
+              ),
+              TextButton(
+                key: const Key('auth-resend-verification-link'),
+                onPressed: _submitting ? null : _resendFromSignIn,
+                child: const Text('Resend verification email'),
+              ),
+            ],
           ),
         if (_error != null) ...[
           const SizedBox(height: 12),

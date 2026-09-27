@@ -150,6 +150,8 @@ export type SendVerificationRateLimitGate = {
   check: SendVerificationRateLimiter;
   approveRequest: (request: Request, email: string) => void;
   consumeRequestApproval: (request: Request | undefined, email: string) => boolean;
+  /** Refunds the consumed token when the downstream send fails. */
+  refund: (email: string) => void;
 };
 
 export function createSendVerificationRateLimitGate(
@@ -166,6 +168,9 @@ export function createSendVerificationRateLimitGate(
       if (!request || approvedRequests.get(request) !== email) return false;
       approvedRequests.delete(request);
       return true;
+    },
+    refund(email) {
+      check.refund(email.trim().toLowerCase());
     },
   };
 }
@@ -209,7 +214,22 @@ export function createSendVerificationEmailCallback(
       warn("verification email suppressed by per-address rate limit");
       return;
     }
-    await send(data, request);
+    try {
+      await send(data, request);
+    } catch (error) {
+      // A transient SMTP failure must not lock the address out for the full
+      // 60s window: refund the consumed token, then let the caller report the
+      // failure. The explicit resend endpoint rethrows (a 5xx is honest);
+      // sign-up/sign-in resends run through better-auth's background wrapper,
+      // which swallows the error so the auth response stays 2xx.
+      gate.refund(email);
+      warn(
+        `verification email send failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      throw error;
+    }
   };
 }
 

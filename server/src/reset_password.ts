@@ -122,7 +122,7 @@ function renderPage(token: string): string {
             return show("err", text);
           }
           document.querySelectorAll("input").forEach((i) => (i.disabled = true));
-          show("ok", "Password updated. You can now sign in from the app with your new password.");
+          show("ok", "Password updated. Sign in from the app with your new password. If your email isn't verified yet, the app will offer to resend the verification link.");
         } catch {
           submit.disabled = false;
           show("err", "Network error. Please try again.");

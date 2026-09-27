@@ -312,13 +312,18 @@ test("limiter failure suppresses the send without turning sign-in 403 into 500",
   const warnings: string[] = [];
   const baseGate = createSendVerificationRateLimitGate({ now: () => 0 });
   let limiterFailed = false;
-  const gate: SendVerificationRateLimitGate = {
-    check(email) {
+  const check = Object.assign(
+    (email: string) => {
       if (limiterFailed) throw new Error("injected limiter failure");
       return baseGate.check(email);
     },
+    { refund: baseGate.refund },
+  );
+  const gate: SendVerificationRateLimitGate = {
+    check,
     approveRequest: baseGate.approveRequest,
     consumeRequestApproval: baseGate.consumeRequestApproval,
+    refund: baseGate.refund,
   };
   const { app } = await buildTestAuth(captures, {
     gate,
@@ -342,4 +347,34 @@ test("limiter failure suppresses the send without turning sign-in 403 into 500",
   assert.equal((signIn.data as { code?: string }).code, "EMAIL_NOT_VERIFIED");
   assert.equal(captures.length, 1);
   assert.deepEqual(warnings, ["verification email suppressed: rate limiter failed"]);
+});
+
+test("a failed send refunds the per-address limiter and rethrows", async () => {
+  const gate = createSendVerificationRateLimitGate({ now: () => 0 });
+  const warnings: string[] = [];
+  const sent: string[] = [];
+  let failNext = true;
+  const callback = createSendVerificationEmailCallback(
+    async (data) => {
+      if (failNext) throw new Error("smtp down");
+      sent.push(data.user.email);
+    },
+    { gate, warn: (message) => warnings.push(message) },
+  );
+  const data = { user: { email: "refund@example.com" }, url: "http://x/verify-email?token=t", token: "t" };
+
+  // First attempt fails: the error propagates (the explicit resend endpoint
+  // surfaces a 5xx) and the consumed token is refunded.
+  await assert.rejects(() => callback(data), /smtp down/);
+  assert.deepEqual(warnings, ["verification email send failed: smtp down"]);
+
+  // Because the token was refunded, an immediate retry is allowed rather than
+  // 429'd for the rest of the 60s window, and it succeeds.
+  failNext = false;
+  const retry = await callback(data);
+  assert.equal(retry, undefined);
+  assert.deepEqual(sent, ["refund@example.com"]);
+  // The successful retry consumed the (only) token, so a third immediate send
+  // is now rate-limited.
+  assert.equal(gate.check("refund@example.com").allowed, false);
 });

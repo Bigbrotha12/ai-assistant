@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../auth/data/auth_client.dart';
+import '../../auth/data/auth_credentials_providers.dart';
+import '../../auth/ui/verify_email_card.dart';
 import '../../attachments/data/files_providers.dart';
 import '../../attachments/data/files_service.dart';
 import '../../settings/data/settings_providers.dart';
@@ -196,6 +198,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final isDbReady = state?.isDbReady ?? false;
     final error = state?.error;
     final authRequired = state?.authRequired ?? false;
+    final emailNotVerified = state?.emailNotVerified ?? false;
     final hasPendingJob = state?.hasPendingJob ?? false;
     final sentinelNotice = state?.sentinelNotice;
 
@@ -261,6 +264,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   .read(conversationProvider(_conversationId).notifier)
                   .dismissAuthRequired(),
             ),
+          if (emailNotVerified)
+            VerifyEmailCard(
+              email: ref.watch(authCredentialsProvider).value?.email,
+              onDismiss: () => ref
+                  .read(conversationProvider(_conversationId).notifier)
+                  .dismissEmailNotVerified(),
+            ),
           if (sentinelNotice != null)
             _SentinelAdvisoryBanner(
               message: sentinelNotice,
@@ -284,7 +294,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             child: MessageList(
               messages: state?.messages ?? const [],
               isStreaming: isStreaming,
-              error: authRequired ? null : error,
+              error: authRequired || emailNotVerified ? null : error,
               isRetryInFlight: state?.isRetryInFlight ?? false,
               onRetry: () => ref
                   .read(conversationProvider(_conversationId).notifier)

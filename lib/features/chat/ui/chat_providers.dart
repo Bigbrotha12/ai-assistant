@@ -70,6 +70,12 @@ class ConversationState {
   /// generic message.
   final bool authRequired;
 
+  /// True when the last failure was a gateway 403 `email_not_verified`: the
+  /// API key is valid but the account's email is unconfirmed (C2). Distinct
+  /// from [authRequired]: the UI renders the verify-email card (resend), not
+  /// the re-auth card — the fix is a new verification email, not a sign-in.
+  final bool emailNotVerified;
+
   final LedgerTaskProjection? backgroundJobProjection;
 
   bool get hasPendingJob =>
@@ -91,6 +97,7 @@ class ConversationState {
     this.isDbReady = false,
     this.attachmentUploads = const {},
     this.authRequired = false,
+    this.emailNotVerified = false,
     this.backgroundJobProjection,
     this.sentinelNotice,
   });
@@ -105,6 +112,7 @@ class ConversationState {
     Object? attachmentUploads = _sentinel,
     bool? isDbReady,
     Object? authRequired = _sentinel,
+    Object? emailNotVerified = _sentinel,
     Object? backgroundJobProjection = _sentinel,
     Object? sentinelNotice = _sentinel,
   }) {
@@ -126,6 +134,9 @@ class ConversationState {
       authRequired: identical(authRequired, _sentinel)
           ? this.authRequired
           : authRequired as bool,
+      emailNotVerified: identical(emailNotVerified, _sentinel)
+          ? this.emailNotVerified
+          : emailNotVerified as bool,
       backgroundJobProjection: identical(backgroundJobProjection, _sentinel)
           ? this.backgroundJobProjection
           : backgroundJobProjection as LedgerTaskProjection?,
@@ -324,6 +335,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         error: null,
         failedMessageId: null,
         authRequired: false,
+        emailNotVerified: false,
         sentinelNotice: null,
       ),
     );
@@ -720,6 +732,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
           error: null,
           failedMessageId: null,
           authRequired: false,
+          emailNotVerified: false,
         ),
       );
 
@@ -799,6 +812,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         error: null,
         failedMessageId: null,
         authRequired: false,
+        emailNotVerified: false,
         backgroundJobProjection: LedgerTaskProjection.queued(),
       ),
     );
@@ -932,6 +946,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
           error: accountDeletedNotice,
           failedMessageId: null,
           authRequired: false,
+          emailNotVerified: false,
         ),
       );
     }
@@ -1004,6 +1019,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       return;
     }
     final authRequired = isAuthRequiredError(error);
+    // A valid key whose owner is unverified: the card offers a resend. Not an
+    // auth-required failure (re-sign-in changes nothing).
+    final emailNotVerified = isEmailNotVerifiedError(error);
     final message = switch (error) {
       // Managed codes map through the single statusPhraseForError surface
       // (the same copy voice speaks) instead of leaking the raw code.
@@ -1039,13 +1057,17 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       cur.copyWith(
         isStreaming: false,
         pendingUserMessageId: null,
-        backgroundJobProjection: authRequired || message.isEmpty
+        backgroundJobProjection:
+            authRequired || emailNotVerified || message.isEmpty
             ? (keepChip ? LedgerTaskProjection.queued() : null)
             : keepChip
             ? LedgerTaskProjection.queued()
             : LedgerTaskProjection.failed(),
-        error: authRequired || message.isEmpty ? null : message,
+        error: authRequired || emailNotVerified || message.isEmpty
+            ? null
+            : message,
         authRequired: authRequired,
+        emailNotVerified: emailNotVerified,
         messages: dropOptimistic && optimisticUserId != null
             ? [
                 for (final m in cur.messages)
@@ -1189,6 +1211,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               error: null,
               failedMessageId: null,
               authRequired: false,
+              emailNotVerified: false,
             ),
           );
         case ManagedStreamedTurn():
@@ -1204,6 +1227,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               error: null,
               failedMessageId: null,
               authRequired: false,
+              emailNotVerified: false,
             ),
           );
         case ManagedBackgroundResubmitted():
@@ -1241,6 +1265,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               error: null,
               failedMessageId: null,
               authRequired: false,
+              emailNotVerified: false,
             ),
           );
           _clearPendingStream();
@@ -1279,6 +1304,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         error: null,
         failedMessageId: null,
         authRequired: false,
+        emailNotVerified: false,
       ),
     );
     _clearPendingStream();
@@ -1329,6 +1355,14 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(current.copyWith(authRequired: false));
   }
 
+  /// Clears the verify-email flag (e.g. the user dismissed the resend card
+  /// after verifying, or chose to fix it later).
+  void dismissEmailNotVerified() {
+    final current = state.value;
+    if (current == null || !current.emailNotVerified) return;
+    _setState(current.copyWith(emailNotVerified: false));
+  }
+
   void dismissSentinelNotice() {
     final current = state.value;
     if (current == null || current.sentinelNotice == null) return;
@@ -1367,6 +1401,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
           error: null,
           failedMessageId: null,
           authRequired: false,
+          emailNotVerified: false,
         ),
       );
       _clearPendingStream();
@@ -1391,6 +1426,9 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // auth-required state (the UI renders the re-auth card) instead of a
     // generic error message. Managed auth codes map through the same helper.
     final authRequired = isAuthRequiredError(error);
+    // A valid key whose owner is unverified: the UI renders the verify-email
+    // card (resend) — never the re-auth card.
+    final emailNotVerified = isEmailNotVerifiedError(error);
 
     // A failed turn can leave a staged pending row (post-admission failures
     // keep it). Surface once with an abandonTurn escape (plan §5 P1): the
@@ -1420,6 +1458,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               pendingUserMessageId: null,
               failedMessageId: assistantId,
               authRequired: false,
+              emailNotVerified: false,
             ),
           );
         } else {
@@ -1443,6 +1482,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
                 pendingUserMessageId: null,
                 failedMessageId: null,
                 authRequired: false,
+                emailNotVerified: false,
                 backgroundJobProjection:
                     cur.backgroundJobProjection ??
                     LedgerTaskProjection.queued(),
@@ -1460,6 +1500,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
             pendingUserMessageId: null,
             failedMessageId: assistantId,
             authRequired: false,
+            emailNotVerified: false,
           ),
         );
       }
@@ -1492,10 +1533,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _setState(
       state.value!.copyWith(
         isStreaming: false,
-        error: authRequired ? null : message,
+        error: authRequired || emailNotVerified ? null : message,
         pendingUserMessageId: null,
         failedMessageId: assistantId,
         authRequired: authRequired,
+        emailNotVerified: emailNotVerified,
       ),
     );
     _clearPendingStream();
