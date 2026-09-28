@@ -42,6 +42,8 @@ import {
   DEFAULT_TOOL_CALL_QUARANTINE_MS,
 } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
+import { JobError } from "./errors.ts";
+import type { JobErrorCode } from "./errors.ts";
 import { LedgerError, projectTaskProgress } from "../ledger.ts";
 import type {
   Ledger,
@@ -127,27 +129,12 @@ import {
  * `plugin_unavailable` (there is no checkpoint scheduler pass anymore).
  */
 
-/** Job error codes surfaced to callers and recorded as ledger steps. */
-export type JobErrorCode =
-  | "credentials_expired"
-  | "task_conflict"
-  | "plugin_unavailable"
-  | "job_failed"
-  | "tool_retry_forbidden"
-  | "budget_exhausted"
-  | "context_length_exceeded"
-  | "account_deleted";
-
-/** Raised by the job runner / tool executor. Never carries credential values. */
-export class JobError extends Error {
-  readonly code: JobErrorCode;
-
-  constructor(code: JobErrorCode, message: string) {
-    super(message);
-    this.name = "JobError";
-    this.code = code;
-  }
-}
+// Job error primitives live in a leaf module so the tool-pipeline interceptors
+// can import them without importing this file (which would close the
+// `runner → pipeline → interceptors → runner` cycle in Phase 1.9). Re-exported
+// here so every existing importer is unaffected.
+export { JobError } from "./errors.ts";
+export type { JobErrorCode } from "./errors.ts";
 
 export const TASK_CANCEL_SCHEMA_VERSION = 1 as const;
 const TASK_CANCEL_COMPLETED_ACTIONS_LIMIT = 64;

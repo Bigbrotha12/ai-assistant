@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Text-only Hono gateway: better-auth (/api/auth/*) + OpenAI-compatible inference proxy (/v1/*) for the AI Assistant Flutter app.",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -15,7 +15,7 @@
     "migrate:ledger": "tsx src/migrate-ledger.ts",
     "sentinel:eval": "tsx src/sentinel/eval-cli.ts",
     "eval:sentinel": "tsx src/sentinel/eval-cli.ts",
-    "test": "node --import tsx --import ./test/test_env.ts --test test/*.test.ts test/**/*.test.ts"
+    "test": "node --import tsx --import ./test/test_env.ts --test \"test/*.test.ts\" \"test/**/*.test.ts\""
   },
   "dependencies": {
     "@better-auth/api-key": "^1.7.2",
