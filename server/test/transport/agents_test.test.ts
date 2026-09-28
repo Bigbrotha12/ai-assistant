@@ -6,6 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
+import { assertNoUrlLeak } from "../helpers/leak.ts";
 import { inferenceRoutes } from "../../src/api_key.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
@@ -154,26 +155,6 @@ async function makeApp(
 }
 
 const auth = { authorization: "Bearer test-key" };
-
-/**
- * Recursively assert a serialized agents payload never carries a provider URL
- * or the redacted keys. Guards the plan §3.3 / guardrail contract.
- */
-function assertNoUrlLeak(node: unknown, path: string): void {
-  if (typeof node === "string") {
-    assert.equal(node.includes("https://"), false, `leaked URL at ${path}: ${node}`);
-    return;
-  }
-  if (Array.isArray(node)) {
-    node.forEach((value, i) => assertNoUrlLeak(value, `${path}[${i}]`));
-    return;
-  }
-  if (typeof node === "object" && node !== null) {
-    for (const [key, value] of Object.entries(node)) {
-      assertNoUrlLeak(value, `${path}.${key}`);
-    }
-  }
-}
 
 describe("GET /v1/agents (HTTP)", () => {
   test("200 with installed agent plugins — no URL leak", async (t) => {

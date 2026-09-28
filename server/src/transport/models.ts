@@ -52,15 +52,22 @@ export type ModelsListResponse = {
   data: ModelSummary[];
 };
 
-/** Build the models list from model plugin definitions, sorted by id. */
+/**
+ * Build the models list from model plugin definitions, sorted by id.
+ *
+ * `now` (epoch seconds) is an optional test seam for the golden wire-shape
+ * contract (`server/test/transport/contract.test.ts`); it defaults to the
+ * current wall-clock second, so production callers are unchanged.
+ */
 export function modelListFromPlugins(
   plugins: ModelPluginDefinition[],
+  now: number = Math.floor(Date.now() / 1000),
 ): ModelsListResponse {
   const data = plugins
     .map((plugin): ModelSummary => ({
       id: plugin.id,
       object: "model",
-      created: Math.floor(Date.now() / 1000),
+      created: now,
       owned_by: "plugin",
       visionCapable: plugin.inference.visionCapable,
       supportsStreaming: plugin.inference.supportsStreaming,

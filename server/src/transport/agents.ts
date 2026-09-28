@@ -27,13 +27,19 @@ export type AgentsListResponse = {
   data: AgentSummary[];
 };
 
+/**
+ * `now` (epoch seconds) is an optional test seam for the golden wire-shape
+ * contract (`server/test/transport/contract.test.ts`); it defaults to the
+ * current wall-clock second, so production callers are unchanged.
+ */
 export function agentListFromCatalogs(
   catalogs: Catalogs,
+  now: number = Math.floor(Date.now() / 1000),
 ): AgentsListResponse {
   const data = catalogs.agents.map(a => ({
     id: a.id,
     object: "agent" as const,
-    created: Math.floor(Date.now() / 1000),
+    created: now,
     owned_by: "plugin" as const,
     name: a.name,
     description: a.description,

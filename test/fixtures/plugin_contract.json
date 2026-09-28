@@ -1,0 +1,163 @@
+{
+  "plugins": [
+    {
+      "id": "vikunja",
+      "type": "tool",
+      "name": "Vikunja",
+      "description": "Task management tools",
+      "version": "1.4.0",
+      "schemaVersion": 1,
+      "installed": true,
+      "baseUrls": [
+        {
+          "id": "vikunja-api",
+          "label": "Vikunja API"
+        }
+      ],
+      "tools": [
+        {
+          "name": "list_tasks",
+          "description": "List tasks from a project",
+          "readOnly": true,
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "projectId": {
+                "type": "string",
+                "description": "Project identifier"
+              }
+            },
+            "required": [
+              "projectId"
+            ]
+          }
+        }
+      ],
+      "credentials": {
+        "apiKey": {
+          "label": "Vikunja token",
+          "required": true
+        }
+      }
+    },
+    {
+      "id": "openrouter",
+      "type": "model",
+      "name": "OpenRouter",
+      "description": "Aggregated LLM inference",
+      "version": "1.0.0",
+      "schemaVersion": 1,
+      "installed": true,
+      "baseUrls": [
+        {
+          "id": "openrouter-api",
+          "label": "OpenRouter API"
+        }
+      ],
+      "inference": {
+        "defaultModel": "openrouter/auto",
+        "tokenLimit": 131072,
+        "supportsStreaming": true,
+        "visionCapable": true
+      },
+      "credentials": {
+        "apiKey": {
+          "label": "OpenRouter API key",
+          "required": true
+        }
+      }
+    },
+    {
+      "id": "kitchen-copilot",
+      "type": "agent",
+      "name": "Kitchen Copilot",
+      "description": "Mealie recipe assistant",
+      "version": "1.0.0",
+      "schemaVersion": 1,
+      "installed": true,
+      "baseUrls": [
+        {
+          "id": "mealie-api",
+          "label": "Mealie API"
+        }
+      ],
+      "credentials": {
+        "apiKey": {
+          "label": "Mealie token",
+          "required": false
+        }
+      },
+      "agent": {
+        "modelRef": "openrouter",
+        "toolGrants": [
+          {
+            "pluginId": "mealie",
+            "required": true
+          }
+        ],
+        "temperature": 0.3,
+        "maxTokens": 2048,
+        "visionCapable": true,
+        "skillCount": 1,
+        "mcpServers": [
+          {
+            "name": "recipes-mcp"
+          }
+        ]
+      }
+    }
+  ],
+  "models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "openrouter",
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "plugin",
+        "visionCapable": true,
+        "supportsStreaming": true,
+        "defaultModel": "openrouter/auto",
+        "tokenLimit": 131072,
+        "parameters": {
+          "temperature": 0.2,
+          "maxTokens": 512,
+          "nested": {
+            "keep": true
+          }
+        }
+      }
+    ]
+  },
+  "agents": {
+    "object": "list",
+    "data": [
+      {
+        "id": "kitchen-copilot",
+        "object": "agent",
+        "created": 1700000000,
+        "owned_by": "plugin",
+        "name": "Kitchen Copilot",
+        "description": "Mealie recipe assistant",
+        "defaultModel": "openrouter",
+        "visionCapable": true,
+        "temperature": 0.3,
+        "maxTokens": 2048,
+        "toolGrants": [
+          {
+            "pluginId": "mealie",
+            "required": true
+          }
+        ],
+        "skillCount": 1,
+        "skillIds": [
+          "recipes"
+        ],
+        "mcpNames": [
+          "recipes-mcp"
+        ],
+        "source": "template"
+      }
+    ]
+  }
+}
