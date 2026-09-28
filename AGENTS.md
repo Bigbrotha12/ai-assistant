@@ -35,3 +35,11 @@ external LLM APIs) are called by the gateway — never by the client directly.
 - Runtime LLM overrides in app settings remain absent — model selection and
   plugin configuration live in the plugin credentials store
   (`plugin_credentials_providers.dart`) and are set through the plugins UI.
+
+## Defensive patterns
+
+`DEFENSIVE_PATTERNS.md` is the versioned reference for the bug classes we keep
+re-learning (lifecycle, concurrency, teardown, egress). Consult it before
+writing lifecycle, concurrency, teardown, or egress code, or before adding a
+tool-execution or plugin-registration seam; it records both the patterns we
+follow and the gaps we have not closed yet.
