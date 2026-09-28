@@ -9,6 +9,9 @@ import type {
 } from "../../src/tools/pipeline.ts";
 import { createSerializeInterceptor } from "../../src/tools/interceptors/serialize.ts";
 import { createExecutionInterceptor } from "../../src/tools/interceptors/execution.ts";
+import { createBudgetInterceptor } from "../../src/tools/interceptors/budget.ts";
+import { makePluginBodies } from "../../src/tools/bind.ts";
+import { createBudgetManager } from "../../src/middleware/budget.ts";
 import { ToolResourceError } from "../../src/tool_bounds.ts";
 import { makeBodies, makeCall, tracingInterceptor } from "./support.ts";
 
@@ -657,7 +660,7 @@ describe("ToolPipeline — onBodySkipped", () => {
     assert.equal(calls.length, 1);
   });
 
-  test("fires exactly once on a beforeBody denial", async () => {
+  test("fires on a beforeBody denial (the dispatch-level backstop may repeat it)", async () => {
     const { scope, calls } = countingScope();
     let bodyRan = false;
     const guard: ToolInterceptor = {
@@ -684,7 +687,10 @@ describe("ToolPipeline — onBodySkipped", () => {
       /fence lost before body/,
     );
     assert.equal(bodyRan, false);
-    assert.equal(calls.length, 1);
+    // The terminal fires it before the error unwinds (finding m3) and the
+    // dispatch-level `finally` repeats it as an idempotent backstop; the
+    // channel resolves an already-settled deferred, so the repeat is a no-op.
+    assert.ok(calls.length >= 1, "the hook fired at least once");
   });
 
   test("fires when a bound throws before the body runs (invalid timeout)", async () => {
@@ -707,7 +713,69 @@ describe("ToolPipeline — onBodySkipped", () => {
       /timeoutMs must be a positive safe integer/,
     );
     assert.equal(bodyRan, false);
-    assert.equal(calls.length, 1);
+    assert.ok(calls.length >= 1, "the hook fired at least once");
+  });
+
+  test("releases the budget slot BEFORE budget's finally, so a body-skip does not transiently quarantine (m3)", async () => {
+    // The probe is OUTER of `budget`, so its catch runs after `budget`'s
+    // `finally` but before the dispatch-level `onBodySkipped` backstop — exactly
+    // the window where the channel's raw deferred used to settle too late and
+    // `pluginQuarantines` was transiently non-zero.
+    const budget = createBudgetManager({ toolCallQuarantineMs: 500 });
+    let concurrentAdmitted = false;
+    let concurrentRejected: unknown;
+    const probe: ToolInterceptor = {
+      name: "probe",
+      async around(_dispatch, next) {
+        try {
+          await next();
+        } catch (error) {
+          try {
+            await budget.withToolCallBudget("owner-1", "vikunja", async () => "second");
+            concurrentAdmitted = true;
+          } catch (rejection) {
+            concurrentRejected = rejection;
+          }
+          throw error;
+        }
+      },
+    };
+    const denyBody: ToolInterceptor = {
+      name: "deny-body",
+      async around(_dispatch, next) {
+        await next();
+      },
+      beforeBody() {
+        throw new Error("body denied");
+      },
+    };
+    const { bodies, scope } = makePluginBodies({
+      invoke: async () => "never",
+      channelLabel: "test",
+    });
+    const pipeline = createToolPipeline({
+      interceptors: [
+        probe,
+        createBudgetInterceptor({ budget }),
+        createExecutionInterceptor(),
+        denyBody,
+      ],
+    });
+
+    await assert.rejects(
+      pipeline.dispatch({
+        call: makeCall({ owner: "owner-1", timeoutMs: 50 }),
+        bodies,
+        scope,
+      }),
+      /body denied/,
+    );
+    assert.equal(
+      concurrentAdmitted,
+      true,
+      "the concurrent same-plugin call was admitted immediately (no transient quarantine)",
+    );
+    assert.equal(concurrentRejected, undefined);
   });
 
   test("a throwing onBodySkipped does not break a successful short-circuit dispatch", async () => {

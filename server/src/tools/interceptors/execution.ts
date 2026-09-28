@@ -2,6 +2,7 @@ import {
   boundToolResult,
   invokeBoundedToolHandler,
 } from "../../tool_bounds.ts";
+import { logger } from "../../logger.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
 
 /**
@@ -61,6 +62,23 @@ export function createExecutionInterceptor(): ToolInterceptor {
         const track = scope.track;
         const result = track ? await track(() => bounded) : await bounded;
         dispatch.content = boundToolResult(result);
+      } catch (error) {
+        // `invokeBoundedToolHandler` can throw BEFORE the body runs (its own
+        // `signal.throwIfAborted()`, or an invalid limit). Release the channel's
+        // raw deferred NOW, before the error unwinds out through `budget`, so a
+        // body-skipped dispatch releases instead of transiently quarantining
+        // (finding m3). The dispatch-level backstop is idempotent.
+        if (!dispatch.executed) {
+          try {
+            scope.onBodySkipped?.();
+          } catch (hookError) {
+            logger.warn(
+              "[tools/execution] onBodySkipped hook threw; dispatch continues:",
+              hookError,
+            );
+          }
+        }
+        throw error;
       } finally {
         scope.onToolEnd?.(call.actionId);
       }

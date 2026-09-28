@@ -54,12 +54,16 @@ import { boundToolResult } from "../tool_bounds.ts";
  *    short-circuit denial); a thrown error's own code wins otherwise, so a
  *    stale `dispatch.errorCode` set before a delegate cannot mask it. `ok`/
  *    `outcome` reflect a denial set by a short-circuiting interceptor.
- * 9. **`onBodySkipped`** is invoked exactly once per `dispatch()`, in the same
- *    `finally` and under the same containment as `onResult`, but ONLY when the
- *    body never started (`executed` is still `false`): a `beforeBody` denial, a
- *    short-circuit, or a bound that threw before running. It lets the channel
- *    settle its raw-body deferred so budget releases instead of quarantining
- *    and the job's `settle()` is not held open for the quarantine deadline.
+ * 9. **`onBodySkipped`** is invoked when the engine knows the body will not
+ *    run: the terminal fires it if a `beforeBody` hook throws, `execution`
+ *    fires it if its bound threw before the body ran, and the dispatch-level
+ *    `finally` is an idempotent backstop. Firing EARLY (before the error
+ *    unwinds through `budget`) is what prevents a transient spurious
+ *    quarantine: budget's own `finally` would otherwise still see an unsettled
+ *    raw body (finding m3). It lets the channel settle its raw-body deferred so
+ *    budget releases instead of quarantining and the job's `settle()` is not
+ *    held open for the quarantine deadline. A channel whose `onBodySkipped`
+ *    resolves an already-resolved deferred is unaffected by the extra call.
  * 10. `dispatch()` returns `dispatch.content`; a thrown body error propagates
  *    unchanged so `ToolNode`'s `handleToolErrors: false` semantics hold.
  */
@@ -322,6 +326,19 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
       };
       const startedAt = Date.now();
 
+      // Contract 9: settle the channel's raw-body deferred when the body never
+      // runs. Contained like `onResult`: a throwing hook must not break the
+      // dispatch. `settleRaw` is idempotent downstream, so this may be called
+      // more than once (the terminal's early release plus the dispatch-level
+      // backstop in `finally`).
+      const notifyBodySkipped = (): void => {
+        try {
+          state.scope.onBodySkipped?.();
+        } catch (error) {
+          logger.warn("[tools/pipeline] onBodySkipped hook threw; dispatch continues:", error);
+        }
+      };
+
       const runAt = async (index: number): Promise<void> => {
         if (index >= interceptors.length) {
           // Contract 4/4a: the terminal is only reached when every registered
@@ -329,8 +346,17 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
           // never gets here and no `beforeBody` runs. Hooks run in registration
           // order; only after they all return is `executed` set and the body
           // invoked, so a throw here aborts with `executed` still `false`.
-          for (const interceptor of interceptors) {
-            interceptor.beforeBody?.(state);
+          try {
+            for (const interceptor of interceptors) {
+              interceptor.beforeBody?.(state);
+            }
+          } catch (error) {
+            // The body will not run: release the channel's raw deferred NOW,
+            // before the error unwinds out through `budget`, so a body-skipped
+            // dispatch does not transiently quarantine the plugin while its
+            // `finally` still sees an unsettled raw body (finding m3).
+            notifyBodySkipped();
+            throw error;
           }
           state.executed = true;
           state.content = await input.bodies[call.source](state, state.bodySignal);
@@ -361,14 +387,11 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
       } finally {
         // Contract 9: a dispatch that never reached the body gets exactly one
         // chance to settle the channel's raw-body deferred. Contained like
-        // `onResult`: a throwing hook must not break the dispatch.
-        if (!state.executed) {
-          try {
-            state.scope.onBodySkipped?.();
-          } catch (error) {
-            logger.warn("[tools/pipeline] onBodySkipped hook threw; dispatch continues:", error);
-          }
-        }
+        // `onResult`: a throwing hook must not break the dispatch. This is the
+        // idempotent backstop; the terminal and `execution` fire it earlier (as
+        // soon as the engine knows the body will not run) so `budget` releases
+        // rather than transiently quarantining (finding m3).
+        if (!state.executed) notifyBodySkipped();
         // Contract 6: apply the DEFAULT-cap bound post-onion so executed calls,
         // cache hits and replay hits all match production (`runner.ts:949,968,980`).
         // The guard keeps a misbehaving body that resolves a non-string from

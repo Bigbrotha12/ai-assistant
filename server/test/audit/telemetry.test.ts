@@ -119,7 +119,7 @@ describe("redacted audit telemetry", () => {
       registry,
       { execute: async () => `result ${SECRET}` },
       undefined,
-      { owner: "owner-1", requestId: "req-plugin-1" },
+      { owner: "owner-1", requestId: "req-plugin-1", channel: "sync-stateless" },
     );
     await tool!.func({}, undefined, {} as never);
     await flushAuditTelemetry();
@@ -200,7 +200,7 @@ describe("redacted audit telemetry", () => {
       { listInstalledPlugins: () => [plugin] } as never,
       { execute: async () => "ok" },
       undefined,
-      { requestId: "safe-request" },
+      { requestId: "safe-request", channel: "sync-stateless" },
     );
     assert.equal(await tool!.func({}, undefined, {} as never), "ok");
     await flushAuditTelemetry();
@@ -228,7 +228,7 @@ describe("redacted audit telemetry", () => {
       { listInstalledPlugins: () => [plugin] } as never,
       { execute: async () => "ok" },
       undefined,
-      { requestId: "slow-audit" },
+      { requestId: "slow-audit", channel: "sync-stateless" },
     );
     const result = await Promise.race([
       Promise.resolve(tool!.func({}, undefined, {} as never)),

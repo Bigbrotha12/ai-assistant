@@ -21,12 +21,10 @@ import type { ToolInterceptor } from "../pipeline.ts";
  *     `finally` runs when the bounded race settles, so it can observe an
  *     unsettled raw body (`runner.ts:908`, plan D7).
  *
- * Phase 1.9's job composition root should build its interceptor array through
- * `createJobToolInterceptors` so the order lives in one place.
- *
- * 1.9 SEAM: the factory is not load-bearing yet — only its own test calls it
- * today. Production still assembles `bindJobTools`' duplicated body. 1.9 wires
- * this factory into the composition root and deletes that body.
+ * The job composition root builds its interceptor array through
+ * `createJobToolInterceptors` so the order lives in one place: `bindJobTools`
+ * (`jobs/runner.ts`) does so and the duplicated inline body was deleted in
+ * Phase 1.9a (finding N5, now resolved).
  */
 export const JOB_TOOL_INTERCEPTOR_ORDER = [
   "fence",
@@ -60,6 +58,59 @@ export function createJobToolInterceptors(
     }),
     createSerializeInterceptor(),
     createReplayInterceptor({ ledger: opts.ledger }),
+    createCacheInterceptor(
+      opts.cache === undefined ? {} : { cache: opts.cache },
+    ),
+    createBudgetInterceptor(
+      opts.budget === undefined ? {} : { budget: opts.budget },
+    ),
+    createExecutionInterceptor(),
+  ];
+}
+
+/**
+ * The canonical sync-channel interceptor order, outer→inner.
+ *
+ * The sync channels (`sync-stateless`, `sync-managed`) deliberately omit two
+ * job-only interceptors:
+ *   - `fence` — there is no background task to guard;
+ *   - `replay` — there is no per-task ledger to dedupe against (sync responses
+ *     are not crash-resumable).
+ *
+ * The order below is the shared prefix of the job order with those removed:
+ *   - `serialize` first preserves the sync path's "args are bounded before any
+ *     policy runs" behaviour (`orchestrator.ts` used to serialize at the top of
+ *     `bindPluginTool.func`);
+ *   - `budget` OUTSIDE `execution` is what makes quarantine possible (plan D7):
+ *     the sync channel previously abandoned the inner promise from an outer
+ *     bound, so `withToolCallBudget`'s `finally` never ran and no quarantine was
+ *     ever registered. Unifying budget around execution fixes that.
+ *
+ * `bindPluginTools` builds its pipeline through this factory so the order lives
+ * in one place.
+ */
+export const SYNC_TOOL_INTERCEPTOR_ORDER = [
+  "serialize",
+  "cache",
+  "budget",
+  "execution",
+] as const;
+
+export type SyncToolInterceptorOptions = {
+  budget?: BudgetManager;
+  cache?: ToolResultCache;
+};
+
+/**
+ * Builds the ordered sync-channel interceptor list. `budget`/`cache` are
+ * optional so a test or a degraded composition can omit them; the order is
+ * identical either way.
+ */
+export function createSyncToolInterceptors(
+  opts: SyncToolInterceptorOptions,
+): ToolInterceptor[] {
+  return [
+    createSerializeInterceptor(),
     createCacheInterceptor(
       opts.cache === undefined ? {} : { cache: opts.cache },
     ),

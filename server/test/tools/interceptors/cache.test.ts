@@ -180,6 +180,45 @@ describe("cache interceptor", () => {
     assert.equal(cache.size, 0);
   });
 
+  test("does not serve a cache hit when call.signal is already aborted (M2)", async (t) => {
+    const cache = makeCache(t);
+    const call = cacheCall();
+    const key = {
+      owner: "user-1",
+      pluginId: "vikunja",
+      pluginVersion: "1.4.0",
+      credentialFingerprint: "fp-1",
+      tool: "list_tasks",
+      argsHash: cache.argsHash({}),
+    };
+    cache.set(key, "CACHED");
+    const controller = new AbortController();
+    controller.abort();
+    let bodyCalls = 0;
+    const results: ToolCallResult[] = [];
+    const pipeline = createToolPipeline({
+      interceptors: [createCacheInterceptor({ cache })],
+      onResult: (_dispatch, result) => results.push(result),
+    });
+
+    await assert.rejects(
+      pipeline.dispatch({
+        call: { ...call, signal: controller.signal },
+        bodies: makeBodies({
+          plugin: async () => {
+            bodyCalls += 1;
+            return "fresh";
+          },
+        }),
+      }),
+      (error: unknown) => error instanceof Error && error.name === "AbortError",
+    );
+    assert.equal(bodyCalls, 0, "the aborted call never reaches the body");
+    assert.equal(results.length, 1);
+    assert.equal(results[0]!.fromCache, false, "the cache hit was not served");
+    assert.notEqual(results[0]!.content, "CACHED");
+  });
+
   test("bounds and redacts a cache hit (cache unit only, via an outer observer)", async (t) => {
     // maxValueChars is raised so the RAW over-long, unredacted value can be
     // stored; the interceptor must still apply the DEFAULT bound on serve.

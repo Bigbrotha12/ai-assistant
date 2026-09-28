@@ -14,6 +14,19 @@ import type { ToolDispatch, ToolInterceptor } from "../pipeline.ts";
  * stored is `boundToolResult(dispatch.content)`, matching production's
  * "store the bounded/redacted result" behaviour (`runner.ts:980-982`).
  *
+ * The bound applied here uses the DEFAULT cap, so the stored value is at most
+ * `DEFAULT_TOOL_RESULT_MAX_CHARS`. The cache's own `maxValueChars` is
+ * independently configurable and may be SMALLER than that default, in which
+ * case `set` still drops the (already-bounded) value — this interceptor does
+ * not thread the cap through, so "oversized values are never dropped" is not a
+ * guarantee at non-default cache settings.
+ *
+ * The interceptor restores the deleted `withToolResultCache` prologue: the
+ * channel signal is checked for an abort BEFORE the lookup, so a read-only
+ * cache hit is never served (or audited `ok`) on an already-cancelled request.
+ * The job channel's `fence` already asserts the signal inactive first, so this
+ * is a no-op belt-and-braces there.
+ *
  * Anonymous JOB calls bypass the cache entirely. Production's anonymous branch
  * (`runner.ts:931-935`) does `return await execute()` — skipping both the
  * ledger and the cache; a cache hit would be a behaviour change outside D1–D8.
@@ -38,6 +51,12 @@ export function createCacheInterceptor(opts: {
     name: "cache",
     async around(dispatch, next) {
       const call = dispatch.call;
+      // Restore the pre-cache abort check (the deleted `withToolResultCache`
+      // began with `signal?.throwIfAborted()`): a cache hit must not be served
+      // to an already-cancelled request. `call.signal` is the channel signal
+      // captured before any timeout controller exists, so this fires before the
+      // lookup without being confused by a handler timeout.
+      call.signal?.throwIfAborted();
       const anonymousJobCall =
         call.channel === "job" && call.toolCallId === undefined;
       const key =

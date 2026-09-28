@@ -15,7 +15,7 @@ import type { StreamEvent } from "./openai.ts";
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
 import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_key.ts";
-import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
+import { AccountDeletedError, assertNotDeleting, isDeleting } from "../account_deletion.ts";
 import { bindPluginTools, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
@@ -26,14 +26,13 @@ import type {
   JobToolHandler,
   JobRunner,
 } from "../jobs/runner.ts";
-import { canRetryTool, getOrCreateTask } from "../credentials/idempotency.ts";
+import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { serializeJobPayload, serializeJobSpec } from "../jobs/runner.ts";
 import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { redactBaseMessage } from "../redact.ts";
 import {
-  credentialFingerprint,
   extractCredentialsFromBody,
   PluginCredentialError,
   validateCredentials,
@@ -46,7 +45,7 @@ import { isModelPlugin, isToolPlugin, pluginIdSchema } from "../plugins/types.ts
 import { composeAgentPrompt } from "../agents/skills.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { Catalogs, ResolvedAgentDef } from "../catalog/index.ts";
-import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
+import type { ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
 import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
@@ -63,11 +62,6 @@ import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
 import type { SessionStore, SessionMissingReason } from "../sessions/store.ts";
-import {
-  boundToolResult,
-  DEFAULT_TOOL_RESULT_MAX_CHARS,
-  invokeBoundedToolHandler,
-} from "../tool_bounds.ts";
 import type { AppendDeltaResult, ReestablishResult } from "../sessions/store.ts";
 import {
   lastUserTextFromMessages,
@@ -1096,69 +1090,53 @@ async function handleSyncStream(
   }
   if (isDeleting(owner)) return accountDeletedResponse(c);
 
+  // Resolve the effective tool timeout once and plumb it into BOTH the
+  // `execution` interceptor (`call.timeoutMs`) and the executor's own HTTP
+  // guard, so a `toolTimeoutMs` override is honored at both layers (plan D3).
+  const effectiveToolTimeoutMs = opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS;
   const toolHandler =
     opts.toolHandler ??
     new ToolExecutor({
       registry: opts.registry,
       getPinnedIps: opts.pluginStore.getPinnedIps.bind(opts.pluginStore),
       trustedHosts: opts.trustedHosts,
+      timeoutMs: effectiveToolTimeoutMs,
     });
-  // H2: inject each tool call's per-plugin credentials (mirrors the async
-  // path's `bindJobTools` threading) so a tool backend that requires auth
+  // H2: the binding threads each tool call's per-plugin credentials (mirrors the
+  // async path's `bindJobTools` threading) so a tool backend that requires auth
   // receives the client's key on the SYNC path too.
   const toolCredentialsByPlugin = resolved.value.toolCredentialsByPlugin;
-  // Phase 4, Wave B: wrap the sync handler with the shared tool-result cache.
-  // Resolution failures degrade to a direct (uncached) execute — the cache is
-  // the tolerant fast path, never an error source on the stream.
-  const cachedHandler = withToolResultCache({
-    registry: opts.registry,
-    owner,
-    cache: opts.toolCache,
-    handler: toolHandler,
-    budget,
-  });
   const execution = createStreamExecution(c.req.raw.signal);
   trackModelExecution(model, execution);
-   const pluginTools = bindPluginTools(opts.registry, {
-     async execute(pluginId, toolName, args, _credentials, signal) {
-       execution.signal.throwIfAborted();
-       const callSignal = signal && signal !== execution.signal
-         ? AbortSignal.any([execution.signal, signal])
-         : execution.signal;
-       return execution.track(() => invokeBoundedToolHandler(
-         (boundedSignal) => cachedHandler.execute(
-           pluginId,
-           toolName,
-           args,
-           toolCredentialsByPlugin[pluginId],
-           boundedSignal,
-         ),
-         {
-           timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
-           maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
-           signal: callSignal,
-           timeoutMessage: `tool '${toolName}' exceeded the handler timeout`,
-         },
-       ));
-     },
-   }, resolved.value.enabledPlugins, {
-     owner,
-     requestId,
-     timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
-   });
-   const mcpServers = resolved.value.agentOverride?.mcpServers
-     ? resolveMcpServers(opts.pluginStore, resolved.value.agentOverride.mcpServers)
-     : undefined;
-   const mcpBinding = mcpServers
-       ? await bindMcpServers(mcpServers, {
-         owner,
-         requestId,
-         signal: execution.signal,
-         trustedHosts: env.MCP_TRUSTED_HOSTS,
-         clientFactory: opts.mcpClientFactory,
-         resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
-       })
-
+  const pluginTools = bindPluginTools(
+    opts.registry,
+    toolHandler,
+    resolved.value.enabledPlugins,
+    {
+      owner,
+      requestId,
+      timeoutMs: effectiveToolTimeoutMs,
+      channel: "sync-stateless",
+      credentialsByPlugin: toolCredentialsByPlugin,
+      budget,
+      ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
+      signal: execution.signal,
+      track: execution.track,
+      assertActive: () => assertNotDeleting(owner),
+    },
+  );
+  const mcpServers = resolved.value.agentOverride?.mcpServers
+    ? resolveMcpServers(opts.pluginStore, resolved.value.agentOverride.mcpServers)
+    : undefined;
+  const mcpBinding = mcpServers
+    ? await bindMcpServers(mcpServers, {
+        owner,
+        requestId,
+        signal: execution.signal,
+        trustedHosts: env.MCP_TRUSTED_HOSTS,
+        clientFactory: opts.mcpClientFactory,
+        resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
+      })
     : undefined;
   // The MCP binding owns live SSE connections + pinned Agents until the stream
   // takes ownership (buildStreamResponse) or this function exits. Every early
@@ -1479,63 +1457,49 @@ async function handleManagedSessionStream(
   }
 
   try {
+    // Same effective-timeout plumbing as the stateless path (plan D3).
+    const effectiveToolTimeoutMs = opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS;
     const toolHandler =
       opts.toolHandler ??
       new ToolExecutor({
         registry: opts.registry,
         getPinnedIps: opts.pluginStore.getPinnedIps.bind(opts.pluginStore),
         trustedHosts: opts.trustedHosts,
+        timeoutMs: effectiveToolTimeoutMs,
       });
     const toolCredentialsByPlugin = resolved.toolCredentialsByPlugin;
-    const cachedHandler = withToolResultCache({
-      registry: opts.registry,
-      owner,
-      cache: opts.toolCache,
-      handler: toolHandler,
-      budget,
-    });
     const execution = createStreamExecution(c.req.raw.signal);
     trackModelExecution(model, execution);
-     const pluginTools = bindPluginTools(opts.registry, {
-       async execute(pluginId, toolName, args, _credentials, signal) {
-         execution.signal.throwIfAborted();
-         const callSignal = signal && signal !== execution.signal
-           ? AbortSignal.any([execution.signal, signal])
-           : execution.signal;
-          return execution.track(() => invokeBoundedToolHandler(
-            (boundedSignal) => cachedHandler.execute(
-              pluginId,
-              toolName,
-              args,
-              toolCredentialsByPlugin[pluginId],
-              boundedSignal,
-            ),
-            {
-              timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
-              maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
-              signal: callSignal,
-              timeoutMessage: `tool '${toolName}' exceeded the handler timeout`,
-            },
-          ));
-       },
-     }, resolved.enabledPlugins, {
-       owner,
-       requestId,
-       timeoutMs: opts.toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
-     });
-     const mcpServers = resolved.agentOverride?.mcpServers
-       ? resolveMcpServers(opts.pluginStore, resolved.agentOverride.mcpServers)
-       : undefined;
-     const mcpBinding = mcpServers
-       ? await bindMcpServers(mcpServers, {
-           owner,
-           requestId,
-           signal: execution.signal,
-           trustedHosts: env.MCP_TRUSTED_HOSTS,
-           clientFactory: opts.mcpClientFactory,
-           resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
-         })
-       : undefined;
+    const pluginTools = bindPluginTools(
+      opts.registry,
+      toolHandler,
+      resolved.enabledPlugins,
+      {
+        owner,
+        requestId,
+        timeoutMs: effectiveToolTimeoutMs,
+        channel: "sync-managed",
+        credentialsByPlugin: toolCredentialsByPlugin,
+        budget,
+        ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
+        signal: execution.signal,
+        track: execution.track,
+        assertActive: () => assertNotDeleting(owner),
+      },
+    );
+    const mcpServers = resolved.agentOverride?.mcpServers
+      ? resolveMcpServers(opts.pluginStore, resolved.agentOverride.mcpServers)
+      : undefined;
+    const mcpBinding = mcpServers
+      ? await bindMcpServers(mcpServers, {
+          owner,
+          requestId,
+          signal: execution.signal,
+          trustedHosts: env.MCP_TRUSTED_HOSTS,
+          clientFactory: opts.mcpClientFactory,
+          resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
+        })
+      : undefined;
     let mcpHandedOff = false;
     let mcpDisposed = false;
     const disposeMcp = async (): Promise<void> => {
@@ -1792,108 +1756,6 @@ function mapSessionAppend(
       console.warn(`chat: session ${sessionId} re-seeded mid-append; turn not anchored`);
       return c.json({ error: "internal" }, 500);
   }
-}
-
-/**
- * Phase 4, Wave B (sync seam): wrap a `ToolCallHandler` with the shared
- * in-memory tool-result cache. A READ-ONLY tool call whose
- * `(owner, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)`
- * matches a live cache entry is served WITHOUT re-executing the backend;
- * every other call executes and (for read-only tools) is cached. Mutating
- * tools — gated by `canRetryTool`, the same predicate that guards checkpoint
- * resume — always execute and are never cached.
- *
- * The wrapper is deliberately tolerant: when the plugin/tool cannot be
- * resolved (plugin uninstalled mid-stream, unknown tool name) the call
- * executes directly and is not cached — the cache never throws into the SSE
- * stream. Plugin resolution is memoized PER REQUEST (one handler per stream),
- * so the registry is not re-read for every tool invocation.
- *
- * The cache stores the RAW handler output; both hits and misses are redacted
- * here with `redactForOutbound` (idempotent) before the result reaches the
- * graph, matching the async runner's discipline.
- */
-function withToolResultCache(opts: {
-  registry: PluginRegistry;
-  owner: string;
-  cache?: ToolResultCache;
-  handler: JobToolHandler;
-  budget: BudgetManager;
-}): JobToolHandler {
-  const { registry, owner, cache, handler, budget } = opts;
-  const invokeTool = async (
-    pluginId: string,
-    toolName: string,
-    args: Record<string, unknown>,
-    credentials?: Record<string, unknown>,
-    signal?: AbortSignal,
-  ): Promise<string> => {
-    return boundToolResult(
-      String(await handler.execute(pluginId, toolName, args, credentials, signal)),
-    );
-  };
-  const executeBounded = (
-    pluginId: string,
-    toolName: string,
-    args: Record<string, unknown>,
-    credentials?: Record<string, unknown>,
-    signal?: AbortSignal,
-  ): Promise<string> =>
-     budget.withToolCallBudget(
-       owner,
-       pluginId,
-       () => invokeTool(pluginId, toolName, args, credentials, signal),
-     );
-  if (!cache) {
-    return { execute: executeBounded };
-  }
-
-  type ToolCallMeta = { readOnly: boolean; version: string };
-  // Per-request memo: pluginId + toolName -> meta, or null when unresolvable.
-  const resolved = new Map<string, ToolCallMeta | null>();
-
-  return {
-    async execute(pluginId, toolName, args, credentials?, signal?) {
-      signal?.throwIfAborted();
-      if (isDeleting(owner)) throw new AccountDeletedError(owner);
-      const lookup = `${pluginId}\u0000${toolName}`;
-      let meta: ToolCallMeta | null | undefined = resolved.get(lookup);
-      if (meta === undefined) {
-        meta = null;
-        try {
-          const plugin = registry.requirePlugin(pluginId);
-          if (isToolPlugin(plugin)) {
-            const toolDef = plugin.tools.find((t) => t.name === toolName);
-            if (toolDef) meta = { readOnly: toolDef.readOnly, version: plugin.version };
-          }
-        } catch {
-          meta = null; // unresolvable -> execute directly, never cache
-        }
-        resolved.set(lookup, meta);
-      }
-      const direct = () =>
-        executeBounded(pluginId, toolName, args, credentials, signal);
-      if (meta === null || !canRetryTool({ readOnly: meta.readOnly })) {
-        return direct();
-      }
-      const key: ToolCacheKey = {
-        owner,
-        pluginId,
-        pluginVersion: meta.version,
-        credentialFingerprint: credentialFingerprint((credentials ?? {}) as Record<string, string>),
-        tool: toolName,
-        argsHash: cache.argsHash(args),
-      };
-      const hit = cache.get(key);
-      if (hit !== undefined) return boundToolResult(hit);
-      const result = await direct();
-      signal?.throwIfAborted();
-      if (isDeleting(owner)) throw new AccountDeletedError(owner);
-      cache.set(key, result);
-
-      return result;
-    },
-  };
 }
 
 /**

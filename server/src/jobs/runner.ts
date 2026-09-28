@@ -37,12 +37,8 @@ import type { ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import { BudgetExhaustedError } from "../middleware/budget.ts";
 import { createToolPipeline } from "../tools/pipeline.ts";
-import type {
-  ToolBody,
-  ToolCall,
-  ToolCallScope,
-  ToolPipeline,
-} from "../tools/pipeline.ts";
+import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
+import { makePluginBodies } from "../tools/bind.ts";
 import { createJobToolInterceptors } from "../tools/interceptors/order.ts";
 import { createPluginAuditSink } from "../tools/audit.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
@@ -898,50 +894,32 @@ function bindJobTool(
         allowMutatingRetry: opts.allowMutatingRetry,
       };
 
-      // The channel owns the raw-body promise: `rawSettled` resolves when the
-      // RAW (unbounded) handler settles, NOT when the bounded race does. The
-      // `budget` interceptor reads it before `execution` runs so it can tell an
-      // unsettled timeout (quarantine) from a release. When the body never
-      // starts, the core calls `onBodySkipped`, which resolves the SAME
-      // deferred so the budget slot releases rather than quarantines and the
-      // job's `settle()` is not held open for the quarantine deadline (D9).
-      let settleRaw!: () => void;
-      const rawSettled = new Promise<void>((resolve) => { settleRaw = resolve; });
-      const pluginBody: ToolBody = async (_dispatch, bodySignal) => {
-        let raw: Promise<string>;
-        try {
-          raw = Promise.resolve(
-            opts.handler.execute(
-              pluginId,
-              toolName,
-              args,
-              invocationCredentials,
-              bodySignal,
-            ),
-          );
-        } catch (error) {
-          // The body was invoked (so the core will NOT fire `onBodySkipped`),
-          // but the raw work never started; settle now so budget releases.
-          settleRaw();
-          throw error;
-        }
-        void raw.then(settleRaw, settleRaw);
-        return raw;
-      };
-      const scope: ToolCallScope = {
-        rawSettled,
-        onBodySkipped: () => settleRaw(),
-        ...(opts.track === undefined ? {} : { track: opts.track }),
-        ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
-        ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
-        ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
-      };
-
-      return pipeline.dispatch({
-        call,
-        bodies: { plugin: pluginBody, mcp: async () => "" },
-        scope,
+      // The channel owns the raw-body promise; the shared helper builds the
+      // `plugin` body, the `rawSettled`/`onBodySkipped` pair, and the fail-loud
+      // `mcp` stub. The deferred resolves when the RAW (unbounded) handler
+      // settles, so the `budget` interceptor can tell an unsettled timeout
+      // (quarantine) from a release. When the body never starts, the core calls
+      // `onBodySkipped`, which resolves the SAME deferred so budget releases and
+      // the job's `settle()` is not held open for the quarantine deadline (D9).
+      const { bodies, scope } = makePluginBodies({
+        invoke: (bodySignal) =>
+          opts.handler.execute(
+            pluginId,
+            toolName,
+            args,
+            invocationCredentials,
+            bodySignal,
+          ),
+        scope: {
+          ...(opts.track === undefined ? {} : { track: opts.track }),
+          ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
+          ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
+          ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
+        },
+        channelLabel: "job",
       });
+
+      return pipeline.dispatch({ call, bodies, scope });
     },
   });
 }

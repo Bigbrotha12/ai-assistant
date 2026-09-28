@@ -44,11 +44,19 @@ import {
   bindJobTools,
 } from "../../src/jobs/runner.ts";
 import type { ToolExecutor } from "../../src/jobs/runner.ts";
+import { bindPluginTools } from "../../src/agents/orchestrator.ts";
+import {
+  AccountDeletedError,
+  assertNotDeleting,
+  clearDeleting,
+  markDeleting,
+} from "../../src/account_deletion.ts";
 import {
   recordToolResult,
 } from "../../src/credentials/idempotency.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
 import { invokeBoundedToolHandler, ToolResourceError } from "../../src/tool_bounds.ts";
+import { env } from "../../src/env.ts";
 import { BudgetExhaustedError } from "../../src/middleware/budget.ts";
 import { logger } from "../../src/logger.ts";
 import {
@@ -329,11 +337,13 @@ function chatBody(overrides: Record<string, unknown> = {}): Record<string, unkno
 // ---------------------------------------------------------------------------
 
 describe("characterization — timeout layering", () => {
-  // The plan §D3 comment on `chat.ts:1101-1105` is that the executor is
-  // constructed WITHOUT `timeoutMs`, so `ToolExecutor`'s internal bound is
-  // always `env.TOOL_CALL_TIMEOUT_MS`. Read the source to verify the claim is
-  // still true; a changed construction would invalidate the sync pins below.
-  test("claim check: both sync ToolExecutor constructions omit timeoutMs (layer 3 is always env)", async () => {
+  // D3: the sync triple-bound collapsed to one. The effective timeout
+  // (`toolTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS`) is now plumbed into BOTH the
+  // `execution` interceptor and the executor's HTTP guard, so this claim check
+  // was re-baselined from "constructions omit timeoutMs" to "constructions pass
+  // the effective timeoutMs". (Was: omitting it capped any override at
+  // `env.TOOL_CALL_TIMEOUT_MS`.)
+  test("D3: both sync ToolExecutor constructions are plumbed with the effective timeoutMs", async () => {
     const src = await import("node:fs/promises").then((fs) =>
       fs.readFile(new URL("../../src/transport/chat.ts", import.meta.url), "utf8"),
     );
@@ -342,36 +352,28 @@ describe("characterization — timeout layering", () => {
     for (const construction of constructions) {
       assert.equal(
         /timeoutMs\s*:/.test(construction),
-        false,
-        "observed: sync ToolExecutor constructions pass no timeoutMs -> layer 3 is env.TOOL_CALL_TIMEOUT_MS",
+        true,
+        "D3: the effective tool timeout is plumbed into the executor HTTP guard",
       );
     }
   });
 
-  // The three timeout tests below do NOT wait on the real
-  // `env.TOOL_CALL_TIMEOUT_MS` (60s). They pin the LAYER COMPOSITION with small
-  // stand-in values for the env-derived inner bound, which is what determines
-  // "which bound fires first". The source-level test above proves layer 3 is
-  // env-derived; layer 2 is `opts.toolTimeoutMs` and layer 1 is the same value
-  // again (orchestrator.ts:107). So an env-sized inner bound is faithful.
-  test("below the env bound: the outer (toolTimeoutMs) bound fires", async () => {
-    // Simulated env bound = 60; toolTimeoutMs = 5 (below). Layer 1 (outer)
-    // fires first.
-    await assertSyncTimeoutFires(5, 60, 5);
+  // D3 (finding m1): the override must be observable END TO END. The tests
+  // below drive the REAL sync app (`makeSyncApp`/`createChatRoutes`) with a
+  // handler that never settles and read the `ToolResourceError.limit` off the
+  // signal that actually aborts the handler. Small millisecond values are used:
+  // the env bound is temporarily set small so "override > env" and
+  // "override < env" are both exercised without waiting on the real 60s default.
+  test("D3: an override ABOVE env fires the override end-to-end (env does not cap it)", async (t) => {
+    const fired = await assertSyncRouteTimeoutFires(t, 80, 10);
+    assert.equal(fired.limit, 80, "the toolTimeoutMs override is the fired bound");
+    assert.notEqual(fired.limit, 10, "the env bound did not cap the override");
   });
 
-  test("equal to the env bound: the bound fires at the shared value", async () => {
-    const fired = await assertSyncTimeoutFires(60, 60, 60);
-    assert.equal(fired.limit, 60);
-  });
-
-  test("above the env bound: the INNER (env) bound fires first — the overlay is silently capped", async () => {
-    // Plan §D3 finding. With toolTimeoutMs=120 and TOOL_CALL_TIMEOUT_MS=60 the
-    // effective timeout is 60ms, NOT 120ms — the executor's env guard caps the
-    // larger override. (Real-world: 60s, not the documented 120s.)
-    const fired = await assertSyncTimeoutFires(120, 60, 60);
-    assert.equal(fired.limit, 60);
-    assert.ok(fired.limit < 120, "observed: the outer toolTimeoutMs override is capped by the inner env bound");
+  test("D3: an override BELOW env still fires the override end-to-end", async (t) => {
+    const fired = await assertSyncRouteTimeoutFires(t, 10, 80);
+    assert.equal(fired.limit, 10, "the toolTimeoutMs override is the fired bound");
+    assert.notEqual(fired.limit, 80, "the env bound did not win over a smaller override");
   });
 
   test("job: the handler bound (handlerTimeoutMs) is the first of two layers to fire", async (t) => {
@@ -399,28 +401,53 @@ describe("characterization — timeout layering", () => {
   });
 });
 
-/** Drive the sync nesting directly and report which bound fired. */
-async function assertSyncTimeoutFires(
-  outerMs: number,
-  innerMs: number,
-  expectedBound: number,
-): Promise<{ limit: number }> {
+/**
+ * Drives the REAL sync route with a never-settling handler and reports the
+ * `ToolResourceError` the handler's signal is actually aborted with. The
+ * `limit` on that error is the effective bound the pipeline applied, so a
+ * regression that plumbed `env.TOOL_CALL_TIMEOUT_MS` instead of `toolTimeoutMs`
+ * fails these assertions (unlike a direct `invokeBoundedToolHandler` nesting,
+ * which never enters the app or the pipeline).
+ */
+async function assertSyncRouteTimeoutFires(
+  t: TestContext,
+  overrideMs: number,
+  envMs: number,
+): Promise<ToolResourceError> {
+  const original = env.TOOL_CALL_TIMEOUT_MS;
+  env.TOOL_CALL_TIMEOUT_MS = envMs;
+  t.after(() => {
+    env.TOOL_CALL_TIMEOUT_MS = original;
+  });
   let fired: unknown;
-  try {
-    await invokeBoundedToolHandler(
-      () =>
-        invokeBoundedToolHandler(() => new Promise<string>(() => undefined), {
-          timeoutMs: innerMs,
-        }),
-      { timeoutMs: outerMs },
-    );
-  } catch (error) {
-    fired = error;
-  }
-  assert.ok(fired instanceof ToolResourceError, "a bound must fire");
+  let onAbort!: () => void;
+  const aborted = new Promise<void>((resolve) => {
+    onAbort = resolve;
+  });
+  const { app } = await makeSyncApp(t, {
+    toolTimeoutMs: overrideMs,
+    buildModel: toolCallingBuildModel([], "list_tasks", "{}"),
+    toolHandler: {
+      execute(_pluginId, _toolName, _args, _credentials, signal) {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            fired = signal.reason;
+            onAbort();
+          },
+          { once: true },
+        );
+        return new Promise<string>(() => undefined);
+      },
+    },
+  });
+  const response = await postChat(app, chatBody());
+  assert.equal(response.status, 200);
+  await response.text();
+  await aborted;
+  assert.ok(fired instanceof ToolResourceError, "the route-level bound fired a ToolResourceError");
   assert.equal(fired.code, "tool_timeout");
-  assert.equal(fired.limit, expectedBound, `expected the ${expectedBound}ms bound to fire`);
-  return { limit: fired.limit };
+  return fired;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,19 +516,23 @@ describe("characterization — quarantine", () => {
     assert.equal(budget.pluginToolCallCount("p"), 0);
   });
 
-  test("sync: a never-settling handler is NOT quarantined through the route — the outer bound abandons the budget call (wart)", async (t) => {
-    // OBSERVED (wart, sync only — contrast with the job-channel test below).
+  test("D7: a never-settling handler IS quarantined through the sync route (budget now wraps execution)", async (t) => {
+    // D7 — the pre-pipeline characterization pinned the OPPOSITE of this
+    // assertion: sync did NOT quarantine a handler that ignores abort, and
+    // leaked one budget slot per call.
     //
-    // Composition: bindPluginTools' invokeBoundedToolHandler (OUTER, fires
-    // first) wraps chat.ts's invokeBoundedToolHandler, which wraps the budget
-    // wrapper. When the OUTER bound fires it abandons the inner promise, so
-    // `withToolCallBudget`'s `finally` never executes: no quarantine is
-    // registered and the budget slot is never released. Each further request
-    // therefore re-enters the handler and holds another slot (up to the
-    // per-plugin concurrency cap).
+    // Pre-migration composition: bindPluginTools' invokeBoundedToolHandler
+    // (OUTER, fired first) wrapped chat.ts's invokeBoundedToolHandler, which
+    // wrapped the budget wrapper. When the OUTER bound fired it abandoned the
+    // inner promise, so `withToolCallBudget`'s `finally` never executed: no
+    // quarantine was registered and the slot was never released. Each further
+    // request re-entered the handler and held another slot.
     //
-    // The job channel does NOT share this wart: there the budget wraps the
-    // bounded call, so its `finally` runs and quarantine fires.
+    // Now `budget` is registered OUTSIDE `execution` in the shared pipeline, so
+    // its `finally` runs when the BOUNDED race settles and observes the
+    // unsettled raw body via the channel-owned `rawSettled` — quarantining the
+    // plugin and holding the slot, exactly like the job channel below. This is
+    // the behaviour the whole phase existed (in part) to fix.
     const budget = createBudgetManager({
       toolCallTimeoutMs: 20,
       toolCallQuarantineMs: DEFAULT_TOOL_CALL_QUARANTINE_MS,
@@ -526,16 +557,16 @@ describe("characterization — quarantine", () => {
     assert.equal(
       budget.pluginToolCallCount("vikunja"),
       1,
-      "observed: the abandoned budget slot is never released",
+      "D7: the unsettled raw body holds its budget slot",
     );
 
-    // Second request: NOT quarantined — the handler is entered again.
+    // Second request: quarantined — the handler is NOT entered again.
     const second = await postChat(app, chatBody());
     assert.equal(second.status, 200);
     const text = await second.text();
     assert.ok(text.includes("data: [DONE]"));
-    assert.equal(calls.length, 2, "observed: sync does NOT quarantine a never-settling handler");
-    assert.equal(budget.pluginToolCallCount("vikunja"), 2, "a second slot is held");
+    assert.equal(calls.length, 1, "D7: sync now DOES quarantine a never-settling handler");
+    assert.equal(budget.pluginToolCallCount("vikunja"), 1, "D7: the quarantined slot is still held");
   });
 
   test("job: the SAME never-settling handler IS quarantined (budget wraps the bounded call)", async (t) => {
@@ -746,6 +777,89 @@ describe("characterization — cache", () => {
     await (await postChat(app, chatBody())).text();
     assert.equal(calls.length, 2);
     assert.equal(toolCache.size, 0);
+  });
+
+  test("M7: a deleting owner is neither served a cache hit nor allowed to cache a fresh result", async (t) => {
+    const owner = "test-user";
+    const registry = { listInstalledPlugins: () => [vikunjaPlugin()] } as never;
+    const hitCache = createToolResultCache();
+    t.after(() => hitCache.dispose());
+    const key: ToolCacheKey = {
+      owner,
+      pluginId: "vikunja",
+      pluginVersion: "1.4.0",
+      credentialFingerprint: credentialFingerprint({ apiKey: "tok-123" }),
+      tool: "list_tasks",
+      argsHash: hitCache.argsHash({}),
+    };
+    hitCache.set(key, "CACHED-SHOULD-NOT-SERVE");
+    const calls: RecordedCall[] = [];
+
+    // (1) Already deleting at dispatch -> the pre-dispatch guard rejects before
+    // the cache lookup, so the hit is not served and the handler never runs.
+    const [served] = bindPluginTools(
+      registry,
+      recordingHandler(calls, '{"fresh":true}'),
+      undefined,
+      {
+        owner,
+        channel: "sync-stateless",
+        cache: hitCache,
+        credentialsByPlugin: { vikunja: { apiKey: "tok-123" } },
+        assertActive: () => assertNotDeleting(owner),
+      },
+    );
+    markDeleting(owner);
+    try {
+      await assert.rejects(
+        Promise.resolve(served!.func({}, undefined, { toolCall: { id: "del-1" } } as never)),
+        (error: unknown) => error instanceof AccountDeletedError,
+      );
+      assert.equal(calls.length, 0, "the cache hit was not served");
+      assert.equal(hitCache.size, 1, "the existing entry is untouched");
+    } finally {
+      clearDeleting(owner);
+    }
+
+    // (2) Deletion begins DURING the call -> the post-execution guard rejects
+    // after the handler resolved, so the fresh result is never cached.
+    const freshCache = createToolResultCache();
+    t.after(() => freshCache.dispose());
+    const freshCalls: RecordedCall[] = [];
+    const [lateDeletion] = bindPluginTools(
+      registry,
+      {
+        async execute(pluginId, toolName, args, credentials) {
+          freshCalls.push({ pluginId, toolName, args, credentials });
+          markDeleting(owner);
+          return '{"fresh":true}';
+        },
+      },
+      undefined,
+      {
+        owner,
+        channel: "sync-stateless",
+        cache: freshCache,
+        credentialsByPlugin: { vikunja: { apiKey: "tok-123" } },
+        assertActive: () => assertNotDeleting(owner),
+      },
+    );
+    try {
+      await assert.rejects(
+        Promise.resolve(
+          lateDeletion!.func(
+            { projectId: "p1" },
+            undefined,
+            { toolCall: { id: "del-2" } } as never,
+          ),
+        ),
+        (error: unknown) => error instanceof AccountDeletedError,
+      );
+      assert.equal(freshCalls.length, 1, "the handler ran (pre-dispatch was active)");
+      assert.equal(freshCache.size, 0, "no fresh result was cached after deletion began");
+    } finally {
+      clearDeleting(owner);
+    }
   });
 
   test("job: a warmup-populated cache entry IS found by sync when credentials are identical and canonical", async (t) => {
