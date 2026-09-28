@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../auth/data/account_deleted_state.dart';
+import '../../../app/theme.dart';
 import '../../auth/data/auth_credentials_providers.dart';
 import '../../chat/data/chat_client.dart';
 import '../../settings/data/settings_providers.dart';
@@ -81,7 +82,9 @@ class _PluginPage extends ConsumerWidget {
     }
     return Scaffold(
       appBar: AppBar(title: Text(title)),
-      body: body,
+      // Bottom safe area so the gesture bar never overlaps the last row of a
+      // subsection's scrollable, matching the settings About footer handling.
+      body: SafeArea(top: false, child: body),
     );
   }
 }
@@ -229,26 +232,6 @@ class _PluginList extends ConsumerWidget {
               selectedAgent == entry.key,
               onEdit: () =>
                   _openEditAgentEditor(context, entry.key, entry.value.agent!),
-              onDelete: () async {
-                try {
-                  await ref
-                      .read(scopedPluginCredentialsProvider)
-                      .removePlugin(entry.key);
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text(
-                        'Removed agent "${entry.value.agent!.name.isNotEmpty ? entry.value.agent!.name : entry.key}"',
-                      ),
-                    ),
-                  );
-                } catch (_) {
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Could not remove agent.')),
-                  );
-                }
-              },
             ),
           const SizedBox(height: 12),
         ],
@@ -273,6 +256,7 @@ class _PluginList extends ConsumerWidget {
           onPressed: () => ref.invalidate(pluginCatalogProvider),
           child: const Text('Refresh catalog'),
         ),
+        const SizedBox(height: 40),
       ],
     );
   }
@@ -282,47 +266,14 @@ class _PluginList extends ConsumerWidget {
     AgentDto agent,
     bool isSelected,
     PluginAccountConfiguration configuration,
-  ) => ListTile(
+  ) => _AgentRow(
     key: ValueKey('agent-${agent.id}'),
-    title: Text(agent.name),
-    subtitle: Text(
-      isSelected ? 'Selected for this account' : agent.description,
-      maxLines: 2,
-      overflow: TextOverflow.ellipsis,
-    ),
-    trailing: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (agent.skillCount > 0)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text('${agent.skillCount} skills'),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        if (agent.toolGrants.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text('${agent.toolGrants.length} tools'),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        if (agent.defaultModel != null)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text(
-                agent.defaultModel!,
-                style: const TextStyle(fontSize: 10),
-              ),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        const Icon(Icons.chevron_right),
-      ],
-    ),
+    name: agent.name,
+    selected: isSelected,
+    description: agent.description,
+    skillCount: agent.skillCount,
+    toolCount: agent.toolGrants.length,
+    model: agent.defaultModel,
     onTap: () => _openAgentEditor(context, agent, configuration),
   );
 
@@ -342,55 +293,17 @@ class _PluginList extends ConsumerWidget {
         : 0;
     final skillCount = template['skillCount'] as int? ?? 0;
     final mcpCount = (template['mcpNames'] as List?)?.length ?? 0;
-    return ListTile(
+    return _AgentRow(
       key: ValueKey('template-$id'),
-      title: Text(name),
-      subtitle: Text(
-        isSelected ? 'Selected for this account' : description,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (skillCount > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Chip(
-                label: Text('$skillCount skills'),
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-          if (mcpCount > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Chip(
-                label: Text('$mcpCount MCP'),
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-          if (toolCount > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Chip(
-                label: Text('$toolCount tools'),
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-          if (modelRef != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Chip(
-                label: Text(modelRef, style: const TextStyle(fontSize: 10)),
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-          if (isSelected)
-            TextButton(onPressed: onDeselect, child: const Text('Deselect'))
-          else
-            TextButton(onPressed: onSelect, child: const Text('Select')),
-        ],
-      ),
+      name: name,
+      selected: isSelected,
+      description: description,
+      skillCount: skillCount,
+      mcpCount: mcpCount,
+      toolCount: toolCount,
+      model: modelRef,
+      onSelect: onSelect,
+      onDeselect: onDeselect,
     );
   }
 
@@ -400,73 +313,19 @@ class _PluginList extends ConsumerWidget {
     AgentConfig agent,
     bool isSelected, {
     VoidCallback? onEdit,
-    VoidCallback? onDelete,
-  }) => ListTile(
+  }) => _AgentRow(
     key: ValueKey('custom-$pluginId'),
-    title: Row(
-      children: [
-        Text(agent.name.isNotEmpty ? agent.name : pluginId),
-        const SizedBox(width: 8),
-        Chip(
-          label: const Text('Custom'),
-          visualDensity: VisualDensity.compact,
-          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-        ),
-      ],
-    ),
-    subtitle: Text(
-      isSelected
-          ? 'Selected for this account'
-          : (agent.description ?? 'No description'),
-      maxLines: 2,
-      overflow: TextOverflow.ellipsis,
-    ),
-    trailing: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (agent.skills.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text('${agent.skills.length} skills'),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        if (agent.mcpServers.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text('${agent.mcpServers.length} MCP'),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        if (agent.tools.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text('${agent.tools.length} tools'),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        if (agent.modelRef != null)
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Chip(
-              label: Text(
-                agent.modelRef!,
-                style: const TextStyle(fontSize: 10),
-              ),
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-        if (isSelected)
-          TextButton(onPressed: onEdit, child: const Text('Edit'))
-        else ...[
-          TextButton(onPressed: onEdit, child: const Text('Edit')),
-          TextButton(onPressed: onDelete, child: const Text('Delete')),
-        ],
-      ],
-    ),
+    name: agent.name.isNotEmpty ? agent.name : pluginId,
+    label: 'Custom',
+    selected: isSelected,
+    description: agent.description,
+    skillCount: agent.skills.length,
+    mcpCount: agent.mcpServers.length,
+    toolCount: agent.tools.length,
+    model: agent.modelRef,
+    // The whole row opens the editor — save and delete live there, so the
+    // list row carries no explicit actions.
+    onTap: onEdit,
   );
 
   void _openAgentEditor(
@@ -547,6 +406,201 @@ class _PluginList extends ConsumerWidget {
                 ),
               ),
       );
+}
+
+/// One agent row for the plugin list. Modern/minimal: name and actions on the
+/// first line, the description at full width underneath, and capability counts
+/// as compact pills on a wrapping line below that.
+///
+/// The previous design squeezed the chips (skills / MCP / tools / model) into
+/// the ListTile's `trailing` slot. The row overflowed once an agent had more
+/// than a couple of tools (each pill stole fixed width, Edit/Delete joined in),
+/// and the description lost all width because ListTile hands the trailing slot
+/// a fixed share. Here the description owns the whole row, the pills sit in a
+/// [Wrap] — which wraps to a new line instead of overflowing, no matter how
+/// many skills or tools an agent selects — and pill width is capped so a long
+/// model id can never starve anything else.
+class _AgentRow extends StatelessWidget {
+  const _AgentRow({
+    super.key,
+    required this.name,
+    this.description,
+    this.selected = false,
+    this.label,
+    this.skillCount = 0,
+    this.mcpCount = 0,
+    this.toolCount = 0,
+    this.model,
+    this.onTap,
+    this.onSelect,
+    this.onDeselect,
+  });
+
+  final String name;
+
+  /// Shown unless [selected] (which replaces it with the selected line).
+  final String? description;
+  final bool selected;
+
+  /// Optional small badge next to the name ("Custom").
+  final String? label;
+  final int skillCount;
+  final int mcpCount;
+  final int toolCount;
+
+  /// Model reference; rendered as a pill, shortened to its last path segment.
+  final String? model;
+
+  /// The whole row opens the editor.
+  final VoidCallback? onTap;
+
+  /// Template select/deselect actions.
+  final VoidCallback? onSelect;
+  final VoidCallback? onDeselect;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final hasCounts =
+        skillCount > 0 ||
+        mcpCount > 0 ||
+        toolCount > 0 ||
+        (model?.isNotEmpty ?? false);
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppRadii.lg),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppSpacing.lg,
+            vertical: AppSpacing.md,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodyLarge?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  if (label != null) ...[
+                    _Pill(
+                      text: label!,
+                      fill: scheme.primaryContainer,
+                      foreground: scheme.onPrimaryContainer,
+                    ),
+                    const SizedBox(width: AppSpacing.sm),
+                  ],
+                  if (onSelect != null && onDeselect != null)
+                    TextButton(
+                      onPressed: selected ? onDeselect : onSelect,
+                      child: Text(selected ? 'Deselect' : 'Select'),
+                    ),
+                  // A tappable row advertises itself with a chevron. All other
+                  // actions (delete, save) live inside the editor, so the list
+                  // row carries exactly one affordance.
+                  if (onTap != null && onSelect == null) ...[
+                    const SizedBox(width: AppSpacing.xs),
+                    Icon(
+                      Icons.chevron_right,
+                      size: 20,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 2),
+              Text(
+                selected
+                    ? 'Selected for this account'
+                    : (description?.isNotEmpty ?? false)
+                    ? description!
+                    : 'No description',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: selected ? scheme.primary : scheme.onSurfaceVariant,
+                  fontWeight: selected ? FontWeight.w600 : null,
+                ),
+              ),
+              if (hasCounts) ...[
+                const SizedBox(height: AppSpacing.sm),
+                Wrap(
+                  spacing: AppSpacing.sm,
+                  runSpacing: AppSpacing.sm,
+                  children: [
+                    if (skillCount > 0) _Pill(text: '$skillCount skills'),
+                    if (mcpCount > 0) _Pill(text: '$mcpCount MCP'),
+                    if (toolCount > 0) _Pill(text: '$toolCount tools'),
+                    if (model?.isNotEmpty ?? false)
+                      _Pill(text: _shortModel(model!), dim: true),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Keeps model ids readable: `provider/model-id` → `model-id`.
+  static String _shortModel(String model) =>
+      model.contains('/') ? model.substring(model.lastIndexOf('/') + 1) : model;
+}
+
+/// Compact count/label pill. Width is capped so a long model id or a big count
+/// can never push a neighbor off its line — the Wrap handles the rest.
+class _Pill extends StatelessWidget {
+  const _Pill({
+    required this.text,
+    this.fill,
+    this.foreground,
+    this.dim = false,
+  });
+
+  final String text;
+  final Color? fill;
+  final Color? foreground;
+
+  /// Muted colour for model/technical pills; count pills use the primary hue.
+  final bool dim;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 180),
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.sm,
+          vertical: 2,
+        ),
+        decoration: BoxDecoration(
+          color: fill ?? scheme.surfaceContainer,
+          borderRadius: BorderRadius.circular(AppRadii.lg),
+        ),
+        child: Text(
+          text,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+            color:
+                foreground ?? (dim ? scheme.onSurfaceVariant : scheme.primary),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _PluginEditor extends ConsumerStatefulWidget {

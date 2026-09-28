@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../app/widgets/app_buttons.dart';
 import '../data/account_deleted_handler.dart';
 import '../data/account_deleted_state.dart';
 import '../data/auth_client.dart';
@@ -298,12 +299,6 @@ class AuthFlowState extends ConsumerState<AuthFlow> {
   /// routes into the check-inbox state on success. Mirrors the verify form's
   /// action so a user who already knows their email is unverified does not
   /// have to submit credentials (and wait for a 403) first.
-  Future<void> _resendFromSignIn() async {
-    await _resendVerification();
-    if (!mounted || !_verifySent) return;
-    setState(() => _verifyMode = true);
-  }
-
   static String _authErrorText(AuthApiError e) => switch (e) {
     AuthInvalidCredentials(code: final code?)
         when code == 'PASSWORD_TOO_SHORT' =>
@@ -416,23 +411,17 @@ class AuthFlowState extends ConsumerState<AuthFlow> {
           ),
         ),
         if (!_createAccount)
-          Wrap(
-            spacing: 8,
-            children: [
-              TextButton(
-                key: const Key('auth-forgot-link'),
-                onPressed: () => setState(() {
-                  _forgotMode = true;
-                  _error = null;
-                }),
-                child: const Text('Forgot password?'),
-              ),
-              TextButton(
-                key: const Key('auth-resend-verification-link'),
-                onPressed: _submitting ? null : _resendFromSignIn,
-                child: const Text('Resend verification email'),
-              ),
-            ],
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              key: const Key('auth-forgot-link'),
+              style: AppButtons.text,
+              onPressed: () => setState(() {
+                _forgotMode = true;
+                _error = null;
+              }),
+              child: const Text('Forgot password?'),
+            ),
           ),
         if (_error != null) ...[
           const SizedBox(height: 12),

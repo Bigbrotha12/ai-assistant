@@ -802,8 +802,10 @@ void main() {
       await tester.pump(const Duration(milliseconds: 300));
       await tester.pump(const Duration(milliseconds: 300));
 
-      expect(find.text('Backend host'), findsOneWidget);
-      expect(find.text('MCP token (optional)'), findsOneWidget);
+      // Account now opens the screen; the backend form lives in the collapsed
+      // Advanced tile (the MCP token field was removed as dead config).
+      expect(find.text('Account'), findsOneWidget);
+      expect(find.text('MCP token (optional)'), findsNothing);
     });
   });
 }

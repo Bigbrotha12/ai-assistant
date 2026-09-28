@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/date_symbol_data_local.dart';
 import 'package:smooth_page_indicator/smooth_page_indicator.dart';
 
 import './app/global_messenger.dart';
@@ -10,7 +11,15 @@ import './app/widgets/gold_band.dart';
 import './app/widgets/step_dots.dart';
 import './features/plugins/data/managed_chat_providers.dart';
 
-void main() => runApp(const ProviderScope(child: AiAssistantApp()));
+void main() {
+  // Loads the date symbol/pattern tables for *every* locale. Without this,
+  // `DateFormat.yMMMd` throws `LocaleDataException` for any locale other than
+  // `en_US`, which would crash date rendering for every non-US user. Safe to
+  // call before `runApp` — it registers data synchronously and returns an
+  // already-completed future.
+  initializeDateFormatting();
+  runApp(const ProviderScope(child: AiAssistantApp()));
+}
 
 class AiAssistantApp extends ConsumerWidget {
   const AiAssistantApp({super.key});

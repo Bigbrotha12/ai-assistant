@@ -174,14 +174,14 @@ void main() {
   }
 
   group('step defaults and gating', () {
-    testWidgets('defaults are pre-filled (language, date)', (tester) async {
+    testWidgets('language is pre-filled from the device locale', (tester) async {
       await pumpOnboarding(tester);
 
       expect(currentStep(tester), 0);
       expect(find.text('STEP 1 OF 4'), findsOneWidget);
 
       // Region is not built until it is first shown (a PageView only builds
-      // the page it needs), so walk to it before reading the dropdowns.
+      // the page it needs), so walk to it before reading the dropdown.
       await signIn(tester);
       expect(find.text('STEP 2 OF 4'), findsOneWidget);
 
@@ -189,9 +189,32 @@ void main() {
           find.byKey(const Key('ob-language')));
       expect(language.value, 'en');
 
-      final dateFormat = tester.widget<DropdownButton<String>>(
-          find.byKey(const Key('ob-date-format')));
-      expect(dateFormat.value, 'en-US');
+      // Onboarding no longer asks for a date format: nothing renders dates
+      // from the stored locale yet, so the picker was collecting a preference
+      // for behaviour that does not exist. The override stays in Settings.
+      expect(find.byKey(const Key('ob-date-format')), findsNothing);
+      expect(find.text('Date format'), findsNothing);
+    });
+
+    testWidgets('the inferred date format is still persisted', (tester) async {
+      // Dropping the picker must not drop the value: Settings seeds its
+      // override from prefs, and a migration-friendly stored value is cheaper
+      // than re-deriving it.
+      final prefsStore = FakePrefsStore();
+      final settingsStore = FakeSettingsStore();
+      await pumpOnboarding(
+        tester,
+        prefs: prefsStore,
+        settings: settingsStore,
+        auth: FakeAuthCredentialsStore(
+          stored: const AuthCredentials(apiKey: 'k', email: 'a@b.com'),
+        ),
+      );
+      await completeFlow(tester);
+      await tapPrimary(tester);
+
+      expect(prefsStore.prefs.dateFormat, isNotEmpty);
+      expect(prefsStore.prefs.onboardingComplete, isTrue);
     });
 
     testWidgets('entered state survives Back and Next', (tester) async {
@@ -505,11 +528,14 @@ void main() {
       await pumpOnboarding(tester, engine: engine);
       await completeFlowToVoice(tester);
 
-      // Supertonic 3 is now a real, downloadable model on this build
-      // (verified URLs are configured), so it renders as a not-yet-downloaded
-      // model rather than "unavailable".
-      expect(find.text('Supertonic 3').hitTestable(), findsOneWidget);
+      // End-user labels, not model names: the engine jargon belongs in Voice
+      // settings. Text to speech is a real, downloadable model on this build
+      // (verified URLs configured), so it renders as not-yet-downloaded.
+      expect(find.text('Speech to text'), findsOneWidget);
+      expect(find.text('Text to speech'), findsOneWidget);
       expect(find.text('not downloaded').hitTestable(), findsOneWidget);
+      expect(find.text('Whisper tiny'), findsNothing);
+      expect(find.text('Supertonic 3'), findsNothing);
 
       // The old "Do it later" button duplicated the primary action, so the CTA
       // is the single way forward and it downloads nothing.
@@ -518,6 +544,66 @@ void main() {
 
       expect(currentStep(tester), 3);
       expect(engine.downloadCalls, 0);
+    });
+  });
+
+  group('finish step gating', () {
+    testWidgets('an unauthenticated flow cannot reach the finish step',
+        (tester) async {
+      // Regression guard for "Get started does nothing": finishing requires an
+      // account, because the startup gate only treats the app as configured
+      // when a stored API key *and* a stored host are both present. There is no
+      // path past step 0 without one.
+      final settingsStore = FakeSettingsStore();
+      await pumpOnboarding(
+        tester,
+        settings: settingsStore,
+        auth: FakeAuthCredentialsStore(),
+        authClient: FakeAuthClient(
+          onSignIn: (email, password) async =>
+              throw const AuthInvalidCredentials('bad'),
+        ),
+      );
+
+      await tester.enterText(
+          find.byKey(const Key('auth-email')), 'nobody@example.com');
+      await tester.enterText(
+          find.byKey(const Key('auth-password')), 'wrong-password');
+      await tapPrimary(tester);
+
+      // The CTA submits rather than advancing, and the rejection is visible.
+      expect(currentStep(tester), 0);
+      expect(find.text('Incorrect email or password'), findsOneWidget);
+
+      // Forward dot taps are refused too, so the finish step is unreachable.
+      final dots = find.byType(StepDots);
+      tester.widget<StepDots>(dots).onDotTapped!(3);
+      await tester.pumpAndSettle();
+      expect(currentStep(tester), 0);
+      expect(find.text('STEP 1 OF 4'), findsOneWidget);
+
+      // Nothing was written.
+      expect(settingsStore.stored, isNull);
+    });
+
+    testWidgets('the blocked-finish prompt only appears without an account',
+        (tester) async {
+      // With a stored key the flow completes normally, so the blocked-finish
+      // prompt must never show.
+      final settingsStore = FakeSettingsStore();
+      await pumpOnboarding(
+        tester,
+        settings: settingsStore,
+        auth: FakeAuthCredentialsStore(
+          stored: const AuthCredentials(apiKey: 'k', email: 'a@b.com'),
+        ),
+      );
+      await completeFlow(tester);
+      await tapPrimary(tester);
+
+      expect(settingsStore.stored, isNotNull);
+      expect(find.text('Sign in to finish setting up the app.'), findsNothing);
+      expect(find.text('Could not save your setup'), findsNothing);
     });
   });
 

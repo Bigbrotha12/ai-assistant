@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_file/open_file.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../auth/data/account_deleted_handler.dart';
 import '../../auth/data/account_deleted_state.dart';
@@ -49,11 +50,12 @@ class SettingsScreen extends ConsumerStatefulWidget {
 
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _hostController = TextEditingController();
-  final _mcpSecretController = TextEditingController();
   final _filesSecretController = TextEditingController();
   final _storageUrlController = TextEditingController();
 
-  bool _obscureMcpSecret = true;
+  /// Resolved once and reused by the About footer.
+  final Future<PackageInfo> _packageInfo = PackageInfo.fromPlatform();
+
   bool _obscureFilesSecret = true;
   bool _probing = false;
   bool _didAutoProbe = false;
@@ -72,7 +74,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   void initState() {
     super.initState();
     _hostController.addListener(_onFormChanged);
-    _mcpSecretController.addListener(_onFormChanged);
     _filesSecretController.addListener(_onFormChanged);
     _storageUrlController.addListener(_onFormChanged);
     _handleSettings(ref.read(settingsProvider));
@@ -90,11 +91,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   @override
   void dispose() {
     _hostController.removeListener(_onFormChanged);
-    _mcpSecretController.removeListener(_onFormChanged);
     _filesSecretController.removeListener(_onFormChanged);
     _storageUrlController.removeListener(_onFormChanged);
     _hostController.dispose();
-    _mcpSecretController.dispose();
     _filesSecretController.dispose();
     _storageUrlController.dispose();
     super.dispose();
@@ -105,9 +104,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   void _populateControllers(BackendSettings settings) {
     if (_hostController.text.isEmpty) {
       _hostController.text = settings.host;
-    }
-    if (_mcpSecretController.text.isEmpty) {
-      _mcpSecretController.text = settings.mcpSecret ?? '';
     }
     if (_filesSecretController.text.isEmpty) {
       _filesSecretController.text = settings.filesSecret ?? '';
@@ -194,7 +190,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   BackendSettings _settingsFromForm() => BackendSettings(
     host: _hostController.text,
     environment: _environment,
-    mcpSecret: _mcpSecretController.text,
+    // The MCP token is deliberately not collected any more: it was stored but
+    // read by nothing (the gateway owns MCP server-side), i.e. dead config.
     filesSecret: _filesSecretController.text,
     storageUrl: _storageUrlController.text,
   );
@@ -226,7 +223,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       builder: (dialogContext) => AlertDialog(
         title: const Text('Clear settings'),
         content: const Text(
-          'Clear saved host, MCP token, files token, and storage URL?',
+          'Clear saved host, files token, and storage URL?',
         ),
         actions: [
           TextButton(
@@ -258,7 +255,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     if (!mounted) return;
     setState(() {
       _hostController.clear();
-      _mcpSecretController.clear();
       _filesSecretController.clear();
       _storageUrlController.clear();
     });
@@ -501,13 +497,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     ref.listen(settingsProvider, _onSettingsChanged);
 
     final isLoading = settingsAsync.isLoading;
-    final hostText = _hostController.text;
-    final hostError = validateHost(hostText);
-    final storageUrlError = validateStorageUrl(_storageUrlController.text);
-    // Test and Save both require a structurally valid host and storage URL.
-    final canTest =
-        !isLoading && !_probing && hostError == null && storageUrlError == null;
-    final canSave = canTest;
 
     return Scaffold(
       appBar: AppBar(title: const BrandAppBarTitle()),
@@ -516,167 +505,178 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           if (isLoading) const LinearProgressIndicator(minHeight: 2),
           if (settingsAsync.hasError) const _SettingsLoadErrorBanner(),
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                TextField(
-                  controller: _hostController,
-                  enabled: !isLoading,
-                  decoration: InputDecoration(
-                    labelText: 'Backend host',
-                    hintText: 'tailnet IP or MagicDNS name',
-                    border: const OutlineInputBorder(),
-                    errorText: hostError,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Environment',
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-                const SizedBox(height: 8),
-                SegmentedButton<BackendEnvironment>(
-                  segments: const [
-                    ButtonSegment(
-                      value: BackendEnvironment.dev,
-                      label: Text('Dev'),
-                      icon: Icon(Icons.code),
-                    ),
-                    ButtonSegment(
-                      value: BackendEnvironment.production,
-                      label: Text('Production'),
-                      icon: Icon(Icons.cloud_outlined),
-                    ),
-                  ],
-                  selected: {_environment},
-                  onSelectionChanged: (selection) {
-                    setState(() => _environment = selection.first);
-                  },
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Controls the http/https scheme used by backend endpoints.',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _mcpSecretController,
-                  enabled: !isLoading,
-                  obscureText: _obscureMcpSecret,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  keyboardType: TextInputType.visiblePassword,
-                  decoration: InputDecoration(
-                    labelText: 'MCP token (optional)',
-                    hintText: 'voice-mcp bearer token (Phase 4)',
-                    border: const OutlineInputBorder(),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _obscureMcpSecret
-                            ? Icons.visibility_off
-                            : Icons.visibility,
-                      ),
-                      tooltip: _obscureMcpSecret
-                          ? 'Show MCP token'
-                          : 'Hide MCP token',
-                      onPressed: () => setState(
-                        () => _obscureMcpSecret = !_obscureMcpSecret,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _filesSecretController,
-                  enabled: !isLoading,
-                  obscureText: _obscureFilesSecret,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  keyboardType: TextInputType.visiblePassword,
-                  decoration: InputDecoration(
-                    labelText: 'Files token (optional)',
-                    hintText: 'files service bearer token',
-                    border: const OutlineInputBorder(),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _obscureFilesSecret
-                            ? Icons.visibility_off
-                            : Icons.visibility,
-                      ),
-                      tooltip: _obscureFilesSecret
-                          ? 'Show files token'
-                          : 'Hide files token',
-                      onPressed: () => setState(
-                        () => _obscureFilesSecret = !_obscureFilesSecret,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text('Storage', style: Theme.of(context).textTheme.titleSmall),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _storageUrlController,
-                  enabled: !isLoading,
-                  decoration: InputDecoration(
-                    labelText: 'Storage service URL (optional)',
-                    hintText: 'e.g. http://minio:9000',
-                    border: const OutlineInputBorder(),
-                    helperText: 'Leave blank to use <host>:17603',
-                    errorText: validateStorageUrl(_storageUrlController.text),
-                  ),
-                  keyboardType: TextInputType.url,
-                ),
-                const SizedBox(height: 24),
-                Row(
-                  children: [
-                    Expanded(
-                      child: FilledButton(
-                        onPressed: canTest ? _testConnection : null,
-                        child: const Text('Test connection'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: canSave ? _save : null,
-                        child: const Text('Save'),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 24),
-                _buildResults(context),
-                const SizedBox(height: 32),
-                _buildFiles(context),
-                const SizedBox(height: 32),
-                _buildDangerZone(context),
+            child: SafeArea(
+              // The About footer must not sit under the gesture bar; the App
+              // Bar already handles the top inset.
+              top: false,
+              child: ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                _buildAccount(context),
                 const SizedBox(height: 32),
                 _buildAppearance(context),
                 const SizedBox(height: 32),
                 _buildGeneral(context),
                 const SizedBox(height: 32),
-                _buildAccount(context),
+                _buildAiAndVoice(context),
                 const SizedBox(height: 32),
-                _buildVoice(context),
+                _buildFiles(context),
                 const SizedBox(height: 32),
-                ListTile(
-                  key: const Key('settings-plugins'),
-                  leading: const Icon(Icons.extension_outlined),
-                  title: const Text('Plugins'),
-                  subtitle: const Text('Staged model and tool configuration'),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const PluginsScreen()),
-                  ),
-                ),
+                _buildConnectivity(context),
+                const SizedBox(height: 32),
+                _buildDangerZone(context),
+                const SizedBox(height: 32),
+                _buildAbout(context),
+                // Extra room under the version footer so it never touches the
+                // device gesture bar even before the SafeArea inset applies.
+                const SizedBox(height: 40),
               ],
+              ),
             ),
           ),
         ],
       ),
+    );
+  }
+
+  /// "Advanced" section: the backend/connectivity form, collapsed under an
+  /// expansion tile. Demoted from the top of the screen — the deployed gateway
+  /// is the default, so this surface exists for self-hosting and debugging.
+  /// The probe results render directly beneath the form that produced them.
+  Widget _buildConnectivity(BuildContext context) {
+    final theme = Theme.of(context);
+    final hostError = validateHost(_hostController.text);
+    final storageUrlError = validateStorageUrl(_storageUrlController.text);
+    final canEdit = !ref.watch(settingsProvider).isLoading;
+    final canRun = canEdit && !_probing && hostError == null &&
+        storageUrlError == null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('Advanced', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        Card(
+          margin: EdgeInsets.zero,
+          clipBehavior: Clip.antiAlias,
+          child: ExpansionTile(
+            key: const Key('settings-advanced'),
+            title: const Text('Backend & connectivity'),
+            subtitle: const Text('Host, environment, files token, storage'),
+            leading: const Icon(Icons.dns_outlined),
+            shape: const Border(),
+            collapsedShape: const Border(),
+            childrenPadding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            children: [
+              TextField(
+                key: const Key('settings-host'),
+                controller: _hostController,
+                enabled: canEdit,
+                decoration: InputDecoration(
+                  labelText: 'Backend host',
+                  hintText: 'tailnet IP or MagicDNS name',
+                  border: const OutlineInputBorder(),
+                  errorText: hostError,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Environment',
+                style: theme.textTheme.titleSmall,
+              ),
+              const SizedBox(height: 8),
+              SegmentedButton<BackendEnvironment>(
+                segments: const [
+                  ButtonSegment(
+                    value: BackendEnvironment.dev,
+                    label: Text('Dev'),
+                    icon: Icon(Icons.code),
+                  ),
+                  ButtonSegment(
+                    value: BackendEnvironment.production,
+                    label: Text('Production'),
+                    icon: Icon(Icons.cloud_outlined),
+                  ),
+                ],
+                selected: {_environment},
+                onSelectionChanged: (selection) {
+                  setState(() => _environment = selection.first);
+                },
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Controls the http/https scheme used by backend endpoints.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                key: const Key('settings-files-token'),
+                controller: _filesSecretController,
+                enabled: canEdit,
+                obscureText: _obscureFilesSecret,
+                autocorrect: false,
+                enableSuggestions: false,
+                keyboardType: TextInputType.visiblePassword,
+                decoration: InputDecoration(
+                  labelText: 'Files token (optional)',
+                  hintText: 'files service bearer token',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      _obscureFilesSecret
+                          ? Icons.visibility_off
+                          : Icons.visibility,
+                    ),
+                    tooltip: _obscureFilesSecret
+                        ? 'Show files token'
+                        : 'Hide files token',
+                    onPressed: () => setState(
+                      () => _obscureFilesSecret = !_obscureFilesSecret,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text('Storage', style: theme.textTheme.titleSmall),
+              const SizedBox(height: 8),
+              TextField(
+                key: const Key('settings-storage-url'),
+                controller: _storageUrlController,
+                enabled: canEdit,
+                decoration: InputDecoration(
+                  labelText: 'Storage service URL (optional)',
+                  hintText: 'e.g. http://minio:9000',
+                  border: const OutlineInputBorder(),
+                  helperText: 'Leave blank to use <host>:17603',
+                  errorText: storageUrlError,
+                ),
+                keyboardType: TextInputType.url,
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: canRun ? _testConnection : null,
+                      child: const Text('Test connection'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: canRun ? _save : null,
+                      child: const Text('Save'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              _buildResults(context),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -734,7 +734,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Files', style: Theme.of(context).textTheme.titleSmall),
+        Text('Files & data', style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 8),
+        Text(
+          // Short enough to be skipped, plain enough to answer "what goes
+          // here": files attached in conversations, stored on your gateway.
+          'Files you attach in conversations live here on your gateway.',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
         const SizedBox(height: 8),
         Row(
           children: [
@@ -849,8 +858,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   /// "Appearance" section: visual tier toggle (standard core vs premium
-  /// paper-and-gold). Adding the section at the *end* of the list keeps the
-  /// text-field indices used by the settings tests stable.
+  /// paper-and-gold). Plays a preference row near the top — identity first,
+  /// then how the app looks, then the more technical surfaces below.
   Widget _buildAppearance(BuildContext context) {
     final theme = Theme.of(context);
     final tier = ref.watch(appTierProvider).value ?? AppTier.standard;
@@ -858,13 +867,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text('Appearance', style: theme.textTheme.titleSmall),
-        const SizedBox(height: 8),
-        Text(
-          'Premium: warm paper surfaces, gold accents, serif headlines.',
-          style: theme.textTheme.bodySmall?.copyWith(
-            color: theme.colorScheme.onSurfaceVariant,
-          ),
-        ),
         const SizedBox(height: 12),
         SegmentedButton<AppTier>(
           segments: const [
@@ -889,9 +891,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   /// "General" section: preferred language (stored in voice settings) and date
-  /// format (stored in prefs), symmetric with the Appearance section. Appended
-  /// at the end of the list so the text-field indices used by the settings
-  /// tests stay stable.
+  /// format (stored in prefs), symmetric with the Appearance section.
   Widget _buildGeneral(BuildContext context) {
     final theme = Theme.of(context);
     final voice =
@@ -905,7 +905,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         InputDecorator(
           decoration: const InputDecoration(
             labelText: 'Language',
-            helperText: 'Spoken language for voice conversations',
             border: OutlineInputBorder(),
           ),
           child: DropdownButton<String>(
@@ -956,12 +955,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  /// "Account" section: signed-in email (or a sign-in prompt) with Sign out /
-  /// Rotate key actions. Signing in and rotating keys open the dedicated
-  /// [SignInScreen]; the shared [AuthFlow] inside it mints and persists a
-  /// fresh API key on success, so this section only reacts to the stored
-  /// credentials. Appended at the end of the list so the text-field indices
-  /// used by the settings tests stay stable.
+  /// "Account" section: identity first — signed-in email (or a sign-in
+  /// prompt) with Sign out / Rotate key / Export actions. Signing in and
+  /// rotating keys open the dedicated [SignInScreen]; the shared [AuthFlow]
+  /// inside it mints and persists a fresh API key on success, so this section
+  /// only reacts to the stored credentials.
   Widget _buildAccount(BuildContext context) {
     final theme = Theme.of(context);
     final creds = ref.watch(authCredentialsProvider).value;
@@ -1029,26 +1027,80 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  /// "Voice" section: entry point to the voice conversation settings screen
-  /// (the voice/chat home screens no longer carry settings in their top
-  /// bars). Appended at the end of the list so the text-field indices used
-  /// by the settings tests stay stable.
-  Widget _buildVoice(BuildContext context) {
+  /// "AI & voice" section: the two capability entries — voice settings and
+  /// the plugins screen (models & tools). Grouped as one block so feature
+  /// entry points sit together, distinct from preferences above and
+  /// connectivity below.
+  Widget _buildAiAndVoice(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('AI & voice', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        Card(
+          margin: EdgeInsets.zero,
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              ListTile(
+                key: const Key('settings-voice'),
+                leading: const Icon(Icons.mic),
+                title: const Text('Voice conversation settings'),
+                subtitle: const Text('Engines, VAD sensitivity, language'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const VoiceSettingsScreen(),
+                  ),
+                ),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                key: const Key('settings-plugins'),
+                leading: const Icon(Icons.extension_outlined),
+                title: const Text('Plugins'),
+                subtitle: const Text('Staged model and tool configuration'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const PluginsScreen()),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// "About" section: app identity and version. Deliberately the final
+  /// section, below the danger zone, mirroring the OS convention of a quiet
+  /// version footer at the very end.
+  Widget _buildAbout(BuildContext context) {
     final theme = Theme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Voice', style: theme.textTheme.titleSmall),
+        Text('About', style: theme.textTheme.titleSmall),
         const SizedBox(height: 8),
-        ListTile(
-          key: const Key('settings-voice'),
-          contentPadding: const EdgeInsets.symmetric(vertical: 4),
-          leading: const Icon(Icons.mic),
-          title: const Text('Voice conversation settings'),
-          subtitle: const Text('Engines, VAD sensitivity, language'),
-          trailing: const Icon(Icons.chevron_right),
-          onTap: () => Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => const VoiceSettingsScreen()),
+        FutureBuilder<PackageInfo>(
+          future: _packageInfo,
+          builder: (context, snapshot) {
+            final info = snapshot.data;
+            return Text(
+              '${'Voice Assist'}'
+              '${info == null ? '' : ' · ${info.version} (${info.buildNumber})'}',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Connect your own AI Assistant gateway, models and tools.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
           ),
         ),
       ],

@@ -1,15 +1,18 @@
 import 'dart:async';
+import 'dart:ui' show PlatformDispatcher;
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
 import 'package:open_file/open_file.dart';
 
 import '../../../core/config.dart';
 import '../../auth/data/account_lifecycle.dart';
 import '../data/files_providers.dart';
 import '../data/files_service.dart';
+import '../../settings/data/prefs_providers.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../chat/data/database_providers.dart';
 import '../data/file_model.dart';
@@ -491,6 +494,9 @@ class _FileTileState extends ConsumerState<_FileTile> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final date = _date;
+    // The user's date-format preference, so dates render the way they asked
+    // for instead of a hardcoded US format.
+    final dateLocale = ref.watch(appPrefsProvider).value?.dateFormat;
     return Card(
       clipBehavior: Clip.antiAlias,
       child: InkWell(
@@ -521,7 +527,7 @@ class _FileTileState extends ConsumerState<_FileTile> {
                   const SizedBox(height: 2),
                   Text(
                     '${formatBytes(widget.file.sizeBytes)}'
-                    '${date != null ? ' · ${_formatDate(date)}' : ''}',
+                    '${date != null ? ' · ${formatDateForLocale(date, dateLocale)}' : ''}',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: scheme.onSurfaceVariant,
                     ),
@@ -570,22 +576,39 @@ class _FileTileState extends ConsumerState<_FileTile> {
   }
 }
 
-const List<String> _kMonths = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-];
-
-String _formatDate(DateTime date) {
+/// Formats [date] in the user's chosen locale (e.g. `Mar 14, 2025` for
+/// `en_US`, `14 mar 2025` for `es`).
+///
+/// This is the consumer for `prefs.dateFormat` — previously the preference was
+/// written by onboarding and Settings but read by nothing, while this function
+/// hardcoded a US format for everyone.
+///
+/// **Total by contract:** it never throws. [locale] is a hint, not a
+/// guarantee — the value is user-editable and persisted as a length-prefixed
+/// string, so a corrupt or hand-edited value must not take down a list tile.
+/// Candidates are tried in order (stored → platform → `en_US`), and anything
+/// unusable falls back to an unambiguous ISO date. `DateFormat` signals a bad
+/// locale two different ways (`ArgumentError` for an unparseable tag,
+/// `LocaleDataException` for a tag with no loaded data — the latter is not
+/// publicly exported), so this catches broadly by design; the only thing lost
+/// is a mis-formatted date, never the tile.
+String formatDateForLocale(DateTime date, String? locale) {
   final local = date.toLocal();
-  return '${_kMonths[local.month - 1]} ${local.day}, ${local.year}';
+  for (final candidate in [
+    locale,
+    // `PlatformDispatcher` rather than `WidgetsBinding.instance` so this stays
+    // a pure function of its arguments — no live binding required.
+    PlatformDispatcher.instance.locale.toLanguageTag(),
+    'en_US',
+  ]) {
+    if (candidate == null || candidate.isEmpty) continue;
+    try {
+      return DateFormat.yMMMd(candidate).format(local);
+    } catch (_) {
+      continue;
+    }
+  }
+  final mm = local.month.toString().padLeft(2, '0');
+  final dd = local.day.toString().padLeft(2, '0');
+  return '${local.year}-$mm-$dd';
 }

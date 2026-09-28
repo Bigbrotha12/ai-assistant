@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Single dev command for the AI Assistant stack.
+# Build and run the Flutter app against the deployed AI Assistant gateway.
 #
-# Provisions the backend gateway (server/.env, npm install, migrate), starts
-# the gateway in the background, waits for it to become healthy, then runs the
-# Flutter app against the dev backend. Everything is torn down on exit.
+# Flutter-only by default: it launches the app on FLUTTER_DEVICE and leaves the
+# backend alone, because the app talks to the deployed `ai-assistant` gateway
+# named by PUBLIC_BACKEND_URL. Pass --with-gateway to also provision and start
+# a local gateway on :17600 (only needed when developing the gateway itself).
 #
 # The backend host baked into the app defaults to this machine's Tailscale
 # IPv4, so the same build works on the Linux desktop (local loopback) and on
@@ -12,8 +13,10 @@
 # localhost.
 #
 # Usage:
-#   ./dev.sh                          # run on Linux with the Tailscale host
+#   ./dev.sh                          # run on Linux against the deployed gateway
 #   FLUTTER_DEVICE=<device-id> ./dev.sh  # run on Android (see: flutter devices)
+#   ./dev.sh --with-gateway           # also provision + start a local :17600
+#   ./dev.sh --gateway-only           # local backend only, no flutter
 #   ./dev.sh -- <flutter args...>     # forward extra args to flutter run (e.g. --dart-define=...)
 #
 # Env (see dev.env.example for persistent configuration):
@@ -22,8 +25,9 @@
 #   PUBLIC_BACKEND_URL  Public backend URL dart-define; also selects the
 #                       production (https) environment. Default: the cluster
 #                       gateway at https://ai-assistant.fire-chain.com. Set to
-#                       an empty string to keep building against HOST_FQDN over
-#                       dev http (e.g. local-only / --gateway-only setups).
+#                       an empty string to build against HOST_FQDN over dev http
+#                       instead (pair it with --with-gateway for a local-only
+#                       stack).
 #   FLUTTER             Flutter SDK binary path (default: $HOME/Projects/mobile/flutter/bin/flutter)
 #   FLUTTER_ARGS    Extra args appended to flutter run (alternative to --)
 
@@ -154,124 +158,164 @@ teardown() {
 trap teardown EXIT INT TERM
 
 # ---------------------------------------------------------------------------
-# Provision the server
+# Arguments
 # ---------------------------------------------------------------------------
-
-cd "$SERVER_DIR"
-
-mkdir -p "$DATA_DIR"
-
-# 1) Create server/.env from .env.example, never overwriting an existing one.
-if [ ! -f .env ]; then
-  cp .env.example .env
-  echo "Created server/.env from .env.example."
-fi
-
-# 2) Auto-generate BETTER_AUTH_SECRET when it still holds the placeholder.
-if grep -q '^BETTER_AUTH_SECRET=replace-me-with-at-least-32-random-characters' .env; then
-  SECRET="$(openssl rand -base64 48 | tr -d '\n')"
-  # Replace the secret line (or append if the line is missing).
-  if grep -q '^BETTER_AUTH_SECRET=' .env; then
-    sed -i.bak "s|^BETTER_AUTH_SECRET=.*|BETTER_AUTH_SECRET=${SECRET}|" .env
-    rm -f .env.bak
-  else
-    printf 'BETTER_AUTH_SECRET=%s\n' "$SECRET" >>.env
-  fi
-  echo "Generated BETTER_AUTH_SECRET in server/.env."
-fi
-
-# 3) Ensure the BETTER_AUTH_URL dev default when missing or blank
-#    (the gateway refuses to boot on a missing/blank URL).
-ensure_env_default() {
-  local key="$1" default="$2"
-  if ! grep -q "^${key}=.*[^[:space:]]" .env; then
-    if grep -q "^${key}=" .env; then
-      # Key present but blank/whitespace-only: fill it.
-      sed -i.bak "s|^${key}=.*|${key}=${default}|" .env
-      rm -f .env.bak
-    else
-      printf '%s=%s\n' "$key" "$default" >>.env
-    fi
-  fi
-}
-ensure_env_default "BETTER_AUTH_URL" "http://${HOST_FQDN}:17600"
-# Catalog directory (skills/agents/mcp) shipped with the repo for dev.
-ensure_env_default "CONFIG_DIR" "./config"
-
-# 4) npm install (only if node_modules is missing).
-if [ ! -d node_modules ]; then
-  echo "Installing server dependencies…"
-  npm install --no-audit --no-fund
-else
-  echo "server/node_modules present; skipping install."
-fi
-
-# 5) Migrate (better-auth + ledger). auth migrate prompts interactively by
-#    default, so pass --yes to skip the confirmation in a script. The chained
-#    `npm run migrate` script cannot receive the flag on `auth migrate` (npm
-#    appends it to the last command), so invoke each step directly.
-echo "Migrating databases…"
-npx auth migrate --yes
-npm run migrate:ledger
-
-# ---------------------------------------------------------------------------
-# Start the gateway in the background
-# ---------------------------------------------------------------------------
-
-echo "Starting gateway (logging to $LOG_FILE)…"
-setsid npm run start >"$LOG_FILE" 2>&1 &
-GATEWAY_PID=$!
-
-# ---------------------------------------------------------------------------
-# Wait for the gateway to become healthy
-# ---------------------------------------------------------------------------
-
-echo "Waiting for gateway health at $HEALTH_URL…"
-HEALTHY=0
-for _ in $(seq 1 30); do
-  if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
-    HEALTHY=1
-    break
-  fi
-  if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
-
-if [ "$HEALTHY" -ne 1 ]; then
-  echo "error: gateway did not become healthy within ~30s." >&2
-  echo "       Check the log: $LOG_FILE" >&2
-  tail -n 40 "$LOG_FILE" >&2 2>/dev/null || true
-  exit 1
-fi
-echo "Gateway is healthy: $(curl -fsS "$HEALTH_URL")"
-
-# ---------------------------------------------------------------------------
-# Run flutter against the local dev backend
-# ---------------------------------------------------------------------------
-
-cd "$ROOT_DIR"
-
-# Argv after "--" (or FLUTTER_ARGS) forwards to flutter run.
+# Parsed BEFORE provisioning so the local gateway can be skipped entirely.
+# Default is flutter-only: the deployed `ai-assistant` gateway named by
+# PUBLIC_BACKEND_URL is what the app talks to, so standing up a second local
+# gateway on :17600 would only be a different backend behind the same UI.
+WITH_GATEWAY=0
 GATEWAY_ONLY=0
-if [ "${1:-}" = "--gateway-only" ]; then
-  # Run only the backend (provision + health-check + keep serving), no
-  # flutter. For standalone phone/tablet builds that talk to this host.
-  GATEWAY_ONLY=1
-  shift
-fi
-if [ "${1:-}" = "--" ]; then
-  shift
-  EXTRA_ARGS=("$@")
-else
-  EXTRA_ARGS=()
-fi
+EXTRA_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --with-gateway)
+      # Also provision (server/.env, npm install, migrate) and start a local
+      # gateway on :17600, then wait for its health check. Only needed when
+      # developing the gateway itself, or for a local-only build.
+      WITH_GATEWAY=1
+      shift
+      ;;
+    --gateway-only)
+      # Local backend only, no flutter. Implies --with-gateway.
+      GATEWAY_ONLY=1
+      WITH_GATEWAY=1
+      shift
+      ;;
+    --)
+      shift
+      EXTRA_ARGS=("$@")
+      set --
+      ;;
+    *)
+      echo "error: unknown argument '$1'" >&2
+      echo "usage: ./dev.sh [--with-gateway] [--gateway-only] [-- <flutter args…>]" >&2
+      exit 2
+      ;;
+  esac
+done
 if [ -n "${FLUTTER_ARGS:-}" ]; then
   # Word-split FLUTTER_ARGS so multiple args survive as separate elements.
   read -r -a FLUTTER_ARGS_SPLIT <<<"$FLUTTER_ARGS"
   EXTRA_ARGS+=("${FLUTTER_ARGS_SPLIT[@]}")
 fi
+
+# ---------------------------------------------------------------------------
+# Provision and start a local gateway on :17600 (--with-gateway / --gateway-only)
+# ---------------------------------------------------------------------------
+#
+# Sets the global GATEWAY_PID so teardown can stop it. Only for developing the
+# gateway itself: the app normally talks to the deployed gateway named by
+# PUBLIC_BACKEND_URL, and a second local one would be a different backend
+# behind the same UI.
+provision_local_gateway() {
+  cd "$SERVER_DIR"
+
+  mkdir -p "$DATA_DIR"
+
+  # 1) Create server/.env from .env.example, never overwriting an existing one.
+  if [ ! -f .env ]; then
+    cp .env.example .env
+    echo "Created server/.env from .env.example."
+  fi
+
+  # 2) Auto-generate BETTER_AUTH_SECRET when it still holds the placeholder.
+  if grep -q '^BETTER_AUTH_SECRET=replace-me-with-at-least-32-random-characters' .env; then
+    SECRET="$(openssl rand -base64 48 | tr -d '\n')"
+    # Replace the secret line (or append if the line is missing).
+    if grep -q '^BETTER_AUTH_SECRET=' .env; then
+      sed -i.bak "s|^BETTER_AUTH_SECRET=.*|BETTER_AUTH_SECRET=${SECRET}|" .env
+      rm -f .env.bak
+    else
+      printf 'BETTER_AUTH_SECRET=%s\n' "$SECRET" >>.env
+    fi
+    echo "Generated BETTER_AUTH_SECRET in server/.env."
+  fi
+
+  # 3) Ensure the BETTER_AUTH_URL dev default when missing or blank
+  #    (the gateway refuses to boot on a missing/blank URL).
+  ensure_env_default() {
+    local key="$1" default="$2"
+    if ! grep -q "^${key}=.*[^[:space:]]" .env; then
+      if grep -q "^${key}=" .env; then
+        # Key present but blank/whitespace-only: fill it.
+        sed -i.bak "s|^${key}=.*|${key}=${default}|" .env
+        rm -f .env.bak
+      else
+        printf '%s=%s\n' "$key" "$default" >>.env
+      fi
+    fi
+  }
+  ensure_env_default "BETTER_AUTH_URL" "http://${HOST_FQDN}:17600"
+  # Catalog directory (skills/agents/mcp) shipped with the repo for dev.
+  ensure_env_default "CONFIG_DIR" "./config"
+
+  # 4) npm install (only if node_modules is missing).
+  if [ ! -d node_modules ]; then
+    echo "Installing server dependencies…"
+    npm install --no-audit --no-fund
+  else
+    echo "server/node_modules present; skipping install."
+  fi
+
+  # 5) Migrate (better-auth + ledger). auth migrate prompts interactively by
+  #    default, so pass --yes to skip the confirmation in a script. The chained
+  #    `npm run migrate` script cannot receive the flag on `auth migrate` (npm
+  #    appends it to the last command), so invoke each step directly.
+  echo "Migrating databases…"
+  npx auth migrate --yes
+  npm run migrate:ledger
+
+  # ---------------------------------------------------------------------------
+  # Start the gateway in the background
+  # ---------------------------------------------------------------------------
+
+  echo "Starting gateway (logging to $LOG_FILE)…"
+  setsid npm run start >"$LOG_FILE" 2>&1 &
+  GATEWAY_PID=$!
+
+  # ---------------------------------------------------------------------------
+  # Wait for the gateway to become healthy
+  # ---------------------------------------------------------------------------
+
+  echo "Waiting for gateway health at $HEALTH_URL…"
+  HEALTHY=0
+  for _ in $(seq 1 30); do
+    if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+      HEALTHY=1
+      break
+    fi
+    if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$HEALTHY" -ne 1 ]; then
+    echo "error: gateway did not become healthy within ~30s." >&2
+    echo "       Check the log: $LOG_FILE" >&2
+    tail -n 40 "$LOG_FILE" >&2 2>/dev/null || true
+    exit 1
+  fi
+  echo "Gateway is healthy: $(curl -fsS "$HEALTH_URL")"
+}
+
+if [ "$WITH_GATEWAY" = "1" ]; then
+  provision_local_gateway
+else
+  echo "Local gateway skipped (--with-gateway not passed)."
+  if [ -n "$PUBLIC_BACKEND_URL" ]; then
+    echo "  The app will talk to the deployed gateway: $PUBLIC_BACKEND_URL"
+  else
+    echo "  The app will talk to http://${HOST_FQDN}:17600 — start it with '--with-gateway' or run the server yourself."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Run flutter against the configured backend
+# ---------------------------------------------------------------------------
+
+cd "$ROOT_DIR"
 
 if [ "$GATEWAY_ONLY" = "1" ]; then
   echo "Gateway-only mode: backend is up at http://${HOST_FQDN}:17600 (health: $HEALTH_URL)."

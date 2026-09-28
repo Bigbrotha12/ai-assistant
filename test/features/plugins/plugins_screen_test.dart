@@ -232,6 +232,20 @@ void main() {
       ),
     );
     await tester.pump();
+    await tester.pump();
+  }
+
+  /// Save now lives in the "Finish" section at the bottom of the editor's
+  /// scroll, so taps must reveal it first (the big AppBar button is gone).
+  Future<void> tapEditorSave(WidgetTester tester) async {
+    await reveal(
+      tester,
+      find.byKey(const Key('agent-save')),
+      scrollable: editorScrollable(),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('agent-save')));
+    await tester.pumpAndSettle();
   }
 
   setUp(() {
@@ -314,6 +328,11 @@ void main() {
             )
             .first,
       );
+      // scrollUntilVisible only exposes the leading edge; bring the whole tile
+      // on screen so its center is tappable (it sits inside the AI & voice
+      // card, which the reordered settings list can leave half-hidden).
+      await tester.ensureVisible(find.byKey(const Key('settings-plugins')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('settings-plugins')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('plugin-openrouter')));
@@ -695,10 +714,18 @@ void main() {
       final catalog = Completer<PluginCatalog>();
       await mountEditor(tester, catalog: catalog.future);
 
-      final save = find.widgetWithText(FilledButton, 'Save');
-      expect(tester.widget<FilledButton>(save).onPressed, isNull);
+      // Top-of-list status assertions must run before scrolling to Save: the
+      // editor ListView builds lazily, so reaching the bottom disposes them.
       expect(find.text('Loading plugins…'), findsOneWidget);
       expect(find.byKey(const Key('agent-catalog-status')), findsOneWidget);
+
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-save')),
+        scrollable: editorScrollable(),
+      );
+      final save = find.widgetWithText(FilledButton, 'Save');
+      expect(tester.widget<FilledButton>(save).onPressed, isNull);
 
       catalog.complete(_loadedCatalog());
     },
@@ -712,13 +739,19 @@ void main() {
     catalog.completeError(StateError('catalog unavailable'));
     await tester.pumpAndSettle();
 
-    final save = find.widgetWithText(FilledButton, 'Save');
-    expect(tester.widget<FilledButton>(save).onPressed, isNull);
     expect(
       find.text("Plugin catalog unavailable — can't validate this agent yet"),
       findsOneWidget,
     );
     expect(find.byKey(const Key('agent-catalog-status')), findsOneWidget);
+
+    await reveal(
+        tester,
+        find.byKey(const Key('agent-save')),
+        scrollable: editorScrollable(),
+      );
+      final save = find.widgetWithText(FilledButton, 'Save');
+    expect(tester.widget<FilledButton>(save).onPressed, isNull);
   });
 
   testWidgets(
@@ -736,10 +769,21 @@ void main() {
       );
       await tester.pumpAndSettle();
 
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-save')),
+        scrollable: editorScrollable(),
+      );
       final save = find.widgetWithText(FilledButton, 'Save');
       expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
-      await tester.tap(save);
-      await tester.pump();
+      await reveal(
+          tester,
+          find.byKey(const Key('agent-save')),
+          scrollable: editorScrollable(),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(save);
+        await tester.pump();
       await reveal(
         tester,
         find.byKey(const Key('agent-error')),
@@ -773,10 +817,21 @@ void main() {
       );
       await tester.pumpAndSettle();
 
+      await reveal(
+        tester,
+        find.byKey(const Key('agent-save')),
+        scrollable: editorScrollable(),
+      );
       final save = find.widgetWithText(FilledButton, 'Save');
       expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
-      await tester.tap(save);
-      await tester.pump();
+      await reveal(
+          tester,
+          find.byKey(const Key('agent-save')),
+          scrollable: editorScrollable(),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(save);
+        await tester.pump();
       await reveal(
         tester,
         find.byKey(const Key('agent-error')),
@@ -864,8 +919,7 @@ void main() {
         isTrue,
       );
 
-      await tester.tap(find.text('Save'));
-      await tester.pumpAndSettle();
+      await tapEditorSave(tester);
       expect(find.byType(AgentEditorScreen), findsNothing);
 
       final config = await store.load(account.accountScope!);
@@ -885,19 +939,94 @@ void main() {
       expect(
         find.descendant(
           of: tile,
-          matching: find.widgetWithText(Chip, '1 tools'),
+          matching: find.text('1 tools'),
         ),
         findsOneWidget,
       );
       expect(
         find.descendant(
           of: tile,
-          matching: find.widgetWithText(Chip, 'openrouter'),
+          matching: find.text('openrouter'),
         ),
         findsOneWidget,
       );
+      // Edit is the whole row now (no separate button to mis-tap next to
+      // Delete); Delete is the only explicit action on the row.
+      // The list row carries no per-row actions — delete lives in the editor.
+      expect(find.byTooltip('Edit agent'), findsNothing);
+      expect(find.byTooltip('Delete agent'), findsNothing);
+
+      // Tapping the row opens the editor with the saved agent pre-filled.
+      await tester.ensureVisible(tile);
+      await tester.pumpAndSettle();
+      await tester.tap(tile);
+      await tester.pumpAndSettle();
+      expect(find.byType(AgentEditorScreen), findsOneWidget);
+      expect(
+        tester
+            .widget<TextField>(find.byKey(const Key('agent-name')))
+            .controller!
+            .text,
+        'Field Agent',
+      );
     },
   );
+
+  testWidgets('deleting a custom agent asks for confirmation and clears selection',
+      (tester) async {
+    await mount(tester);
+
+    // Seed a custom agent and make it the selected agent directly through the
+    // store (the scoped wrapper would invalidate mid-test), then bump the
+    // epoch so the plugin list rebuilds from the new state.
+    await store.setAgentConfig(
+      account.accountScope!,
+      'my-agent',
+      AgentConfig(
+        id: 'my-agent',
+        kind: AgentKind.custom,
+        name: 'My Agent',
+        description: 'A custom agent',
+      ),
+    );
+    await store.setSelectedAgent(account.accountScope!, 'my-agent');
+    container.read(pluginCredentialsEpochProvider.notifier).invalidate();
+    await tester.pumpAndSettle();
+
+    final tile = find.byKey(const ValueKey('custom-my-agent'));
+    await tester.ensureVisible(tile);
+    await tester.pumpAndSettle();
+    await tester.tap(tile);
+    await tester.pumpAndSettle();
+
+    // Delete lives in the editor's Finish section, not on the list row.
+    expect(find.byTooltip('Delete agent'), findsNothing);
+    final delete = find.byKey(const Key('agent-delete'));
+    await reveal(tester, delete, scrollable: editorScrollable());
+    await tester.pumpAndSettle();
+
+    // First tap: confirmation guard. Cancel keeps everything.
+    await tester.tap(delete);
+    await tester.pumpAndSettle();
+    expect(find.text('Delete agent?'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AgentEditorScreen), findsOneWidget);
+    expect(
+      (await store.load(account.accountScope!)).plugins.containsKey('my-agent'),
+      isTrue,
+    );
+
+    // Confirm actually deletes, pops back, and clears the dangling selection.
+    await tester.tap(find.byKey(const Key('agent-delete')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AgentEditorScreen), findsNothing);
+    final config = await store.load(account.accountScope!);
+    expect(config.plugins.containsKey('my-agent'), isFalse);
+    expect(config.selectedAgent, isNull);
+  });
 
   testWidgets('over-cap system prompt and max tokens block the save', (
     tester,
@@ -924,8 +1053,7 @@ void main() {
     );
     await tester.pump();
 
-    await tester.tap(find.text('Save'));
-    await tester.pumpAndSettle();
+    await tapEditorSave(tester);
     await reveal(
       tester,
       find.byKey(const Key('agent-error')),
@@ -955,8 +1083,7 @@ void main() {
     await tester.enterText(find.byKey(const Key('agent-max-tokens')), '200001');
     await tester.pump();
 
-    await tester.tap(find.text('Save'));
-    await tester.pumpAndSettle();
+    await tapEditorSave(tester);
     await reveal(
       tester,
       find.byKey(const Key('agent-error')),
@@ -989,14 +1116,14 @@ void main() {
     expect(
       find.descendant(
         of: agentTile,
-        matching: find.widgetWithText(Chip, '1 tools'),
+        matching: find.text('1 tools'),
       ),
       findsOneWidget,
     );
     expect(
       find.descendant(
         of: agentTile,
-        matching: find.widgetWithText(Chip, 'openrouter'),
+        matching: find.text('openrouter'),
       ),
       findsOneWidget,
     );
@@ -1005,14 +1132,14 @@ void main() {
     expect(
       find.descendant(
         of: templateTile,
-        matching: find.widgetWithText(Chip, '1 tools'),
+        matching: find.text('1 tools'),
       ),
       findsOneWidget,
     );
     expect(
       find.descendant(
         of: templateTile,
-        matching: find.widgetWithText(Chip, 'openrouter'),
+        matching: find.text('openrouter'),
       ),
       findsOneWidget,
     );

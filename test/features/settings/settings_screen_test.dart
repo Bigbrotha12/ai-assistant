@@ -84,6 +84,20 @@ AuthCredentials scopedCredentials({
 );
 
 void main() {
+
+  /// The backend form lives inside the collapsed "Advanced" tile. Tests that
+  /// touch a field or read probe rows must expand it first (idempotent).
+  Future<void> expandAdvanced(WidgetTester tester) async {
+    if (tester.any(find.byKey(const Key('settings-host')))) return;
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('settings-advanced')),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.byKey(const Key('settings-advanced')));
+    await tester.pumpAndSettle();
+  }
+
   Widget settingsApp(
     WidgetTester tester, {
     required FakeSettingsStore store,
@@ -101,10 +115,9 @@ void main() {
     ManagedConversationRepository? managedRepo,
     PluginCredentialsStore? pluginStore,
   }) {
-    // The settings form is tall (host, environment, MCP, files token, storage
-    // URL, probe results, Files section, danger zone). Use a tall test
-    // viewport so most sections are laid out without scrolling — ListView
-    // builds children lazily, so off-screen widgets are absent from the tree.
+    // The Advanced tile and the later sections (Files & data, danger zone)
+    // can exceed the viewport; a tall test screen keeps most of them built
+    // — ListView builds children lazily, so off-screen widgets are absent.
     tester.view.physicalSize = const Size(800, 2200);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -157,7 +170,9 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    final filesField = tester.widget<TextField>(find.byType(TextField).at(2));
+    await expandAdvanced(tester);
+      final filesField = tester.widget<TextField>(
+          find.byKey(const Key('settings-files-token')));
     expect(filesField.controller!.text, 'files-token');
   });
 
@@ -173,8 +188,12 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
-    await tester.enterText(find.byType(TextField).at(2), 'files-token');
+    await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'tailscale.local');
+    await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-files-token')), 'files-token');
     await tester.pump();
 
     await tester.tap(find.text('Save'));
@@ -279,7 +298,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('Voice Assist'), findsOneWidget);
+      // App bar wordmark + About footer both carry the name.
+      expect(find.text('Voice Assist'), findsWidgets);
+      await expandAdvanced(tester);
       expect(find.text('Backend host'), findsOneWidget);
       expect(probe.calls, 0);
     });
@@ -298,10 +319,10 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final hostField = tester.widget<TextField>(find.byType(TextField).at(0));
-      final mcpField = tester.widget<TextField>(find.byType(TextField).at(1));
+      await expandAdvanced(tester);
+      final hostField = tester.widget<TextField>(
+          find.byKey(const Key('settings-host')));
       expect(hostField.controller!.text, 'myhost');
-      expect(mcpField.controller!.text, '');
     });
 
     testWidgets('save persists settings and shows a SnackBar', (tester) async {
@@ -318,7 +339,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'tailscale.local');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -363,7 +386,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'myhost');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'myhost');
       await tester.tap(find.text('Test connection'));
       await tester.pumpAndSettle();
 
@@ -405,7 +430,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'myhost');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'myhost');
       await tester.tap(find.text('Test connection'));
       await tester.pumpAndSettle();
 
@@ -431,7 +458,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'myhost');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'myhost');
       await tester.tap(find.text('Test connection'));
       await tester.pumpAndSettle();
 
@@ -509,7 +538,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'tailscale.local');
       await tester.pump();
 
       final saveButton = tester.widget<OutlinedButton>(
@@ -539,7 +570,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'tailscale.local');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -565,7 +598,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'myhost');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'myhost');
       await tester.pump();
 
       await tester.tap(find.text('Test connection'));
@@ -595,7 +630,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.enterText(find.byType(TextField).at(0), 'myhost');
+      await expandAdvanced(tester);
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'myhost');
       await tester.pump();
 
       await tester.tap(find.text('Save'));
@@ -623,8 +660,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
+      await expandAdvanced(tester);
       await tester.enterText(
-        find.byType(TextField).at(0),
+        find.byKey(const Key('settings-host')),
         'https://evil.example',
       );
       await tester.pump();
@@ -640,65 +678,6 @@ void main() {
       expect(testButton.onPressed, isNull);
     });
 
-    testWidgets('MCP token field is present and optional', (tester) async {
-      final store = FakeSettingsStore();
-      await tester.pumpWidget(
-        settingsApp(
-          tester,
-          store: store,
-          filesClient: NoOpFilesClient(),
-          fileCache: FakeFileCache(),
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      expect(find.text('MCP token (optional)'), findsOneWidget);
-      expect(find.text('voice-mcp bearer token (Phase 4)'), findsOneWidget);
-    });
-
-    testWidgets('MCP token field prefills from saved settings', (tester) async {
-      final store = FakeSettingsStore(
-        stored: const BackendSettings(host: 'myhost', mcpSecret: 'mcp-token'),
-      );
-      await tester.pumpWidget(
-        settingsApp(
-          tester,
-          store: store,
-          filesClient: NoOpFilesClient(),
-          fileCache: FakeFileCache(),
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      final mcpField = tester.widget<TextField>(find.byType(TextField).at(1));
-      expect(mcpField.controller!.text, 'mcp-token');
-    });
-
-    testWidgets('save persists the MCP token', (tester) async {
-      final store = FakeSettingsStore();
-      final probe = FakeProbe();
-      await tester.pumpWidget(
-        settingsApp(
-          tester,
-          store: store,
-          filesClient: NoOpFilesClient(),
-          fileCache: FakeFileCache(),
-          probe: probe,
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
-      await tester.enterText(find.byType(TextField).at(1), 'mcp-token');
-      await tester.pump();
-
-      await tester.tap(find.text('Save'));
-      await tester.pumpAndSettle();
-
-      expect(store.stored, isNotNull);
-      expect(store.stored!.host, 'tailscale.local');
-      expect(store.stored!.mcpSecret, 'mcp-token');
-    });
 
     testWidgets('Clear settings shows a dialog and clears on confirm', (
       tester,
@@ -725,7 +704,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.text('Clear saved host, MCP token, files token, and storage URL?'),
+        find.text('Clear saved host, files token, and storage URL?'),
         findsOneWidget,
       );
 
@@ -777,6 +756,7 @@ void main() {
       );
       await tester.pumpAndSettle();
 
+      await expandAdvanced(tester);
       final segmented = tester.widget<SegmentedButton<BackendEnvironment>>(
         find.byType(SegmentedButton<BackendEnvironment>),
       );
@@ -798,9 +778,11 @@ void main() {
       );
       await tester.pumpAndSettle();
 
+      await expandAdvanced(tester);
       await tester.tap(find.text('Production'));
       await tester.pump();
-      await tester.enterText(find.byType(TextField).at(0), 'tailscale.local');
+      await tester.enterText(
+          find.byKey(const Key('settings-host')), 'tailscale.local');
       await tester.pump();
 
       await tester.tap(find.text('Save'));

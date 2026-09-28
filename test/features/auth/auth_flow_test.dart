@@ -544,9 +544,14 @@ void main() {
       },
     );
 
-    testWidgets('sign-in form offers a direct resend-verification link', (
+    testWidgets('sign-in form does not offer a resend link up front', (
       tester,
     ) async {
+      // The resend action belongs to the check-inbox state, which the flow
+      // enters automatically when the server reports EMAIL_NOT_VERIFIED (see
+      // "sign-in rejected with EMAIL_NOT_VERIFIED routes to check-inbox").
+      // Offering it on the sign-in form showed it before the user had any
+      // reason to believe their address was an unverified account.
       final store = FakeAuthCredentialsStore();
       final client = FakeAuthClient();
       await pumpAuthFlow(
@@ -556,32 +561,14 @@ void main() {
         onSuccess: _noop,
       );
 
-      // No address yet: the link surfaces the same validation as the button.
-      await tester.tap(
+      expect(
         find.byKey(const Key('auth-resend-verification-link')),
+        findsNothing,
       );
-      await tester.pumpAndSettle();
-      expect(find.text('Enter your email address'), findsOneWidget);
+      expect(find.text('Resend verification email'), findsNothing);
+      // "Forgot password?" is unrelated and stays.
+      expect(find.byKey(const Key('auth-forgot-link')), findsOneWidget);
       expect(client.verificationEmailRequests, isEmpty);
-
-      await tester.enterText(
-        find.byKey(const Key('auth-email')),
-        'user@example.com',
-      );
-      await tester.tap(
-        find.byKey(const Key('auth-resend-verification-link')),
-      );
-      await tester.pumpAndSettle();
-
-      expect(client.verificationEmailRequests, ['user@example.com']);
-      expect(
-        find.text('Verify your email — check your inbox'),
-        findsOneWidget,
-      );
-      expect(
-        find.text('Verification email sent again to user@example.com.'),
-        findsOneWidget,
-      );
     });
   });
 }

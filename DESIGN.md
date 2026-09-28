@@ -317,6 +317,33 @@ Rules:
   `SegmentedButton` and dropdowns, and a drag competes with all three. The dots
   are tappable **backwards only** — a forward tap is refused so the user cannot
   skip past a step whose validation has not run.
+- **Finishing requires an account.** The startup gate only treats the app as
+  configured when a stored API key *and* a stored host are both present
+  (`isConfigured`). `_getStarted` therefore refuses up front when no account is
+  signed in, and the finish step then offers "Sign in" — not a "Retry" that
+  would fail identically. Writing the settings anyway made the button look
+  inert: the save succeeded and the gate bounced straight back to onboarding
+  with no message.
+
+#### What onboarding may ask
+
+Onboarding asks the **minimum** set of questions that the app can act on. A
+control earns its place only if something consumes its value.
+
+- **Ask** for the spoken language — it drives on-device STT/TTS.
+- **Do not ask** for a date format. The app has no date renderer that reads
+  `prefs.dateFormat` (the one renderer, `files_screen.dart::_formatDate`,
+  hardcodes a US format). Ask in Settings, and only once a renderer honours it.
+- **Never infer a locale from a timezone.** Locale and timezone are different
+  axes: locale decides *formatting* (`14/03` vs `03/14`), timezone decides
+  *absolute time* ("5 minutes ago"). The device locale already encodes the
+  user's formatting choice — the OS derived it from their own language/region
+  settings — and a user in `Europe/Berlin` whose phone language is English
+  expects `Mar 14`, not `14/03`.
+- **No transport detail in user-facing copy.** No gateway, API key, token,
+  host or protocol wording. If the user does not need it in order to choose,
+  it does not belong on the card — pass a null subtitle rather than a
+  shortened technical one.
 
 #### Step indicator
 

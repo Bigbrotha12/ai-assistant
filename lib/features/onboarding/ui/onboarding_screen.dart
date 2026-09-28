@@ -79,8 +79,11 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // Region.
   String _language = 'en';
   bool _languageTouched = false;
+
+  /// Locale used to format dates. Inferred from the device and never edited
+  /// here (the picker lives in Settings); the app has no date renderer that
+  /// consumes it yet, so onboarding persists the inferred value untouched.
   String _dateFormat = 'en-US';
-  bool _dateFormatTouched = false;
 
   // Models.
   bool _downloading = false;
@@ -88,6 +91,11 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // Finish.
   bool _saving = false;
   String? _saveError;
+
+  /// True when finishing was blocked because no account is signed in. The
+  /// finish step then offers "Sign in" rather than a Retry that would fail
+  /// the same way.
+  bool _needsAccount = false;
 
   @override
   void initState() {
@@ -138,7 +146,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     AsyncValue<AppPrefs>? previous,
     AsyncValue<AppPrefs> next,
   ) {
-    if (next.isLoading || _dateFormatTouched) return;
+    if (next.isLoading) return;
     final saved = next.value?.dateFormat;
     if (saved != null && saved != _dateFormat) {
       setState(() => _dateFormat = saved);
@@ -293,6 +301,24 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   // Language & region step
   // -------------------------------------------------------------------------
 
+  /// Language step.
+  ///
+  /// Asks only for the spoken language. The date format is **inferred** from the
+  /// device locale and persisted without asking: nothing in the app reads
+  /// `prefs.dateFormat` to render a date yet — the one date renderer
+  /// (`files_screen.dart::_formatDate`) hardcodes a US format and ignores it —
+  /// so a picker in onboarding collects a preference for behaviour that does not
+  /// exist. Settings still exposes the override.
+  ///
+  /// Deliberately no timezone control. Locale and timezone are different things:
+  /// locale decides *formatting* (`14/03` vs `03/14`), timezone decides
+  /// *absolute time* ("5 minutes ago"). Nothing here does absolute-time
+  /// arithmetic against a user timezone either, so a timezone picker would be
+  /// just as inert — and inferring a locale from a timezone would be wrong. A
+  /// user in `Europe/Berlin` whose phone language is English expects `Mar 14`,
+  /// not `14/03`. The device locale already encodes that choice; the OS derived
+  /// it from the user's own language/region settings, which is strictly better
+  /// signal than a timezone we would have to guess a mapping for.
   Widget _buildRegionStep() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -300,7 +326,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         InputDecorator(
           decoration: const InputDecoration(
             labelText: 'Language',
-            helperText: 'Spoken language for voice conversations',
             border: OutlineInputBorder(),
           ),
           child: DropdownButton<String>(
@@ -318,32 +343,6 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                 setState(() {
                   _language = value;
                   _languageTouched = true;
-                });
-              }
-            },
-          ),
-        ),
-        const SizedBox(height: AppSpacing.lg),
-        InputDecorator(
-          decoration: const InputDecoration(
-            labelText: 'Date format',
-            border: OutlineInputBorder(),
-          ),
-          child: DropdownButton<String>(
-            key: const Key('ob-date-format'),
-            value: _dateFormat,
-            isExpanded: true,
-            isDense: true,
-            underline: const SizedBox.shrink(),
-            items: [
-              for (final (code, label) in dateFormatOptions(_dateFormat))
-                DropdownMenuItem(value: code, child: Text(label)),
-            ],
-            onChanged: (value) {
-              if (value != null) {
-                setState(() {
-                  _dateFormat = value;
-                  _dateFormatTouched = true;
                 });
               }
             },
@@ -427,16 +426,16 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text(
-          'Chat works without models; Whisper adds on-device speech input '
-          'and Supertonic speech output. You can download these later from '
-          'Voice settings.',
+          'You can talk to the app by voice. These two downloads let it hear '
+          'you and read replies back, and they work without internet.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
         ),
         const SizedBox(height: AppSpacing.xl),
         _ModelRow(
-          label: 'Whisper tiny',
+          label: 'Speech to text',
+          helper: 'Lets the app hear what you say',
           size: '~75 MB',
           status: stt,
           progress: progress,
@@ -444,7 +443,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         ),
         const SizedBox(height: AppSpacing.sm),
         _ModelRow(
-          label: 'Supertonic 3',
+          label: 'Text to speech',
+          helper: 'Lets the app read replies back to you',
           status: supertonic,
           progress: progress,
           // Without a retry action a failed Supertonic download would render
@@ -478,8 +478,22 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
 
   Future<void> _getStarted() async {
     if (_saving) return;
+    // The startup gate only treats the app as configured when BOTH a stored
+    // API key and a stored host are present (see `isConfigured`). Writing the
+    // settings without a key would "succeed" and then bounce straight back to
+    // onboarding with no explanation, so refuse up front and send the user to
+    // the one thing that can actually fix it.
+    if (!_accountReady) {
+      setState(() {
+        _saving = false;
+        _needsAccount = true;
+        _saveError = null;
+      });
+      return;
+    }
     setState(() {
       _saving = true;
+      _needsAccount = false;
       _saveError = null;
     });
     try {
@@ -528,9 +542,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         const SizedBox(height: AppSpacing.md),
         _SummaryRow(label: 'Account email', value: _accountEmail ?? '—'),
         _SummaryRow(label: 'Language', value: _language),
-        _SummaryRow(label: 'Date format', value: _dateFormat),
         _SummaryRow(label: 'Models', value: _modelsSummary),
-        if (_saveError != null) ...[
+        if (_needsAccount || _saveError != null) ...[
           const SizedBox(height: AppSpacing.lg),
           Material(
             color: scheme.errorContainer,
@@ -540,10 +553,12 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
               child: Row(
                 children: [
                   Icon(Icons.error_outline, color: scheme.onErrorContainer),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: AppSpacing.sm),
                   Expanded(
                     child: Text(
-                      'Could not save your setup: $_saveError',
+                      _needsAccount
+                          ? 'Sign in to finish setting up the app.'
+                          : 'Could not save your setup: $_saveError',
                       style: TextStyle(color: scheme.onErrorContainer),
                     ),
                   ),
@@ -551,8 +566,12 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                     style: TextButton.styleFrom(
                       foregroundColor: scheme.onErrorContainer,
                     ),
-                    onPressed: _saving ? null : _getStarted,
-                    child: const Text('Retry'),
+                    // Finishing is blocked, so "Retry" would fail identically —
+                    // send them to the step that can actually unblock it.
+                    onPressed: _needsAccount
+                        ? () => _goToStep(_accountStepIndex)
+                        : (_saving ? null : _getStarted),
+                    child: Text(_needsAccount ? 'Sign in' : 'Retry'),
                   ),
                 ],
               ),
@@ -569,20 +588,24 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
 
   /// Per-step heading copy. Kept beside the step builders so the card header
   /// and the dot indicator can never drift out of sync with the content.
-  List<({String title, String subtitle})> get _stepMeta => [
+  ///
+  /// Subtitles are end-user copy only — no transport, gateway or API detail.
+  /// Anything the user does not need in order to choose is left out; a null
+  /// subtitle renders no description at all.
+  List<({String title, String? subtitle})> get _stepMeta => [
         (
           title: widget.accountDeleted ? 'Account deleted' : 'Sign in',
           subtitle: widget.accountDeleted
               ? 'This account is no longer available.'
-              : 'The app talks to your gateway with a per-user API key.',
+              : null,
         ),
         (
-          title: 'Language & region',
-          subtitle: 'Set the spoken language and how dates are shown.',
+          title: 'Language',
+          subtitle: 'The language the app listens and speaks in.',
         ),
         (
           title: 'Voice & models',
-          subtitle: 'Download the on-device models for offline speech.',
+          subtitle: 'Optional. Lets the app listen and speak without internet.',
         ),
         (
           title: 'Review & finish',
@@ -749,7 +772,11 @@ class _StepCard extends StatefulWidget {
 
   final String eyebrow;
   final String title;
-  final String subtitle;
+
+  /// Optional end-user description. Null renders the heading on its own with
+  /// no description block.
+  final String? subtitle;
+
   final Widget child;
 
   @override
@@ -781,13 +808,15 @@ class _StepCardState extends State<_StepCard>
             ),
             const SizedBox(height: AppSpacing.sm),
             Text(widget.title, style: theme.textTheme.titleLarge),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              widget.subtitle,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: scheme.onSurfaceVariant,
+            if (widget.subtitle case final subtitle?) ...[
+              const SizedBox(height: AppSpacing.xs),
+              Text(
+                subtitle,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
               ),
-            ),
+            ],
             const SizedBox(height: AppSpacing.xl),
             Expanded(
               child: SingleChildScrollView(child: widget.child),
@@ -799,17 +828,21 @@ class _StepCardState extends State<_StepCard>
   }
 }
 
-/// Model status row: status icon, label, size/detail and optional action.
+/// Model status row: status icon, end-user label + what it does, size/detail
+/// and optional action. [helper] is the plain-language "why would I want
+/// this" line — model names and engine jargon belong in Voice settings.
 class _ModelRow extends StatelessWidget {
   const _ModelRow({
     required this.label,
     required this.status,
+    this.helper,
     this.size,
     this.progress,
     this.onAction,
   });
 
   final String label;
+  final String? helper;
   final VoiceEngineStatus status;
   final String? size;
   final ModelDownloadProgress? progress;
@@ -874,6 +907,13 @@ class _ModelRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(label, style: theme.textTheme.labelLarge),
+                if (helper case final helper?) ...[
+                  Text(
+                    helper,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
+                  ),
+                ],
                 const SizedBox(height: 2),
                 Text(
                   subtitle,
@@ -902,6 +942,10 @@ class _ModelRow extends StatelessWidget {
 }
 
 /// Read-only label/value pair for the Finish summary.
+///
+/// Stacked rather than side-by-side: a fixed-width label column squeezed a
+/// long value (an email address) into a narrow column and wrapped it. The
+/// value now gets the card's full width and wraps naturally.
 class _SummaryRow extends StatelessWidget {
   const _SummaryRow({required this.label, required this.value});
 
@@ -912,20 +956,23 @@ class _SummaryRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
+      padding: const EdgeInsets.only(bottom: AppSpacing.md),
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            width: 120,
-            child: Text(
-              label,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
+          Text(
+            label,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          Expanded(child: Text(value, style: theme.textTheme.bodyMedium)),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: theme.textTheme.bodyMedium,
+            softWrap: true,
+            overflow: TextOverflow.visible,
+          ),
         ],
       ),
     );

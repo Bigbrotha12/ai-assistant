@@ -247,6 +247,72 @@ class _AgentEditorScreenState extends ConsumerState<AgentEditorScreen> {
     }
   }
 
+  /// Confirmation guard before [delete]: deleting is destructive and
+  /// permanent, so it is never one tap away.
+  Future<void> _confirmDelete() async {
+    final existing = widget.existing;
+    if (existing == null || _busy) return;
+    final name = existing.name.isNotEmpty ? existing.name : existing.id;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete agent?'),
+        content: Text(
+          'This permanently removes "$name" from this account, along with '
+          'its skills, tools, and model selection. This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _deleteAgent();
+  }
+
+  /// Removes the agent's plugin record and, if it was the account's selected
+  /// agent, clears the selection so nothing dangles. Leaves the screen only
+  /// after the write succeeds.
+  Future<void> _deleteAgent() async {
+    final existing = widget.existing;
+    if (existing == null) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final notifier = ref.read(scopedPluginCredentialsProvider);
+      final config = await ref
+          .read(pluginCredentialsStoreProvider)
+          .load(notifier.scope);
+      if (config.selectedAgent == existing.id) {
+        await ref.read(scopedPluginCredentialsProvider).setSelectedAgent(null);
+      }
+      await ref.read(scopedPluginCredentialsProvider).removePlugin(existing.id);
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Agent deleted')));
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = 'Could not delete the agent. Try again.';
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // Keep a live subscription on the scoped handle: `_write`'s `_invalidate()`
@@ -278,158 +344,190 @@ class _AgentEditorScreenState extends ConsumerState<AgentEditorScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.existing != null ? 'Edit Agent' : 'New Agent'),
-        actions: [
-          FilledButton(
-            onPressed: _busy || catalogMessage != null ? null : _save,
-            child: const Text('Save'),
-          ),
-
-          const SizedBox(width: 8),
-        ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          if (catalogMessage != null)
-            Padding(
-              key: const Key('agent-catalog-status'),
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Text(catalogMessage),
-            ),
-          TextField(
-            key: const Key('agent-name'),
-            controller: _nameController,
-            enabled: !_busy,
-            decoration: const InputDecoration(
-              labelText: 'Agent name',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            key: const Key('agent-description'),
-            controller: _descriptionController,
-            enabled: !_busy,
-            maxLines: 2,
-            decoration: const InputDecoration(
-              labelText: 'Description (optional)',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            key: const Key('agent-system-prompt'),
-            controller: _systemPromptController,
-            enabled: !_busy,
-            maxLines: 6,
-            decoration: const InputDecoration(
-              labelText: 'System prompt',
-              hintText: 'You are a helpful assistant...',
-              helperText: 'Up to 8000 characters',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Text('Skills', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          if (skills.isLoading)
-            const Text('Loading skills...')
-          else if (skills.hasError)
-            const Text('Could not load skills.')
-          else if (skills.value?.isEmpty ?? true)
-            const Text('No skills available.')
-          else
-            ..._buildSkillTiles(skills.requireValue),
-          const SizedBox(height: 16),
-          Text('MCP Servers', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          if (mcps.isLoading)
-            const Text('Loading MCP servers...')
-          else if (mcps.hasError)
-            const Text('Could not load MCP servers.')
-          else if (mcps.value?.isEmpty ?? true)
-            const Text('No MCP servers available.')
-          else
-            ..._buildMcpTiles(mcps.requireValue),
-          const SizedBox(height: 16),
-          Text('Tools', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          if (catalog.isLoading && catalogValue == null)
-            const Text('Loading tools...')
-          else if (catalogValue == null)
-            const Text('Could not load tools.')
-          else if (toolPlugins.isEmpty)
-            const Text('No tool plugins available.')
-          else
-            ..._buildToolTiles(toolPlugins),
-          const SizedBox(height: 16),
-          Text('Model', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          _buildModelField(models, catalogValue),
-          const SizedBox(height: 16),
-          Text('Inference', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Row(
-            children: [
-              Text(
-                'Temperature: ${_temperature.toStringAsFixed(1)}',
-                key: const Key('agent-temperature-value'),
-                style: Theme.of(context).textTheme.bodySmall,
+      // Bottom safe area: the Finish section must stay clear of the gesture
+      // bar, like the settings About footer.
+      body: SafeArea(
+        top: false,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            if (catalogMessage != null)
+              Padding(
+                key: const Key('agent-catalog-status'),
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(catalogMessage),
               ),
-            ],
-          ),
-          Slider(
-            key: const Key('agent-temperature'),
-            value: _temperature,
-            min: 0,
-            max: 2,
-            divisions: 20,
-            label: _temperature.toStringAsFixed(1),
-            onChanged: _busy
-                ? null
-                : (value) => setState(() {
-                    _temperature = value;
-                    _temperatureTouched = true;
-                  }),
-          ),
-          const SizedBox(height: 4),
-          TextField(
-            key: const Key('agent-max-tokens'),
-            controller: _maxTokensController,
-            enabled: !_busy,
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            decoration: const InputDecoration(
-              labelText: 'Max tokens (optional)',
-              hintText: 'Provider default when blank',
-              helperText: 'Whole number up to 200000',
-              border: OutlineInputBorder(),
+            TextField(
+              key: const Key('agent-name'),
+              controller: _nameController,
+              enabled: !_busy,
+              decoration: const InputDecoration(
+                labelText: 'Agent name',
+                border: OutlineInputBorder(),
+              ),
             ),
-          ),
-          SwitchListTile(
-            key: const Key('agent-vision'),
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Vision capable'),
-            subtitle: const Text('Let this agent describe attached images'),
-            value: _visionCapable,
-            onChanged: _busy
-                ? null
-                : (value) => setState(() => _visionCapable = value),
-          ),
-          if (_busy) const LinearProgressIndicator(),
-          if (_error != null)
-            Semantics(
-              key: const Key('agent-error'),
-              liveRegion: true,
-              child: Padding(
-                padding: const EdgeInsets.only(top: 12),
-                child: Text(
-                  _error!,
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('agent-description'),
+              controller: _descriptionController,
+              enabled: !_busy,
+              maxLines: 2,
+              decoration: const InputDecoration(
+                labelText: 'Description (optional)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('agent-system-prompt'),
+              controller: _systemPromptController,
+              enabled: !_busy,
+              maxLines: 6,
+              decoration: const InputDecoration(
+                labelText: 'System prompt',
+                hintText: 'You are a helpful assistant...',
+                helperText: 'Up to 8000 characters',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text('Skills', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            if (skills.isLoading)
+              const Text('Loading skills...')
+            else if (skills.hasError)
+              const Text('Could not load skills.')
+            else if (skills.value?.isEmpty ?? true)
+              const Text('No skills available.')
+            else
+              ..._buildSkillTiles(skills.requireValue),
+            const SizedBox(height: 16),
+            Text('MCP Servers', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            if (mcps.isLoading)
+              const Text('Loading MCP servers...')
+            else if (mcps.hasError)
+              const Text('Could not load MCP servers.')
+            else if (mcps.value?.isEmpty ?? true)
+              const Text('No MCP servers available.')
+            else
+              ..._buildMcpTiles(mcps.requireValue),
+            const SizedBox(height: 16),
+            Text('Tools', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            if (catalog.isLoading && catalogValue == null)
+              const Text('Loading tools...')
+            else if (catalogValue == null)
+              const Text('Could not load tools.')
+            else if (toolPlugins.isEmpty)
+              const Text('No tool plugins available.')
+            else
+              ..._buildToolTiles(toolPlugins),
+            const SizedBox(height: 16),
+            Text('Model', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            _buildModelField(models, catalogValue),
+            const SizedBox(height: 16),
+            Text('Inference', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Text(
+                  'Temperature: ${_temperature.toStringAsFixed(1)}',
+                  key: const Key('agent-temperature-value'),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+            Slider(
+              key: const Key('agent-temperature'),
+              value: _temperature,
+              min: 0,
+              max: 2,
+              divisions: 20,
+              label: _temperature.toStringAsFixed(1),
+              onChanged: _busy
+                  ? null
+                  : (value) => setState(() {
+                      _temperature = value;
+                      _temperatureTouched = true;
+                    }),
+            ),
+            const SizedBox(height: 4),
+            TextField(
+              key: const Key('agent-max-tokens'),
+              controller: _maxTokensController,
+              enabled: !_busy,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: const InputDecoration(
+                labelText: 'Max tokens (optional)',
+                hintText: 'Provider default when blank',
+                helperText: 'Whole number up to 200000',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            SwitchListTile(
+              key: const Key('agent-vision'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Vision capable'),
+              subtitle: const Text('Let this agent describe attached images'),
+              value: _visionCapable,
+              onChanged: _busy
+                  ? null
+                  : (value) => setState(() => _visionCapable = value),
+            ),
+            const SizedBox(height: 24),
+            Text('Finish', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'Review the agent, then save it to this account. Delete is only '
+              'available for an existing agent.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              key: const Key('agent-save'),
+              onPressed: _busy || catalogMessage != null ? null : _save,
+              child: const Text('Save'),
+            ),
+            if (widget.existing != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                key: const Key('agent-delete'),
+                onPressed: _busy ? null : _confirmDelete,
+                icon: Icon(
+                  Icons.delete_outline,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                label: Text(
+                  'Delete agent',
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
-            ),
-        ],
+            ],
+            if (_busy) const LinearProgressIndicator(),
+            if (_error != null)
+              Semantics(
+                key: const Key('agent-error'),
+                liveRegion: true,
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(
+                    _error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ),
+              ),
+            // Clearance so the Finish section never sits under the gesture bar.
+            const SizedBox(height: 40),
+          ],
+        ),
       ),
     );
   }
