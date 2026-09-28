@@ -177,7 +177,7 @@ not the session token):
 | Endpoint                  | Purpose                                                              |
 | ------------------------- | -------------------------------------------------------------------- |
 | `GET  /v1/auth/check`     | API-key validity check (no upstream call). `200 {"status":"ok"}` with a valid key, else `401 {"error":"unauthorized"}` — or `403 email_not_verified` for an unverified owner (probe surfaces "verify your email"). |
-| `POST /v1/chat/completions` | LangGraph agent run streamed as OpenAI-compatible SSE (see `docs/wire-spec.md`). |
+| `POST /v1/chat/completions` | LangGraph agent run streamed as OpenAI-compatible SSE (see `WIRE_SPEC.md`). |
 | `GET  /v1/models`         | Lists installed MODEL plugins (id + capability flags incl. `visionCapable`); never leaks provider endpoints. |
 | `GET  /v1/agents`         | Redacted agent-template summaries (no systemPrompt/skill content/mcp url). |
 | `GET  /v1/skills`         | Redacted skill catalog (`id`, `title` only — content never serialized). |
@@ -198,7 +198,7 @@ client, not a browser).
 `POST /v1/chat/completions` runs the LangGraph agent graph and translates its
 events into OpenAI-compatible SSE frames (`server/src/transport/openai.ts`),
 emitting a single terminal `data: [DONE]`. The byte-level contract lives in
-`docs/wire-spec.md`; the Flutter client parses those frames directly.
+`WIRE_SPEC.md`; the Flutter client parses those frames directly.
 
 ## Typical app flow
 

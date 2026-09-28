@@ -196,7 +196,7 @@ const customAgentSpecSchema = z.object({
  * through the ledger; it does not mutate the already-sent HTTP response.
  *
  * ERROR MAPPING (pre-stream; flat `{"error": <code>}` for consistency with the
- * sibling plugin/checkpoint surfaces — the wire-spec §5.1 categories are noted):
+ * sibling plugin/checkpoint surfaces — see `WIRE_SPEC.md` §5.1):
  *   401 unauthorized              no/invalid gateway key (auth_error)
  *   403 email_not_verified        valid key, owner's email unconfirmed (C2)
  *   429 rate_limited              per-owner rate limiter rejected (rate_limited)

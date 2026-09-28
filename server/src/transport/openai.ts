@@ -13,7 +13,7 @@ function exhaustionCode(error: unknown): string | undefined {
  * OpenAI-compatible SSE adapter (Phase 3, Wave A).
  *
  * Translates a LangGraph `streamEvents(..., { version: "v2" })` async iterable
- * into OpenAI chat-completions SSE frames, byte-exactly per `docs/wire-spec.md`
+ * into OpenAI chat-completions SSE frames, byte-exactly per `WIRE_SPEC.md`
  * (§6 mapping table, §3.3 finish chunk, §3.4 error envelope, §4 sticky finish,
  * §7 canonical frame sequences).
  *

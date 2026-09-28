@@ -133,7 +133,7 @@ function finishReasonsIn(frames: string[]): Array<string | null> {
     });
 }
 
-// Canonical golden fixtures from docs/wire-spec.md §7. Byte-exact, including
+// Canonical golden fixtures from WIRE_SPEC.md §7. Byte-exact, including
 // the trailing `\n\n` on every frame.
 const GOLDEN_7_1 =
   'data: {"id":"chatcmpl-001","object":"chat.completion.chunk","created":1726080000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\n' +
