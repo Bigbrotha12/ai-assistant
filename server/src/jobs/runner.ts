@@ -15,7 +15,7 @@ import {
 } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import type { TrackedExecution } from "../agents/execution.ts";
-import { jsonSchemaToZod, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
+import { mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import {
   lastUserTextFromMessages,
@@ -37,8 +37,7 @@ import type { ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import { BudgetExhaustedError } from "../middleware/budget.ts";
 import { createToolPipeline } from "../tools/pipeline.ts";
-import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
-import { makePluginBodies } from "../tools/bind.ts";
+import { bindTools, makePluginBodies } from "../tools/bind.ts";
 import { createJobToolInterceptors } from "../tools/interceptors/order.ts";
 import { createPluginAuditSink } from "../tools/audit.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
@@ -55,7 +54,6 @@ import type {
 } from "../ledger.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isMcpHeaderReference, isToolPlugin } from "../plugins/types.ts";
-import type { ToolDefinition, ToolPluginDefinition } from "../plugins/types.ts";
 import {
   createEgressPolicy,
   policyFetch,
@@ -774,10 +772,9 @@ export type BindJobToolsOptions = {
 /**
  * Bind the installed tool plugins into `DynamicStructuredTool`s.
  *
- * The whole job-channel policy now lives in the shared `ToolPipeline`: this
- * function only assembles the binding layer — the duplicate-name gate, the
- * per-binding anonymous-sequence counter, and the per-call `ToolCall` +
- * `ToolCallScope` — and dispatches. The interceptor set
+ * The whole job-channel policy lives in the shared `ToolPipeline`, and the
+ * loop/filter/dedupe/dispatch skeleton lives in `bindTools`; this function only
+ * supplies the job-specific hooks. The interceptor set
  * (`fence → serialize → replay → cache → budget → execution`, built by
  * `createJobToolInterceptors`) reproduces the previous inline body exactly:
  *
@@ -796,9 +793,6 @@ export type BindJobToolsOptions = {
  * executes immediately with no dedupe — there is no id to dedupe against.
  */
 export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[] {
-  const tools: DynamicStructuredTool[] = [];
-  const seen = new Set<string>();
-  let anonymousToolSequence = 0;
   // One pipeline per binding: `createJobToolInterceptors` closes over this
   // job's ledger/budget/cache/dispatch guard, while every per-call value rides
   // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2). The pipeline is stateless
@@ -812,88 +806,42 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
     }),
     onResult: createPluginAuditSink(),
   });
-  for (const plugin of opts.registry.listInstalledPlugins()) {
-    if (!isToolPlugin(plugin) || !Object.hasOwn(opts.credentialsByPlugin, plugin.id)) continue;
-    const credentials = opts.credentialsByPlugin[plugin.id] ?? {};
-    for (const toolDef of plugin.tools) {
-      if (seen.has(toolDef.name)) {
-        console.warn(
-          `[jobs] skipping duplicate tool '${toolDef.name}' from plugin '${plugin.id}'`,
-        );
-        continue;
-      }
-      seen.add(toolDef.name);
-      tools.push(
-        bindJobTool(
-          opts,
-          pipeline,
-          plugin,
-          toolDef,
-          credentials,
-          () => ++anonymousToolSequence,
-        ),
-      );
-    }
-  }
-  return tools;
-}
-
-function bindJobTool(
-  opts: BindJobToolsOptions,
-  pipeline: ToolPipeline,
-  plugin: ToolPluginDefinition,
-  toolDef: ToolDefinition,
-  credentials: Record<string, string>,
-  nextAnonymousToolSequence: () => number,
-): DynamicStructuredTool {
-  return new DynamicStructuredTool({
-    name: toolDef.name,
-    description: toolDef.description,
-    schema: jsonSchemaToZod(toolDef.inputSchema),
-    func: async (input, _runManager, config) => {
-      const pluginId = plugin.id;
-      const toolName = toolDef.name;
-      const args = input as Record<string, unknown>;
-      const configSignal = (config as { signal?: AbortSignal } | undefined)?.signal;
-      // The channel signal is the composition of the job's own signal and the
-      // LangChain run signal. Captured before any timeout controller exists;
-      // the `execution` interceptor composes its timeout on top via next(signal).
-      const signal = opts.signal && configSignal
-        ? AbortSignal.any([opts.signal, configSignal])
-        : opts.signal ?? configSignal;
-      const toolCallId = (
-        config as { toolCall?: { id?: string } } | undefined
-      )?.toolCall?.id;
-      // The anonymous sequence counter belongs to the binding layer; it is only
-      // consulted when the model supplied no tool-call id (plan §4.1).
-      const actionId =
-        toolCallId ?? `tool:${pluginId}:${toolName}:${nextAnonymousToolSequence()}`;
-      const pin = opts.getCredentials?.(pluginId);
-      const invocationCredentials = pin?.credentials ?? { ...credentials };
-      const call: ToolCall = {
-        source: "plugin",
-        pluginId,
-        pluginVersion: plugin.version,
-        tool: toolName,
-        args,
-        readOnly: toolDef.readOnly,
-        owner: opts.owner,
-        ...(opts.requestId === undefined ? {} : { requestId: opts.requestId }),
-        credentials: invocationCredentials,
-        credentialFingerprint:
-          pin?.fingerprint ?? opts.fingerprintsByPlugin?.[pluginId] ??
-          credentialFingerprint(invocationCredentials),
-        ...(signal === undefined ? {} : { signal }),
-        channel: "job",
-        ...(toolCallId === undefined ? {} : { toolCallId }),
-        actionId,
-        timeoutMs: opts.handlerTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
-        maxResultChars: opts.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
-        taskId: opts.taskId,
-        fenceToken: opts.fenceToken,
-        allowMutatingRetry: opts.allowMutatingRetry,
-      };
-
+  return bindTools({
+    registry: opts.registry,
+    pipeline,
+    ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+    duplicateLogPrefix: "[jobs]",
+    hooks: {
+      // Ownership gate: the job may call only plugins whose credentials it owns.
+      select: (plugin) => Object.hasOwn(opts.credentialsByPlugin, plugin.id),
+      buildCall: (ctx) => {
+        const pin = opts.getCredentials?.(ctx.plugin.id);
+        const credentials = opts.credentialsByPlugin[ctx.plugin.id] ?? {};
+        const invocationCredentials = pin?.credentials ?? { ...credentials };
+        return {
+          source: "plugin",
+          pluginId: ctx.plugin.id,
+          pluginVersion: ctx.plugin.version,
+          tool: ctx.toolDef.name,
+          args: ctx.args,
+          readOnly: ctx.toolDef.readOnly,
+          owner: opts.owner,
+          ...(opts.requestId === undefined ? {} : { requestId: opts.requestId }),
+          credentials: invocationCredentials,
+          credentialFingerprint:
+            pin?.fingerprint ?? opts.fingerprintsByPlugin?.[ctx.plugin.id] ??
+            credentialFingerprint(invocationCredentials),
+          ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+          channel: "job",
+          ...(ctx.toolCallId === undefined ? {} : { toolCallId: ctx.toolCallId }),
+          actionId: ctx.actionId,
+          timeoutMs: opts.handlerTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
+          maxResultChars: opts.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
+          taskId: opts.taskId,
+          fenceToken: opts.fenceToken,
+          allowMutatingRetry: opts.allowMutatingRetry,
+        };
+      },
       // The channel owns the raw-body promise; the shared helper builds the
       // `plugin` body, the `rawSettled`/`onBodySkipped` pair, and the fail-loud
       // `mcp` stub. The deferred resolves when the RAW (unbounded) handler
@@ -901,25 +849,25 @@ function bindJobTool(
       // (quarantine) from a release. When the body never starts, the core calls
       // `onBodySkipped`, which resolves the SAME deferred so budget releases and
       // the job's `settle()` is not held open for the quarantine deadline (D9).
-      const { bodies, scope } = makePluginBodies({
-        invoke: (bodySignal) =>
-          opts.handler.execute(
-            pluginId,
-            toolName,
-            args,
-            invocationCredentials,
-            bodySignal,
-          ),
-        scope: {
-          ...(opts.track === undefined ? {} : { track: opts.track }),
-          ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
-          ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
-          ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
-        },
-        channelLabel: "job",
-      });
-
-      return pipeline.dispatch({ call, bodies, scope });
+      // `call.credentials` is reused so the pin is resolved exactly once.
+      buildExecution: (ctx, call) =>
+        makePluginBodies({
+          invoke: (bodySignal) =>
+            opts.handler.execute(
+              ctx.plugin.id,
+              ctx.toolDef.name,
+              ctx.args,
+              call.credentials,
+              bodySignal,
+            ),
+          scope: {
+            ...(opts.track === undefined ? {} : { track: opts.track }),
+            ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
+            ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
+            ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
+          },
+          channelLabel: "job",
+        }),
     },
   });
 }
