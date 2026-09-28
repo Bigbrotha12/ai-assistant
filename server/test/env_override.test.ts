@@ -61,6 +61,17 @@ describe("immutable-image env overrides (env schema)", () => {
     ]);
   });
 
+  test("NOTIFY_TRUSTED_HOSTS defaults to an empty list", () => {
+    assert.deepEqual(parse().NOTIFY_TRUSTED_HOSTS, []);
+  });
+
+  test("NOTIFY_TRUSTED_HOSTS parses a comma-separated list", () => {
+    const env = parse({
+      NOTIFY_TRUSTED_HOSTS: "ntfy.local, 192.168.1.50 ",
+    });
+    assert.deepEqual(env.NOTIFY_TRUSTED_HOSTS, ["ntfy.local", "192.168.1.50"]);
+  });
+
   test("agent spec caps + skill budget are env-configurable", () => {
     const env = parse({
       AGENT_SKILL_BUDGET_TOKENS: "9000",
@@ -178,6 +189,46 @@ describe("MCP_TRUSTED_HOSTS fail-fast (fresh process)", () => {
   test("a malformed entry (scheme) fails fast at load", () => {
     const result = run("http://example.com");
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /invalid MCP_TRUSTED_HOSTS|must be an exact/);
+    assert.match(result.stderr, /invalid MCP_TRUSTED_HOSTS/);
+  });
+});
+
+describe("NOTIFY_TRUSTED_HOSTS fail-fast (fresh process)", () => {
+  const run = (notifyTrustedHosts: string) => {
+    const environment = { ...process.env };
+    for (const key of [
+      "NOTIFY_TRUSTED_HOSTS",
+      "MCP_TRUSTED_HOSTS",
+      "PLUGINS_TRUSTED_HOSTS",
+    ]) {
+      delete environment[key];
+    }
+    return spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+      await import('./src/env.ts');
+      process.stdout.write('ok');
+    `], {
+      cwd: new URL("../", import.meta.url),
+      encoding: "utf8",
+      env: {
+        ...environment,
+        DOTENV_CONFIG_PATH: "/dev/null",
+        NODE_ENV: "test",
+        BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
+        BETTER_AUTH_URL: "http://localhost:17600",
+        NOTIFY_TRUSTED_HOSTS: notifyTrustedHosts,
+      },
+    });
+  };
+
+  test("a well-formed allowlist starts the gateway", () => {
+    const result = run("ntfy.local,192.168.1.50");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "ok");
+  });
+
+  test("a malformed entry (scheme) fails fast at load", () => {
+    const result = run("http://ntfy.local");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /invalid NOTIFY_TRUSTED_HOSTS/);
   });
 });

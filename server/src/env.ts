@@ -14,6 +14,22 @@ config({ quiet: true });
  */
 const NOTIFY_STORE_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
 
+/**
+ * Shared parser for the comma-separated trusted-host allowlists
+ * (`PLUGINS_`/`MCP_`/`NOTIFY_TRUSTED_HOSTS`): split on commas, trim, drop
+ * empties. Entry-SHAPE validation is deferred to the fail-fast pass below so
+ * the error can name the specific env var (see `parseTrustedHostEntries`).
+ */
+const trustedHostsList = z
+  .string()
+  .default("")
+  .transform((value) =>
+    value
+      .split(",")
+      .map((host) => host.trim())
+      .filter((host) => host.length > 0),
+  );
+
 export const envSchema = z.object({
   BETTER_AUTH_SECRET: z
     .string()
@@ -140,15 +156,7 @@ export const envSchema = z.object({
       }
     }),
   PLUGINS_STORE_PATH: z.string().default("./data/plugins.json"),
-  PLUGINS_TRUSTED_HOSTS: z
-    .string()
-    .default("")
-    .transform((value) =>
-      value
-        .split(",")
-        .map((host) => host.trim())
-        .filter((host) => host.length > 0),
-    ),
+  PLUGINS_TRUSTED_HOSTS: trustedHostsList,
   // Admin-vouched MCP server hosts (hostnames/IPs/wildcards, comma-separated).
   // Two privileges over the default SSRF posture, scoped to the MCP path ONLY:
   //  1. Range checks are bypassed (like PLUGINS_TRUSTED_HOSTS) so in-cluster
@@ -159,15 +167,19 @@ export const envSchema = z.object({
   //     for everything else (plugins, LLM endpoints) is untouched, and all
   //     other SSRF defenses (DNS-rebinding pinning, redirect refusal) still
   //     apply to MCP calls.
-  MCP_TRUSTED_HOSTS: z
-    .string()
-    .default("")
-    .transform((value) =>
-      value
-        .split(",")
-        .map((host) => host.trim())
-        .filter((host) => host.length > 0),
-    ),
+  MCP_TRUSTED_HOSTS: trustedHostsList,
+  // Admin-vouched ntfy push hosts (hostnames/IPs/wildcards, comma-separated).
+  // Two privileges over the default SSRF posture, scoped to the notify push
+  // path ONLY:
+  //  1. Range checks are bypassed (like PLUGINS_TRUSTED_HOSTS) so a self-hosted
+  //     ntfy on loopback or an RFC1918 address delivers without
+  //     DISALLOWED_HOST/DNS_REBINDING.
+  //  2. Unlike plugins — which stay https-only in production — a notify host on
+  //     this list MAY use http: in production, because a homelab ntfy is often a
+  //     plain http service. Scheme enforcement for everything else (plugins, LLM
+  //     endpoints, MCP) is untouched, and all other SSRF defenses (DNS-rebinding
+  //     pinning, redirect refusal) still apply to notify calls.
+  NOTIFY_TRUSTED_HOSTS: trustedHostsList,
   // Default model plugin provider override — provider-agnostic. The builtin
   // model plugin's endpoint + default model come from these (OpenRouter
   // defaults), so a self-hosted operator can point at any OpenAI-compatible
@@ -195,25 +207,24 @@ if (!parsed.success) {
 
 export const env = parsed.data;
 
-// PLUGINS_TRUSTED_HOSTS entries are used verbatim as SSRF trusted-host
-// patterns; a malformed entry (a scheme, port, path, whitespace, bare `*` or
-// mid-string wildcard) silently never matches and would leave an admin
-// thinking an internal host is allowed when it is not. Fail fast at load,
-// matching the other env checks below.
-try {
-  parseTrustedHostEntries(env.PLUGINS_TRUSTED_HOSTS);
-} catch (err) {
-  console.error(`Gateway: ${(err as Error).message}`);
-  process.exit(1);
-}
-
-// Same fail-fast for MCP_TRUSTED_HOSTS; a malformed entry would silently never
-// match and leave an admin thinking an internal MCP host is reachable.
-try {
-  parseTrustedHostEntries(env.MCP_TRUSTED_HOSTS);
-} catch (err) {
-  console.error(`Gateway: ${(err as Error).message}`);
-  process.exit(1);
+// Trusted-host entries are used verbatim as SSRF trusted-host patterns; a
+// malformed entry (a scheme, port, path, whitespace, bare `*` or mid-string
+// wildcard) silently never matches and would leave an admin thinking an
+// internal host is allowed when it is not. Fail fast at load, naming the
+// specific knob. Order is PLUGINS → MCP → NOTIFY, before the ledger threshold
+// check below.
+const trustedHostsEnvs: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["PLUGINS_TRUSTED_HOSTS", env.PLUGINS_TRUSTED_HOSTS],
+  ["MCP_TRUSTED_HOSTS", env.MCP_TRUSTED_HOSTS],
+  ["NOTIFY_TRUSTED_HOSTS", env.NOTIFY_TRUSTED_HOSTS],
+];
+for (const [envVarName, entries] of trustedHostsEnvs) {
+  try {
+    parseTrustedHostEntries(entries, envVarName);
+  } catch (err) {
+    console.error(`Gateway: ${(err as Error).message}`);
+    process.exit(1);
+  }
 }
 
 // The ledger threshold ordering is fixed: stuck-timeout must be strictly

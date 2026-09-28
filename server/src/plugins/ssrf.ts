@@ -723,22 +723,28 @@ export function isValidTrustedHostEntry(entry: string): boolean {
 }
 
 /**
- * Parse the raw comma-separated `PLUGINS_TRUSTED_HOSTS` env value into
- * validated entries (trimmed, empties dropped). Throws `SsrfValidationError`
- * on the first invalid entry so the app can fail fast at env parse time with
- * an actionable message. Prefer `parseTrustedHostEntries` when the value has
- * already been split (e.g. after a zod transform).
+ * Parse a raw comma-separated trusted-host env value (e.g.
+ * `PLUGINS_TRUSTED_HOSTS`) into validated entries (trimmed, empties dropped).
+ * Throws `SsrfValidationError` on the first invalid entry so the app can fail
+ * fast at env parse time with an actionable message. `envVarName` names the
+ * offending variable in that message; prefer `parseTrustedHostEntries` when the
+ * value has already been split (e.g. after a zod transform).
  */
-export function parseTrustedHosts(raw: string): string[] {
-  return parseTrustedHostEntries(raw.split(","));
+export function parseTrustedHosts(raw: string, envVarName?: string): string[] {
+  return parseTrustedHostEntries(raw.split(","), envVarName);
 }
 
 /**
  * Validate an already-split list of trusted-host entries. See
  * `parseTrustedHosts`. Throws `SsrfValidationError` on the first invalid
- * entry.
+ * entry. `envVarName` is the env var the entries came from, so the error names
+ * the knob the operator actually misconfigured (default: the original
+ * `PLUGINS_TRUSTED_HOSTS`, kept for callers that predate the per-var naming).
  */
-export function parseTrustedHostEntries(entries: readonly string[]): string[] {
+export function parseTrustedHostEntries(
+  entries: readonly string[],
+  envVarName = "PLUGINS_TRUSTED_HOSTS",
+): string[] {
   const out: string[] = [];
   for (const rawEntry of entries) {
     const entry = rawEntry.trim();
@@ -746,7 +752,7 @@ export function parseTrustedHostEntries(entries: readonly string[]): string[] {
     if (!isValidTrustedHostEntry(entry)) {
       throw new SsrfValidationError(
         "INVALID_URL",
-        `invalid PLUGINS_TRUSTED_HOSTS entry '${entry}': entries must be an exact ` +
+        `invalid ${envVarName} entry '${entry}': entries must be an exact ` +
           `hostname (vn.example), an IP literal (v4/v6), or a single-'*.'-prefixed ` +
           `wildcard (*.internal); schemes (://), ports, paths, whitespace and bare ` +
           `'*' are refused`,
@@ -755,6 +761,24 @@ export function parseTrustedHostEntries(entries: readonly string[]): string[] {
     out.push(entry);
   }
   return out;
+}
+
+/**
+ * The SSRF trust options for an egress path where the private-range bypass
+ * (`trustedHosts`) and the production `http:` carve-out (`httpAllowedHosts`) are
+ * the SAME admin-vouched list and MUST always move together. Used by the ntfy
+ * notify hook: an admin-listed private homelab ntfy is also the plain-`http:`
+ * carve-out, so passing one without the other silently drops notifications.
+ *
+ * NOTE: `agents/mcp.ts` currently inlines this exact pairing at several call
+ * sites; it is scheduled for a Phase 2 rewrite and should migrate to this
+ * helper then. Do not add new inline pairings.
+ */
+export function egressTrustOptions(trustedHosts: readonly string[]): {
+  trustedHosts: readonly string[];
+  httpAllowedHosts: readonly string[];
+} {
+  return { trustedHosts, httpAllowedHosts: trustedHosts };
 }
 
 export type ValidatedFetchOptions = {

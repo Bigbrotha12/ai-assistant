@@ -215,9 +215,9 @@ flutter test                 # client unit tests (700+)
   The client stores them in the OS secure storage.
 - **Encrypted ntfy tokens.** Notification credentials are AES-256-GCM
   encrypted at rest, keyed by `NOTIFY_STORE_KEY`, and never logged.
-- **SSRF-hardened outbound calls.** Plugin endpoints are validated against an
-  admin-curated allowlist; DNS-rebinding pinning prevents host-name reuse
-  attacks; redirects are not followed.
+- **SSRF-hardened outbound calls.** Plugin endpoints — and ntfy push delivery —
+  are validated against an admin-curated allowlist; DNS-rebinding pinning
+  prevents host-name reuse attacks; redirects are not followed.
 - **Budget and rate limiting.** Per-user budget gates prevent runaway spending;
   per-owner rate limiters prevent abuse of the inference endpoint.
 - Full details are in the (local-only) planning docs under `docs/`; the

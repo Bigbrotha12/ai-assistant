@@ -9,6 +9,7 @@ import {
   isValidTrustedHostEntry,
   parseTrustedHosts,
   parseTrustedHostEntries,
+  egressTrustOptions,
   resolveAndValidateHost,
   isTrustedHost,
   REDIRECT_POLICY,
@@ -323,6 +324,43 @@ describe("Fix 3: parseTrustedHosts / PLUGINS_TRUSTED_HOSTS entry validation", ()
   test("empty input yields an empty list", () => {
     assert.deepEqual(parseTrustedHosts(""), []);
     assert.deepEqual(parseTrustedHosts("  , , "), []);
+  });
+
+  test("the error names the passed env var; the default stays PLUGINS_TRUSTED_HOSTS", () => {
+    assert.throws(
+      () => parseTrustedHostEntries(["http://bad.example"], "MCP_TRUSTED_HOSTS"),
+      (e: unknown) =>
+        e instanceof SsrfValidationError &&
+        e.message.includes("invalid MCP_TRUSTED_HOSTS entry 'http://bad.example'"),
+    );
+    assert.throws(
+      () => parseTrustedHosts("http://bad.example", "NOTIFY_TRUSTED_HOSTS"),
+      (e: unknown) =>
+        e instanceof SsrfValidationError &&
+        e.message.includes("invalid NOTIFY_TRUSTED_HOSTS entry"),
+    );
+    assert.throws(
+      () => parseTrustedHostEntries(["http://bad.example"]),
+      (e: unknown) =>
+        e instanceof SsrfValidationError &&
+        e.message.includes("invalid PLUGINS_TRUSTED_HOSTS entry"),
+    );
+  });
+});
+
+describe("egressTrustOptions", () => {
+  test("pairs trustedHosts with the identical httpAllowedHosts list", () => {
+    const hosts = ["ntfy.local", "192.168.1.50"];
+    const opts = egressTrustOptions(hosts);
+    assert.deepEqual(opts.trustedHosts, hosts);
+    assert.deepEqual(opts.httpAllowedHosts, hosts);
+    assert.equal(opts.trustedHosts, opts.httpAllowedHosts, "the same list must back both");
+  });
+
+  test("empty trust yields empty carve-outs", () => {
+    const opts = egressTrustOptions([]);
+    assert.deepEqual(opts.trustedHosts, []);
+    assert.deepEqual(opts.httpAllowedHosts, []);
   });
 });
 

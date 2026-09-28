@@ -100,6 +100,7 @@ the ledger needs migrating.
 | `PLUGINS_STORE_PATH` | no | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests. |
 | `PLUGINS_TRUSTED_HOSTS` | no | `""` | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin base URLs; scheme enforcement is not bypassed. |
 | `MCP_TRUSTED_HOSTS` | no | `""` | Comma-separated admin-vouched MCP hostnames/IPs; internal MCP services may use HTTP in production. |
+| `NOTIFY_TRUSTED_HOSTS` | no | `""` | Comma-separated admin-vouched ntfy push hosts. A private/reserved-address ntfy, or a plain-`http:` ntfy in production, **must** be listed here or SSRF validation refuses the push and notifications are silently dropped. Listing a host with an `http:` `NOTIFY_BASE_URL` lets the notify bearer token travel in cleartext — prefer `https:`. |
 | `DEFAULT_MODEL_PROVIDER_BASE_URL` | no | `https://openrouter.ai/api/v1` | Provider-agnostic base URL for the built-in model plugin. |
 | `DEFAULT_MODEL_PROVIDER_MODEL` | no | `openrouter/auto` | Default model name for the built-in model plugin. |
 | `LOG_LEVEL` | no | `info` | Console log level: `error`, `warn`, `info`, or `debug`. |
@@ -356,7 +357,12 @@ client no longer routes through `thread_id`.
 The ntfy topic and access token are encrypted at rest by `NotifyStore` in
 `./data/notify.json` (or the configured store path) and are provisioned through
 `/api/notify`. `NOTIFY_STORE_KEY` supplies the encryption key; `NOTIFY_BASE_URL`
-is the optional ntfy base URL, with an empty value disabling push delivery.
+is the optional ntfy base URL, with an empty value disabling push delivery. If
+`NOTIFY_BASE_URL` targets a private/reserved address, or uses plain `http:` in
+production, its host **must** be added to `NOTIFY_TRUSTED_HOSTS` — otherwise
+SSRF validation refuses every push and notifications are silently dropped (the
+gateway logs a boot warning; delivery is best-effort by design). Listing such a
+host with an `http:` base URL sends the bearer token in cleartext.
 The file is atomically replaced with `0600` permissions, and the store keeps a
 cached in-process snapshot behind a mutation mutex.
 

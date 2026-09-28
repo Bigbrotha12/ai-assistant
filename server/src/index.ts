@@ -13,7 +13,7 @@ import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { createLedgerRoutes, ledger } from "./ledger.routes.ts";
-import { createNtfyNotificationHook } from "./notify/hook.ts";
+import { createNtfyNotificationHook, notifyEgressConfigWarning } from "./notify/hook.ts";
 import { createNotifyRoutes } from "./notify/routes.ts";
 import { NotifyStore } from "./notify/store.ts";
 import { createPluginWiring } from "./plugins/index.ts";
@@ -207,6 +207,15 @@ const warmups = createWarmupManager({
 });
 let jobRunner: JobRunner | undefined;
 let jobPins: CredentialPinStore | undefined;
+// M1: tie NOTIFY_BASE_URL's host to NOTIFY_TRUSTED_HOSTS at boot. A private-
+// address (or production http:) ntfy that is not trusted would otherwise be
+// refused by SSRF validation and its pushes SILENTLY dropped — best-effort by
+// design, so warn loudly rather than exit.
+const notifyConfigWarning = notifyEgressConfigWarning(env.NOTIFY_BASE_URL, {
+  trustedHosts: env.NOTIFY_TRUSTED_HOSTS,
+  mode: env.NODE_ENV,
+});
+if (notifyConfigWarning) console.warn(notifyConfigWarning);
 try {
   jobPins = new CredentialPinStore();
   jobRunner = createJobRunner({
@@ -225,6 +234,9 @@ try {
     notification: createNtfyNotificationHook({
       store: notifyStore,
       baseUrl: env.NOTIFY_BASE_URL,
+      // Admin-vouched ntfy hosts (private-range bypass + production http:
+      // carve-out), scoped to notify egress only.
+      trustedHosts: env.NOTIFY_TRUSTED_HOSTS,
     }),
     // Phase 4, Wave B: the shared in-memory tool-result cache so a repeated
     // read-only tool call is never executed twice across sync and async.
