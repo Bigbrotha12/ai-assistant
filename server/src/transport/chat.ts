@@ -16,7 +16,7 @@ import { env } from "../env.ts";
 import { logger } from "../logger.ts";
 import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_key.ts";
 import { AccountDeletedError, assertNotDeleting, isDeleting } from "../account_deletion.ts";
-import { bindPluginTools, mergePluginAndMcpTools } from "../agents/orchestrator.ts";
+import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import { isRecord } from "../util.ts";
@@ -1136,6 +1136,16 @@ async function handleSyncStream(
         trustedHosts: env.MCP_TRUSTED_HOSTS,
         clientFactory: opts.mcpClientFactory,
         resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
+        // Step 1.11: MCP dispatches through the same engine as the plugin tools
+        // above, gaining budget (D1) and read-only result caching (D2). The
+        // plugin tools are already bound, so their names seed the tie-break.
+        channel: "sync-stateless",
+        budget,
+        ...(opts.toolCache === undefined ? {} : { toolCache: opts.toolCache }),
+        track: execution.track,
+        assertActive: () => assertNotDeleting(owner),
+        excludeToolNames: new Set(pluginTools.map((tool) => tool.name)),
+        duplicateLogPrefix: "[chat]",
       })
     : undefined;
   // The MCP binding owns live SSE connections + pinned Agents until the stream
@@ -1158,7 +1168,7 @@ async function handleSyncStream(
   };
   try {
     const mcpTools = mcpBinding?.tools ?? [];
-    const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
+    const tools = [...pluginTools, ...mcpTools];
     if (tools.length === 0 && requestedToolCount(resolved.value) > 0) {
       // Nothing bound though tools were requested: fail loudly (the `finally`
       // below disposes the empty MCP binding).
@@ -1498,6 +1508,14 @@ async function handleManagedSessionStream(
           trustedHosts: env.MCP_TRUSTED_HOSTS,
           clientFactory: opts.mcpClientFactory,
           resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
+          // Same engine wiring as the stateless path above (D1/D2).
+          channel: "sync-managed",
+          budget,
+          ...(opts.toolCache === undefined ? {} : { toolCache: opts.toolCache }),
+          track: execution.track,
+          assertActive: () => assertNotDeleting(owner),
+          excludeToolNames: new Set(pluginTools.map((tool) => tool.name)),
+          duplicateLogPrefix: "[chat]",
         })
       : undefined;
     let mcpHandedOff = false;
@@ -1513,7 +1531,7 @@ async function handleManagedSessionStream(
     };
     try {
       const mcpTools = mcpBinding?.tools ?? [];
-      const tools = mergePluginAndMcpTools(pluginTools, mcpTools, "[chat]");
+      const tools = [...pluginTools, ...mcpTools];
       if (tools.length === 0 && requestedToolCount(resolved) > 0) {
         // Tools were requested but none bound (e.g. every MCP server denied by
         // policy). Roll the appended turn back and surface the failure — never

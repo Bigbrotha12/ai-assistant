@@ -1,6 +1,6 @@
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import type { PluginRegistry } from "../plugins/registry.ts";
-import { jsonSchemaToZod } from "./mcp.ts";
+import { jsonSchemaToZod } from "../tools/schema.ts";
 import {
   DEFAULT_TOOL_HANDLER_TIMEOUT_MS,
   DEFAULT_TOOL_RESULT_MAX_CHARS,
@@ -13,9 +13,11 @@ import { bindTools, makePluginBodies } from "../tools/bind.ts";
 import { createSyncToolInterceptors } from "../tools/interceptors/order.ts";
 import { createPluginAuditSink } from "../tools/audit.ts";
 
-// Single source of truth for JSON-Schema -> zod translation lives in
-// `agents/mcp.ts` (it also infers `type` for schema-less MCP tools). Re-export
-// it here so the tool-binding path and the runner keep importing from one spot.
+// Single source of truth for JSON-Schema -> zod translation lives in the neutral
+// `tools/schema.ts` (it also infers `type` for schema-less MCP tools), so neither
+// this module nor `tools/bind.ts` forms an import cycle with `agents/mcp.ts`
+// (finding m2). Re-export it here so the runner and tests keep importing from one
+// spot.
 export { jsonSchemaToZod };
 
 /**
@@ -184,32 +186,4 @@ export function bindPluginTools(
         }),
     },
   });
-}
-
-/**
- * Merge plugin-bound tools with MCP tools, deduplicating by name (the MCP
- * version loses ties, matching both the sync transport and the job runner).
- */
-export function mergePluginAndMcpTools(
-  pluginTools: DynamicStructuredTool[],
-  mcpTools: DynamicStructuredTool[],
-  logPrefix: string,
-): DynamicStructuredTool[] {
-  const allTools: DynamicStructuredTool[] = [];
-  const seen = new Set<string>();
-  // Identity set built once: `mcpTools.includes(t)` inside the loop was O(n²).
-  const mcpToolSet = new Set(mcpTools);
-  for (const t of [...pluginTools, ...mcpTools]) {
-    if (seen.has(t.name)) {
-      if (mcpToolSet.has(t)) {
-        console.warn(
-          `${logPrefix} tool '${t.name}' defined by both a plugin and an MCP server; skipping MCP version`,
-        );
-      }
-      continue;
-    }
-    seen.add(t.name);
-    allTools.push(t);
-  }
-  return allTools;
 }

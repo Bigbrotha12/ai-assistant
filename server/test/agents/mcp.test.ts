@@ -1384,6 +1384,58 @@ describe("mcp", () => {
     assert.equal(closes, 3, "circuit-open and binding disposal close each client once");
   });
 
+  test("MCP timeouts are counted failures and open the circuit (finding M1)", async () => {
+    const telemetry = captureMcpTelemetry();
+    // A hung server: `callTool` never settles, so the pipeline's `execution`
+    // bound (which shares `timeoutMs` with MCP's own `withMcpTimeout` and
+    // schedules its timer first) fires. The `AbortError` it produces must be
+    // attributed as MCP_TIMEOUT so `completeMcpOperation` records a countable
+    // failure — before the fix it classified as `cancelled`/`MCP_ABORTED` and
+    // the circuit never opened.
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+      callTool: async () => new Promise<McpCallResult>(() => {}),
+      close: async () => {},
+    });
+    const cfg: McpServerConfig = { name: "timeout-circuit", url: "https://timeout-circuit.example.com" };
+    // Threshold 2 so two timeouts open the circuit; cooldown raised so the
+    // circuit stays open for the assertion.
+    const binding = await bindMcpServers([cfg], {
+      clientFactory: factory,
+      timeoutMs: 5,
+      limits: { circuitFailureThreshold: 2, circuitCooldownMs: 30_000 },
+    });
+    try {
+      await assert.rejects(
+        Promise.resolve(binding.tools[0]!.func({})),
+        (err: unknown) => err instanceof ToolResourceError && err.code === "tool_timeout",
+      );
+      await assert.rejects(
+        Promise.resolve(binding.tools[0]!.func({})),
+        (err: unknown) => err instanceof ToolResourceError && err.code === "tool_timeout",
+      );
+      assert.equal(
+        getMcpCircuitState(cfg).state,
+        "open",
+        "a timeout is a countable failure, so repeated timeouts open the circuit",
+      );
+      await flushAuditTelemetry();
+      const toolAudits = telemetry.records.filter((record) => record.event === "mcp.tool");
+      assert.ok(
+        toolAudits.some((record) => record.outcome === "timeout" && record.errorCode === "MCP_TIMEOUT"),
+        "the mcp.tool audit records a countable timeout, not a cancellation",
+      );
+      assert.equal(
+        toolAudits.some((record) => record.outcome === "cancelled"),
+        false,
+        "no timeout is misclassified as cancelled",
+      );
+    } finally {
+      telemetry.restore();
+      resetMcpRuntimeState();
+    }
+  });
+
   test("MCP failure window resets consecutive failures before the threshold", async () => {
     let now = 0;
     let fail = true;
@@ -1444,12 +1496,45 @@ describe("mcp", () => {
     phase = "invoke";
     const invokeCfg: McpServerConfig = { name: "invoke-timeout", url: "https://invoke-timeout.example.com" };
     const invokeBinding = await bindMcpServers([invokeCfg], { clientFactory: factory, timeoutMs: 5 });
+    // Step 1.11 routes the MCP tool call through the pipeline whose `execution`
+    // interceptor applies the SAME `timeoutMs` as MCP's own `withMcpTimeout`
+    // (requirement 7). Both timers are scheduled and the pipeline's is first, so
+    // the INVOKE phase is bounded by the pipeline: the rejection is the
+    // pipeline's `tool_timeout` ToolResourceError. The connect and list phases
+    // above are NOT pipeline-routed and still surface MCP's own `MCP_TIMEOUT`.
     await assert.rejects(
       Promise.resolve(invokeBinding.tools[0]!.func({})),
-      (err: unknown) => err instanceof McpError && err.code === "MCP_TIMEOUT",
+      (err: unknown) => err instanceof ToolResourceError && err.code === "tool_timeout",
+      "the invoke bound is the pipeline's `execution` interceptor",
     );
     await invokeBinding.dispose();
     invokePending.reject(new Error("late invoke"));
+  });
+
+  test("the MCP invoke is bounded by the pipeline, not MCP's own withMcpTimeout (finding m3)", async () => {
+    // Both bounds are `timeoutMs` and the pipeline's timer is scheduled first,
+    // so a hung `callTool` must reject with the PIPELINE's `tool_timeout`
+    // (`ToolResourceError`), never MCP's own `MCP_TIMEOUT` (`McpError`). The
+    // error TYPE is what pins which layer fired; the widened assertion above
+    // cannot distinguish them (finding m3).
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "tool", description: "t" }] }),
+      callTool: async () => new Promise<McpCallResult>(() => {}),
+      close: async () => {},
+    });
+    const cfg: McpServerConfig = { name: "pipeline-bound", url: "https://pipeline-bound.example.com" };
+    const binding = await bindMcpServers([cfg], { clientFactory: factory, timeoutMs: 5 });
+    try {
+      await assert.rejects(
+        Promise.resolve(binding.tools[0]!.func({})),
+        (err: unknown) =>
+          err instanceof ToolResourceError &&
+          err.code === "tool_timeout" &&
+          err.message.includes("exceeded the handler timeout"),
+      );
+    } finally {
+      await binding.dispose();
+    }
   });
 
   test("default SSE factory uses retained pins and never re-resolves after DNS changes", async () => {

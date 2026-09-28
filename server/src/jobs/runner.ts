@@ -14,8 +14,6 @@ import {
   type McpServerConfig,
 } from "../agents/mcp.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
-import type { TrackedExecution } from "../agents/execution.ts";
-import { mergePluginAndMcpTools } from "../agents/orchestrator.ts";
 import type { ToolCallHandler } from "../agents/orchestrator.ts";
 import {
   lastUserTextFromMessages,
@@ -25,11 +23,7 @@ import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 import { redactForOutbound, redactMessages } from "../redact.ts";
 import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { env } from "../env.ts";
-import {
-  getOrCreateTask,
-  hasToolResult,
-  recordToolResult,
-} from "../credentials/idempotency.ts";
+import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";
 import type { CredentialPin, CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
@@ -872,80 +866,6 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
   });
 }
 
-type McpReplayOptions = {
-  ledger: Ledger;
-  taskId: string;
-  owner: string;
-  fenceToken: string;
-  allowMutatingRetry: boolean;
-  requestId: string;
-  safeToolNames: ReadonlySet<string>;
-  assertActive: () => void;
-};
-
-function trackMcpTools(
-  tools: readonly DynamicStructuredTool[],
-  execution: TrackedExecution,
-  onToolStart: (actionId: string) => void,
-  onToolEnd: (actionId: string) => void,
-  replay: McpReplayOptions,
-): DynamicStructuredTool[] {
-  let sequence = 0;
-  return tools.map((tool) =>
-    new DynamicStructuredTool({
-      name: tool.name,
-      description: tool.description,
-      schema: tool.schema,
-      func: async (input, _runManager, config) => {
-        const toolCallId = (
-          config as { toolCall?: { id?: string } } | undefined
-        )?.toolCall?.id;
-        const actionId = toolCallId ?? `mcp:${tool.name}:${++sequence}`;
-        onToolStart(actionId);
-        try {
-          serializeBoundedToolArguments(input);
-          replay.assertActive();
-          if (toolCallId && hasToolResult(replay.ledger, {
-            taskId: replay.taskId,
-            owner: replay.owner,
-            toolCallId,
-          })) {
-            const step = replay.ledger.getStepByToolCallId(
-              replay.taskId,
-              toolCallId,
-              replay.owner,
-            );
-            return boundToolResult(step?.result ?? "");
-          }
-          if (!replay.allowMutatingRetry && !replay.safeToolNames.has(tool.name)) {
-            throw new JobError(
-              "tool_retry_forbidden",
-              `MCP tool '${tool.name}' is not explicitly read-only and has no stored result; ` +
-                "refusing to re-execute a possibly-applied side effect",
-            );
-          }
-           const raw = await execution.track(async () => tool.func(input));
-           const result = boundToolResult(String(raw));
-          replay.assertActive();
-          if (toolCallId) {
-            recordToolResult(replay.ledger, {
-              taskId: replay.taskId,
-              owner: replay.owner,
-              fenceToken: replay.fenceToken,
-              toolCallId,
-              toolName: tool.name,
-              result,
-            });
-          }
-          return result;
-        } finally {
-          onToolEnd(actionId);
-        }
-      },
-    }),
-  );
-}
-
 export class JobRunner {
   private readonly deps: JobRunnerDeps;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -1377,40 +1297,41 @@ export class JobRunner {
             owner,
             requestId,
             signal,
-             trustedHosts: env.MCP_TRUSTED_HOSTS,
-             clientFactory: this.deps.mcpClientFactory,
-             resolvePins: async (server) => {
+            trustedHosts: env.MCP_TRUSTED_HOSTS,
+            clientFactory: this.deps.mcpClientFactory,
+            resolvePins: async (server) => {
               const agentPluginId = server.id?.trim();
               if (!agentPluginId) return undefined;
               const entry = this.deps.getPinnedIps?.(
                 `${agentPluginId}:mcp:${server.name}`,
               )?.[0];
-               return entry?.pinned === undefined ? undefined : [...entry.pinned];
+              return entry?.pinned === undefined ? undefined : [...entry.pinned];
             },
+            // Step 1.11: MCP now dispatches through the SAME job engine as the
+            // plugin tools, so the deleted `trackMcpTools` wrapper's replay,
+            // fence, budget and cache behaviour is provided by the pipeline.
+            channel: "job",
+            ledger: this.deps.ledger,
+            ...(this.deps.budget === undefined ? {} : { budget: this.deps.budget }),
+            ...(this.deps.toolCache === undefined ? {} : { toolCache: this.deps.toolCache }),
+            taskId: claimed.id,
+            fenceToken,
+            allowMutatingRetry: !replaying,
+            assertActive,
+            track: (run) => execution.track(run),
+            trackUntil: (run, maxDurationMs) => execution.trackUntil(run, maxDurationMs),
+            onToolStart: (actionId) => {
+              if (!activeJob.cancelRequested) activeJob.stage = "running";
+              activeJob.activeToolCallIds.add(actionId);
+            },
+            onToolEnd: (actionId) => {
+              activeJob.activeToolCallIds.delete(actionId);
+            },
+            excludeToolNames: new Set(tools.map((tool) => tool.name)),
+            duplicateLogPrefix: "[jobs]",
           })
         : undefined;
-      const mcpTools = trackMcpTools(
-        mcpBinding?.tools ?? [],
-        execution,
-        (actionId) => {
-          if (!activeJob.cancelRequested) activeJob.stage = "running";
-          activeJob.activeToolCallIds.add(actionId);
-        },
-         (actionId) => {
-           activeJob.activeToolCallIds.delete(actionId);
-         },
-         {
-           ledger: this.deps.ledger,
-           taskId: claimed.id,
-           owner,
-           fenceToken,
-           allowMutatingRetry: !replaying,
-           requestId,
-           safeToolNames: mcpBinding?.toolReadOnly ?? new Set<string>(),
-           assertActive,
-         },
-       );
-      const allTools = mergePluginAndMcpTools(tools, mcpTools, "[jobs]");
+      const allTools = [...tools, ...(mcpBinding?.tools ?? [])];
       const graph = createAgentGraph({
         model,
         tools: allTools,

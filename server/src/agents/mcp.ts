@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { DynamicStructuredTool } from "@langchain/core/tools";
+import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { z } from "zod";
@@ -9,6 +9,9 @@ import {
   createMcpToolListCache,
   type McpToolListCache,
 } from "../middleware/cache.ts";
+import type { ToolResultCache } from "../middleware/cache.ts";
+import type { BudgetManager } from "../middleware/budget.ts";
+import type { Ledger } from "../ledger.ts";
 import { SsrfValidationError, validateMcpHeaderName } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import {
@@ -22,9 +25,16 @@ import {
 import { credentialFingerprint } from "../plugins/credential.ts";
 import {
   boundToolResult,
-  serializeBoundedToolArguments,
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
   TOOL_RESULT_TRUNCATION_MARKER,
 } from "../tool_bounds.ts";
+import { createBoundTool, makeToolBodies } from "../tools/bind.ts";
+import { createToolPipeline } from "../tools/pipeline.ts";
+import type { ToolCall, ToolCallScope } from "../tools/pipeline.ts";
+import {
+  createJobToolInterceptors,
+  createSyncToolInterceptors,
+} from "../tools/interceptors/order.ts";
 import { redactForOutbound } from "../redact.ts";
 import {
   emitAuditEvent,
@@ -33,6 +43,42 @@ import {
 } from "../audit/telemetry.ts";
 import { isMcpHeaderReference } from "../plugins/types.ts";
 import type { JsonSchema } from "../plugins/types.ts";
+import { jsonSchemaToZod } from "../tools/schema.ts";
+
+/**
+ * MCP tools on the shared tool pipeline (step 1.11).
+ *
+ * MCP connection/circuit/list-cache lifecycle stays here; only per-call policy
+ * moves onto `tools/pipeline.ts`. `bindMcpServers` dispatches every MCP tool
+ * call through the SAME engine the plugin channels use, with
+ * `pluginId: "mcp:<serverName>"` and `source: "mcp"`. Consequences recorded in
+ * the plan (`docs/plugin-seam-architecture-plan.md` §5 D1/D2, §13):
+ *
+ *   - **D1 — MCP is budgeted.** Because MCP calls now carry `requestId` and
+ *     `tool`, `withToolCallBudget` applies its FULL policy in addition to MCP's
+ *     own per-server/per-owner caps. Concretely, an MCP server's tools are
+ *     capped per owner at `DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_TURN`
+ *     (8 calls to the SAME tool in one turn) and
+ *     `DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_WINDOW` (20 calls to ANY tool
+ *     of that one server per owner per `DEFAULT_TOOL_CALL_RATE_WINDOW_MS`
+ *     (60 s)), in addition to the per-owner/per-plugin concurrency caps. The
+ *     effective concurrency is `min(mcp cap, budget cap)`. This is a deliberate
+ *     side effect of a uniform budget policy, accepted as ample for a chat agent
+ *     and pinned by `test/agents/mcp_pipeline.test.ts`.
+ *   - **D2 — MCP results are cacheable.** Read-only calls are keyed including a
+ *     fingerprint of the RESOLVED request headers, so rotating `${MCP_TOKEN}`
+ *     cannot serve a stale entry.
+ *   - **D5 — MCP audit stays inside `runMcpOperation`.** The pipeline's
+ *     `onResult` sink is plugin-source only; MCP audit carries fields
+ *     (`circuitState`, `policyCode`, `ownerBound`, `cacheHit`) the sink cannot.
+ *
+ * Accepted minor divergence (no D-number, 1.11): a read-only RESULT-CACHE HIT
+ * short-circuits in the pipeline's `cache` interceptor before the body, so
+ * `runMcpOperation` never runs and the hit emits NO `mcp.tool` audit record.
+ * D5 keeps audit inside the body, so closing this would require a second audit
+ * path; the hit is not silent end to end (`cache.size`/diagnostics), but it is
+ * not audited. See the plan's 1.11 "Accepted minor divergences".
+ */
 
 export type McpServerConfig = {
   name: string;
@@ -271,7 +317,6 @@ export type McpClientFactory = (
 
 export type McpBinding = {
   tools: DynamicStructuredTool[];
-  toolReadOnly: ReadonlySet<string>;
   dispose: () => Promise<void>;
 };
 
@@ -933,6 +978,41 @@ export type McpBindOptions = {
   resolvePins?: McpPinResolver;
   limits?: Partial<McpLimits>;
   bounds?: Partial<McpBoundaryLimits>;
+  /**
+   * Step 1.11: policy deps for the pipeline every MCP tool call dispatches
+   * through. Interceptors close over the SAME budget/cache/ledger objects the
+   * channel's plugin tools use, so MCP gains budget (D1) and read-only result
+   * caching (D2). When omitted, MCP still dispatches through the engine, just
+   * with an empty policy (the transport guard inside the body still applies).
+   */
+  budget?: BudgetManager;
+  toolCache?: ToolResultCache;
+  /** Job channel only: the ledger the `fence`/`replay` interceptors read. */
+  ledger?: Ledger;
+  /**
+   * Channel the MCP calls belong to. `warmup` is not a valid MCP channel.
+   * Defaults to `sync-stateless`.
+   */
+  channel?: "sync-stateless" | "sync-managed" | "job";
+  /** Job channel: task-fence fields carried on the `ToolCall`. */
+  taskId?: string;
+  fenceToken?: string;
+  allowMutatingRetry?: boolean;
+  /** Job channel: task-fence re-check, also supplied to the `fence` interceptor. */
+  assertActive?: () => void;
+  /** Channel-owned tracked execution (job/sync `settle()` draining). */
+  track?: <T>(run: () => Promise<T>) => Promise<T>;
+  trackUntil?: (run: () => Promise<void>, maxDurationMs: number) => void;
+  onToolStart?: (actionId: string) => void;
+  onToolEnd?: (actionId: string) => void;
+  /**
+   * Plugin tool names already bound for this request. An MCP tool whose name is
+   * in this set loses the tie (plugin wins) and is skipped with the same warning
+   * the deleted `mergePluginAndMcpTools` emitted.
+   */
+  excludeToolNames?: ReadonlySet<string>;
+  /** Warning prefix for the MCP-loses-tie message (`[chat]` / `[jobs]`). */
+  duplicateLogPrefix?: string;
 };
 
 function resolveMcpSessionConfig(
@@ -1205,6 +1285,23 @@ function isAbortFailure(err: unknown, signal?: AbortSignal): boolean {
   return signal?.aborted === true || (err instanceof Error && err.name === "AbortError");
 }
 
+/**
+ * True when `signal` was aborted by the pipeline's `execution` bound rather than
+ * by the caller: `invokeBoundedToolHandler` aborts its controller with the
+ * `tool_timeout` `ToolResourceError` as the reason (`tool_bounds.ts:146`). The
+ * MCP body inspects the reason to attribute the resulting `AbortError` as an MCP
+ * timeout (finding M1) instead of a cancellation.
+ */
+function isToolTimeoutAbort(signal: AbortSignal): boolean {
+  const reason: unknown = signal.reason;
+  return (
+    typeof reason === "object" &&
+    reason !== null &&
+    "code" in reason &&
+    (reason as { code?: unknown }).code === "tool_timeout"
+  );
+}
+
 function isPolicyFailure(err: unknown): boolean {
   return err instanceof SsrfValidationError ||
     (err instanceof McpError && err.code === "MCP_POLICY_DENIED");
@@ -1351,7 +1448,17 @@ type McpOperationOptions<T> = {
   owner?: string;
   ownerKey?: string;
   requestId?: string;
-  signal?: AbortSignal;
+  /**
+   * The signal used to ATTRIBUTE a failure, not to cancel the outbound call
+   * (finding M1). It is the CHANNEL signal (`call.signal`), captured before any
+   * timeout controller exists — never the pipeline-composed `bodySignal`, which
+   * the `execution` interceptor aborts on a handler timeout. Passing the
+   * composed signal here would make `isAbortFailure` classify every genuine
+   * timeout as a caller cancellation, so the circuit never counts it. The
+   * outbound cancellation signal is passed directly to
+   * `runMcpClientOperation`/`withMcpTimeout` by the caller.
+   */
+  attributionSignal?: AbortSignal;
   event: McpAuditEvent;
   tool?: string;
   cacheHit: boolean;
@@ -1416,7 +1523,7 @@ async function runMcpOperation<T>(
     });
     return value;
   } catch (err) {
-    const failure = classifyMcpFailure(err, options.signal);
+    const failure = classifyMcpFailure(err, options.attributionSignal);
      if (permit) {
        const state = completeMcpOperation(runtime, permit, limits, false, failure.countable);
         emitMcpCircuitTransition(
@@ -1455,54 +1562,11 @@ async function runMcpOperation<T>(
   }
 }
 
-/**
- * Map a JSON schema to a Zod schema for a tool's arguments. MCP tool schemas
- * frequently omit a top-level `type` (e.g. `{ properties: {...} }`), so the
- * shape is inferred from `properties`/`items` when absent. Only genuinely
- * unrecognized `type` values fall back to `z.any()` (and warn) — an empty or
- * inferable schema maps cleanly without a warning.
- */
-export function jsonSchemaToZod(schema: JsonSchema): z.ZodType {
-  const rawType = typeof schema.type === "string" ? schema.type : undefined;
-  const inferred =
-    rawType ?? (schema.properties ? "object" : schema.items ? "array" : undefined);
-
-  switch (inferred) {
-    case "object": {
-      const properties = schema.properties ?? {};
-      const entries = Object.entries(properties).map(([key, prop]) => {
-        const field = withDescription(jsonSchemaToZod(prop), prop);
-        return [key, schema.required?.includes(key) ? field : field.optional()] as const;
-      });
-      if (entries.length === 0) return z.record(z.string(), z.any());
-      return z.object(Object.fromEntries(entries));
-    }
-    case "string":
-      return z.string();
-    case "number":
-      return z.number();
-    case "integer":
-      return z.number().int();
-    case "boolean":
-      return z.boolean();
-    case "array": {
-      const items = schema.items ?? {};
-      return z.array(withDescription(jsonSchemaToZod(items), items));
-    }
-    case "null":
-      return z.null();
-    default: {
-      if (rawType !== undefined) {
-        logger.warn(`[mcp] tool schema: unrecognized type '${rawType}' → z.any()`);
-      }
-      return z.any();
-    }
-  }
-}
-
-function withDescription(field: z.ZodType, schema: JsonSchema): z.ZodType {
-  return schema.description ? field.describe(schema.description) : field;
-}
+// `jsonSchemaToZod` lives in the neutral `tools/schema.ts` (finding m2) so
+// `tools/bind.ts` no longer has to import from this module, which imports
+// `tools/bind.ts` back. Imported for local use above and re-exported here so
+// existing importers (`test/agents/mcp.test.ts`) keep working unchanged.
+export { jsonSchemaToZod } from "../tools/schema.ts";
 
 function resolveMcpRequestHeaders(
   server: McpServerConfig,
@@ -1767,6 +1831,33 @@ export function resetMcpToolListCache(): void {
   setMcpToolListCache(undefined);
 }
 
+/**
+ * The D2 result-cache credential component: a one-way fingerprint of the
+ * RESOLVED request headers for a server. Unlike `mcpToolListCacheKey` (which
+ * fingerprints the literal `${REF}` strings so the tool-list entry stays stable
+ * across rotations), this resolves `${MCP_TOKEN}` first, so rotating the env var
+ * changes the fingerprint and a stale cached tool result cannot be served.
+ * Returns undefined when a header reference cannot be resolved: the call will
+ * fail at connect, and skipping the cache (rather than keying it under a bogus
+ * value) is the safe behaviour.
+ */
+function mcpResolvedCredentialFingerprint(
+  server: McpServerConfig,
+): string | undefined {
+  try {
+    return credentialFingerprint(resolveMcpRequestHeaders(server) ?? {});
+  } catch {
+    return undefined;
+  }
+}
+
+function requireJobLedger(opts: McpBindOptions | undefined): Ledger {
+  if (opts?.ledger === undefined) {
+    throw new Error("bindMcpServers: channel 'job' requires a ledger");
+  }
+  return opts.ledger;
+}
+
 export async function bindMcpServers(
   mcpServers: McpServerConfig[],
   opts?: McpBindOptions,
@@ -1781,6 +1872,44 @@ export async function bindMcpServers(
   const closeTimeoutMs = resolveTimeoutMs(opts?.closeTimeoutMs ?? opts?.timeoutMs);
   const session = resolveMcpSessionConfig(opts, limits);
   const bindingPins = new Map<string, Promise<readonly string[]>>();
+
+  // Step 1.11: MCP calls dispatch through the SAME shared engine as plugin
+  // tools. The interceptor set is per channel and closes over the SAME
+  // budget/cache/ledger objects the channel's plugin tools use, so budget (D1)
+  // and read-only result caching (D2) apply to MCP without a second policy path.
+  // `onResult` is deliberately omitted: MCP audit stays in `runMcpOperation`
+  // (D5), and the pipeline's `onResult` sink is plugin-source-only.
+  const channel = opts?.channel ?? "sync-stateless";
+  const scopeHooks: Omit<ToolCallScope, "rawSettled" | "onBodySkipped"> = {
+    ...(opts?.track === undefined ? {} : { track: opts.track }),
+    ...(opts?.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
+    ...(opts?.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
+    ...(opts?.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
+  };
+  const pipeline = channel === "job"
+    ? createToolPipeline({
+        interceptors: createJobToolInterceptors({
+          ledger: requireJobLedger(opts),
+          ...(opts?.budget === undefined ? {} : { budget: opts.budget }),
+          ...(opts?.toolCache === undefined ? {} : { cache: opts.toolCache }),
+          ...(opts?.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
+        }),
+      })
+    : createToolPipeline({
+        interceptors: createSyncToolInterceptors({
+          ...(opts?.budget === undefined ? {} : { budget: opts.budget }),
+          ...(opts?.toolCache === undefined ? {} : { cache: opts.toolCache }),
+        }),
+      });
+  // Plugin-wins tie-break (the deleted `mergePluginAndMcpTools`): the set starts
+  // with the plugin tool names and grows as MCP tools are added, so an MCP
+  // duplicate against either a plugin or an earlier MCP tool is skipped with the
+  // same warning. The anonymous `actionId` sequence is per binding, exactly like
+  // `bindTools`.
+  const pluginToolNames = opts?.excludeToolNames;
+  const boundToolNames = new Set<string>(pluginToolNames ?? []);
+  const duplicateLogPrefix = opts?.duplicateLogPrefix ?? "[mcp]";
+  let mcpAnonymousToolSequence = 0;
 
   for (const server of mcpServers) {
     if (opts?.signal?.aborted) break;
@@ -1952,7 +2081,6 @@ export async function bindMcpServers(
 
     try {
       let listed = cache.get(cacheKey);
-      const cacheHit = listed !== undefined;
        if (listed !== undefined) {
          assertMcpToolList(listed, boundaryLimits);
          emitMcpAudit({
@@ -1974,7 +2102,9 @@ export async function bindMcpServers(
            owner: opts?.owner,
            ownerKey: scope,
            requestId: opts?.requestId,
-           signal: opts?.signal,
+           // Attribution only; the outbound list call is cancelled by the same
+           // channel signal passed to `runMcpClientOperation` below.
+           attributionSignal: opts?.signal,
 
           event: "mcp.list",
           cacheHit: false,
@@ -2006,55 +2136,158 @@ export async function bindMcpServers(
          cache.set(cacheKey, listed);
 
       }
+      const resolvedFingerprint = mcpResolvedCredentialFingerprint(server);
       for (const tool of listed) {
         if (!tool.name) continue;
         const safe = isMcpToolSafeToRepeat(tool);
         toolSafety.set(tool.name, (toolSafety.get(tool.name) ?? true) && safe);
+        // Plugin-wins tie-break, exactly as the deleted `mergePluginAndMcpTools`:
+        // the first occurrence wins and an MCP duplicate (against a plugin or an
+        // earlier MCP tool) is skipped with the same warning.
+        if (boundToolNames.has(tool.name)) {
+          // Finding m4: name the actual owners. A duplicate is either against a
+          // plugin tool (the seeded set) or against an earlier MCP server.
+          const owner =
+            pluginToolNames?.has(tool.name) === true
+              ? "both a plugin and an MCP server"
+              : "multiple MCP servers";
+          console.warn(
+            `${duplicateLogPrefix} tool '${tool.name}' defined by ${owner}; skipping MCP version`,
+          );
+          continue;
+        }
+        boundToolNames.add(tool.name);
         const schema = tool.inputSchema
           ? jsonSchemaToZod(tool.inputSchema as JsonSchema)
           : z.object({});
 
         tools.push(
-          new DynamicStructuredTool({
+          createBoundTool({
+            pipeline,
             name: tool.name,
             description: tool.description ?? "",
             schema,
-             func: async (args: Record<string, unknown>) => {
-               const serializedArgs = serializeBoundedToolArguments(args);
-                    const result = await runMcpOperation({
-                  server,
-                  owner: opts?.owner,
-                  ownerKey: scope,
-                  requestId: opts?.requestId,
-                  signal: opts?.signal,
-
-                 event: "mcp.tool",
-                  tool: tool.name,
-                  cacheHit,
-                   inputBytes: Buffer.byteLength(serializedArgs, "utf8"),
-                   limits,
-
-                  run: async () => {
-                    const handle = await getClient();
-                    const raw = await runMcpClientOperation(
-                      handle,
-                      opts?.signal,
-                      () => withMcpTimeout(
-                        () => handle.client.callTool({ name: tool.name, arguments: args }),
-                        timeoutMs,
-                        "invoke",
-                        server.name,
-                      ),
-                    );
-                    return boundMcpCallResult(raw, boundaryLimits);
-                  },
-                 onFailure: invalidateCurrent,
-                  outputBytes: callResultBytes,
-
-               });
-               const content = result.content ?? [];
-               return content.map((item) => item.text ?? "").join("\n");
-
+            actionIdPrefix: `mcp:${server.name}:${tool.name}`,
+            bindingSignal: opts?.signal,
+            nextAnonymousToolSequence: () => ++mcpAnonymousToolSequence,
+            prepare: (ctx) => {
+              // Sync account-deletion tombstone, mirroring the plugin channel's
+              // `buildCall` pre-check (the job channel's fence interceptor owns
+              // this instead). Runs before `serialize`/`cache` via `dispatch`.
+              if (channel !== "job") opts?.assertActive?.();
+              const { bodies, scope: bodyScope } = makeToolBodies({
+                source: "mcp",
+                channelLabel: "mcp",
+                scope: scopeHooks,
+                invoke: (bodySignal, dispatch) =>
+                  runMcpOperation({
+                    server,
+                    owner: opts?.owner,
+                    ownerKey: scope,
+                    requestId: opts?.requestId,
+                    // Finding M1: attribute the failure with the CHANNEL signal
+                    // (`call.signal`), NOT the pipeline-composed `bodySignal`,
+                    // which the `execution` interceptor aborts on timeout. The
+                    // composed signal still reaches the outbound call below so a
+                    // timeout/cancel genuinely aborts it (contract 3, N1).
+                    attributionSignal: dispatch.call.signal,
+                    event: "mcp.tool",
+                    tool: tool.name,
+                    // Finding m1: this audit describes the TOOL call, not the
+                    // tool-LIST cache. The list cache already emits its own
+                    // `mcp.list` audit; claiming the list hit here would falsely
+                    // report a result-cache hit on every warm-bind invocation.
+                    cacheHit: false,
+                    inputBytes: dispatch.inputBytes,
+                    limits,
+                    run: async () => {
+                      const handle = await getClient();
+                      try {
+                        const raw = await runMcpClientOperation(
+                          handle,
+                          bodySignal,
+                          () => withMcpTimeout(
+                            () => handle.client.callTool({ name: tool.name, arguments: ctx.args }),
+                            timeoutMs,
+                            "invoke",
+                            server.name,
+                          ),
+                        );
+                        return boundMcpCallResult(raw, boundaryLimits);
+                      } catch (error) {
+                        // The pipeline's `execution` bound shares `timeoutMs`
+                        // with MCP's own `withMcpTimeout` and schedules its timer
+                        // first, so a timeout surfaces here as the bare
+                        // `AbortError` from `runMcpClientOperation`. Attribute it
+                        // as MCP's own timeout so `classifyMcpFailure` (reading
+                        // the non-aborted channel signal) counts it toward the
+                        // circuit instead of recording a cancellation (M1).
+                        if (
+                          error instanceof Error &&
+                          error.name === "AbortError" &&
+                          isToolTimeoutAbort(bodySignal)
+                        ) {
+                          throw new McpError(
+                            `MCP invoke to '${redactForOutbound(server.name)}' timed out after ${timeoutMs}ms`,
+                            "MCP_TIMEOUT",
+                          );
+                        }
+                        throw error;
+                      }
+                    },
+                    onFailure: invalidateCurrent,
+                    outputBytes: callResultBytes,
+                  }).then((result) => {
+                    // Post-execution tombstone re-check: do not cache a result
+                    // produced after the owner began deleting (mirrors plugin sync).
+                    if (channel !== "job") opts?.assertActive?.();
+                    const content = result.content ?? [];
+                    return content.map((item) => item.text ?? "").join("\n");
+                  }),
+              });
+              const call: ToolCall = {
+                source: "mcp",
+                pluginId: `mcp:${server.name}`,
+                // The tool-list cache identity: URL + (unresolved) header
+                // fingerprint. The result-cache key's credential component is the
+                // RESOLVED-header fingerprint below (D2), so a rotated
+                // `${MCP_TOKEN}` cannot serve a stale entry even though this
+                // component stays stable.
+                pluginVersion: cacheKey,
+                tool: tool.name,
+                args: ctx.args,
+                // Finding M5: conservative AND-merge across ALL servers, read at
+                // invocation time. `safe` is the FIRST occurrence's value, but a
+                // later server (whose duplicate tool is skipped) may declare the
+                // same name destructive; `toolSafety` holds the AND of every
+                // occurrence, so a name any server declares non-repeatable is
+                // never treated as read-only (and therefore never cached or
+                // job-replayed).
+                readOnly: toolSafety.get(tool.name) ?? safe,
+                ...(opts?.owner === undefined ? {} : { owner: opts.owner }),
+                ...(opts?.requestId === undefined ? {} : { requestId: opts.requestId }),
+                ...(resolvedFingerprint === undefined
+                  ? {}
+                  : { credentialFingerprint: resolvedFingerprint }),
+                ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+                channel,
+                ...(ctx.toolCallId === undefined ? {} : { toolCallId: ctx.toolCallId }),
+                actionId: ctx.actionId,
+                // Requirement 7: the pipeline's execution bound agrees exactly
+                // with MCP's own `withMcpTimeout` transport guard.
+                timeoutMs,
+                maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+                ...(channel === "job"
+                  ? {
+                      ...(opts?.taskId === undefined ? {} : { taskId: opts.taskId }),
+                      ...(opts?.fenceToken === undefined ? {} : { fenceToken: opts.fenceToken }),
+                      ...(opts?.allowMutatingRetry === undefined
+                        ? {}
+                        : { allowMutatingRetry: opts.allowMutatingRetry }),
+                    }
+                  : {}),
+              };
+              return { call, bodies, scope: bodyScope };
             },
           }),
         );
@@ -2084,7 +2317,6 @@ export async function bindMcpServers(
   };
   return {
     tools,
-    toolReadOnly: new Set([...toolSafety].filter(([, safe]) => safe).map(([name]) => name)),
     dispose: disposeBinding,
   };
 }
