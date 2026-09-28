@@ -8,10 +8,9 @@ import {
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
-import { createToolPipeline } from "../tools/pipeline.ts";
+import type { ToolPipeline } from "../tools/pipeline.ts";
 import { bindTools, makePluginBodies } from "../tools/bind.ts";
-import { createSyncToolInterceptors } from "../tools/interceptors/order.ts";
-import { createPluginAuditSink } from "../tools/audit.ts";
+import { buildPipelineForChannel } from "../tools/channel.ts";
 
 // Single source of truth for JSON-Schema -> zod translation lives in the neutral
 // `tools/schema.ts` (it also infers `type` for schema-less MCP tools), so neither
@@ -67,6 +66,15 @@ export type BindPluginToolsOptions = {
    * longer substitutes them (`withToolResultCache` is gone).
    */
   credentialsByPlugin?: Record<string, Record<string, string>>;
+  /**
+   * Composition-root-supplied engine for this channel. When present it is used
+   * verbatim; otherwise the binder falls back to
+   * {@link buildPipelineForChannel} with the `budget`/`cache` deps below (the
+   * unit-test path). The root injects one shared sync-shaped engine so the
+   * construction and the channel→interceptor mapping live in one place
+   * (plan task 1.13).
+   */
+  pipeline?: ToolPipeline;
   budget?: BudgetManager;
   cache?: ToolResultCache;
   /**
@@ -112,16 +120,15 @@ export function bindPluginTools(
 ): DynamicStructuredTool[] {
   // `undefined` means "all installed"; an empty array means "none".
   const enabled = enabledPlugins === undefined ? null : new Set(enabledPlugins);
-  // One pipeline per binding: `createSyncToolInterceptors` closes over this
-  // stream's budget/cache, while every per-call value rides
-  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2).
-  const pipeline = createToolPipeline({
-    interceptors: createSyncToolInterceptors({
+  // The engine is injected by the composition root; the fallback preserves the
+  // unit-test call shape (no explicit pipeline). Either way the channel→
+  // interceptor mapping lives in `buildPipelineForChannel` and every per-call
+  // value rides `ToolCall`/`ToolCallScope` (plan §4.1/§4.2).
+  const pipeline = options.pipeline ??
+    buildPipelineForChannel(options.channel, {
       ...(options.budget === undefined ? {} : { budget: options.budget }),
       ...(options.cache === undefined ? {} : { cache: options.cache }),
-    }),
-    onResult: createPluginAuditSink(),
-  });
+    });
   return bindTools({
     registry,
     pipeline,

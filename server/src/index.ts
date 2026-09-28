@@ -38,6 +38,7 @@ import { createBudgetManager } from "./middleware/budget.ts";
 import { createPerOwnerRateLimiter } from "./middleware/rate_limit.ts";
 import { createToolResultCache } from "./middleware/cache.ts";
 import { createWarmupManager } from "./middleware/warmup.ts";
+import { buildPipelineForChannel } from "./tools/channel.ts";
 import { loadCatalogs } from "./catalog/index.ts";
 import type { Catalogs } from "./catalog/index.ts";
 
@@ -188,6 +189,18 @@ const chatBudget = createBudgetManager({
   maxModelCallsPerWindow: env.BUDGET_MODEL_CALL_LIMIT,
   modelCallWindowMs: env.BUDGET_MODEL_CALL_WINDOW_MS,
 });
+// Step 1.13: tool-pipeline construction is a composition-root concern. ONE
+// sync-shaped engine (`serialize → cache → budget → execution`) is shared by
+// the sync transport's plugin and MCP bindings AND by warmup; it is stateless
+// between dispatches (per-call data rides `ToolCall`/`ToolCallScope`). The
+// job-shaped engine cannot be a root singleton — its `fence` interceptor closes
+// over the per-job `assertActive` — so the root supplies the factory to the
+// runner below. The channel→interceptor mapping lives in
+// `buildPipelineForChannel` (tools/channel.ts).
+const syncToolPipeline = buildPipelineForChannel("sync-managed", {
+  budget: chatBudget,
+  cache: toolCache,
+});
 const warmupExecutor = new ToolExecutor({
   registry: pluginRegistry,
   getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
@@ -200,6 +213,7 @@ const warmups = createWarmupManager({
   registry: pluginRegistry,
   cache: toolCache,
   budget: chatBudget,
+  pipeline: syncToolPipeline,
   createHandler: ({ signal }) => ({
     execute: (pluginId, toolName, args, credentials) =>
       warmupExecutor.execute(pluginId, toolName, args, credentials, signal),
@@ -242,6 +256,17 @@ try {
     // read-only tool call is never executed twice across sync and async.
     toolCache,
     budget: chatBudget,
+    // Step 1.13: the job-channel engine is built here (from the same shared
+    // deps) but instantiated per job by the runner, because `fence` closes over
+    // the per-job `assertActive`. The channel→interceptor mapping still lives
+    // in `buildPipelineForChannel`.
+    createToolPipeline: (assertActive) =>
+      buildPipelineForChannel("job", {
+        ledger,
+        budget: chatBudget,
+        cache: toolCache,
+        assertActive,
+      }),
     // M1: periodic credential-pin GC. In-memory pins are released by the
     // runner's finally / the transport's non-claimed-path releases, but a
     // crash between admission and claim could still leak one; a periodic
@@ -323,6 +348,8 @@ app.route(
     jobRunner,
     pins: jobPins,
     toolCache,
+    // Step 1.13: the ONE sync-shaped engine, shared with warmup above.
+    toolPipeline: syncToolPipeline,
     trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
     rateLimiter: chatRateLimiter,
     budget: chatBudget,

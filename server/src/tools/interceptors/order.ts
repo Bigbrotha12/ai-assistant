@@ -21,10 +21,10 @@ import type { ToolInterceptor } from "../pipeline.ts";
  *     `finally` runs when the bounded race settles, so it can observe an
  *     unsettled raw body (`runner.ts:908`, plan D7).
  *
- * The job composition root builds its interceptor array through
- * `createJobToolInterceptors` so the order lives in one place: `bindJobTools`
- * (`jobs/runner.ts`) does so and the duplicated inline body was deleted in
- * Phase 1.9a (finding N5, now resolved).
+ * The composition root builds the job channel's interceptor array through
+ * `createJobToolInterceptors` (via `buildPipelineForChannel`, `tools/channel.ts`)
+ * so the order lives in one place; `bindJobTools` (`jobs/runner.ts`) receives
+ * the resulting engine (task 1.13) rather than re-deriving the set.
  */
 export const JOB_TOOL_INTERCEPTOR_ORDER = [
   "fence",
@@ -86,8 +86,10 @@ export function createJobToolInterceptors(
  *     bound, so `withToolCallBudget`'s `finally` never ran and no quarantine was
  *     ever registered. Unifying budget around execution fixes that.
  *
- * `bindPluginTools` builds its pipeline through this factory so the order lives
- * in one place.
+ * `buildPipelineForChannel` (`tools/channel.ts`) builds the sync-shaped engine
+ * through this factory, so the order lives in one place; `bindPluginTools`,
+ * `bindMcpServers` and the warmup manager receive that engine (task 1.13)
+ * rather than re-deriving the set.
  */
 export const SYNC_TOOL_INTERCEPTOR_ORDER = [
   "serialize",

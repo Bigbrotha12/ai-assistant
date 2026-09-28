@@ -9,10 +9,9 @@ import {
   serializeBoundedToolArguments,
 } from "../tool_bounds.ts";
 import type { ToolCacheKey, ToolResultCache } from "./cache.ts";
-import type { ToolCall } from "../tools/pipeline.ts";
-import { createToolPipeline } from "../tools/pipeline.ts";
+import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
 import { makePluginBodies } from "../tools/bind.ts";
-import { createSyncToolInterceptors } from "../tools/interceptors/order.ts";
+import { buildPipelineForChannel } from "../tools/channel.ts";
 
 export type WarmupCall = {
   owner: string;
@@ -49,6 +48,15 @@ export type WarmupOptions = {
   registry: Pick<PluginRegistry, "requirePlugin">;
   cache: ToolResultCache;
   budget: BudgetManager;
+  /**
+   * Composition-root-supplied sync-shaped engine. Warmup is a sync-shaped
+   * channel (`serialize → cache → budget → execution`) and the root shares the
+   * one sync engine with it; the shared `onResult` sink skips
+   * `channel === "warmup"`, so no `plugin.tool` audit is emitted (D6). When
+   * absent the manager falls back to {@link buildPipelineForChannel} (the
+   * unit-test path).
+   */
+  pipeline?: ToolPipeline;
   createHandler: (context: WarmupContext) => ToolCallHandler;
 };
 
@@ -91,15 +99,15 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
       throw new Error(`createWarmupManager: ${name} must be a positive bounded integer`);
     }
   }
-  // One shared pipeline per manager. The interceptors close over the
-  // manager's budget/cache; every per-call value rides `ToolCall`/`ToolCallScope`
-  // (plan §4.1/§4.2). Deliberately no `onResult` sink — warmup emits no audit (D6).
-  const pipeline = createToolPipeline({
-    interceptors: createSyncToolInterceptors({
+  // One shared engine per manager (injected by the root; the fallback builds
+  // the sync shape through the same helper). Every per-call value rides
+  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2). Warmup emits no `plugin.tool`
+  // audit (D6): the shared `onResult` sink skips `channel === "warmup"`.
+  const pipeline = opts.pipeline ??
+    buildPipelineForChannel("warmup", {
       budget: opts.budget,
       cache: opts.cache,
-    }),
-  });
+    });
   const running = new Map<string, AbortController>();
   let disposed = false;
 

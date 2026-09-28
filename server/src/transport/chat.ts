@@ -18,6 +18,7 @@ import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_k
 import { AccountDeletedError, assertNotDeleting, isDeleting } from "../account_deletion.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
+import type { ToolPipeline } from "../tools/pipeline.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
 import { isRecord } from "../util.ts";
 import { createAgentGraph } from "../agents/graph.ts";
@@ -336,6 +337,14 @@ export type ChatRoutesOptions = {
    * BUDGET_QUEUE_MAX.
    */
   budget?: BudgetManager;
+  /**
+   * Composition-root-supplied sync-shaped engine (plan task 1.13). The root
+   * builds ONE sync engine and shares it with this transport; every sync
+   * plugin/MCP binding dispatches through it. When absent, the binders fall
+   * back to building their own through the shared channel helper (the
+   * unit-test path).
+   */
+  toolPipeline?: ToolPipeline;
   /** Test seam; defaults to the real model builder (transport/model.ts). */
   buildModel?: typeof buildModel;
   /**
@@ -1119,6 +1128,7 @@ async function handleSyncStream(
       channel: "sync-stateless",
       credentialsByPlugin: toolCredentialsByPlugin,
       budget,
+      ...(opts.toolPipeline === undefined ? {} : { pipeline: opts.toolPipeline }),
       ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
       signal: execution.signal,
       track: execution.track,
@@ -1141,6 +1151,7 @@ async function handleSyncStream(
         // plugin tools are already bound, so their names seed the tie-break.
         channel: "sync-stateless",
         budget,
+        ...(opts.toolPipeline === undefined ? {} : { pipeline: opts.toolPipeline }),
         ...(opts.toolCache === undefined ? {} : { toolCache: opts.toolCache }),
         track: execution.track,
         assertActive: () => assertNotDeleting(owner),
@@ -1491,6 +1502,7 @@ async function handleManagedSessionStream(
         channel: "sync-managed",
         credentialsByPlugin: toolCredentialsByPlugin,
         budget,
+        ...(opts.toolPipeline === undefined ? {} : { pipeline: opts.toolPipeline }),
         ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
         signal: execution.signal,
         track: execution.track,
@@ -1511,6 +1523,7 @@ async function handleManagedSessionStream(
           // Same engine wiring as the stateless path above (D1/D2).
           channel: "sync-managed",
           budget,
+          ...(opts.toolPipeline === undefined ? {} : { pipeline: opts.toolPipeline }),
           ...(opts.toolCache === undefined ? {} : { toolCache: opts.toolCache }),
           track: execution.track,
           assertActive: () => assertNotDeleting(owner),

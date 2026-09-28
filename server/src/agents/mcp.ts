@@ -28,13 +28,14 @@ import {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   TOOL_RESULT_TRUNCATION_MARKER,
 } from "../tool_bounds.ts";
-import { createBoundTool, makeToolBodies } from "../tools/bind.ts";
-import { createToolPipeline } from "../tools/pipeline.ts";
-import type { ToolCall, ToolCallScope } from "../tools/pipeline.ts";
 import {
-  createJobToolInterceptors,
-  createSyncToolInterceptors,
-} from "../tools/interceptors/order.ts";
+  channelScopeHooks,
+  createAnonymousSequence,
+  createBoundTool,
+  makeToolBodies,
+} from "../tools/bind.ts";
+import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
+import { buildPipelineForChannel } from "../tools/channel.ts";
 import { redactForOutbound } from "../redact.ts";
 import {
   emitAuditEvent,
@@ -979,6 +980,15 @@ export type McpBindOptions = {
   limits?: Partial<McpLimits>;
   bounds?: Partial<McpBoundaryLimits>;
   /**
+   * Step 1.13: the composition-root-supplied engine for this binding's channel
+   * (the same one the channel's plugin tools use). When absent, the binder
+   * falls back to {@link buildPipelineForChannel} with the policy deps below
+   * (the unit-test path), so the channel→interceptor mapping still lives in one
+   * place. MCP audit stays inside `runMcpOperation` (D5); the shared engine's
+   * `onResult` sink is plugin-source-only, so an MCP dispatch is a no-op there.
+   */
+  pipeline?: ToolPipeline;
+  /**
    * Step 1.11: policy deps for the pipeline every MCP tool call dispatches
    * through. Interceptors close over the SAME budget/cache/ledger objects the
    * channel's plugin tools use, so MCP gains budget (D1) and read-only result
@@ -1851,13 +1861,6 @@ function mcpResolvedCredentialFingerprint(
   }
 }
 
-function requireJobLedger(opts: McpBindOptions | undefined): Ledger {
-  if (opts?.ledger === undefined) {
-    throw new Error("bindMcpServers: channel 'job' requires a ledger");
-  }
-  return opts.ledger;
-}
-
 export async function bindMcpServers(
   mcpServers: McpServerConfig[],
   opts?: McpBindOptions,
@@ -1873,34 +1876,28 @@ export async function bindMcpServers(
   const session = resolveMcpSessionConfig(opts, limits);
   const bindingPins = new Map<string, Promise<readonly string[]>>();
 
-  // Step 1.11: MCP calls dispatch through the SAME shared engine as plugin
-  // tools. The interceptor set is per channel and closes over the SAME
-  // budget/cache/ledger objects the channel's plugin tools use, so budget (D1)
-  // and read-only result caching (D2) apply to MCP without a second policy path.
-  // `onResult` is deliberately omitted: MCP audit stays in `runMcpOperation`
-  // (D5), and the pipeline's `onResult` sink is plugin-source-only.
+  // Step 1.11/1.13: MCP calls dispatch through the SAME shared engine as plugin
+  // tools. The engine is injected by the caller (one per channel shape, built
+  // by the composition root); the fallback goes through the same
+  // `buildPipelineForChannel` helper, so the channel→interceptor mapping lives
+  // in exactly one place. Budget (D1) and read-only result caching (D2) apply
+  // to MCP without a second policy path. MCP audit stays in `runMcpOperation`
+  // (D5): the engine's `onResult` sink is plugin-source-only, so an MCP
+  // dispatch reaching it is a no-op.
   const channel = opts?.channel ?? "sync-stateless";
-  const scopeHooks: Omit<ToolCallScope, "rawSettled" | "onBodySkipped"> = {
-    ...(opts?.track === undefined ? {} : { track: opts.track }),
-    ...(opts?.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
-    ...(opts?.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
-    ...(opts?.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
-  };
-  const pipeline = channel === "job"
-    ? createToolPipeline({
-        interceptors: createJobToolInterceptors({
-          ledger: requireJobLedger(opts),
-          ...(opts?.budget === undefined ? {} : { budget: opts.budget }),
-          ...(opts?.toolCache === undefined ? {} : { cache: opts.toolCache }),
-          ...(opts?.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
-        }),
-      })
-    : createToolPipeline({
-        interceptors: createSyncToolInterceptors({
-          ...(opts?.budget === undefined ? {} : { budget: opts.budget }),
-          ...(opts?.toolCache === undefined ? {} : { cache: opts.toolCache }),
-        }),
-      });
+  const scopeHooks = channelScopeHooks({
+    track: opts?.track,
+    trackUntil: opts?.trackUntil,
+    onToolStart: opts?.onToolStart,
+    onToolEnd: opts?.onToolEnd,
+  });
+  const pipeline = opts?.pipeline ??
+    buildPipelineForChannel(channel, {
+      ...(opts?.budget === undefined ? {} : { budget: opts.budget }),
+      ...(opts?.toolCache === undefined ? {} : { cache: opts.toolCache }),
+      ...(opts?.ledger === undefined ? {} : { ledger: opts.ledger }),
+      ...(opts?.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
+    });
   // Plugin-wins tie-break (the deleted `mergePluginAndMcpTools`): the set starts
   // with the plugin tool names and grows as MCP tools are added, so an MCP
   // duplicate against either a plugin or an earlier MCP tool is skipped with the
@@ -1909,7 +1906,7 @@ export async function bindMcpServers(
   const pluginToolNames = opts?.excludeToolNames;
   const boundToolNames = new Set<string>(pluginToolNames ?? []);
   const duplicateLogPrefix = opts?.duplicateLogPrefix ?? "[mcp]";
-  let mcpAnonymousToolSequence = 0;
+  const nextAnonymousToolSequence = createAnonymousSequence();
 
   for (const server of mcpServers) {
     if (opts?.signal?.aborted) break;
@@ -2169,7 +2166,7 @@ export async function bindMcpServers(
             schema,
             actionIdPrefix: `mcp:${server.name}:${tool.name}`,
             bindingSignal: opts?.signal,
-            nextAnonymousToolSequence: () => ++mcpAnonymousToolSequence,
+            nextAnonymousToolSequence,
             prepare: (ctx) => {
               // Sync account-deletion tombstone, mirroring the plugin channel's
               // `buildCall` pre-check (the job channel's fence interceptor owns

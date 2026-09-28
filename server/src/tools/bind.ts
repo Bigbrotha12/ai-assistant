@@ -100,7 +100,7 @@ export type BindToolsOptions = {
 export function bindTools(opts: BindToolsOptions): DynamicStructuredTool[] {
   const tools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
-  let anonymousToolSequence = 0;
+  const nextAnonymousToolSequence = createAnonymousSequence();
   for (const plugin of opts.registry.listInstalledPlugins()) {
     if (!isToolPlugin(plugin)) continue;
     if (!opts.hooks.select(plugin)) continue;
@@ -113,7 +113,7 @@ export function bindTools(opts: BindToolsOptions): DynamicStructuredTool[] {
       }
       seen.add(toolDef.name);
       tools.push(
-        bindTool(opts, plugin, toolDef, () => ++anonymousToolSequence),
+        bindTool(opts, plugin, toolDef, nextAnonymousToolSequence),
       );
     }
   }
@@ -177,6 +177,39 @@ export function createBoundTool(opts: {
       return opts.pipeline.dispatch({ call, bodies, scope });
     },
   });
+}
+
+/**
+ * The per-binding anonymous-sequence counter (plan §4.1). Shared by `bindTools`
+ * (plugin sources) and `bindMcpServers` (MCP source) so the "1-based, per
+ * binding, only consulted when the model supplied no tool-call id" rule is
+ * written once. Returns the next sequence number; `createBoundTool` composes
+ * the `actionId` as `` `${prefix}:${n}` ``.
+ */
+export function createAnonymousSequence(): () => number {
+  let sequence = 0;
+  return () => ++sequence;
+}
+
+/**
+ * The channel-owned `ToolCallScope` extras (`track`/`trackUntil`/
+ * `onToolStart`/`onToolEnd`), assembled once for every binder. `rawSettled` and
+ * `onBodySkipped` are NOT here: the channel's `ToolBodies` wrapper owns those
+ * (plan §4.2). A `undefined` field is omitted rather than set to `undefined`,
+ * matching the pre-1.13 inline bundles.
+ */
+export function channelScopeHooks(opts: {
+  readonly track?: ToolCallScope["track"];
+  readonly trackUntil?: ToolCallScope["trackUntil"];
+  readonly onToolStart?: (actionId: string) => void;
+  readonly onToolEnd?: (actionId: string) => void;
+}): Omit<ToolCallScope, "rawSettled" | "onBodySkipped"> {
+  return {
+    ...(opts.track === undefined ? {} : { track: opts.track }),
+    ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
+    ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
+    ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
+  };
 }
 
 function bindTool(

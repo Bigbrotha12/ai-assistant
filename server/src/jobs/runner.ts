@@ -30,10 +30,9 @@ import { credentialFingerprint } from "../plugins/credential.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import { BudgetExhaustedError } from "../middleware/budget.ts";
-import { createToolPipeline } from "../tools/pipeline.ts";
-import { bindTools, makePluginBodies } from "../tools/bind.ts";
-import { createJobToolInterceptors } from "../tools/interceptors/order.ts";
-import { createPluginAuditSink } from "../tools/audit.ts";
+import type { ToolPipeline } from "../tools/pipeline.ts";
+import { bindTools, channelScopeHooks, makePluginBodies } from "../tools/bind.ts";
+import { buildPipelineForChannel } from "../tools/channel.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 import { JobError } from "./errors.ts";
 import type { JobErrorCode } from "./errors.ts";
@@ -697,6 +696,15 @@ export type JobRunnerDeps = {
    * no per-owner model-call budget.
    */
   budget?: BudgetManager;
+  /**
+   * Composition-root-owned job-channel engine factory (plan task 1.13). The
+   * job shape is the ONLY engine that cannot be a root singleton: its `fence`
+   * interceptor closes over the per-job `assertActive` guard, which the runner
+   * builds for each admitted task. The root supplies the factory (with the
+   * shared ledger/budget/cache) and the runner calls it once per job; omitted →
+   * the runner builds the same engine through {@link buildPipelineForChannel}.
+   */
+  createToolPipeline?: (assertActive: () => void) => ToolPipeline;
   toolHandlerTimeoutMs?: number;
   maxToolResultChars?: number;
   setInterval?: typeof setInterval;
@@ -727,6 +735,13 @@ function isConflict(e: unknown): boolean {
 export type BindJobToolsOptions = {
   registry: PluginRegistry;
   handler: JobToolHandler;
+  /**
+   * Composition-root-supplied job-channel engine. When absent the binder falls
+   * back to {@link buildPipelineForChannel} with the deps below (the unit-test
+   * path); the runner always injects the per-job engine it built for both the
+   * plugin and MCP bindings.
+   */
+  pipeline?: ToolPipeline;
   credentialsByPlugin: Record<string, Record<string, string>>;
   getCredentials?: (pluginId: string) => CredentialPin;
   assertActive?: () => void;
@@ -787,19 +802,18 @@ export type BindJobToolsOptions = {
  * executes immediately with no dedupe — there is no id to dedupe against.
  */
 export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[] {
-  // One pipeline per binding: `createJobToolInterceptors` closes over this
-  // job's ledger/budget/cache/dispatch guard, while every per-call value rides
-  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2). The pipeline is stateless
-  // between dispatches.
-  const pipeline = createToolPipeline({
-    interceptors: createJobToolInterceptors({
+  // The engine is injected by the runner (one per job, because `fence` closes
+  // over the per-job `assertActive`); the fallback preserves the unit-test call
+  // shape. Either way the channel→interceptor mapping lives in
+  // `buildPipelineForChannel` and every per-call value rides
+  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2).
+  const pipeline = opts.pipeline ??
+    buildPipelineForChannel("job", {
       ledger: opts.ledger,
       ...(opts.budget === undefined ? {} : { budget: opts.budget }),
       ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
       ...(opts.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
-    }),
-    onResult: createPluginAuditSink(),
-  });
+    });
   return bindTools({
     registry: opts.registry,
     pipeline,
@@ -854,12 +868,12 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
               call.credentials,
               bodySignal,
             ),
-          scope: {
-            ...(opts.track === undefined ? {} : { track: opts.track }),
-            ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
-            ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
-            ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
-          },
+          scope: channelScopeHooks({
+            track: opts.track,
+            trackUntil: opts.trackUntil,
+            onToolStart: opts.onToolStart,
+            onToolEnd: opts.onToolEnd,
+          }),
           channelLabel: "job",
         }),
     },
@@ -1264,12 +1278,24 @@ export class JobRunner {
       trackModelExecution(model, execution);
       const executor = this.deps.executor ?? this.createDefaultExecutor();
       const handler = descriptor.toolHandler ?? executor;
+      // ONE job-channel engine per job, shared by the plugin and MCP bindings
+      // below. Built through the composition root's factory (which owns the
+      // shared ledger/budget/cache) so the per-job `assertActive` rides the
+      // `fence` interceptor exactly once (plan task 1.13).
+      const jobPipeline = (this.deps.createToolPipeline ?? ((assertActive: () => void) =>
+        buildPipelineForChannel("job", {
+          ledger: this.deps.ledger,
+          ...(this.deps.budget === undefined ? {} : { budget: this.deps.budget }),
+          ...(this.deps.toolCache === undefined ? {} : { cache: this.deps.toolCache }),
+          assertActive,
+        })))(assertActive);
       const tools = bindJobTools({
         registry: this.deps.registry,
          handler,
          credentialsByPlugin,
         getCredentials,
         assertActive,
+        pipeline: jobPipeline,
         signal,
         fingerprintsByPlugin,
         onToolStart: (actionId) => {
@@ -1310,7 +1336,10 @@ export class JobRunner {
             // Step 1.11: MCP now dispatches through the SAME job engine as the
             // plugin tools, so the deleted `trackMcpTools` wrapper's replay,
             // fence, budget and cache behaviour is provided by the pipeline.
+            // Task 1.13: that engine is the ONE `jobPipeline` built above and
+            // shared with `bindJobTools`, not a second hand-built pipeline.
             channel: "job",
+            pipeline: jobPipeline,
             ledger: this.deps.ledger,
             ...(this.deps.budget === undefined ? {} : { budget: this.deps.budget }),
             ...(this.deps.toolCache === undefined ? {} : { toolCache: this.deps.toolCache }),
