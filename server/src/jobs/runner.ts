@@ -23,11 +23,9 @@ import {
 } from "../sentinel/shadow.ts";
 import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 import { redactForOutbound, redactMessages } from "../redact.ts";
-import { emitPluginToolAudit } from "../audit/telemetry.ts";
 import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { env } from "../env.ts";
 import {
-  canRetryTool,
   getOrCreateTask,
   hasToolResult,
   recordToolResult,
@@ -35,12 +33,18 @@ import {
 import { CredentialPinError } from "../credentials/pins.ts";
 import type { CredentialPin, CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
-import type { ToolCacheKey, ToolResultCache } from "../middleware/cache.ts";
+import type { ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
-import {
-  BudgetExhaustedError,
-  DEFAULT_TOOL_CALL_QUARANTINE_MS,
-} from "../middleware/budget.ts";
+import { BudgetExhaustedError } from "../middleware/budget.ts";
+import { createToolPipeline } from "../tools/pipeline.ts";
+import type {
+  ToolBody,
+  ToolCall,
+  ToolCallScope,
+  ToolPipeline,
+} from "../tools/pipeline.ts";
+import { createJobToolInterceptors } from "../tools/interceptors/order.ts";
+import { createPluginAuditSink } from "../tools/audit.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 import { JobError } from "./errors.ts";
 import type { JobErrorCode } from "./errors.ts";
@@ -67,7 +71,6 @@ import {
   boundToolResult,
   DEFAULT_TOOL_RESPONSE_MAX_BYTES,
   DEFAULT_TOOL_RESULT_MAX_CHARS,
-  invokeBoundedToolHandler,
   serializeBoundedToolArguments,
   readBoundedResponseText,
   ToolResourceError,
@@ -773,16 +776,25 @@ export type BindJobToolsOptions = {
 };
 
 /**
- * Bind the installed tool plugins into `DynamicStructuredTool`s, injecting the
- * pinned credentials per plugin AND tool-call replay dedupe:
+ * Bind the installed tool plugins into `DynamicStructuredTool`s.
  *
- *   - before executing, `hasToolResult(taskId, owner, toolCallId)` → a stored
- *     result is returned WITHOUT re-executing (crash-resume safety);
- *   - after executing, `recordToolResult(...)` persists the result atomically
- *     with the tool-call id and the fence token;
- *   - only `readOnly` tools may be re-run when `allowMutatingRetry` is false
- *     and no stored result exists — a mutating tool that cannot be proven
- *     never-run throws `tool_retry_forbidden`.
+ * The whole job-channel policy now lives in the shared `ToolPipeline`: this
+ * function only assembles the binding layer — the duplicate-name gate, the
+ * per-binding anonymous-sequence counter, and the per-call `ToolCall` +
+ * `ToolCallScope` — and dispatches. The interceptor set
+ * (`fence → serialize → replay → cache → budget → execution`, built by
+ * `createJobToolInterceptors`) reproduces the previous inline body exactly:
+ *
+ *   - `fence` guards the task's running fence pre/post/before-body;
+ *   - `serialize` bounds and measures the args (`task_conflict` still wins over
+ *     `tool_args_too_large` because it is ordered after `fence`);
+ *   - `replay` returns a stored result WITHOUT re-executing (crash-resume
+ *     safety) and records the result on a fresh execution only;
+ *   - `cache` serves/stores read-only results;
+ *   - `budget` gates per owner+plugin and quarantines an unsettled raw body;
+ *   - `execution` bounds the handler, propagates the abort signal, and owns the
+ *     body-scoped cancellation telemetry.
+ *   - `onResult` emits the `plugin.tool` audit the per-call `finally` used to.
  *
  * A tool call invoked WITHOUT a tool-call context (direct/unit invocation)
  * executes immediately with no dedupe — there is no id to dedupe against.
@@ -791,6 +803,19 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
   const tools: DynamicStructuredTool[] = [];
   const seen = new Set<string>();
   let anonymousToolSequence = 0;
+  // One pipeline per binding: `createJobToolInterceptors` closes over this
+  // job's ledger/budget/cache/dispatch guard, while every per-call value rides
+  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2). The pipeline is stateless
+  // between dispatches.
+  const pipeline = createToolPipeline({
+    interceptors: createJobToolInterceptors({
+      ledger: opts.ledger,
+      ...(opts.budget === undefined ? {} : { budget: opts.budget }),
+      ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
+      ...(opts.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
+    }),
+    onResult: createPluginAuditSink(),
+  });
   for (const plugin of opts.registry.listInstalledPlugins()) {
     if (!isToolPlugin(plugin) || !Object.hasOwn(opts.credentialsByPlugin, plugin.id)) continue;
     const credentials = opts.credentialsByPlugin[plugin.id] ?? {};
@@ -805,6 +830,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
       tools.push(
         bindJobTool(
           opts,
+          pipeline,
           plugin,
           toolDef,
           credentials,
@@ -818,6 +844,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
 
 function bindJobTool(
   opts: BindJobToolsOptions,
+  pipeline: ToolPipeline,
   plugin: ToolPluginDefinition,
   toolDef: ToolDefinition,
   credentials: Record<string, string>,
@@ -828,180 +855,93 @@ function bindJobTool(
     description: toolDef.description,
     schema: jsonSchemaToZod(toolDef.inputSchema),
     func: async (input, _runManager, config) => {
-      const startedAt = Date.now();
-      let inputBytes = 0;
-      let outputBytes = 0;
-      let outcome: "ok" | "error" | "timeout" | "cancelled" = "ok";
-      let errorCode: string | undefined;
-      try {
-        const assertActive = () => {
-          opts.signal?.throwIfAborted();
-          config?.signal?.throwIfAborted();
-          const task = opts.ledger.getTask(opts.taskId, opts.owner);
-          if (!task || task.status !== "running" || task.fence_token !== opts.fenceToken) {
-            throw new JobError("task_conflict", "background job no longer holds a running task fence");
-          }
-          opts.assertActive?.();
-        };
-        assertActive();
-        const serializedArgs = serializeBoundedToolArguments(input);
-        inputBytes = Buffer.byteLength(serializedArgs, "utf8");
-        const pin = opts.getCredentials?.(plugin.id);
-        const invocationCredentials = pin?.credentials ?? { ...credentials };
-        const signal = opts.signal && config?.signal
-          ? AbortSignal.any([opts.signal, config.signal])
-          : opts.signal ?? config?.signal;
-        const toolCallId = (
-          config as { toolCall?: { id?: string } } | undefined
-        )?.toolCall?.id;
-        const actionId =
-          toolCallId ??
-          `tool:${plugin.id}:${toolDef.name}:${nextAnonymousToolSequence()}`;
-        const execute = async () => {
-          let settleRaw!: () => void;
-          const rawSettled = new Promise<void>((resolve) => { settleRaw = resolve; });
-          let rawStarted = false;
-          const timeoutMs = opts.handlerTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS;
-          const invoke = async () => {
-            assertActive();
-            opts.onToolStart?.(actionId);
-            try {
-              const bounded = invokeBoundedToolHandler(
-                (boundedSignal) => {
-                  rawStarted = true;
-                  let raw: Promise<string>;
-                  try {
-                    raw = Promise.resolve(opts.handler.execute(
-                      plugin.id,
-                      toolDef.name,
-                      input as Record<string, unknown>,
-                      invocationCredentials,
-                      boundedSignal,
-                    ));
-                  } catch (error) {
-                    settleRaw();
-                    throw error;
-                  }
-                  void raw.then(settleRaw, settleRaw);
-                  return raw;
-                },
-                {
-                  timeoutMs,
-                  maxResultChars: opts.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
-                  signal,
-                  timeoutMessage: `tool '${toolDef.name}' of plugin '${plugin.id}' exceeded the handler timeout`,
-                },
-              );
-              if (opts.budget) {
-                void opts.trackUntil?.(
-                  () => rawSettled,
-                  timeoutMs + DEFAULT_TOOL_CALL_QUARANTINE_MS,
-                );
-              }
-              const result = opts.track ? await opts.track(() => bounded) : await bounded;
-              assertActive();
-              return result;
-            } finally {
-              if (!rawStarted) settleRaw();
-              opts.onToolEnd?.(actionId);
-            }
-          };
-          return opts.budget
-            ? opts.budget.withToolCallBudget(opts.owner, plugin.id, invoke, {
-                requestId: opts.requestId,
-                tool: toolDef.name,
-                timeoutMs,
-                rawSettled,
-              })
-            : invoke();
-        };
-        if (!toolCallId) {
-          if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
-            throw new JobError("tool_retry_forbidden", "cannot replay a mutating tool without a stored result");
-          }
-          return await execute();
-        }
-        if (
-          hasToolResult(opts.ledger, {
-            taskId: opts.taskId,
-            owner: opts.owner,
-            toolCallId,
-          })
-        ) {
-          const step = opts.ledger.getStepByToolCallId(
-            opts.taskId,
-            toolCallId,
-            opts.owner,
-          );
-          const result = boundToolResult(step?.result ?? "");
-          outputBytes = Buffer.byteLength(result, "utf8");
-          return result;
-        }
-        const cache = opts.toolCache;
-        let cacheKey: ToolCacheKey | undefined;
-        if (cache && canRetryTool({ readOnly: toolDef.readOnly })) {
-          cacheKey = {
-            owner: opts.owner,
-            pluginId: plugin.id,
-            pluginVersion: plugin.version,
-            credentialFingerprint:
-              pin?.fingerprint ?? opts.fingerprintsByPlugin?.[plugin.id] ??
-              credentialFingerprint(invocationCredentials),
-            tool: toolDef.name,
-            argsHash: cache.argsHash(input as Record<string, unknown>),
-          };
-          const cached = cache.get(cacheKey);
-          if (cached !== undefined) {
-            const result = boundToolResult(cached);
-            outputBytes = Buffer.byteLength(result, "utf8");
-            return result;
-          }
-        }
-        if (!opts.allowMutatingRetry && !canRetryTool({ readOnly: toolDef.readOnly })) {
-          throw new JobError(
-            "tool_retry_forbidden",
-            `tool '${toolDef.name}' of plugin '${plugin.id}' is not read-only and has ` +
-              "no stored result; refusing to re-execute a possibly-applied side effect",
-          );
-        }
-         const result = boundToolResult(String(await execute()));
-         outputBytes = Buffer.byteLength(result, "utf8");
-        if (cacheKey) cache?.set(cacheKey, result);
-        recordToolResult(opts.ledger, {
-          taskId: opts.taskId,
-          owner: opts.owner,
-          fenceToken: opts.fenceToken,
-          toolCallId,
-          toolName: toolDef.name,
-          result,
-        });
-        return result;
-      } catch (error) {
-        outcome = opts.signal?.aborted || config?.signal?.aborted || (error instanceof Error && error.name === "AbortError")
-          ? "cancelled"
-          : error instanceof Error && "code" in error && error.code === "tool_timeout"
-            ? "timeout"
-            : "error";
-        errorCode = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-          ? error.code
-          : undefined;
-        throw error;
-      } finally {
+      const pluginId = plugin.id;
+      const toolName = toolDef.name;
+      const args = input as Record<string, unknown>;
+      const configSignal = (config as { signal?: AbortSignal } | undefined)?.signal;
+      // The channel signal is the composition of the job's own signal and the
+      // LangChain run signal. Captured before any timeout controller exists;
+      // the `execution` interceptor composes its timeout on top via next(signal).
+      const signal = opts.signal && configSignal
+        ? AbortSignal.any([opts.signal, configSignal])
+        : opts.signal ?? configSignal;
+      const toolCallId = (
+        config as { toolCall?: { id?: string } } | undefined
+      )?.toolCall?.id;
+      // The anonymous sequence counter belongs to the binding layer; it is only
+      // consulted when the model supplied no tool-call id (plan §4.1).
+      const actionId =
+        toolCallId ?? `tool:${pluginId}:${toolName}:${nextAnonymousToolSequence()}`;
+      const pin = opts.getCredentials?.(pluginId);
+      const invocationCredentials = pin?.credentials ?? { ...credentials };
+      const call: ToolCall = {
+        source: "plugin",
+        pluginId,
+        pluginVersion: plugin.version,
+        tool: toolName,
+        args,
+        readOnly: toolDef.readOnly,
+        owner: opts.owner,
+        ...(opts.requestId === undefined ? {} : { requestId: opts.requestId }),
+        credentials: invocationCredentials,
+        credentialFingerprint:
+          pin?.fingerprint ?? opts.fingerprintsByPlugin?.[pluginId] ??
+          credentialFingerprint(invocationCredentials),
+        ...(signal === undefined ? {} : { signal }),
+        channel: "job",
+        ...(toolCallId === undefined ? {} : { toolCallId }),
+        actionId,
+        timeoutMs: opts.handlerTimeoutMs ?? env.TOOL_CALL_TIMEOUT_MS,
+        maxResultChars: opts.maxResultChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
+        taskId: opts.taskId,
+        fenceToken: opts.fenceToken,
+        allowMutatingRetry: opts.allowMutatingRetry,
+      };
+
+      // The channel owns the raw-body promise: `rawSettled` resolves when the
+      // RAW (unbounded) handler settles, NOT when the bounded race does. The
+      // `budget` interceptor reads it before `execution` runs so it can tell an
+      // unsettled timeout (quarantine) from a release. When the body never
+      // starts, the core calls `onBodySkipped`, which resolves the SAME
+      // deferred so the budget slot releases rather than quarantines and the
+      // job's `settle()` is not held open for the quarantine deadline (D9).
+      let settleRaw!: () => void;
+      const rawSettled = new Promise<void>((resolve) => { settleRaw = resolve; });
+      const pluginBody: ToolBody = async (_dispatch, bodySignal) => {
+        let raw: Promise<string>;
         try {
-          emitPluginToolAudit({
-            owner: opts.owner,
-            pluginId: plugin.id,
-            tool: toolDef.name,
-            requestId: opts.requestId,
-            outcome,
-            durationMs: Math.max(0, Date.now() - startedAt),
-            inputBytes,
-            outputBytes,
-            ...(errorCode === undefined ? {} : { errorCode }),
-          });
-        } catch {
+          raw = Promise.resolve(
+            opts.handler.execute(
+              pluginId,
+              toolName,
+              args,
+              invocationCredentials,
+              bodySignal,
+            ),
+          );
+        } catch (error) {
+          // The body was invoked (so the core will NOT fire `onBodySkipped`),
+          // but the raw work never started; settle now so budget releases.
+          settleRaw();
+          throw error;
         }
-      }
+        void raw.then(settleRaw, settleRaw);
+        return raw;
+      };
+      const scope: ToolCallScope = {
+        rawSettled,
+        onBodySkipped: () => settleRaw(),
+        ...(opts.track === undefined ? {} : { track: opts.track }),
+        ...(opts.trackUntil === undefined ? {} : { trackUntil: opts.trackUntil }),
+        ...(opts.onToolStart === undefined ? {} : { onToolStart: opts.onToolStart }),
+        ...(opts.onToolEnd === undefined ? {} : { onToolEnd: opts.onToolEnd }),
+      };
+
+      return pipeline.dispatch({
+        call,
+        bodies: { plugin: pluginBody, mcp: async () => "" },
+        scope,
+      });
     },
   });
 }
@@ -1867,6 +1807,13 @@ export class JobRunner {
       registry: this.deps.registry,
       getPinnedIps: this.deps.getPinnedIps ?? (() => undefined),
       trustedHosts: this.deps.trustedHosts,
+      // D3: honor the job's effective handler bound at the executor's HTTP
+      // guard too, so a `toolHandlerTimeoutMs` override is not silently capped
+      // by `env.TOOL_CALL_TIMEOUT_MS`. Absent (the default) preserves today's
+      // env-derived executor timeout exactly.
+      ...(this.deps.toolHandlerTimeoutMs === undefined
+        ? {}
+        : { timeoutMs: this.deps.toolHandlerTimeoutMs }),
     });
   }
 
