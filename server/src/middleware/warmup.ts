@@ -6,10 +6,13 @@ import { isToolPlugin } from "../plugins/types.ts";
 import { BudgetExhaustedError, type BudgetManager } from "./budget.ts";
 import {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
-  invokeBoundedToolHandler,
   serializeBoundedToolArguments,
 } from "../tool_bounds.ts";
 import type { ToolCacheKey, ToolResultCache } from "./cache.ts";
+import type { ToolCall } from "../tools/pipeline.ts";
+import { createToolPipeline } from "../tools/pipeline.ts";
+import { makePluginBodies } from "../tools/bind.ts";
+import { createSyncToolInterceptors } from "../tools/interceptors/order.ts";
 
 export type WarmupCall = {
   owner: string;
@@ -52,6 +55,34 @@ export type WarmupOptions = {
 export const DEFAULT_WARMUP_MAX_CONCURRENT = 2;
 export const DEFAULT_WARMUP_TIMEOUT_MS = 10_000;
 
+/**
+ * Warmup — the proactive, best-effort pre-execution channel (plan §5, task 1.12).
+ *
+ * Admission stays here: the disabled/disposed/global-concurrency gates, the
+ * read-only + credential validation, the args re-serialization, the
+ * pre-existing cache probe, the duplicate-in-flight check, and the
+ * `reserveSync` slot reservation. What this manager no longer owns is the
+ * execution stack: the dispatched call runs through the shared `ToolPipeline`
+ * with `channel: "warmup"` and the sync interceptor set
+ * (`serialize → cache → budget → execution`).
+ *
+ * Divergences preserved deliberately:
+ *   - `timeoutMs` (default 10 s) rides `ToolCall.timeoutMs` and bounds the
+ *     pipeline's `execution` interceptor; the `ToolExecutor` handed in by the
+ *     composition root keeps its own env-derived guard. Warmup is explicitly
+ *     out of D3's scope.
+ *   - The credential fingerprint is derived from
+ *     `validateCredentials(...)`-canonicalised credentials (plan §10.1),
+ *     unlike the sync (raw body) and job (pin-preferred) channels.
+ *   - No `plugin.tool` audit is emitted (D6): the pipeline is constructed
+ *     WITHOUT an `onResult` sink, so the intent is explicit rather than relying
+ *     on `createPluginAuditSink` skipping the channel.
+ *   - `handlerSettled`/`releaseAfterHandler`: `cleanup()` (which releases the
+ *     `reserveSync` slot and clears the in-flight entry) runs as soon as the
+ *     dispatch settles, UNLESS the raw handler promise is still pending — in
+ *     which case it is deferred until that promise settles. A handler that
+ *     ignores abort must not free its slot early.
+ */
 export function createWarmupManager(opts: WarmupOptions): WarmupManager {
   const maxConcurrent = opts.maxConcurrent ?? DEFAULT_WARMUP_MAX_CONCURRENT;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_WARMUP_TIMEOUT_MS;
@@ -60,6 +91,15 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
       throw new Error(`createWarmupManager: ${name} must be a positive bounded integer`);
     }
   }
+  // One shared pipeline per manager. The interceptors close over the
+  // manager's budget/cache; every per-call value rides `ToolCall`/`ToolCallScope`
+  // (plan §4.1/§4.2). Deliberately no `onResult` sink — warmup emits no audit (D6).
+  const pipeline = createToolPipeline({
+    interceptors: createSyncToolInterceptors({
+      budget: opts.budget,
+      cache: opts.cache,
+    }),
+  });
   const running = new Map<string, AbortController>();
   let disposed = false;
 
@@ -149,41 +189,50 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
             !current.tools.some((candidate) => candidate.name === key.tool && canRetryTool(candidate))) {
           return { status: "cancelled" };
         }
-        if (opts.cache.get(key) !== undefined) {
-          return { status: "cached" };
-        }
-         const result = await opts.budget.withToolCallBudget(
-           key.owner,
-           key.pluginId,
-           () => {
-             const handler = opts.createHandler(context);
-             const handlerPromise = Promise.resolve().then(() =>
-               handler.execute(key.pluginId, key.tool, args, credentials, controller.signal),
-             );
-             handlerSettled = false;
-             void handlerPromise.then(
-               () => {
-                 handlerSettled = true;
-                 releaseAfterHandler?.();
-               },
-               () => {
-                 handlerSettled = true;
-                 releaseAfterHandler?.();
-               },
-             );
-             return invokeBoundedToolHandler(
-               () => handlerPromise,
-               {
-                 timeoutMs,
-                 signal: controller.signal,
-                 maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
-                 timeoutMessage: `warmup tool '${key.tool}' exceeded ${timeoutMs}ms`,
-               },
-             );
-           },
-         );
-         controller.signal.throwIfAborted();
-         opts.cache.set(key, result);
+        const toolCall: ToolCall = {
+          source: "plugin",
+          pluginId: key.pluginId,
+          pluginVersion: key.pluginVersion,
+          tool: key.tool,
+          args,
+          readOnly: true,
+          owner: key.owner,
+          credentials,
+          credentialFingerprint: key.credentialFingerprint,
+          signal: controller.signal,
+          channel: "warmup",
+          actionId: id,
+          timeoutMs,
+          maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+        };
+        // The channel owns the raw-body promise (plan §4.2). `makePluginBodies`
+        // builds the `plugin` body, the `rawSettled`/`onBodySkipped` pair the
+        // `budget` interceptor reads, and the fail-loud `mcp` stub. The handler
+        // is created inside `invoke`, i.e. only once every interceptor has
+        // admitted the call — a cache hit or a budget rejection never builds it.
+        const { bodies, scope } = makePluginBodies({
+          invoke: (bodySignal) => {
+            const handler = opts.createHandler(context);
+            const handlerPromise = Promise.resolve().then(() =>
+              handler.execute(key.pluginId, key.tool, args, credentials, bodySignal),
+            );
+            handlerSettled = false;
+            void handlerPromise.then(
+              () => {
+                handlerSettled = true;
+                releaseAfterHandler?.();
+              },
+              () => {
+                handlerSettled = true;
+                releaseAfterHandler?.();
+              },
+            );
+            return handlerPromise;
+          },
+          channelLabel: "warmup",
+        });
+        await pipeline.dispatch({ call: toolCall, bodies, scope });
+        controller.signal.throwIfAborted();
         return { status: "warmed" };
       }).catch((error: unknown): WarmupOutcome => {
         if (controller.signal.aborted) return { status: timedOut ? "timed_out" : "cancelled" };

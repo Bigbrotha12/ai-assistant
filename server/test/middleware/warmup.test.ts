@@ -208,6 +208,10 @@ describe("warmups", () => {
     assert.throws(() => hook());
     assert.equal(budget.modelCallCount("user"), 0);
     assert.equal(manager.activeCount, 1);
+    // The hung handler must retain warmup's own reserveSync slot too: `cleanup()`
+    // releases the running entry and the slot together, so `activeCount===1`
+    // implies the slot is still held. Pin it explicitly.
+    assert.equal(budget.activeCount("user"), 1);
     assert.deepEqual(manager.schedule({ ...call, owner: "other" }), { ok: false, reason: "busy" });
     release();
     await tick();
