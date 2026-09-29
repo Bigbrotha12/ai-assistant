@@ -28,8 +28,11 @@ import type { LookupAddress } from "node:dns";
  *     validates each one; the returned IPs are meant to be pinned by the
  *     caller ("connect-to-validated-IP") so the connection never re-resolves
  *     to a different, disallowed address.
- *  5. Redirects — outbound callers MUST pass REDIRECT_POLICY (`redirect:
- *     "manual"`) and treat ANY 3xx response as failure (isRedirectStatus).
+ *  5. Redirects — enforced at the egress facade (`egress/client.ts`): every
+ *     outbound request is sent with `redirect: "manual"` and any 3xx response
+ *     is refused via isRedirectStatus. `validatedFetch` and `policyFetch` below
+ *     are the facade's internal implementations, not caller-facing entry
+ *     points; new outbound code should use `EgressClient` instead.
  *
  */
 
@@ -676,14 +679,6 @@ export async function resolveAndValidateHost(
   return pinned;
 }
 
-/**
- * Redirect policy for every outbound plugin/LLM call (Phase 2/3). Callers MUST
- * spread this into fetch() and treat ANY 3xx as a failure (it could be a
- * redirect to a disallowed internal URL that static validation no longer
- * covers). Centralized here so the policy cannot drift.
- */
-export const REDIRECT_POLICY = { redirect: "manual" } as const;
-
 /** True for any 3xx redirect status. */
 export function isRedirectStatus(status: number): boolean {
   return status >= 300 && status < 400;
@@ -712,8 +707,8 @@ const TRUSTED_HOST_ENTRY = /^(\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9]
  * hostname (`vn.example`, `vikunja.local`), an IP literal (v4/v6), or a
  * single-`*.`-prefix wildcard (`*.internal`). Refused: bare `*`, mid-string
  * wildcards, anything carrying a scheme (`://`), port (`:`), path (`/`) or
- * whitespace. Generation of `parseTrustedHosts`; kept separate so env parsing
- * and callers can validate a single entry.
+ * whitespace. Generation of `parseTrustedHostEntries`; kept separate so env
+ * parsing and callers can validate a single entry.
  */
 export function isValidTrustedHostEntry(entry: string): boolean {
   if (entry === "") return false;
@@ -723,23 +718,12 @@ export function isValidTrustedHostEntry(entry: string): boolean {
 }
 
 /**
- * Parse a raw comma-separated trusted-host env value (e.g.
- * `PLUGINS_TRUSTED_HOSTS`) into validated entries (trimmed, empties dropped).
- * Throws `SsrfValidationError` on the first invalid entry so the app can fail
- * fast at env parse time with an actionable message. `envVarName` names the
- * offending variable in that message; prefer `parseTrustedHostEntries` when the
- * value has already been split (e.g. after a zod transform).
- */
-export function parseTrustedHosts(raw: string, envVarName?: string): string[] {
-  return parseTrustedHostEntries(raw.split(","), envVarName);
-}
-
-/**
- * Validate an already-split list of trusted-host entries. See
- * `parseTrustedHosts`. Throws `SsrfValidationError` on the first invalid
- * entry. `envVarName` is the env var the entries came from, so the error names
- * the knob the operator actually misconfigured (default: the original
- * `PLUGINS_TRUSTED_HOSTS`, kept for callers that predate the per-var naming).
+ * Validate a list of trusted-host entries (trimmed, empties dropped). Throws
+ * `SsrfValidationError` on the first invalid entry so the app can fail fast at
+ * env parse time with an actionable message. `envVarName` is the env var the
+ * entries came from, so the error names the knob the operator actually
+ * misconfigured (default: the original `PLUGINS_TRUSTED_HOSTS`, kept for
+ * callers that predate the per-var naming).
  */
 export function parseTrustedHostEntries(
   entries: readonly string[],
@@ -861,6 +845,14 @@ async function fetchWithPinnedAddresses(
   }
 }
 
+/**
+ * FACADE-INTERNAL: the policy-less implementation behind
+ * `EgressClient.fetch(url)` (see `egress/client.ts`). It is exported for the
+ * facade to compose, not as a public entry point — new outbound code should
+ * use `EgressClient`. Statically validates the URL, resolves and validates
+ * every A/AAAA record, pins the connection to those addresses, forces
+ * `redirect: "manual"`, and refuses any 3xx.
+ */
 export async function validatedFetch(
   url: string,
   init: RequestInit = {},

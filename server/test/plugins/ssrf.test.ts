@@ -7,12 +7,10 @@ import {
   validateStaticUrl,
   isIpAllowed,
   isValidTrustedHostEntry,
-  parseTrustedHosts,
   parseTrustedHostEntries,
   egressTrustOptions,
   resolveAndValidateHost,
   isTrustedHost,
-  REDIRECT_POLICY,
   isRedirectStatus,
   createEgressPolicy,
   authorizeEgressRequest,
@@ -263,7 +261,7 @@ describe("isTrustedHost matching", () => {
   });
 });
 
-describe("Fix 3: parseTrustedHosts / PLUGINS_TRUSTED_HOSTS entry validation", () => {
+describe("Fix 3: parseTrustedHostEntries / PLUGINS_TRUSTED_HOSTS entry validation", () => {
   test("accepts exact hostnames, IP literals, and single-*. wildcards", () => {
     for (const entry of [
       "vn.example",
@@ -278,14 +276,13 @@ describe("Fix 3: parseTrustedHosts / PLUGINS_TRUSTED_HOSTS entry validation", ()
     ]) {
       assert.equal(isValidTrustedHostEntry(entry), true, `${entry} must be accepted`);
     }
+    // Retargeted from the deleted `parseTrustedHosts` (which was just
+    // `parseTrustedHostEntries(raw.split(","))`): the same trimming,
+    // empty-dropping and ordering behaviour on the already-split path env.ts
+    // uses.
     assert.deepEqual(
-      parseTrustedHosts(" vn.example , vikunja.local , *.internal ,  "),
+      parseTrustedHostEntries([" vn.example ", "", " vikunja.local ", "*.internal", "  "]),
       ["vn.example", "vikunja.local", "*.internal"],
-    );
-    // parseTrustedHostEntries is the post-split path used by env.ts.
-    assert.deepEqual(
-      parseTrustedHostEntries([" vn.example ", "", "*.internal"]),
-      ["vn.example", "*.internal"],
     );
   });
 
@@ -311,9 +308,9 @@ describe("Fix 3: parseTrustedHosts / PLUGINS_TRUSTED_HOSTS entry validation", ()
     }
   });
 
-  test("parseTrustedHosts throws an actionable message on the first invalid entry", () => {
+  test("parseTrustedHostEntries throws an actionable message on the first invalid entry", () => {
     assert.throws(
-      () => parseTrustedHosts("vikunja.local,http://evil.example"),
+      () => parseTrustedHostEntries(["vikunja.local", "http://evil.example"]),
       (e: unknown) =>
         e instanceof SsrfValidationError &&
         e.code === "INVALID_URL" &&
@@ -322,8 +319,8 @@ describe("Fix 3: parseTrustedHosts / PLUGINS_TRUSTED_HOSTS entry validation", ()
   });
 
   test("empty input yields an empty list", () => {
-    assert.deepEqual(parseTrustedHosts(""), []);
-    assert.deepEqual(parseTrustedHosts("  , , "), []);
+    assert.deepEqual(parseTrustedHostEntries([""]), []);
+    assert.deepEqual(parseTrustedHostEntries(["  ", " ", " "]), []);
   });
 
   test("the error names the passed env var; the default stays PLUGINS_TRUSTED_HOSTS", () => {
@@ -334,7 +331,7 @@ describe("Fix 3: parseTrustedHosts / PLUGINS_TRUSTED_HOSTS entry validation", ()
         e.message.includes("invalid MCP_TRUSTED_HOSTS entry 'http://bad.example'"),
     );
     assert.throws(
-      () => parseTrustedHosts("http://bad.example", "NOTIFY_TRUSTED_HOSTS"),
+      () => parseTrustedHostEntries(["http://bad.example"], "NOTIFY_TRUSTED_HOSTS"),
       (e: unknown) =>
         e instanceof SsrfValidationError &&
         e.message.includes("invalid NOTIFY_TRUSTED_HOSTS entry"),
@@ -542,10 +539,11 @@ describe("resolveAndValidateHost (DNS rebinding defense)", () => {
 });
 
 describe("redirect policy", () => {
-  test("REDIRECT_POLICY forces manual redirects", () => {
-    assert.equal(REDIRECT_POLICY.redirect, "manual");
-  });
-
+  // The `REDIRECT_POLICY` constant was deleted in 2.5: `redirect: "manual"` is
+  // now enforced inside `EgressClient` (openPinned's streamFetch and
+  // fetchWithPinnedAddresses), and that behaviour is asserted at the facade in
+  // `test/egress/client.test.ts` ("forces redirect: manual against a pinned
+  // agent…") and in `test/plugins/validatedFetch.test.ts`.
   test("isRedirectStatus is true for 300-399 and false otherwise", () => {
     for (const status of [300, 301, 302, 304, 307, 308, 399]) {
       assert.equal(isRedirectStatus(status), true);

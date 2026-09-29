@@ -239,7 +239,7 @@ describe("validatedFetch", () => {
     assert.equal(spy.lastUrl, "https://example.com/api");
   });
 
-  test("always requests redirect: manual (REDIRECT_POLICY)", async () => {
+  test("always requests redirect: manual (facade-internal policy)", async () => {
     const spy = fetchSpy();
     const res = await validatedFetch(
       "https://example.com/api",

@@ -30,6 +30,7 @@ import {
 } from "../../src/agents/mcp.ts";
 import { logger } from "../../src/logger.ts";
 import { ToolResourceError } from "../../src/tool_bounds.ts";
+import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import {
   configureAuditTelemetry,
   flushAuditTelemetry,
@@ -1595,6 +1596,152 @@ describe("mcp", () => {
       },
     );
     assert.equal(lookups, 1);
+    await connected.close();
+  });
+
+  // --- MCP-seam SSRF enforcement (plan step 2.4 coverage gap) -----------
+  //
+  // Step 2.4 moved MCP's SSE egress behind `EgressClient.openPinned`, but the
+  // private-URL rejection and redirect-refusal assertions lived only at the
+  // facade. These pin them at the MCP seam so a future change to the factory
+  // cannot silently drop the policy again.
+  test("default SSE factory rejects private/loopback/link-local MCP URLs before any client or transport is built", async () => {
+    for (const url of [
+      "https://10.0.0.5/mcp",
+      "https://127.0.0.1/mcp",
+      "https://192.168.1.1/mcp",
+      "https://169.254.169.254/latest/meta-data",
+      "https://[::1]/mcp",
+    ]) {
+      let agents = 0;
+      let transports = 0;
+      let clients = 0;
+      await assert.rejects(
+        defaultSseClientFactory(
+          { name: "private-url", url },
+          { trustedHosts: [], mode: "test" },
+          {
+            createAgent: () => {
+              agents++;
+              return { destroy: async () => {} };
+            },
+            createTransport: () => {
+              transports++;
+              return { close: async () => {} };
+            },
+            createClient: () => {
+              clients++;
+              return {
+                connect: async () => {},
+                listTools: async () => ({ tools: [] }),
+                callTool: async () => ({ content: [] }),
+                close: async () => {},
+              };
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "DISALLOWED_HOST",
+        url,
+      );
+      assert.equal(agents, 0, `no agent may be built for ${url}`);
+      assert.equal(transports, 0, `no transport may be built for ${url}`);
+      assert.equal(clients, 0, `no client may be built for ${url}`);
+    }
+  });
+
+  test("default SSE factory rejects a hostname resolving into a private range (DNS_REBINDING)", async () => {
+    let agents = 0;
+    await assert.rejects(
+      defaultSseClientFactory(
+        { name: "rebind", url: "https://rebind.example.com/mcp" },
+        {
+          trustedHosts: [],
+          mode: "test",
+          lookup: async () => [{ address: "10.0.0.5", family: 4 }],
+        },
+        {
+          createAgent: () => {
+            agents++;
+            return { destroy: async () => {} };
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof SsrfValidationError && error.code === "DNS_REBINDING",
+    );
+    assert.equal(agents, 0, "the private resolution is refused before any agent exists");
+  });
+
+  test("default SSE factory accepts a private MCP URL that IS in the trusted list", async () => {
+    let agents = 0;
+    const connected = await defaultSseClientFactory(
+      { name: "trusted-private", url: "https://10.0.0.5/mcp" },
+      { trustedHosts: ["10.0.0.5"], mode: "test" },
+      {
+        createAgent: () => {
+          agents++;
+          return { destroy: async () => {} };
+        },
+        createTransport: () => ({ close: async () => {} }),
+        createClient: () => ({
+          connect: async () => {},
+          listTools: async () => ({ tools: [] }),
+          callTool: async () => ({ content: [] }),
+          close: async () => {},
+        }),
+      },
+    );
+    assert.equal(agents, 1, "an admin-trusted private host builds one pinned agent");
+    await connected.close();
+  });
+
+  test("default SSE factory forces redirect: manual on the pinned stream (a 3xx is never followed)", async (t) => {
+    let capturedInit: RequestInit | undefined;
+    let networkCalls = 0;
+    const fetchStub: typeof fetch = async (_input, init) => {
+      networkCalls++;
+      capturedInit = init;
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://evil.internal/steal" },
+      });
+    };
+    t.mock.method(globalThis, "fetch", fetchStub);
+
+    let transportFetch:
+      | ((input: string | URL | Request, init?: RequestInit) => Promise<Response>)
+      | undefined;
+    const connected = await defaultSseClientFactory(
+      { name: "redirect", url: "https://redirect.example.com/mcp" },
+      {
+        trustedHosts: [],
+        mode: "test",
+        lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      },
+      {
+        createAgent: () => ({ destroy: async () => {} }),
+        createTransport: (_url, options) => {
+          transportFetch = options.fetch;
+          return { close: async () => {} };
+        },
+        createClient: () => ({
+          connect: async () => {},
+          listTools: async () => ({ tools: [] }),
+          callTool: async () => ({ content: [] }),
+          close: async () => {},
+        }),
+      },
+    );
+    assert.ok(transportFetch, "the transport receives the pinned fetch");
+    const response = await transportFetch("https://redirect.example.com/mcp");
+    assert.equal(response.status, 302, "the 3xx is surfaced, never followed");
+    assert.equal(
+      capturedInit?.redirect,
+      "manual",
+      "the pinned stream forces redirect: manual (redirect refusal)",
+    );
+    assert.equal(networkCalls, 1, "a redirect is not retried or followed");
     await connected.close();
   });
 
