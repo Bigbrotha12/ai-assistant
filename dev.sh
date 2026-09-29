@@ -361,10 +361,20 @@ discover_wireless_endpoint() {
     | awk '$2=="_adb-tls-connect._tcp" {print $NF; exit}'
 }
 
+# The `_adb-tls-pairing._tcp` service is advertised *only* while the phone's
+# "Pair device with pairing code" dialog is open, and it listens on a different
+# port than the connect service. Print its `ip:port`, or nothing if no dialog is
+# showing. Used purely to hand the user an exact command to run.
+discover_pairing_endpoint() {
+  [ -n "$ADB_BIN" ] || return 1
+  "$ADB_BIN" mdns services 2>/dev/null \
+    | awk '$2=="_adb-tls-pairing._tcp" {print $NF; exit}'
+}
+
 ensure_wireless_target() {
   device_connected "$FLUTTER_DEVICE" && return 0
 
-  local usb_serial endpoint
+  local usb_serial raw_endpoint tailnet_endpoint candidate pairing_endpoint
   usb_serial="$("$ADB_BIN" devices -l 2>/dev/null | awk '/usb:/ && $2=="device" {print $1; exit}')"
   if [ -n "$usb_serial" ]; then
     echo "Wireless adb target $FLUTTER_DEVICE not connected; re-enabling TCP mode on USB device $usb_serial…"
@@ -378,25 +388,69 @@ ensure_wireless_target() {
   "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
   device_connected "$FLUTTER_DEVICE" && return 0
 
-  endpoint="$(discover_wireless_endpoint)" || true
-  if [ -n "$endpoint" ]; then
-    endpoint="${FLUTTER_DEVICE%%:*}:${endpoint##*:}"
-    "$ADB_BIN" connect "$endpoint" >/dev/null 2>&1 || true
-    if device_connected "$endpoint"; then
-      echo "Connected to wireless adb target $endpoint."
-      FLUTTER_DEVICE="$endpoint"
-      return 0
-    fi
+  raw_endpoint="$(discover_wireless_endpoint)" || true
+  if [ -n "$raw_endpoint" ]; then
+    # Keep the configured host and only refresh the port, so a Tailscale target
+    # stays on the tailnet as documented in dev.env. The raw mDNS address is the
+    # fallback: it is what actually owns that port, so it works when the phone
+    # is on the LAN but not yet on the tailnet.
+    tailnet_endpoint="${FLUTTER_DEVICE%%:*}:${raw_endpoint##*:}"
+
+    for candidate in "$tailnet_endpoint" "$raw_endpoint"; do
+      "$ADB_BIN" connect "$candidate" >/dev/null 2>&1 || true
+      if device_connected "$candidate"; then
+        echo "Connected to wireless adb target $candidate."
+        FLUTTER_DEVICE="$candidate"
+        return 0
+      fi
+    done
   fi
 
-  echo "warning: wireless adb target $FLUTTER_DEVICE is not connected and no wireless device was discovered." >&2
-  echo "         After a phone reboot, plug in USB once — this script will re-enable TCP mode." >&2
-  echo "         Or re-enable Wireless Debugging on the phone." >&2
+  # Nothing connected. Report what was actually observed: a discovered-but-
+  # refused target and a target that was never discovered have entirely
+  # different fixes, and the old single message claimed "no wireless device was
+  # discovered" even when mDNS had just found one.
+  {
+    echo "warning: could not connect to the adb target $FLUTTER_DEVICE."
+    if [ -n "$raw_endpoint" ]; then
+      echo "         Discovered over mDNS: $raw_endpoint — visible on this network, but the"
+      echo "         connection was refused. On Android 11+ that normally means this host is"
+      echo "         not paired with the phone yet. Pairing is separate from USB authorisation"
+      echo "         and is required once per phone."
+      pairing_endpoint="$(discover_pairing_endpoint || true)"
+      if [ -n "$pairing_endpoint" ]; then
+        echo "         The phone is showing a pairing dialog. Run:"
+        echo "             $ADB_BIN pair $pairing_endpoint"
+        echo "         then enter the 6-digit code displayed on the phone."
+      else
+        echo "         On the phone: Developer options -> Wireless debugging ->"
+        echo "         'Pair device with pairing code', then run:"
+        echo "             $ADB_BIN pair <phone-ip>:<pairing-port>"
+        echo "         using the ip:port from that dialog (it is not $raw_endpoint)."
+      fi
+    else
+      echo "         No _adb-tls-connect._tcp service was discovered on this network."
+      echo "         Turn on Wireless debugging on the phone and keep the phone on the"
+      echo "         same network as this machine (mDNS does not cross subnets)."
+    fi
+    echo "         Alternatively, plug the phone in over USB and re-run: this script then"
+    echo "         re-enables legacy adb TCP mode on port ${FLUTTER_DEVICE##*:}. That port is not"
+    echo "         persisted across a reboot, so treat it as a stopgap, not a fix."
+  } >&2
   return 1
 }
 
 case "$FLUTTER_DEVICE" in
-  *.*:[0-9]*) [ -n "$ADB_BIN" ] && ensure_wireless_target || true ;;
+  *.*:[0-9]*)
+    if [ -z "$ADB_BIN" ]; then
+      # Without adb we cannot discover or repair a wireless target, and the
+      # failure would otherwise surface as an opaque `flutter run -d` error.
+      echo "warning: no adb binary found, so the wireless target $FLUTTER_DEVICE cannot be checked." >&2
+      echo "         Put adb on PATH, set ADB, or add sdk.dir to android/local.properties." >&2
+    else
+      ensure_wireless_target || true
+    fi
+    ;;
 esac
 
 "$FLUTTER_BIN" run \
