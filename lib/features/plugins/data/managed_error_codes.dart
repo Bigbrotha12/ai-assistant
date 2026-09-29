@@ -6,7 +6,9 @@
 /// side. Codes produced by the transport layer (`plugin_http.dart`:
 /// `invalid_configuration`, `invalid_response`, `server_error`, …) are kept
 /// where they already live — the mapper treats any unknown code as a server
-/// error.
+/// error. Neither set mirrors the server's emitter list: this class names the
+/// codes the client produces, while `plugin_http.dart`'s `_safeCodes` is a
+/// reachability-filtered allowlist.
 abstract final class ManagedErrorCodes {
   static const pendingTurnExists = 'pending_turn_exists';
   static const noPendingTurn = 'no_pending_turn';

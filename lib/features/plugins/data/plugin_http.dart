@@ -18,8 +18,24 @@ class PluginClientException implements Exception {
   String toString() => 'PluginClientException: $code';
 }
 
+// Reachability-filtered allowlist for wire error codes, **not** a mirror of the
+// server's emitters. A code the app cannot encounter is deliberately omitted
+// rather than added speculatively; `safePluginErrorCode` degrades anything
+// absent to `server_error`. Deliberately absent today (do not add without a
+// reachable client path plus a test):
+// - `pin_mismatch` — install/uninstall only (`server/src/plugins/routes.ts`);
+//   the plugin client only GETs the catalog.
+// - `plugin_rejected` — install (SSRF-rejected manifest); no install path.
+// - `plugin_already_installed` — install pre-check; no install path.
+// - `builtin_plugin` — uninstall; no uninstall path.
+// - `fence_conflict` — ledger worker claim/heartbeat/complete
+//   (`server/src/ledger.routes.ts`); the ledger client only cancels and reads.
+// - `not_configured` — `server/src/notify/routes.ts`; `notif_client.dart`
+//   reaches it through its own `Dio`, never through [PluginHttp].
 const _safeCodes = {
   'unauthorized',
+  'unsupported',
+  'shutting_down',
   'rate_limited',
   'busy',
   'invalid_request',

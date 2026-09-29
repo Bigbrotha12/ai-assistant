@@ -570,4 +570,29 @@ void main() {
       expect(phrase, anyOf(serverErrorPhrases));
     });
   });
+
+  group('safePluginErrorCode (reachability-filtered allowlist)', () {
+    test('preserves unsupported (model plugin cannot serve the request)', () {
+      expect(
+        safePluginErrorCode(const {'error': 'unsupported'}),
+        'unsupported',
+      );
+    });
+
+    test('preserves shutting_down (gateway shutdown 503 gate)', () {
+      expect(
+        safePluginErrorCode(const {'error': 'shutting_down'}),
+        'shutting_down',
+      );
+    });
+
+    test('deliberately-absent server code degrades to server_error', () {
+      // `fence_conflict` comes only from the ledger worker routes, which this
+      // app never calls; it is intentionally not allowlisted.
+      expect(
+        safePluginErrorCode(const {'error': 'fence_conflict'}),
+        'server_error',
+      );
+    });
+  });
 }
