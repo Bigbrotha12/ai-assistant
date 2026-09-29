@@ -14,13 +14,8 @@ import type { BudgetManager } from "../middleware/budget.ts";
 import type { Ledger } from "../ledger.ts";
 import { SsrfValidationError, validateMcpHeaderName } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
-import {
-  egressTrustOptions,
-  normalizeHostname,
-  resolveAndValidateHost,
-  validateStaticUrl,
-} from "../plugins/ssrf.ts";
-import { createPinnedEgressClient } from "../egress/client.ts";
+import { egressTrustOptions } from "../plugins/ssrf.ts";
+import { createPinnedEgressClient, resolvePins } from "../egress/client.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import {
   boundToolResult,
@@ -1940,14 +1935,15 @@ export async function bindMcpServers(
       let pending = bindingPins.get(runtimeKey);
       if (pending === undefined) {
         pending = Promise.resolve().then(async () => {
-          const parsed = validateStaticUrl(server.url, {
-            trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
-            httpAllowedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
+          // M1: one trust-construction path. `resolvePins` performs the same
+          // static validation + DNS pinning `openPinned` uses, with the MCP
+          // `http:` carve-out paired via `egressTrustOptions` instead of being
+          // re-inlined here.
+          const pins = await resolvePins(server.url, {
+            ...egressTrustOptions(opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS),
             mode: opts?.mode,
-          });
-          const pins = await resolveAndValidateHost(normalizeHostname(parsed.hostname), {
-            trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
             lookup: opts?.lookup,
+            subject: "mcp",
           });
           retainedPins = pins;
           return pins;

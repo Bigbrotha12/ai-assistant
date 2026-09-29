@@ -201,14 +201,82 @@ describe("EgressClient.openPinned", () => {
       assert.equal(first.status, 200);
       assert.equal(spy.callCount, 1);
 
-      // Validation is synchronous (as MCP's `mcpFetch` is today): a disallowed
-      // URL throws before the network is reached, on the second call too.
-      assert.throws(
-        () => stream.fetch("https://10.0.0.5/mcp"),
+      // Re-validation happens before the network is reached, on the second
+      // call too. `stream.fetch` is async, so the rejection is observed with
+      // `assert.rejects` (a validation failure is still intact, just not a
+      // synchronous throw).
+      await assert.rejects(
+        stream.fetch("https://10.0.0.5/mcp"),
         (error: unknown) =>
           error instanceof SsrfValidationError && error.code === "DISALLOWED_HOST",
       );
       assert.equal(spy.callCount, 1, "the second call must re-validate before fetching");
+    } finally {
+      await stream.dispose();
+    }
+  });
+
+  test("refuses a 3xx from the pinned stream rather than surfacing it", async () => {
+    const client = createPinnedEgressClient({
+      mode: "test",
+      lookup: fakeLookup(PUBLIC),
+      fetchFn: async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://evil.internal/steal" },
+        }),
+    });
+    const stream = await client.openPinned("https://example.com/mcp");
+    try {
+      await assert.rejects(
+        stream.fetch("https://example.com/mcp"),
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "REDIRECT_REFUSED",
+      );
+    } finally {
+      await stream.dispose();
+    }
+  });
+
+  test("refuses a re-pointed destination even when a custom agent would allow it", async () => {
+    // `createAgent` is a test-only seam; the stream's own host/scheme/port
+    // assertion must not depend on the agent to notice a different URL.
+    let networkCalls = 0;
+    const client = createPinnedEgressClient({
+      mode: "test",
+      lookup: fakeLookup([{ address: "93.184.216.34", family: 4 }]),
+      fetchFn: async () => {
+        networkCalls += 1;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const stream = await client.openPinned("https://pinned.example/mcp", {
+      createAgent: () => ({ destroy: async () => {} }),
+    });
+    try {
+      // Different host.
+      await assert.rejects(
+        stream.fetch("https://other.example/mcp"),
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "DISALLOWED_HOST",
+        "a different host must be refused",
+      );
+      // Same host, different port.
+      await assert.rejects(
+        stream.fetch("https://pinned.example:8443/mcp"),
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "DISALLOWED_HOST",
+        "a different port must be refused",
+      );
+      // Same host and port, different scheme (http is statically allowed in
+      // test mode, so only the pin comparison can refuse it).
+      await assert.rejects(
+        stream.fetch("http://pinned.example/mcp"),
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "DISALLOWED_HOST",
+        "a different scheme must be refused",
+      );
+      assert.equal(networkCalls, 0, "no re-pointed request reaches the network");
     } finally {
       await stream.dispose();
     }

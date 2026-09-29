@@ -301,9 +301,10 @@ export class ToolExecutor implements ToolCallHandler {
 
   constructor(private readonly opts: ToolExecutorOptions) {
     // Per-domain egress client: the plugin trust list is captured here and
-    // never shared with the model/notify clients. The policy supplies the
-    // per-call trust/allowlist; the client mainly supplies the injected
-    // `fetchFn` (test seam).
+    // never shared with the model/notify clients. The client mainly supplies the
+    // injected `fetchFn` (test seam): `execute` always passes a per-call policy,
+    // so the client-level `trustedHosts`/`mode` are INERT on the policy branch
+    // (`policyFetch` reads trust/mode from the policy).
     this.egress = createPinnedEgressClient({
       trustedHosts: this.opts.trustedHosts,
       mode: this.opts.mode,

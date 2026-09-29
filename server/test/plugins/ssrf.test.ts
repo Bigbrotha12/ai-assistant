@@ -276,10 +276,11 @@ describe("Fix 3: parseTrustedHostEntries / PLUGINS_TRUSTED_HOSTS entry validatio
     ]) {
       assert.equal(isValidTrustedHostEntry(entry), true, `${entry} must be accepted`);
     }
-    // Retargeted from the deleted `parseTrustedHosts` (which was just
-    // `parseTrustedHostEntries(raw.split(","))`): the same trimming,
-    // empty-dropping and ordering behaviour on the already-split path env.ts
-    // uses.
+    // Retargeted from the deleted `parseTrustedHosts`
+    // (`parseTrustedHostEntries(raw.split(","))`): this covers the
+    // trimming, empty-dropping and ordering behaviour on the already-split
+    // list env.ts passes. It no longer exercises the comma-split itself; that
+    // path is covered by `test/env_override.test.ts`.
     assert.deepEqual(
       parseTrustedHostEntries([" vn.example ", "", " vikunja.local ", "*.internal", "  "]),
       ["vn.example", "vikunja.local", "*.internal"],
@@ -539,11 +540,13 @@ describe("resolveAndValidateHost (DNS rebinding defense)", () => {
 });
 
 describe("redirect policy", () => {
-  // The `REDIRECT_POLICY` constant was deleted in 2.5: `redirect: "manual"` is
-  // now enforced inside `EgressClient` (openPinned's streamFetch and
-  // fetchWithPinnedAddresses), and that behaviour is asserted at the facade in
-  // `test/egress/client.test.ts` ("forces redirect: manual against a pinned
-  // agent…") and in `test/plugins/validatedFetch.test.ts`.
+  // The `REDIRECT_POLICY` constant was deleted in 2.5: `redirect: "manual"` and
+  // 3xx refusal are now enforced inside `EgressClient` (openPinned's streamFetch
+  // and fetchWithPinnedAddresses), and that behaviour is asserted at the facade
+  // in `test/egress/client.test.ts` ("forces redirect: manual against a pinned
+  // agent…", "refuses a 3xx from the pinned stream…"), in
+  // `test/agents/mcp.test.ts` ("default SSE factory refuses a 3xx…"), and in
+  // `test/plugins/validatedFetch.test.ts`.
   test("isRedirectStatus is true for 300-399 and false otherwise", () => {
     for (const status of [300, 301, 302, 304, 307, 308, 399]) {
       assert.equal(isRedirectStatus(status), true);

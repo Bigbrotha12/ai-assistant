@@ -4,10 +4,10 @@ import { env } from "../env.ts";
 import { pluginIdSchema } from "../plugins/types.ts";
 import {
   SsrfValidationError,
+  egressTrustOptions,
   validateMcpHeaderName,
-  validateStaticUrl,
-  resolveAndValidateHost,
 } from "../plugins/ssrf.ts";
+import { resolvePins } from "../egress/client.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 
 export type McpEntry = {
@@ -97,14 +97,13 @@ export async function loadMcpCatalog(
     seen.add(entry.name);
 
     const trustedHosts = options.trustedHosts ?? env.MCP_TRUSTED_HOSTS;
-    const parsedUrl = validateStaticUrl(entry.url, {
+    // M1: the MCP http: carve-out is paired via `egressTrustOptions` and the
+    // validation/pinning is the same facade path `openPinned` uses.
+    entry.pinnedIps = await resolvePins(entry.url, {
+      ...egressTrustOptions(trustedHosts),
       mode: options.mode ?? env.NODE_ENV,
-      trustedHosts,
-      httpAllowedHosts: trustedHosts,
-    });
-    entry.pinnedIps = await resolveAndValidateHost(parsedUrl.hostname, {
-      trustedHosts,
       lookup: options.lookup,
+      subject: "mcp-catalog",
     });
 
     if (entry.headers) {

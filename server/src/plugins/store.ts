@@ -29,10 +29,9 @@ import { computeManifestDigest } from "./digest.ts";
 import {
   NODE_ENV,
   SsrfValidationError,
-  resolveAndValidateHost,
   validateMcpHeaderName,
-  validateStaticUrl,
 } from "./ssrf.ts";
+import { resolvePins } from "../egress/client.ts";
 import type { LookupFn, Mode } from "./ssrf.ts";
 import { isRecord } from "../util.ts";
 import { AsyncMutex } from "../jobs/mutex.ts";
@@ -50,9 +49,10 @@ import { AsyncMutex } from "../jobs/mutex.ts";
  * `toggleBuiltin` operation without disturbing the manifest lifecycle.
  *
  * SSRF posture (see `ssrf.ts`): EVERY allowlisted baseUrl of a plugin being
- * installed is re-validated (`validateStaticUrl` for scheme + literal-IP
- * ranges, plus `resolveAndValidateHost` for per-record DNS-rebinding defense —
- * a hostname resolving to a private address is rejected unless admin-trusted),
+ * installed is re-validated through the egress facade's `resolvePins`
+ * (`validateStaticUrl` for scheme + literal-IP ranges, plus
+ * `resolveAndValidateHost` for per-record DNS-rebinding defense — a hostname
+ * resolving to a private address is rejected unless admin-trusted),
  * and the SAME pass runs over every persisted URL on `load()`/`reload()`, so a
  * store written under an older/looser trusted-hosts policy cannot survive a
  * tightening. Validation failures at load/reload leave the store unapplied
@@ -704,10 +704,11 @@ export class PluginStore {
   }
 
   /**
-   * Validate a set of URL entries: `validateStaticUrl` for scheme + literal-IP
-   * ranges, then `resolveAndValidateHost` for per-record DNS-rebinding defense
-   * (a hostname resolving to a private address is rejected unless
-   * admin-trusted). Aggregates per-entry reasons into one SSRF_REJECTED error.
+   * Validate a set of URL entries through the facade's `resolvePins`
+   * (`validateStaticUrl` for scheme + literal-IP ranges, then
+   * `resolveAndValidateHost` for per-record DNS-rebinding defense — a hostname
+   * resolving to a private address is rejected unless admin-trusted).
+   * Aggregates per-entry reasons into one SSRF_REJECTED error.
    * Returns the validated pin list on success.
    */
   private async validateUrlEntries(
@@ -719,13 +720,18 @@ export class PluginStore {
     const validated: Array<{ entryId: string; url: string; pinned: string[] }> = [];
     for (const entry of entries) {
       try {
-        validateStaticUrl(entry.url, { trustedHosts: this.trustedHosts, mode: this.mode });
-        const { hostname } = new URL(entry.url);
-        const pinned = await resolveAndValidateHost(hostname, {
+        // M1: use the facade's single trust-construction path. Plugins are
+        // https-only and never get the production `http:` carve-out, so unlike
+        // MCP/notify this caller passes only `trustedHosts` (no
+        // `httpAllowedHosts`) — the facade, not an inline pairing, decides what
+        // that omission means.
+        const pinned = await resolvePins(entry.url, {
           trustedHosts: this.trustedHosts,
+          mode: this.mode,
           lookup: this.lookup,
+          subject: "plugin-store",
         });
-        validated.push({ entryId: entry.id, url: entry.url, pinned });
+        validated.push({ entryId: entry.id, url: entry.url, pinned: [...pinned] });
       } catch (err) {
         if (err instanceof SsrfValidationError) {
           failures.push(`  ${entry.id} (${entry.url}): ${err.message}`);

@@ -1696,7 +1696,7 @@ describe("mcp", () => {
     await connected.close();
   });
 
-  test("default SSE factory forces redirect: manual on the pinned stream (a 3xx is never followed)", async (t) => {
+  test("default SSE factory refuses a 3xx on the pinned stream (never surfaced)", async (t) => {
     let capturedInit: RequestInit | undefined;
     let networkCalls = 0;
     const fetchStub: typeof fetch = async (_input, init) => {
@@ -1734,8 +1734,16 @@ describe("mcp", () => {
       },
     );
     assert.ok(transportFetch, "the transport receives the pinned fetch");
-    const response = await transportFetch("https://redirect.example.com/mcp");
-    assert.equal(response.status, 302, "the 3xx is surfaced, never followed");
+    // Behaviour change (plan Phase 2, M2): the pinned stream now refuses a 3xx
+    // via `isRedirectStatus`, matching the documented redirect policy and the
+    // short path (`validatedFetch`/`policyFetch`). A caller has no legitimate
+    // use for a 3xx from a pinned stream, so it is never surfaced.
+    await assert.rejects(
+      transportFetch("https://redirect.example.com/mcp"),
+      (error: unknown) =>
+        error instanceof SsrfValidationError && error.code === "REDIRECT_REFUSED",
+      "the 3xx is refused, never surfaced to the transport",
+    );
     assert.equal(
       capturedInit?.redirect,
       "manual",
@@ -1743,6 +1751,50 @@ describe("mcp", () => {
     );
     assert.equal(networkCalls, 1, "a redirect is not retried or followed");
     await connected.close();
+  });
+
+  test("default SSE factory rejects a non-http(s) MCP URL scheme before any client or transport is built", async () => {
+    // M4: this case is ONLY catchable by `validateStaticUrl`. A literal private
+    // IP or a rebinding hostname is also rejected by `resolveAndValidateHost`,
+    // so the tests above would pass even if the facade's static check were
+    // removed. A non-http(s) scheme never reaches host resolution at all, so it
+    // pins the facade call itself.
+    for (const url of ["file:///etc/passwd", "ftp://files.example.com/mcp"]) {
+      let agents = 0;
+      let transports = 0;
+      let clients = 0;
+      await assert.rejects(
+        defaultSseClientFactory(
+          { name: "bad-scheme", url },
+          { trustedHosts: [], mode: "test" },
+          {
+            createAgent: () => {
+              agents++;
+              return { destroy: async () => {} };
+            },
+            createTransport: () => {
+              transports++;
+              return { close: async () => {} };
+            },
+            createClient: () => {
+              clients++;
+              return {
+                connect: async () => {},
+                listTools: async () => ({ tools: [] }),
+                callTool: async () => ({ content: [] }),
+                close: async () => {},
+              };
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof SsrfValidationError && error.code === "UNSUPPORTED_SCHEME",
+        url,
+      );
+      assert.equal(agents, 0, `no agent may be built for ${url}`);
+      assert.equal(transports, 0, `no transport may be built for ${url}`);
+      assert.equal(clients, 0, `no client may be built for ${url}`);
+    }
   });
 
   test("bindMcpServers passes retained pins to the client factory and retains an unpinned resolution", async () => {
