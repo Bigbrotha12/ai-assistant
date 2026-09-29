@@ -1,18 +1,20 @@
 import type { NotificationHook } from "../jobs/runner.ts";
 import type { NotifyCredentials } from "./store.ts";
-import { egressTrustOptions, isIpAllowed, isTrustedHost, normalizeHostname, NODE_ENV, validatedFetch } from "../plugins/ssrf.ts";
+import { egressTrustOptions, isIpAllowed, isTrustedHost, normalizeHostname, NODE_ENV } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
+import { createPinnedEgressClient } from "../egress/client.ts";
 import { isIP } from "node:net";
 
 /**
  * Real ntfy push behind the job runner's {@link NotificationHook} DI seam.
  *
  * SECURITY CONTRACT
- *  - Outbound delivery is SSRF-validated via `validatedFetch` (plugin/LLM
- *    egress primitive): the ntfy URL is validated, its DNS records resolved and
- *    pinned, and any 3xx redirect refused. A private-address ntfy (loopback,
- *    RFC1918) requires its host in `NOTIFY_TRUSTED_HOSTS`; an admin-listed host
- *    is also granted the production `http:` carve-out.
+ *  - Outbound delivery is SSRF-validated through the egress seam
+ *    (`EgressClient`, the `validatedFetch` facade): the ntfy URL is validated,
+ *    its DNS records resolved and pinned, and any 3xx redirect refused. A
+ *    private-address ntfy (loopback, RFC1918) requires its host in
+ *    `NOTIFY_TRUSTED_HOSTS`; an admin-listed host is also granted the
+ *    production `http:` carve-out.
  *  - The access token is read from the encrypted-at-rest notify store and used
  *    ONLY in the `Authorization: Bearer` header. It is never logged, never
  *    echoed into the summary, and never returned.
@@ -32,17 +34,17 @@ export type NtfyNotificationHookOptions = {
   store: NotificationCredentialSource;
   /** ntfy base URL, e.g. `https://ntfy.example.com`. Empty = disabled. */
   baseUrl: string;
-  /** Test seam forwarded to `validatedFetch` as its `fetchFn` (defaults to the global `fetch` when omitted). */
+  /** Test seam forwarded to the egress client as its `fetchFn` (defaults to the global `fetch` when omitted). */
   fetchImpl?: typeof fetch;
   /**
-   * Admin-vouched notify hosts. Passed to `validatedFetch` as BOTH
+   * Admin-vouched notify hosts. Passed to the egress client as BOTH
    * `trustedHosts` (private-range bypass) and `httpAllowedHosts` (production
    * `http:` carve-out) — mirroring the MCP path.
    */
   trustedHosts?: readonly string[];
-  /** Test seam: injectable A/AAAA resolver for `validatedFetch`. */
+  /** Test seam: injectable A/AAAA resolver for the egress client. */
   lookup?: LookupFn;
-  /** Test seam: overrides NODE_ENV for `validatedFetch` scheme enforcement. */
+  /** Test seam: overrides NODE_ENV for the egress client's scheme enforcement. */
   mode?: Mode;
 };
 
@@ -118,6 +120,15 @@ export function createNtfyNotificationHook(
   const base = trimTrailingSlashes(opts.baseUrl.trim());
   const trustedHosts = opts.trustedHosts ?? [];
 
+  // Per-domain egress client: the NOTIFY trust list is captured here and never
+  // shared with the plugin/model clients.
+  const egress = createPinnedEgressClient({
+    ...egressTrustOptions(trustedHosts),
+    fetchFn: opts.fetchImpl,
+    lookup: opts.lookup,
+    mode: opts.mode,
+  });
+
   return {
     async notifyJobComplete(owner, taskId, summary) {
       if (base === "") return;
@@ -134,7 +145,7 @@ export function createNtfyNotificationHook(
       if (!credentials) return;
 
       try {
-        await validatedFetch(
+        await egress.fetch(
           `${base}/${encodeURIComponent(credentials.topic)}`,
           {
             method: "POST",
@@ -144,12 +155,6 @@ export function createNtfyNotificationHook(
               Title: `Job ${taskId}`,
             },
             body: summary,
-          },
-          {
-            fetchFn: opts.fetchImpl,
-            ...egressTrustOptions(trustedHosts),
-            lookup: opts.lookup,
-            mode: opts.mode,
           },
         );
       } catch (err) {

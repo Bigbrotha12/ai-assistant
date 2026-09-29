@@ -49,11 +49,12 @@ import type { PluginRegistry } from "../plugins/registry.ts";
 import { isMcpHeaderReference, isToolPlugin } from "../plugins/types.ts";
 import {
   createEgressPolicy,
-  policyFetch,
   SsrfValidationError,
   validateMcpHeaderName,
 } from "../plugins/ssrf.ts";
 import type { Mode } from "../plugins/ssrf.ts";
+import { createPinnedEgressClient } from "../egress/client.ts";
+import type { EgressClient } from "../egress/client.ts";
 import {
   boundToolResult,
   DEFAULT_TOOL_RESPONSE_MAX_BYTES,
@@ -94,7 +95,7 @@ import {
  *      pluginId)`). A `credentials_expired` pin fails the job with a
  *      `credentials_expired` step — no graph invoke happens.
  *   6. Build the agent (`createAgentGraph`, NO checkpointer) with a REAL
- *      `ToolCallHandler`: the {@link ToolExecutor} (policyFetch + pinned IPs
+ *      `ToolCallHandler`: the {@link ToolExecutor} (egress client + pinned IPs
  *      + credentials + trusted hosts) wrapped with tool-call replay dedupe
  *      (`hasToolResult`/`recordToolResult`, `tool_retry_forbidden` for mutating
  *      tools that cannot be proven never-run when the task is a replay).
@@ -223,9 +224,9 @@ export type ToolExecutorOptions = {
   getPinnedIps: (pluginId: string) => PinnedUrlEntry[] | undefined;
   /** Endpoint resolution; defaults to first pinned base URL + `/<toolName>`. */
   resolveEndpoint?: ToolEndpointResolver;
-  /** Injectable fetch for `policyFetch` (tests stub this; never the network). */
+  /** Injectable fetch for the egress client's policy fetch (tests stub this; never the network). */
   fetchFn?: typeof fetch;
-  /** Scheme enforcement mode override for `policyFetch`. */
+  /** Scheme enforcement mode override for the egress policy. */
   mode?: Mode;
   /**
    * Admin-trusted hostnames/IPs used to validate the retained store pins and
@@ -285,9 +286,10 @@ function toolEgressPolicy(
  *   - resolves the plugin's pinned IPs (`getPinnedIps`) — a plugin with no
  *     pins is `plugin_unavailable` (the pins are the SSRF-validated resolve
  *     result; a job must never ad-hoc resolve a plugin URL),
- *   - calls `policyFetch` — the ONLY sanctioned outbound path — against the
- *     allowlisted URL with the pinned credentials (bearer header),
- *   - refuses any 3xx (policyFetch does this; redirects are never followed),
+ *   - calls the egress client (`policyFetch` under the hood) — the ONLY
+ *     sanctioned outbound path — against the allowlisted URL with the pinned
+ *     credentials (bearer header),
+ *   - refuses any 3xx (the egress client does this; redirects are never followed),
  *   - redacts the result with `redactForOutbound` before it is returned so
  *     credential-shaped material never reaches graph state.
  *
@@ -295,7 +297,19 @@ function toolEgressPolicy(
  * no handle to the pin store (the threat model in pins.ts).
  */
 export class ToolExecutor implements ToolCallHandler {
-  constructor(private readonly opts: ToolExecutorOptions) {}
+  private readonly egress: EgressClient;
+
+  constructor(private readonly opts: ToolExecutorOptions) {
+    // Per-domain egress client: the plugin trust list is captured here and
+    // never shared with the model/notify clients. The policy supplies the
+    // per-call trust/allowlist; the client mainly supplies the injected
+    // `fetchFn` (test seam).
+    this.egress = createPinnedEgressClient({
+      trustedHosts: this.opts.trustedHosts,
+      mode: this.opts.mode,
+      fetchFn: this.opts.fetchFn,
+    });
+  }
 
   async execute(
     pluginId: string,
@@ -339,7 +353,7 @@ export class ToolExecutor implements ToolCallHandler {
       ? AbortSignal.any([signal, timeoutSignal])
       : timeoutSignal;
     try {
-      const response = await policyFetch(
+      const response = await this.egress.fetch(
         url,
         {
           method: "POST",
@@ -350,10 +364,7 @@ export class ToolExecutor implements ToolCallHandler {
           },
           body: serializedArgs,
         },
-        {
-          policy,
-          fetchFn: this.opts.fetchFn,
-        },
+        policy,
       );
       callSignal.throwIfAborted();
       if (!response.ok) {
@@ -670,7 +681,7 @@ export type JobRunnerDeps = {
   /** Override the real ToolExecutor (tests inject a real one with a stubbed fetch). */
   executor?: ToolExecutor;
   /**
-    * Admin-trusted hosts forwarded into the default executor's `policyFetch`
+    * Admin-trusted hosts forwarded into the default executor's egress policy
    * (see `ToolExecutorOptions.trustedHosts`). Wire the plugin store's
    * trusted-host list (env `PLUGINS_TRUSTED_HOSTS`) so admin-trusted internal
    * plugin backends are not rejected at call time.

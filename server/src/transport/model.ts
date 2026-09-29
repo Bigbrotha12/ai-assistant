@@ -9,11 +9,11 @@ import { isModelPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import {
   createEgressPolicy,
-  policyFetch,
   resolveAndValidateHost,
   SsrfValidationError,
 } from "../plugins/ssrf.ts";
 import type { EgressPolicy, LookupFn, Mode } from "../plugins/ssrf.ts";
+import { createPinnedEgressClient } from "../egress/client.ts";
 
 /**
  * Model construction (Phase 3, Wave C1).
@@ -27,8 +27,9 @@ import type { EgressPolicy, LookupFn, Mode } from "../plugins/ssrf.ts";
  *
  * SSRF BOUNDARY (the one hard rule): ChatOpenAI's underlying OpenAI SDK client
  * MUST NOT use the global fetch. The SDK's `ClientOptions` accepts a custom
- * `fetch`, and {@link buildModel} wires a `policyFetch` adapter
- * (plugins/ssrf.ts — the ONLY sanctioned outbound path) into
+ * `fetch`, and {@link buildModel} wires an egress-client adapter
+ * (`policyFetch` under the hood — plugins/ssrf.ts, the ONLY sanctioned
+ * outbound path) into
  * `configuration.fetch`, so every provider call enforces the manifest-derived
  * origin/method/path policy and connects only through validated retained pins,
  * with `redirect: "manual"`. An admin-trusted internal endpoint (e.g.
@@ -45,7 +46,7 @@ import type { EgressPolicy, LookupFn, Mode } from "../plugins/ssrf.ts";
  * verbatim (no `/v1` mangling; the OpenRouter builtin endpoint already carries
  * it). The custom `fetch` is invoked with the fully-resolved request URL (e.g.
  * `https://openrouter.ai/api/v1/chat/completions`), which is exactly the URL
- * `policyFetch` must see.
+ * the egress policy must see.
  *
  * CREDENTIALS: ChatOpenAI requires a non-empty apiKey to construct its OpenAI
  * client, and the gateway must NEVER fall back to the server host's
@@ -99,7 +100,7 @@ export type BuildModelInput = {
   mode?: Mode;
   /** Injectable DNS resolver for a missing retained model pin (tests). */
   lookup?: LookupFn;
-  /** Injectable fetch for `policyFetch` (tests). */
+  /** Injectable fetch for the egress client (tests). */
   fetchFn?: typeof fetch;
 };
 
@@ -162,8 +163,8 @@ function modelEgressPolicy(
 /**
  * Build the chat model for one request. `pluginStore` is accepted for the
  * stable seam (Wave C2's background jobs); `buildModel` resolves the plugin
- * definition through the registry and routes all outbound traffic through
- * `policyFetch`.
+ * definition through the registry and routes all outbound traffic through the
+ * egress client (`policyFetch` under the hood).
  */
 export function buildModel(input: BuildModelInput): BaseChatModel {
   let plugin;
@@ -248,25 +249,25 @@ export type ValidatedFetchAdapterOptions = {
 
 /**
  * The custom `fetch` handed to the OpenAI SDK via `configuration.fetch`.
- * Routes EVERY provider call through `policyFetch` — the only sanctioned
- * outbound path — with the manifest-derived egress policy and any injected
- * fetchFn. Exported so the SSRF contract can be unit-tested
- * without constructing a real `ChatOpenAI`.
+ * Routes EVERY provider call through the egress client (`policyFetch` under
+ * the hood) — the only sanctioned outbound path — with the manifest-derived
+ * egress policy and any injected fetchFn. Exported so the SSRF contract can be
+ * unit-tested without constructing a real `ChatOpenAI`.
+ *
+ * The policy already carries the trust/allowlist and the fallback resolver, so
+ * the client only needs to supply the injected `fetchFn` test seam.
  */
 export function createValidatedFetchAdapter(
   opts: ValidatedFetchAdapterOptions,
 ): typeof fetch {
-  return (url, init) =>
-    policyFetch(resolveFetchUrl(url), init, {
-      policy: opts.policy,
-      fetchFn: opts.fetchFn,
-    });
+  const egress = createPinnedEgressClient({ fetchFn: opts.fetchFn });
+  return (url, init) => egress.fetch(resolveFetchUrl(url), init, opts.policy);
 }
 
 /**
  * The OpenAI SDK calls the custom fetch with a string URL (verified against
  * 1.5.13), but tolerate `URL`/`Request` objects so a future SDK revision or a
- * direct test cannot slip a `[object Request]` into `policyFetch`.
+ * direct test cannot slip a `[object Request]` into the egress client.
  */
 function resolveFetchUrl(url: string | URL | Request): string {
   if (typeof url === "string") return url;
