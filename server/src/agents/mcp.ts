@@ -15,13 +15,12 @@ import type { Ledger } from "../ledger.ts";
 import { SsrfValidationError, validateMcpHeaderName } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import {
-  authorizeEgressRequest,
-  buildPinnedAgent,
-  createEgressPolicy,
+  egressTrustOptions,
   normalizeHostname,
   resolveAndValidateHost,
   validateStaticUrl,
 } from "../plugins/ssrf.ts";
+import { createPinnedEgressClient } from "../egress/client.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import {
   boundToolResult,
@@ -1615,30 +1614,6 @@ function resolveMcpRequestHeaders(
   return headers;
 }
 
-async function validateMcpRetainedPins(
-  parsed: URL,
-  pinnedIps: readonly string[],
-  trustedHosts: readonly string[],
-  mode: Mode | undefined,
-): Promise<readonly string[]> {
-  const validationUrl = new URL(`${parsed.origin}${parsed.pathname}`);
-  const policy = createEgressPolicy({
-    subject: "mcp",
-    destinations: [{
-      baseUrl: validationUrl.href,
-      pinnedIps,
-      methods: ["GET", "POST"],
-      exactPaths: [validationUrl.pathname],
-    }],
-    trustedHosts,
-    httpAllowedHosts: trustedHosts,
-    mode,
-  });
-  const authorized = await authorizeEgressRequest(policy, validationUrl.href, "GET");
-  return authorized.pinnedIps;
-}
-
-
 export async function defaultSseClientFactory(
   server: McpServerConfig,
   deps: {
@@ -1651,32 +1626,30 @@ export async function defaultSseClientFactory(
   overrides: McpSseFactoryOverrides = {},
 ): Promise<McpClientLike> {
   const trusted = deps.trustedHosts;
-  const parsed = validateStaticUrl(server.url, {
-    trustedHosts: trusted,
-    httpAllowedHosts: trusted,
-    mode: deps.mode,
-  });
-  const hostname = normalizeHostname(parsed.hostname);
   const retainedPins = deps.pinnedIps ?? server.pinnedIps;
-  const pinned = retainedPins === undefined
-    ? await resolveAndValidateHost(hostname, {
-        trustedHosts: trusted,
-        lookup: deps.lookup,
-      })
-    : await validateMcpRetainedPins(parsed, retainedPins, trusted, deps.mode);
-  const agent = overrides.createAgent?.(hostname, parsed, pinned) ?? buildPinnedAgent(hostname, parsed, pinned);
+  // The EgressClient owns the SSRF policy for this long-lived stream: it does
+  // the static validation plus the retained-pin re-authorization (or the single
+  // validated DNS resolution), builds the pinned agent, and re-validates on
+  // every request so an SSE reconnect cannot bypass the check. MCP still owns
+  // the connect controller and the client/transport teardown below; only the
+  // agent's lifetime moves behind `stream.dispose()`.
+  const egress = createPinnedEgressClient({
+    ...egressTrustOptions(trusted),
+    mode: deps.mode,
+    lookup: deps.lookup,
+    subject: "mcp",
+  });
+  const stream = await egress.openPinned(server.url, {
+    ...(retainedPins === undefined ? {} : { pinnedIps: retainedPins }),
+    ...(overrides.createAgent === undefined ? {} : { createAgent: overrides.createAgent }),
+  });
   const mcpFetch = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    // `PinnedStream.fetch` takes only a string; narrow the transport's
+    // string|URL|Request here. The bespoke fetch read `input.url` too, so a
+    // Request's body/method/headers were never forwarded — behaviour is
+    // unchanged.
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    validateStaticUrl(url, {
-      trustedHosts: trusted,
-      httpAllowedHosts: trusted,
-      mode: deps.mode,
-    });
-    return globalThis.fetch(url, {
-      ...init,
-      redirect: "manual",
-      dispatcher: agent,
-    } as unknown as RequestInit);
+    return stream.fetch(url, init);
   };
   const connectController = new AbortController();
   const connectSignal = deps.signal
@@ -1701,7 +1674,7 @@ export async function defaultSseClientFactory(
      forceCloseStarted = true;
      connectController.abort();
      void Promise.allSettled([
-       agent.destroy(),
+       stream.dispose(),
        transport.close(),
        client.close(),
      ]);
@@ -1709,7 +1682,7 @@ export async function defaultSseClientFactory(
    const closeClient = (): Promise<void> => {
      closePromise ??= (async () => {
        connectController.abort();
-       await Promise.allSettled([agent.destroy(), client.close()]);
+       await Promise.allSettled([stream.dispose(), client.close()]);
      })();
      return closePromise;
    };
