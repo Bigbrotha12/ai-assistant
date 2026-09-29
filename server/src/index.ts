@@ -221,6 +221,15 @@ const warmups = createWarmupManager({
 });
 let jobRunner: JobRunner | undefined;
 let jobPins: CredentialPinStore | undefined;
+// Phase 3.5 (credential seam): the composition root owns the SHARED credential
+// dependency — the in-memory pin store — but NOT the two providers. Both are
+// inherently per-invocation and are constructed by their consumers:
+//   - `RequestBodyCredentialResolver` per REQUEST in `transport/chat.ts`
+//     (it closes over that request's validated body maps); and
+//   - `PinStoreCredentialResolver` per JOB in `jobs/runner.ts`
+//     (it closes over the admitted pin handles + running-fence guard).
+// Neither can be a root singleton: a shared one would either hold one
+// request's credentials for another's turn or lose the per-job handle/fence.
 // M1: tie NOTIFY_BASE_URL's host to NOTIFY_TRUSTED_HOSTS at boot. A private-
 // address (or production http:) ntfy that is not trusted would otherwise be
 // refused by SSRF validation and its pushes SILENTLY dropped — best-effort by

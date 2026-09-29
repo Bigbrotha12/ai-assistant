@@ -25,7 +25,7 @@ import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
 import { env } from "../env.ts";
 import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";
-import type { CredentialPin, CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
+import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
@@ -48,6 +48,8 @@ import type {
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isMcpHeaderReference, isToolPlugin } from "../plugins/types.ts";
 import { resolveEnvReference } from "../credentials/env_reference.ts";
+import { PinStoreCredentialResolver } from "../credentials/pin_store.ts";
+import type { CredentialResolver } from "../credentials/resolver.ts";
 import {
   createEgressPolicy,
   SsrfValidationError,
@@ -755,7 +757,14 @@ export type BindJobToolsOptions = {
    */
   pipeline?: ToolPipeline;
   credentialsByPlugin: Record<string, Record<string, string>>;
-  getCredentials?: (pluginId: string) => CredentialPin;
+  /**
+   * Per-job credential source (plan §5 Phase 3, steps 3.3/3.5). When provided
+   * (the runner always injects `PinStoreCredentialResolver`) it is the sole
+   * source of a tool call's credentials + fingerprint, replacing the former
+   * inline `getCredentials` closure. `credentialsByPlugin` remains the
+   * ownership gate (`select`) and the unit-test fallback.
+   */
+  credentialsResolver?: CredentialResolver;
   assertActive?: () => void;
   signal?: AbortSignal;
   ledger: Ledger;
@@ -835,9 +844,19 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
       // Ownership gate: the job may call only plugins whose credentials it owns.
       select: (plugin) => Object.hasOwn(opts.credentialsByPlugin, plugin.id),
       buildCall: (ctx) => {
-        const pin = opts.getCredentials?.(ctx.plugin.id);
-        const credentials = opts.credentialsByPlugin[ctx.plugin.id] ?? {};
-        const invocationCredentials = pin?.credentials ?? { ...credentials };
+        // Step 3.3/3.5: the per-job pin provider is the credential source when
+        // injected; the map fallback preserves the unit-test shape (no explicit
+        // resolver, no pin store). Either way the call's credentials + the
+        // channel's OWN fingerprint derivation (the pin's precomputed value)
+        // ride the `ToolCall`.
+        const resolvedCredentials = opts.credentialsResolver?.resolve({
+          owner: opts.owner,
+          pluginId: ctx.plugin.id,
+          kind: "tool",
+          channel: "job",
+        });
+        const credentials = opts.credentialsByPlugin[ctx.plugin.id];
+        const invocationCredentials = resolvedCredentials?.credentials ?? { ...credentials };
         return {
           source: "plugin",
           pluginId: ctx.plugin.id,
@@ -849,7 +868,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
           ...(opts.requestId === undefined ? {} : { requestId: opts.requestId }),
           credentials: invocationCredentials,
           credentialFingerprint:
-            pin?.fingerprint ?? opts.fingerprintsByPlugin?.[ctx.plugin.id] ??
+            resolvedCredentials?.fingerprint ?? opts.fingerprintsByPlugin?.[ctx.plugin.id] ??
             credentialFingerprint(invocationCredentials),
           ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
           channel: "job",
@@ -1229,14 +1248,18 @@ export class JobRunner {
       }
       signal.throwIfAborted();
     };
-    const getCredentials = (pluginId: string) => {
-      assertActive();
-      const handle = descriptor.pinHandles?.[pluginId];
-      if (handle === undefined) {
-        throw new JobError("credentials_expired", `no admitted credential pin for plugin '${pluginId}'`);
-      }
-      return this.deps.pins.get(owner, pluginId, handle);
-    };
+    // Step 3.3/3.5: the per-job credential source. It closes over THIS job's
+    // owner + admitted handles (`descriptor.pinHandles`) and the running-fence
+    // guard, so `resolve({pluginId, kind, channel})` is the whole call surface.
+    // Constructed here — not in `index.ts` — because the handles and the guard
+    // only exist once the task is admitted (plan §5 Phase 3: the resolver is
+    // per-job, not a root singleton).
+    const credentialResolver = new PinStoreCredentialResolver({
+      pins: this.deps.pins,
+      owner,
+      pinHandles: descriptor.pinHandles ?? {},
+      assertActive,
+    });
 
     try {
       if (isDeleting(owner)) return accountDeletedResult(threadId, claimed.id);
@@ -1258,7 +1281,21 @@ export class JobRunner {
       // the cache-key component (never re-derive, never store raw values).
       const fingerprintsByPlugin: Record<string, string> = {};
       for (const pluginId of toolPlugins) {
-        const pin = getCredentials(pluginId);
+        const pin = credentialResolver.resolve({
+          owner,
+          pluginId,
+          kind: "tool",
+          channel: "job",
+        });
+        // The pin provider throws `credentials_expired` rather than returning
+        // undefined; this guard is unreachable and only satisfies the shared
+        // selector's `?`.
+        if (pin === undefined) {
+          throw new JobError(
+            "credentials_expired",
+            `no admitted credential pin for plugin '${pluginId}'`,
+          );
+        }
         credentialsByPlugin[pluginId] = pin.credentials;
         fingerprintsByPlugin[pluginId] = pin.fingerprint;
       }
@@ -1270,7 +1307,11 @@ export class JobRunner {
       //    checkpointer — the graph runs on the submitted snapshot.
       const assertDispatch = () => {
         assertActive();
-        for (const pluginId of Object.keys(descriptor.pinHandles ?? {})) getCredentials(pluginId);
+        for (const pluginId of Object.keys(descriptor.pinHandles ?? {})) {
+          // Validation sweep: re-run the fence guard + pin existence/expiry for
+          // every admitted handle. The result is intentionally discarded.
+          credentialResolver.resolve({ owner, pluginId, kind: "tool", channel: "job" });
+        }
       };
       const beforeModelCall = (messages: unknown) => {
         void messages;
@@ -1280,7 +1321,12 @@ export class JobRunner {
       };
       const model = await this.resolveModel(descriptor, {
         credentials: descriptor.pinHandles?.[descriptor.modelPluginId]
-          ? getCredentials(descriptor.modelPluginId).credentials
+          ? credentialResolver.resolve({
+              owner,
+              pluginId: descriptor.modelPluginId,
+              kind: "model",
+              channel: "job",
+            })?.credentials
           : undefined,
         signal,
         assertActive: assertDispatch,
@@ -1305,7 +1351,7 @@ export class JobRunner {
         registry: this.deps.registry,
          handler,
          credentialsByPlugin,
-        getCredentials,
+        credentialsResolver: credentialResolver,
         assertActive,
         pipeline: jobPipeline,
         signal,

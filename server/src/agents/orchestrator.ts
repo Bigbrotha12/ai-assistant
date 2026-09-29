@@ -6,6 +6,8 @@ import {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
 } from "../tool_bounds.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
+import type { CredentialResolver } from "../credentials/resolver.ts";
+import { RequestBodyCredentialResolver } from "../credentials/request_body.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
@@ -61,9 +63,17 @@ export type BindPluginToolsOptions = {
    */
   channel: "sync-stateless" | "sync-managed";
   /**
-   * Per-plugin credentials collected from the request body. The binding threads
-   * the call's own credentials through `ToolCall.credentials`; the transport no
-   * longer substitutes them (`withToolResultCache` is gone).
+   * Per-request credential source (plan §5 Phase 3, steps 3.2/3.5). When
+   * provided it is the SOLE source of a tool call's credentials + fingerprint,
+   * closing over the request's validated maps (constructed in `chat.ts`); the
+   * binder no longer looks up `credentialsByPlugin` inline.
+   */
+  credentialsResolver?: CredentialResolver;
+  /**
+   * Per-plugin credentials collected from the request body. Retained for the
+   * unit-test call shape (and as the request-body resolver's own input when no
+   * explicit resolver is injected); production wiring passes
+   * `credentialsResolver` instead.
    */
   credentialsByPlugin?: Record<string, Record<string, string>>;
   /**
@@ -129,6 +139,16 @@ export function bindPluginTools(
       ...(options.budget === undefined ? {} : { budget: options.budget }),
       ...(options.cache === undefined ? {} : { cache: options.cache }),
     });
+  // Step 3.2/3.5: one credential source for the binding. Production injects
+  // the per-request `RequestBodyCredentialResolver` (chat.ts); the fallback
+  // preserves the unit-test shape by wrapping `credentialsByPlugin` in the
+  // same provider, so `buildCall` never performs an inline map lookup.
+  const credentialsResolver = options.credentialsResolver ??
+    (options.credentialsByPlugin === undefined
+      ? undefined
+      : new RequestBodyCredentialResolver({
+          toolCredentialsByPlugin: options.credentialsByPlugin,
+        }));
   return bindTools({
     registry,
     pipeline,
@@ -142,9 +162,17 @@ export function bindPluginTools(
         // `withToolResultCache` pre-check).
         options.assertActive?.();
         // Sync fingerprints the raw per-plugin request credentials (plan §10.1);
-        // this derivation is deliberately NOT unified with warmup/job.
-        const credentials = options.credentialsByPlugin?.[ctx.plugin.id];
-        const fingerprint = credentialFingerprint(credentials ?? {});
+        // this derivation is deliberately NOT unified with warmup/job and lives
+        // in the provider now. Missing -> undefined credentials, with the empty
+        // fingerprint the inline `credentialFingerprint(credentials ?? {})` used.
+        const resolvedCredentials = credentialsResolver?.resolve({
+          ...(options.owner === undefined ? {} : { owner: options.owner }),
+          pluginId: ctx.plugin.id,
+          kind: "tool",
+          channel: "sync",
+        });
+        const credentials = resolvedCredentials?.credentials;
+        const fingerprint = resolvedCredentials?.fingerprint ?? credentialFingerprint({});
         return {
           source: "plugin",
           pluginId: ctx.plugin.id,

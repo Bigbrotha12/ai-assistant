@@ -31,6 +31,7 @@ import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { serializeJobPayload, serializeJobSpec } from "../jobs/runner.ts";
 import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
+import { RequestBodyCredentialResolver } from "../credentials/request_body.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { redactBaseMessage } from "../redact.ts";
 import {
@@ -1077,9 +1078,20 @@ async function handleSyncStream(
     requestModel,
     plugin,
     credentials,
+    toolCredentialsByPlugin,
     rawMessages,
     requestParameters,
   } = resolved.value;
+
+  // Step 3.2/3.5: ONE per-request credential source for both halves of the
+  // request body — the selected model plugin's validated credentials and the
+  // validated TOOL map. Constructed here because it is inherently per-request
+  // (it closes over this request's maps); `index.ts` owns only the shared pin
+  // store, which cannot supply request-body credentials.
+  const requestCredentials = new RequestBodyCredentialResolver({
+    toolCredentialsByPlugin,
+    model: { pluginId: modelPluginId, credentials },
+  });
 
   if (isDeleting(owner)) return accountDeletedResponse(c);
   const buildModelFn = opts.buildModel ?? buildModel;
@@ -1091,7 +1103,12 @@ async function handleSyncStream(
       modelPluginId,
       requestModel,
       requestParameters,
-      credentials,
+      credentials: requestCredentials.resolve({
+        owner,
+        pluginId: modelPluginId,
+        kind: "model",
+        channel: "sync",
+      })?.credentials ?? credentials,
       trustedHosts: opts.trustedHosts,
     } satisfies BuildModelInput);
   } catch (err) {
@@ -1113,8 +1130,8 @@ async function handleSyncStream(
     });
   // H2: the binding threads each tool call's per-plugin credentials (mirrors the
   // async path's `bindJobTools` threading) so a tool backend that requires auth
-  // receives the client's key on the SYNC path too.
-  const toolCredentialsByPlugin = resolved.value.toolCredentialsByPlugin;
+  // receives the client's key on the SYNC path too. Step 3.2/3.5: that sourcing
+  // is now the per-request resolver, not an inline map lookup.
   const execution = createStreamExecution(c.req.raw.signal);
   trackModelExecution(model, execution);
   const pluginTools = bindPluginTools(
@@ -1126,7 +1143,7 @@ async function handleSyncStream(
       requestId,
       timeoutMs: effectiveToolTimeoutMs,
       channel: "sync-stateless",
-      credentialsByPlugin: toolCredentialsByPlugin,
+      credentialsResolver: requestCredentials,
       budget,
       ...(opts.toolPipeline === undefined ? {} : { pipeline: opts.toolPipeline }),
       ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
@@ -1449,7 +1466,19 @@ async function handleManagedSessionStream(
   // mark, and they RETURN (or stream) rather than rethrowing into this wrapper,
   // so no path double-marks.
   const buildModelFn = opts.buildModel ?? buildModel;
-  const { modelPluginId, requestModel, plugin, credentials, requestParameters } = resolved;
+  const {
+    modelPluginId,
+    requestModel,
+    plugin,
+    credentials,
+    toolCredentialsByPlugin,
+    requestParameters,
+  } = resolved;
+  // Step 3.2/3.5: same per-request credential source as the stateless path.
+  const requestCredentials = new RequestBodyCredentialResolver({
+    toolCredentialsByPlugin,
+    model: { pluginId: modelPluginId, credentials },
+  });
   if (isDeleting(owner)) return accountDeletedResponse(c);
   // The generation captured at append time (in scope on every path that reaches
   // this section — all four append/seed branches above set it) keeps the rollback
@@ -1464,7 +1493,12 @@ async function handleManagedSessionStream(
       modelPluginId,
       requestModel,
       requestParameters,
-      credentials,
+      credentials: requestCredentials.resolve({
+        owner,
+        pluginId: modelPluginId,
+        kind: "model",
+        channel: "sync",
+      })?.credentials ?? credentials,
       trustedHosts: opts.trustedHosts,
     } satisfies BuildModelInput);
   } catch (err) {
@@ -1488,7 +1522,6 @@ async function handleManagedSessionStream(
         trustedHosts: opts.trustedHosts,
         timeoutMs: effectiveToolTimeoutMs,
       });
-    const toolCredentialsByPlugin = resolved.toolCredentialsByPlugin;
     const execution = createStreamExecution(c.req.raw.signal);
     trackModelExecution(model, execution);
     const pluginTools = bindPluginTools(
@@ -1500,7 +1533,7 @@ async function handleManagedSessionStream(
         requestId,
         timeoutMs: effectiveToolTimeoutMs,
         channel: "sync-managed",
-        credentialsByPlugin: toolCredentialsByPlugin,
+        credentialsResolver: requestCredentials,
         budget,
         ...(opts.toolPipeline === undefined ? {} : { pipeline: opts.toolPipeline }),
         ...(opts.toolCache === undefined ? {} : { cache: opts.toolCache }),
