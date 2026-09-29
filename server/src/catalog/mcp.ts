@@ -8,6 +8,7 @@ import {
   validateMcpHeaderName,
 } from "../plugins/ssrf.ts";
 import { resolvePins } from "../egress/client.ts";
+import { resolveEnvReference } from "../credentials/env_reference.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 
 export type McpEntry = {
@@ -24,9 +25,6 @@ export type McpCatalogLoadOptions = {
   mode?: Mode;
 };
 
-const envVarRe = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
-const controlRe = /[\r\n\u0000-\u001f]/;
-
 const mcpEntrySchema = z.object({
   name: pluginIdSchema,
   url: z.string().url("must be an absolute URL"),
@@ -36,28 +34,24 @@ const mcpEntrySchema = z.object({
 const mcpFileSchema = z.array(mcpEntrySchema);
 
 function resolveHeaderValue(value: string): string {
-  const match = value.match(envVarRe);
-  if (!match) {
+  const resolution = resolveEnvReference(value);
+  if (resolution.ok) return resolution.value;
+  if (resolution.reason === "not-a-reference") {
     throw new SsrfValidationError(
       "INVALID_URL",
       `MCP header value must match \${ENV_VAR} pattern, got '${value}'`,
     );
   }
-  const varName = value.slice(2, -1);
-  const resolved = process.env[varName];
-  if (resolved === undefined) {
+  if (resolution.reason === "undefined") {
     throw new SsrfValidationError(
       "INVALID_URL",
-      `MCP header references undefined environment variable '${varName}'`,
+      `MCP header references undefined environment variable '${resolution.variable}'`,
     );
   }
-  if (controlRe.test(resolved)) {
-    throw new SsrfValidationError(
-      "INVALID_URL",
-      `MCP header resolved value for '${varName}' contains control characters or CRLF`,
-    );
-  }
-  return resolved;
+  throw new SsrfValidationError(
+    "INVALID_URL",
+    `MCP header resolved value for '${resolution.variable}' contains control characters or CRLF`,
+  );
 }
 
 export async function loadMcpCatalog(

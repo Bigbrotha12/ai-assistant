@@ -37,6 +37,7 @@ import {
   type AuditOutcome,
 } from "../audit/telemetry.ts";
 import { isMcpHeaderReference } from "../plugins/types.ts";
+import { resolveEnvReference } from "../credentials/env_reference.ts";
 import type { JsonSchema } from "../plugins/types.ts";
 import { jsonSchemaToZod } from "../tools/schema.ts";
 
@@ -1595,16 +1596,15 @@ function resolveMcpRequestHeaders(
       headers[name] = value;
       continue;
     }
-    const variable = value.slice(2, -1);
-    const resolved = process.env[variable];
-    if (resolved === undefined || /[\r\n\u0000-\u001f]/.test(resolved)) {
+    const resolution = resolveEnvReference(value);
+    if (!resolution.ok) {
       throw new McpError(
         `MCP header reference for '${name}' is unavailable or invalid`,
         "MCP_POLICY_DENIED",
         "INVALID_URL",
       );
     }
-    headers[name] = resolved;
+    headers[name] = resolution.value;
   }
   return headers;
 }

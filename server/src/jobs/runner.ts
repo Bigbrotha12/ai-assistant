@@ -47,6 +47,7 @@ import type {
 } from "../ledger.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isMcpHeaderReference, isToolPlugin } from "../plugins/types.ts";
+import { resolveEnvReference } from "../credentials/env_reference.ts";
 import {
   createEgressPolicy,
   SsrfValidationError,
@@ -575,10 +576,9 @@ export function parsePersistedJobSpec(
             return null;
           }
           if (typeof reference !== "string" || !isMcpHeaderReference(reference)) return null;
-          const variable = reference.slice(2, -1);
-          const resolved = process.env[variable];
-          if (resolved === undefined || /[\r\n\u0000-\u001f]/.test(resolved)) return null;
-          headers[name] = resolved;
+          const resolution = resolveEnvReference(reference);
+          if (!resolution.ok) return null;
+          headers[name] = resolution.value;
         }
       }
        mcpServers.push({
