@@ -47,6 +47,7 @@ function vikunjaManifest(
     type: "tool",
     name: "Vikunja",
     description: "Task management tools",
+    category: "General",
     tools: [
       {
         name: "list_tasks",
@@ -200,6 +201,7 @@ describe("PluginRegistry list (public) endpoints", () => {
     const vikunja = list.find((p) => p.id === "vikunja")!;
     assert.equal(vikunja.installed, false);
     assert.equal(vikunja.type, "tool");
+    assert.equal(vikunja.category, "General");
     assert.deepEqual(vikunja.tools![0]!.name, "list_tasks");
     assert.deepEqual(vikunja.tools![0]!.inputSchema.required, ["projectId"]);
     assert.ok(vikunja.baseUrls.every((b) => !("url" in b)));

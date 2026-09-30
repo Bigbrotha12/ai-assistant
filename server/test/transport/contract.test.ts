@@ -56,6 +56,7 @@ function toolPlugin(): ToolPluginDefinition {
     type: "tool",
     name: "Vikunja",
     description: "Task management tools",
+    category: "General",
     tools: [
       {
         name: "list_tasks",

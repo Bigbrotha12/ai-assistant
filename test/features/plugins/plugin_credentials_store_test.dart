@@ -18,11 +18,11 @@ class DelayedSecureStorage extends InMemorySecureStorage {
   Future<void> write({
     required String key,
     required String? value,
-    IOSOptions? iOptions,
+    AppleOptions? iOptions,
     AndroidOptions? aOptions,
     LinuxOptions? lOptions,
     WebOptions? webOptions,
-    MacOsOptions? mOptions,
+    AppleOptions? mOptions,
     WindowsOptions? wOptions,
   }) async {
     await gate?.future;
@@ -234,6 +234,49 @@ void main() {
     expect(config.inference!.maxTokens, 2048);
     expect(config.inference!.visionCapable, isTrue);
   });
+
+  test(
+    'selectAgent stores a template entry for ready-made ids and preserves custom configs',
+    () async {
+      final storage = InMemorySecureStorage();
+      final store = PluginCredentialsStore(storage: storage);
+      final a = scope('a');
+
+      // A server-provided agent is sent as its string id, so selecting it has
+      // to write the backing template entry `resolveAgentForSend` reads.
+      await store.selectAgent(a, 'ready-agent');
+      var loaded = await store.load(a);
+      expect(loaded.selectedAgent, 'ready-agent');
+      expect(loaded.plugins['ready-agent']!.agent!.kind, AgentKind.template);
+      expect(loaded.plugins['ready-agent']!.enabled, isTrue);
+
+      // A custom agent's own definition is preserved, never replaced by a
+      // template placeholder.
+      await store.setAgentConfig(a, 'my-custom', AgentConfig(
+        id: 'my-custom',
+        kind: AgentKind.custom,
+        name: 'My Custom',
+        systemPrompt: 'hi',
+      ));
+      await store.selectAgent(a, 'my-custom');
+      loaded = await store.load(a);
+      expect(loaded.selectedAgent, 'my-custom');
+      expect(loaded.plugins['my-custom']!.agent!.kind, AgentKind.custom);
+      expect(loaded.plugins['my-custom']!.agent!.systemPrompt, 'hi');
+
+      // Selecting another ready-made agent switches exclusively.
+      await store.selectAgent(a, 'other-ready');
+      loaded = await store.load(a);
+      expect(loaded.selectedAgent, 'other-ready');
+      expect(loaded.plugins['other-ready']!.agent!.kind, AgentKind.template);
+
+      // Null clears the selection but leaves the entries intact.
+      await store.selectAgent(a, null);
+      loaded = await store.load(a);
+      expect(loaded.selectedAgent, isNull);
+      expect(loaded.plugins.containsKey('my-custom'), isTrue);
+    },
+  );
 
   test('seeding: no template id leaves the store empty (never fabricated)', () async {
     final storage = InMemorySecureStorage();

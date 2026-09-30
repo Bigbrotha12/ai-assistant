@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 
@@ -26,6 +27,8 @@ import '../data/voice_runtime_policy.dart';
 /// Monotonic clock shared by the debug-only speak-queue diagnostics, so
 /// per-chunk timings are independent of wall-clock adjustments.
 final Stopwatch _diagStopwatch = Stopwatch()..start();
+
+double _log10(double value) => math.log(value) / math.ln10;
 
 /// One queued utterance awaiting synthesis + playback. Exactly one of [text]
 /// / [pcm] is set: text is synthesised inside the drain loop, pre-built PCM
@@ -238,6 +241,13 @@ final class VoiceController {
   /// Whisper transcribes the end of an utterance best, where the actual
   /// request usually is.
   static const int micBufferCapSamples = 16000 * 180; // 2,880,000 samples
+
+  /// A buffered utterance counts as speech when some sample's peak exceeds this
+  /// fraction of full scale (~±100/32767 ≈ −50 dBFS). Content quieter than
+  /// that is noise or digital silence — the input Whisper-tiny answers with
+  /// polite filler ("see ya", "thank you very much"). A peak gate (not
+  /// whole-buffer RMS) so natural inter-word pauses never read as silence.
+  static const double sttSpeechPeak = 100 / 32767;
 
   /// Serialisation tail: turns (STT → LLM → TTS) run one at a time so a VAD
   /// flush racing the release-flush can never interleave two chat streams or
@@ -627,6 +637,28 @@ final class VoiceController {
     }
     if (engine == null || buffer.isEmpty) return;
 
+    // A buffer with no sample above the speech floor is silence/noise, not an
+    // utterance — a bare hold with nothing spoken. Whisper-tiny cannot decode
+    // it and answers with polite filler ("see ya", "thank you very much")
+    // instead of reporting silence, so drop it before STT with a notice.
+    // Pauses between words do NOT trip this gate: only completely inaudible
+    // buffers are dropped.
+    final envelope = analyzePcm16Envelope(buffer);
+    if (envelope.peak < sttSpeechPeak) {
+      if (kDebugMode) {
+        debugPrint(
+          'VoiceController: flush dropped (peak '
+          '${(20 * _log10(envelope.peak)).toStringAsFixed(1)} dBFS)',
+        );
+      }
+      _update(
+        _state.copyWith(
+          notice: 'No speech detected. Try speaking closer to the mic.',
+        ),
+      );
+      return;
+    }
+
     // Busy state (W1.2): at most ONE utterance may wait behind the in-flight
     // turn. A further flush is dropped with an on-screen notice — the mic
     // buffer was already consumed above, so nothing accumulates and nothing
@@ -677,8 +709,17 @@ final class VoiceController {
     try {
       // Bounded: one hung transcription must cost one utterance, never the
       // turn tail (an unbounded await here would wedge every future flush).
+      // Whisper decodes far more reliably (and invents far less filler) on
+      // speech bounded by its own silence: a hold-to-talk tape includes the
+      // empty start and tail, which the tiny model reads as "nothing clear" and
+      // answers with polite hallucinations. Trim the edges so it sees only the
+      // utterance (keeping a natural pre/post-roll).
+      final trimmed = trimPcm16Silence(
+        buffer,
+        amplitudeThreshold: (sttSpeechPeak * 32767).round(),
+      );
       final raw = await engine
-          .transcribe(buffer, sampleRate: kPlaybackSampleRate)
+          .transcribe(trimmed, sampleRate: kPlaybackSampleRate)
           .timeout(const Duration(minutes: 2));
       policy?.recordSttInferenceSuccess();
       if (kDebugMode) {

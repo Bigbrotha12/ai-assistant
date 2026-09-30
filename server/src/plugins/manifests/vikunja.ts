@@ -23,6 +23,7 @@ const parsed = pluginDefinitionSchema.parse({
   type: "tool",
   name: "Vikunja",
   description: "Task management for your Vikunja instance (homelab).",
+  category: "General",
   baseUrls: [
     {
       id: "vikunja-homelab",

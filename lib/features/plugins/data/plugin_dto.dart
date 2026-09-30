@@ -160,6 +160,14 @@ class PluginDto {
     type = pluginJsonString(json['type']);
     name = pluginJsonString(json['name']);
     description = pluginJsonString(json['description']);
+    // Optional display grouping for the marketplace; absent on older gateways
+    // and on plugins installed before categories existed. Trim treats a
+    // blank/whitespace value as absent (parity with the UI bucket helper) so
+    // one malformed row can never fail the whole plugin list.
+    final rawCategory = json['category'];
+    category = rawCategory is String && rawCategory.trim().isNotEmpty
+        ? rawCategory
+        : null;
     version = pluginJsonString(json['version']);
     if (!RegExp(r'^\d+\.\d+\.\d+$').hasMatch(version)) {
       throw const PluginProtocolException();
@@ -190,6 +198,7 @@ class PluginDto {
   late final String type;
   late final String name;
   late final String description;
+  late final String? category;
   late final String version;
   late final int schemaVersion;
   late final bool installed;

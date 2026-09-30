@@ -122,14 +122,19 @@ Map<String, dynamic> agentPluginJson() => {
   'installed': true,
 };
 
-Map<String, dynamic> toolPluginJson() => {
-  'id': 'web-search',
+Map<String, dynamic> toolPluginJson({
+  String id = 'web-search',
+  String name = 'Web Search',
+  String? category = 'General',
+}) => {
+  'id': id,
   'type': 'tool',
-  'name': 'Web Search',
+  'name': name,
   'description': 'Search the web',
   'version': '1.0.0',
   'schemaVersion': 1,
   'installed': true,
+  'category': ?category,
   'tools': [
     {
       'name': 'search',
@@ -144,6 +149,18 @@ Map<String, dynamic> toolPluginJson() => {
       },
     },
   ],
+};
+
+/// A tool that requires a personal access token, for the marketplace flow.
+Map<String, dynamic> keyedTool({
+  String id = 'bookings',
+  String name = 'Bookings',
+  String category = 'General',
+}) => {
+  ...toolPluginJson(id: id, name: name, category: category),
+  'credentials': {
+    'apiKey': {'label': 'Personal access token', 'required': true},
+  },
 };
 
 PluginCatalog _loadedCatalog() => PluginCatalog(
@@ -164,6 +181,7 @@ void main() {
   bool failed = false;
   bool terminal = false;
   bool empty = false;
+  late List<Map<String, dynamic>> toolPlugins;
 
   Future<void> mount(
     WidgetTester tester, {
@@ -252,6 +270,7 @@ void main() {
     failed = false;
     terminal = false;
     empty = false;
+    toolPlugins = [toolPluginJson()];
     store = PluginCredentialsStore(storage: InMemorySecureStorage());
     adapter = FakePluginAdapter((options) {
       if (terminal) {
@@ -268,7 +287,7 @@ void main() {
           return jsonResponse({
             'plugins': empty
                 ? []
-                : [pluginJson(), agentPluginJson(), toolPluginJson()],
+                : [pluginJson(), agentPluginJson(), ...toolPlugins],
           });
         case '/v1/models':
           return jsonResponse({
@@ -460,8 +479,10 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('No models available'), findsOneWidget);
     empty = false;
+    await reveal(tester, find.text('Refresh catalog'));
     await tester.tap(find.text('Refresh catalog'));
     await tester.pumpAndSettle();
+    await reveal(tester, find.byKey(const Key('plugin-openrouter')));
     await tester.tap(find.byKey(const Key('plugin-openrouter')));
     await tester.pumpAndSettle();
     await tester.enterText(find.byKey(const Key('plugin-api-key')), 'unsaved');
@@ -566,14 +587,27 @@ void main() {
     );
   });
 
-  testWidgets('agent section shows agent tile and can navigate to editor', (
+  testWidgets('ready-made agent tile selects and opens details', (
     tester,
   ) async {
     await mount(tester);
-    expect(find.text('Test Agent'), findsAtLeastNWidgets(1));
-    await tester.tap(find.byKey(const ValueKey('agent-test-agent')));
+    final tile = find.byKey(const ValueKey('ready-test-agent'));
+    await reveal(tester, tile);
+    expect(find.text('Test Agent'), findsOneWidget);
+
+    // Tapping the row selects it exclusively.
+    await tester.tap(tile);
     await tester.pumpAndSettle();
-    expect(find.text('Configure agent'), findsOneWidget);
+    expect(
+      (await store.load(account.accountScope!)).selectedAgent,
+      'test-agent',
+    );
+    expect(find.text('Selected for this account'), findsAtLeastNWidgets(1));
+
+    // The info action opens the read-only details page.
+    await tester.tap(find.byKey(const ValueKey('ready-details-test-agent')));
+    await tester.pumpAndSettle();
+    expect(find.text('Agent details'), findsOneWidget);
     expect(find.text('A test agent'), findsOneWidget);
   });
 
@@ -581,33 +615,66 @@ void main() {
     empty = true;
     await mount(tester);
     expect(
-      find.text(
-        'No agents available. Ask your administrator to install an agent plugin.',
-      ),
+      find.text('No ready-made agents yet. Ask your administrator to add one.'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('You have not created any custom agents yet.'),
       findsOneWidget,
     );
   });
 
-  testWidgets('selecting and deselecting an agent', (tester) async {
+  testWidgets('selecting an agent switches exclusively', (tester) async {
     await mount(tester);
-    await tester.tap(find.byKey(const ValueKey('agent-test-agent')));
+    // Seed a custom agent directly through the store (the scoped wrapper would
+    // invalidate mid-test), then bump the epoch so the list rebuilds.
+    await store.setAgentConfig(
+      account.accountScope!,
+      'my-agent',
+      AgentConfig(
+        id: 'my-agent',
+        kind: AgentKind.custom,
+        name: 'My Agent',
+        description: 'A custom agent',
+      ),
+    );
+    container.read(pluginCredentialsEpochProvider.notifier).invalidate();
     await tester.pumpAndSettle();
-    // The first catalog template is seeded as the selected agent.
+
+    final customTile = find.byKey(const ValueKey('custom-my-agent'));
+    await reveal(tester, customTile);
+    await tester.tap(customTile);
+    await tester.pumpAndSettle();
+    expect((await store.load(account.accountScope!)).selectedAgent, 'my-agent');
+    expect(
+      find.descendant(
+        of: customTile,
+        matching: find.text('Selected for this account'),
+      ),
+      findsOneWidget,
+    );
+
+    final readyTile = find.byKey(const ValueKey('ready-test-agent'));
+    await reveal(tester, readyTile);
+    await tester.tap(readyTile);
+    await tester.pumpAndSettle();
     expect(
       (await store.load(account.accountScope!)).selectedAgent,
       'test-agent',
     );
-    expect(find.text('Deselect agent'), findsOneWidget);
-    await tester.tap(find.text('Deselect agent'));
-    await tester.pumpAndSettle();
-    expect(find.text('Select agent'), findsOneWidget);
-    expect((await store.load(account.accountScope!)).selectedAgent, isNull);
-    await tester.tap(find.text('Select agent'));
-    await tester.pumpAndSettle();
-    expect(find.text('Deselect agent'), findsOneWidget);
     expect(
-      (await store.load(account.accountScope!)).selectedAgent,
-      'test-agent',
+      find.descendant(
+        of: readyTile,
+        matching: find.text('Selected for this account'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: customTile,
+        matching: find.text('Selected for this account'),
+      ),
+      findsNothing,
     );
   });
 
@@ -615,7 +682,7 @@ void main() {
     'agent editor exposes tool grants, model picker, and inference controls',
     (tester) async {
       await mount(tester);
-      await tester.tap(find.text('New Agent'));
+      await tester.tap(find.text('Create agent'));
       await tester.pumpAndSettle();
       expect(find.byType(AgentEditorScreen), findsOneWidget);
       final editor = find.byType(AgentEditorScreen);
@@ -746,11 +813,11 @@ void main() {
     expect(find.byKey(const Key('agent-catalog-status')), findsOneWidget);
 
     await reveal(
-        tester,
-        find.byKey(const Key('agent-save')),
-        scrollable: editorScrollable(),
-      );
-      final save = find.widgetWithText(FilledButton, 'Save');
+      tester,
+      find.byKey(const Key('agent-save')),
+      scrollable: editorScrollable(),
+    );
+    final save = find.widgetWithText(FilledButton, 'Save');
     expect(tester.widget<FilledButton>(save).onPressed, isNull);
   });
 
@@ -777,13 +844,13 @@ void main() {
       final save = find.widgetWithText(FilledButton, 'Save');
       expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
       await reveal(
-          tester,
-          find.byKey(const Key('agent-save')),
-          scrollable: editorScrollable(),
-        );
-        await tester.pumpAndSettle();
-        await tester.tap(save);
-        await tester.pump();
+        tester,
+        find.byKey(const Key('agent-save')),
+        scrollable: editorScrollable(),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(save);
+      await tester.pump();
       await reveal(
         tester,
         find.byKey(const Key('agent-error')),
@@ -825,13 +892,13 @@ void main() {
       final save = find.widgetWithText(FilledButton, 'Save');
       expect(tester.widget<FilledButton>(save).onPressed, isNotNull);
       await reveal(
-          tester,
-          find.byKey(const Key('agent-save')),
-          scrollable: editorScrollable(),
-        );
-        await tester.pumpAndSettle();
-        await tester.tap(save);
-        await tester.pump();
+        tester,
+        find.byKey(const Key('agent-save')),
+        scrollable: editorScrollable(),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(save);
+      await tester.pump();
       await reveal(
         tester,
         find.byKey(const Key('agent-error')),
@@ -854,7 +921,7 @@ void main() {
     'editor saves tool grants, modelRef, and inference into the agent store',
     (tester) async {
       await mount(tester);
-      await tester.tap(find.text('New Agent'));
+      await tester.tap(find.text('Create agent'));
       await tester.pumpAndSettle();
 
       await reveal(
@@ -937,29 +1004,21 @@ void main() {
       final tile = find.byKey(const ValueKey('custom-field-agent'));
       expect(tile, findsOneWidget);
       expect(
-        find.descendant(
-          of: tile,
-          matching: find.text('1 tools'),
-        ),
+        find.descendant(of: tile, matching: find.text('1 tools')),
         findsOneWidget,
       );
       expect(
-        find.descendant(
-          of: tile,
-          matching: find.text('openrouter'),
-        ),
+        find.descendant(of: tile, matching: find.text('openrouter')),
         findsOneWidget,
       );
-      // Edit is the whole row now (no separate button to mis-tap next to
-      // Delete); Delete is the only explicit action on the row.
-      // The list row carries no per-row actions — delete lives in the editor.
-      expect(find.byTooltip('Edit agent'), findsNothing);
+      // The row selects on tap; the pencil edits. Delete stays in the editor.
       expect(find.byTooltip('Delete agent'), findsNothing);
+      expect(find.byTooltip('Edit agent'), findsOneWidget);
 
-      // Tapping the row opens the editor with the saved agent pre-filled.
+      // The pencil opens the editor with the saved agent pre-filled.
       await tester.ensureVisible(tile);
       await tester.pumpAndSettle();
-      await tester.tap(tile);
+      await tester.tap(find.byKey(const ValueKey('custom-edit-field-agent')));
       await tester.pumpAndSettle();
       expect(find.byType(AgentEditorScreen), findsOneWidget);
       expect(
@@ -972,67 +1031,71 @@ void main() {
     },
   );
 
-  testWidgets('deleting a custom agent asks for confirmation and clears selection',
-      (tester) async {
-    await mount(tester);
+  testWidgets(
+    'deleting a custom agent asks for confirmation and clears selection',
+    (tester) async {
+      await mount(tester);
 
-    // Seed a custom agent and make it the selected agent directly through the
-    // store (the scoped wrapper would invalidate mid-test), then bump the
-    // epoch so the plugin list rebuilds from the new state.
-    await store.setAgentConfig(
-      account.accountScope!,
-      'my-agent',
-      AgentConfig(
-        id: 'my-agent',
-        kind: AgentKind.custom,
-        name: 'My Agent',
-        description: 'A custom agent',
-      ),
-    );
-    await store.setSelectedAgent(account.accountScope!, 'my-agent');
-    container.read(pluginCredentialsEpochProvider.notifier).invalidate();
-    await tester.pumpAndSettle();
+      // Seed a custom agent and make it the selected agent directly through the
+      // store (the scoped wrapper would invalidate mid-test), then bump the
+      // epoch so the plugin list rebuilds from the new state.
+      await store.setAgentConfig(
+        account.accountScope!,
+        'my-agent',
+        AgentConfig(
+          id: 'my-agent',
+          kind: AgentKind.custom,
+          name: 'My Agent',
+          description: 'A custom agent',
+        ),
+      );
+      await store.setSelectedAgent(account.accountScope!, 'my-agent');
+      container.read(pluginCredentialsEpochProvider.notifier).invalidate();
+      await tester.pumpAndSettle();
 
-    final tile = find.byKey(const ValueKey('custom-my-agent'));
-    await tester.ensureVisible(tile);
-    await tester.pumpAndSettle();
-    await tester.tap(tile);
-    await tester.pumpAndSettle();
+      final tile = find.byKey(const ValueKey('custom-my-agent'));
+      await tester.ensureVisible(tile);
+      await tester.pumpAndSettle();
+      // The pencil opens the editor; the row itself selects.
+      await tester.tap(find.byKey(const ValueKey('custom-edit-my-agent')));
+      await tester.pumpAndSettle();
 
-    // Delete lives in the editor's Finish section, not on the list row.
-    expect(find.byTooltip('Delete agent'), findsNothing);
-    final delete = find.byKey(const Key('agent-delete'));
-    await reveal(tester, delete, scrollable: editorScrollable());
-    await tester.pumpAndSettle();
+      // Delete lives in the editor's Finish section, not on the list row.
+      expect(find.byTooltip('Delete agent'), findsNothing);
+      final delete = find.byKey(const Key('agent-delete'));
+      await reveal(tester, delete, scrollable: editorScrollable());
+      await tester.pumpAndSettle();
 
-    // First tap: confirmation guard. Cancel keeps everything.
-    await tester.tap(delete);
-    await tester.pumpAndSettle();
-    expect(find.text('Delete agent?'), findsOneWidget);
-    await tester.tap(find.text('Cancel'));
-    await tester.pumpAndSettle();
-    expect(find.byType(AgentEditorScreen), findsOneWidget);
-    expect(
-      (await store.load(account.accountScope!)).plugins.containsKey('my-agent'),
-      isTrue,
-    );
+      // First tap: confirmation guard. Cancel keeps everything.
+      await tester.tap(delete);
+      await tester.pumpAndSettle();
+      expect(find.text('Delete agent?'), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AgentEditorScreen), findsOneWidget);
+      expect(
+        (await store.load(account.accountScope!)).plugins
+            .containsKey('my-agent'),
+        isTrue,
+      );
 
-    // Confirm actually deletes, pops back, and clears the dangling selection.
-    await tester.tap(find.byKey(const Key('agent-delete')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
-    await tester.pumpAndSettle();
-    expect(find.byType(AgentEditorScreen), findsNothing);
-    final config = await store.load(account.accountScope!);
-    expect(config.plugins.containsKey('my-agent'), isFalse);
-    expect(config.selectedAgent, isNull);
-  });
+      // Confirm actually deletes, pops back, and clears the dangling selection.
+      await tester.tap(find.byKey(const Key('agent-delete')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AgentEditorScreen), findsNothing);
+      final config = await store.load(account.accountScope!);
+      expect(config.plugins.containsKey('my-agent'), isFalse);
+      expect(config.selectedAgent, isNull);
+    },
+  );
 
   testWidgets('over-cap system prompt and max tokens block the save', (
     tester,
   ) async {
     await mount(tester);
-    await tester.tap(find.text('New Agent'));
+    await tester.tap(find.text('Create agent'));
     await tester.pumpAndSettle();
 
     await reveal(
@@ -1107,41 +1170,133 @@ void main() {
     );
   });
 
-  testWidgets('installed agent and template tiles show tool and model chips', (
+  testWidgets('ready-made agent tile merges server sources and shows chips', (
     tester,
   ) async {
     await mount(tester);
-    final agentTile = find.byKey(const ValueKey('agent-test-agent'));
+    // Templates and installed agent plugins overlap for `test-agent`; the
+    // merged list must show exactly one row for it.
+    final agentTile = find.byKey(const ValueKey('ready-test-agent'));
     await reveal(tester, agentTile);
     expect(
-      find.descendant(
-        of: agentTile,
-        matching: find.text('1 tools'),
-      ),
+      find.descendant(of: agentTile, matching: find.text('1 tools')),
       findsOneWidget,
     );
     expect(
-      find.descendant(
-        of: agentTile,
-        matching: find.text('openrouter'),
-      ),
+      find.descendant(of: agentTile, matching: find.text('openrouter')),
       findsOneWidget,
     );
-    final templateTile = find.byKey(const ValueKey('template-test-agent'));
-    await reveal(tester, templateTile);
-    expect(
-      find.descendant(
-        of: templateTile,
-        matching: find.text('1 tools'),
-      ),
-      findsOneWidget,
-    );
-    expect(
-      find.descendant(
-        of: templateTile,
-        matching: find.text('openrouter'),
-      ),
-      findsOneWidget,
-    );
+    expect(find.byKey(const ValueKey('agent-test-agent')), findsNothing);
+    expect(find.byKey(const ValueKey('template-test-agent')), findsNothing);
+  });
+
+  testWidgets(
+    'tools section offers the marketplace and configured tools entry points',
+    (tester) async {
+      await mount(tester);
+      await reveal(tester, find.byKey(const Key('tool-marketplace')));
+      expect(find.byKey(const Key('configured-tools')), findsOneWidget);
+      expect(find.byKey(const Key('tool-marketplace')), findsOneWidget);
+      // The account-level catalog list is gone from this screen: tools live
+      // behind the two entry points now.
+      expect(find.byKey(const ValueKey('plugin-web-search')), findsNothing);
+      expect(find.text('Disabled for this account'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'configured tools shows an empty state before any tool is set up',
+    (tester) async {
+      await mount(tester);
+      await reveal(tester, find.byKey(const Key('configured-tools')));
+      await tester.tap(find.byKey(const Key('configured-tools')));
+      await tester.pumpAndSettle();
+      expect(find.text('Configured tools'), findsWidgets);
+      expect(
+        find.text('No tools set up yet. Open the Tool marketplace to add one.'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'marketplace adds a tool and configured tools lists it as Ready',
+    (tester) async {
+      toolPlugins = [keyedTool()];
+      await mount(tester);
+      await reveal(tester, find.byKey(const Key('tool-marketplace')));
+      await tester.tap(find.byKey(const Key('tool-marketplace')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Tool marketplace'), findsWidgets);
+      // The single tool defaults into the "General" group.
+      expect(find.text('General'), findsOneWidget);
+      final row = find.byKey(const ValueKey('market-bookings'));
+      await tester.ensureVisible(row);
+      await tester.pumpAndSettle();
+      expect(
+        find.descendant(of: row, matching: find.text('Add')),
+        findsOneWidget,
+      );
+
+      // Opening the tool, enabling it, and saving a token makes it Ready.
+      await tester.tap(row);
+      await tester.pumpAndSettle();
+      expect(find.text('Tool setup'), findsOneWidget);
+      await tester.tap(find.text('Enable for this account'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('plugin-api-key')),
+        'secret-token',
+      );
+      await tester.pump();
+      await tester.tap(find.text('Save API key'));
+      await tester.pumpAndSettle();
+
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      final readyRow = find.byKey(const ValueKey('market-bookings'));
+      await tester.ensureVisible(readyRow);
+      await tester.pumpAndSettle();
+      expect(
+        find.descendant(of: readyRow, matching: find.text('Ready')),
+        findsOneWidget,
+      );
+
+      // The configured tools screen lists it now.
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      await reveal(tester, find.byKey(const Key('configured-tools')));
+      await tester.tap(find.byKey(const Key('configured-tools')));
+      await tester.pumpAndSettle();
+      final configured = find.byKey(const ValueKey('configured-bookings'));
+      expect(configured, findsOneWidget);
+      expect(
+        find.descendant(of: configured, matching: find.text('Ready')),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('marketplace groups tools by category and filters by search', (
+    tester,
+  ) async {
+    toolPlugins = [
+      toolPluginJson(id: 'notes', name: 'Notes', category: 'Productivity'),
+      toolPluginJson(id: 'fitness', name: 'Fitness', category: 'Health'),
+      // No explicit category -> "General".
+      toolPluginJson(id: 'plain', name: 'Plain Tool', category: null),
+    ];
+    await mount(tester);
+    await reveal(tester, find.byKey(const Key('tool-marketplace')));
+    await tester.tap(find.byKey(const Key('tool-marketplace')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('General'), findsOneWidget);
+    expect(find.text('Health'), findsOneWidget);
+    expect(find.text('Productivity'), findsOneWidget);
+    expect(find.byKey(const ValueKey('market-notes')), findsOneWidget);
+    expect(find.byKey(const ValueKey('market-fitness')), findsOneWidget);
+    expect(find.byKey(const ValueKey('market-plain')), findsOneWidget);
   });
 }

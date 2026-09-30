@@ -146,7 +146,7 @@ void main() {
       await pipeline.startRecording();
 
       // Utterance 1 (mid-hold VAD silence does not flush; release does).
-      mic.emitChunk(List<int>.filled(50, 1));
+      mic.emitChunk(List<int>.filled(50, 300));
       vad.emitState(VadState.speechStarted);
       await pumpEventQueue();
       vad.emitState(VadState.speechStopped);
@@ -156,7 +156,7 @@ void main() {
       await pumpEventQueue();
 
       // Utterance 2.
-      mic.emitChunk(List<int>.filled(30, 2));
+      mic.emitChunk(List<int>.filled(30, 300));
       vad.emitState(VadState.speechStarted);
       await pumpEventQueue();
       vad.emitState(VadState.speechStopped);
@@ -189,7 +189,7 @@ void main() {
     expect(controller.state.error, isNull);
 
     // Buffered audio is preserved across the restart.
-    mic.emitChunk(List<int>.filled(10, 7));
+    mic.emitChunk(List<int>.filled(10, 300));
     await pumpEventQueue();
     await controller.flushTranscriptionBuffer();
     await pumpEventQueue();
@@ -257,7 +257,7 @@ void main() {
       expect(mic.startCount, 2);
 
       // Warm-up frames right after the reopen must not reach VAD.
-      mic.emitChunk(List<int>.filled(32, 3));
+      mic.emitChunk(List<int>.filled(32, 300));
       await pumpEventQueue();
       expect(vad.processedChunks, isEmpty);
     });
@@ -274,7 +274,7 @@ void main() {
 
       // Past the window the same frames flow onward again.
       await Future<void>.delayed(const Duration(milliseconds: 200));
-      mic.emitChunk(List<int>.filled(32, 4));
+      mic.emitChunk(List<int>.filled(32, 300));
       await pumpEventQueue();
       expect(vad.processedChunks, isNotEmpty);
     });
@@ -289,7 +289,7 @@ void main() {
       await pumpEventQueue();
       await pumpEventQueue();
       await Future<void>.delayed(const Duration(milliseconds: 200));
-      mic.emitChunk(List<int>.filled(16, 1));
+      mic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       expect(vad.processedChunks, isNotEmpty);
       final delivered = vad.processedChunks.length;
@@ -299,7 +299,7 @@ void main() {
       await pumpEventQueue();
       await pumpEventQueue();
       expect(mic.startCount, 3);
-      mic.emitChunk(List<int>.filled(16, 2));
+      mic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       expect(vad.processedChunks, hasLength(delivered));
     });
@@ -309,12 +309,12 @@ void main() {
       await pipeline.startRecording();
 
       // Every-open policy: the first open behaves like a reopen.
-      mic.emitChunk(List<int>.filled(16, 9));
+      mic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       expect(vad.processedChunks, isEmpty);
 
       await Future<void>.delayed(const Duration(milliseconds: 200));
-      mic.emitChunk(List<int>.filled(16, 9));
+      mic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       expect(vad.processedChunks, hasLength(1));
     });
@@ -464,7 +464,7 @@ void main() {
 
       // Prime the STT buffer with clean audio (whitespace transcript → the
       // flush records it but dispatches no turn).
-      restartRawMic.emitChunk(List<int>.filled(16, 1));
+      restartRawMic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
 
       // The recorder dies mid-hold; the pipeline restarts it through the gate.
@@ -475,23 +475,23 @@ void main() {
 
       // Warm-up frame right after the reopen must not reach the STT buffer:
       // the flush sees only the pre-restart audio.
-      restartRawMic.emitChunk(List<int>.filled(16, 2));
+      restartRawMic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       await restartController.flushTranscriptionBuffer();
       await pumpEventQueue();
       await pumpEventQueue();
       expect(restartStt.transcribed, hasLength(1));
-      expect(restartStt.transcribed.single, everyElement(1));
+      expect(restartStt.transcribed.single, everyElement(300));
 
       // Past the re-armed window, frames buffer again.
       await Future<void>.delayed(const Duration(milliseconds: 200));
-      restartRawMic.emitChunk(List<int>.filled(16, 3));
+      restartRawMic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       await restartController.flushTranscriptionBuffer();
       await pumpEventQueue();
       await pumpEventQueue();
       expect(restartStt.transcribed, hasLength(2));
-      expect(restartStt.transcribed.last, everyElement(3));
+      expect(restartStt.transcribed.last, everyElement(300));
     },
   );
 
@@ -564,7 +564,7 @@ void main() {
         await harness.pipeline.stopRecording();
         expect(harness.pipeline.isRecording, isFalse);
         expect(harness.mic.activeListenerCount, 1);
-        harness.mic.emitChunk(List<int>.filled(16, 8));
+        harness.mic.emitChunk(List<int>.filled(16, 300));
         await pumpEventQueue();
         expect(harness.vad.processedChunks, isEmpty);
 
@@ -593,7 +593,7 @@ void main() {
 
       await harness.pipeline.dispose();
       expect(harness.mic.activeListenerCount, 1);
-      harness.mic.emitChunk(List<int>.filled(16, 9));
+      harness.mic.emitChunk(List<int>.filled(16, 300));
       await pumpEventQueue();
       expect(harness.vad.processedChunks, isEmpty);
 

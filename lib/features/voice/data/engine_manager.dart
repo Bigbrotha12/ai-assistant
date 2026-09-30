@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -57,12 +58,28 @@ enum VoiceEngineStatus {
 class EngineManager extends ChangeNotifier {
   EngineManager({String? modelDir, FreeStorageBytesReader? freeStorageBytes})
     : _modelDir = modelDir ?? '.voice_models',
-      _downloader = ModelDownloader(freeStorageBytes: freeStorageBytes);
+      _downloader = ModelDownloader(freeStorageBytes: freeStorageBytes) {
+    // Fold the downloader's per-artifact events into overall progress per
+    // engine model, keyed by the engine model id the UI renders.
+    _downloaderSub = _downloader.progress.listen(_onDownloaderProgress);
+  }
 
   final String _modelDir;
 
   final ModelDownloader _downloader;
   final Map<String, VoiceEngineStatus> _statuses = {};
+  StreamSubscription<ModelDownloadProgress>? _downloaderSub;
+
+  /// Overall download progress (0.0–1.0) per engine model id (whisper /
+  /// supertonic). Grows monotonically across a model's multiple artifact
+  /// files, so a multi-file model reads as one continuous download.
+  final StreamController<Map<String, double>> _modelProgressController =
+      StreamController.broadcast();
+  final Map<String, double> _modelProgress = {};
+
+  /// Emits per-model overall progress snapshots while a download is in flight.
+  Stream<Map<String, double>> get modelProgress =>
+      _modelProgressController.stream;
 
   /// The registered TTS engine, kept so [dispose] can release its native
   /// resources.
@@ -79,6 +96,30 @@ class EngineManager extends ChangeNotifier {
   /// Emits progress events for the currently-active model download, or a
   /// single null after the last event when no download is in flight.
   Stream<ModelDownloadProgress> get downloadProgress => _downloader.progress;
+
+  /// Translates a downloader event into overall progress for the engine model
+  /// it belongs to: `(artifactIndex + event.percent) / artifactCount`. Each
+  /// completed file therefore advances the model's bar by `1/N` instead of
+  /// restarting it, and only the model actually downloading is touched.
+  void _onDownloaderProgress(ModelDownloadProgress event) {
+    if (_disposed) return;
+    for (final entry in _modelConfig.entries) {
+      final types = _downloaderTypes(entry.value);
+      final index = types.indexOf(event.modelType);
+      if (index < 0) continue;
+      final overall = ((index + event.percent) / types.length).clamp(0.0, 1.0);
+      _modelProgress[entry.key] = overall;
+      _modelProgressController.add(Map.unmodifiable(_modelProgress));
+      return;
+    }
+  }
+
+  /// Ordered artifact downloader types for a model (primary file first), used
+  /// to index downloader progress events into an overall model percentage.
+  static List<String> _downloaderTypes(_ModelConfig config) => [
+    config.downloaderType,
+    for (final artifact in config.artifacts) artifact.downloaderType,
+  ];
 
   /// Whether initialization has completed (engines registered, statuses set).
   ///
@@ -204,6 +245,26 @@ class EngineManager extends ChangeNotifier {
     return getStatus(modelId) == VoiceEngineStatus.ready;
   }
 
+  /// Deletes every artifact of [modelId] from disk (final files plus any
+  /// leftover `.part` temp) and resets the model to [VoiceEngineStatus.notStarted]
+  /// so it can be re-downloaded. Returns `true` when the model was deletable.
+  Future<bool> deleteModel(String modelId) async {
+    final config = _modelConfig[modelId];
+    if (config == null || !config.downloadable) return false;
+    final dir = await _resolveModelDir();
+    for (final target in config.allTargets(dir)) {
+      await _deleteIfExists(target);
+      await _deleteIfExists(File('${target.path}.part'));
+    }
+    _statuses[modelId] = VoiceEngineStatus.notStarted;
+    _modelProgress.remove(modelId);
+    if (!_disposed) {
+      _modelProgressController.add(Map.unmodifiable(_modelProgress));
+    }
+    _notify();
+    return true;
+  }
+
   /// Downloads every artifact of [config] into [dir] (primary file first,
   /// then the secondary artifacts). Callers own the status bookkeeping.
   Future<void> _downloadArtifacts(_ModelConfig config, String dir) async {
@@ -305,6 +366,9 @@ class EngineManager extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _downloaderSub?.cancel();
+    _downloaderSub = null;
+    _modelProgressController.close();
     _ttsEngine?.dispose();
     _downloader.dispose();
     super.dispose();
@@ -425,6 +489,19 @@ class EngineManager extends ChangeNotifier {
   void _notify() {
     if (!_disposed) {
       notifyListeners();
+    }
+  }
+
+  /// Best-effort deletion of a model artifact or temp file, swallowing any
+  /// secondary error (the caller decides whether the delete succeeded by
+  /// checking the file system afterwards).
+  static Future<void> _deleteIfExists(File file) async {
+    try {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {
+      // Intentionally ignored; the caller's status check is authoritative.
     }
   }
 }

@@ -6,7 +6,6 @@ import './device_health_provider.dart';
 import './engine_config.dart';
 import './engine_manager.dart';
 import './engine_registry.dart';
-import './model_downloader.dart';
 import './voice_runtime_policy_provider.dart';
 import './stt_engine.dart';
 import './tts_engine.dart';
@@ -82,8 +81,12 @@ class VoiceEngineStatusNotifier
     if (!await _canDownloadModels()) return;
     final manager = ref.read(engineManagerProvider);
     await manager.ensureModelsDownloaded(
-      progress: (modelId) {
-        state = {...state, modelId: VoiceEngineStatus.downloading};
+      // Snapshot the manager's real statuses at every model boundary instead
+      // of accumulating `downloading`: `ensureModelsDownloaded` marks one model
+      // at a time, so the map must reflect that (whisper flips to ready before
+      // Supertonic starts) or both chips render as downloading at once.
+      progress: (_) {
+        state = manager.allStatuses;
       },
     );
     // Snapshot final statuses.
@@ -100,6 +103,14 @@ class VoiceEngineStatusNotifier
     state = manager.allStatuses;
   }
 
+  /// Removes the downloaded files for [modelId] so it can be re-downloaded
+  /// (e.g. to exercise the download UI again), then snapshots the statuses.
+  Future<void> deleteModel(String modelId) async {
+    final manager = ref.read(engineManagerProvider);
+    await manager.deleteModel(modelId);
+    state = manager.allStatuses;
+  }
+
   Future<bool> _canDownloadModels() async {
     final policy = ref.read(voiceRuntimePolicyProvider);
     await policy.refreshHealth();
@@ -107,12 +118,16 @@ class VoiceEngineStatusNotifier
   }
 }
 
-/// Progress events for the currently-active model download (if any).
-final modelDownloadProgressProvider = StreamProvider<ModelDownloadProgress?>((
+/// Overall download progress (0.0–1.0) per engine model id (e.g.
+/// `whisper_tiny` / `supertonic_3`), aggregated across a model's artifact
+/// files. A row only renders the entry for its own model, so downloading STT
+/// never leaks progress onto the TTS bar (and vice versa), and multi-file
+/// models read as one monotonic download.
+final modelDownloadProgressProvider = StreamProvider<Map<String, double>>((
   ref,
 ) {
   final manager = ref.watch(engineManagerProvider);
-  return manager.downloadProgress;
+  return manager.modelProgress;
 });
 
 // ---------------------------------------------------------------------------

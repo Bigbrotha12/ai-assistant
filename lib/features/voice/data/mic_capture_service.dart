@@ -58,8 +58,8 @@ class MicReopenDiscardGate implements MicCaptureService {
 
   @override
   Stream<List<int>> get audioStream => _inner.audioStream.where(
-        (chunk) => !DateTime.now().isBefore(_discardUntil),
-      );
+    (chunk) => !DateTime.now().isBefore(_discardUntil),
+  );
 
   @override
   Future<void> start({int sampleRate = 16000}) async {
@@ -112,6 +112,20 @@ class RecordMicCaptureService implements MicCaptureService {
           encoder: AudioEncoder.pcm16bits,
           sampleRate: sampleRate,
           numChannels: 1,
+          // Normalise the input: auto-gain lifts quiet speakers into a range
+          // Whisper-tiny can actually decode (low-level capture is its #1
+          // hallucination trigger), and noise-suppression stops room murmur
+          // from being decoded as polite filler.
+          autoGain: true,
+          noiseSuppress: true,
+          // Voice-recognition capture source: routes the mic through the
+          // device's own voice DSP (source-level gain control). The fallback
+          // `defaultSource` delivered ~30 dB too-quiet PCM on device, which
+          // Whisper-tiny read as [INAUDIBLE] even for a clearly spoken
+          // sentence.
+          androidConfig: const AndroidRecordConfig(
+            audioSource: AndroidAudioSource.voiceRecognition,
+          ),
           // The shared AudioSessionManager owns audio focus for the voice
           // conversation. record's own focus request (default `pause`) steals
           // AUDIOFOCUS_GAIN from the active session on every turn, pausing

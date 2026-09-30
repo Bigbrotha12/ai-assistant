@@ -23,6 +23,7 @@ const parsed = pluginDefinitionSchema.parse({
   type: "tool",
   name: "SpielIndexer",
   description: "Media search and indexing for your SpielIndexer instance (homelab).",
+  category: "General",
   baseUrls: [
     {
       id: "spiel-homelab",

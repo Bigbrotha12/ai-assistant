@@ -42,7 +42,16 @@ class ModelDownloadLimitException implements Exception {
 
 /// Progress report for a model download.
 class ModelDownloadProgress {
-  const ModelDownloadProgress({required this.percent, required this.status});
+  const ModelDownloadProgress({
+    required this.modelType,
+    required this.percent,
+    required this.status,
+  });
+
+  /// The downloader type this event belongs to (e.g. `whisper_tiny` or one of
+  /// Supertonic's artifact ids). Lets consumers attribute progress to the right
+  /// model when several are downloaded in sequence.
+  final String modelType;
 
   /// Percentage complete (0.0–1.0).
   final double percent;
@@ -164,6 +173,15 @@ class ModelDownloader {
         : '$dir/ggml$modelType.bin';
 
     _states[modelType] = Downloading();
+    // Emit an immediate 0% so the UI never sits on a stale value while the
+    // network connection is establishing.
+    _progressController.add(
+      ModelDownloadProgress(
+        modelType: modelType,
+        percent: 0.0,
+        status: 'downloading',
+      ),
+    );
     await _doDownload(modelType, url, resolvedPath, requiredBytes);
   }
 
@@ -197,7 +215,11 @@ class ModelDownloader {
             if (total > 0) expectedTotal = total;
             final progress = total > 0 ? count / total : 0.0;
             _progressController.add(
-              ModelDownloadProgress(percent: progress, status: 'downloading'),
+              ModelDownloadProgress(
+                modelType: modelType,
+                percent: progress,
+                status: 'downloading',
+              ),
             );
             _states[modelType] = Downloading(
               receivedBytes: count,
@@ -271,7 +293,11 @@ class ModelDownloader {
 
       _states[modelType] = Ready();
       _progressController.add(
-        ModelDownloadProgress(percent: 1.0, status: 'complete'),
+        ModelDownloadProgress(
+          modelType: modelType,
+          percent: 1.0,
+          status: 'complete',
+        ),
       );
 
       if (kDebugMode) {
@@ -282,7 +308,11 @@ class ModelDownloader {
       final error = e.toString();
       _states[modelType] = Failed(error: error);
       _progressController.add(
-        ModelDownloadProgress(percent: 0.0, status: 'error: $error'),
+        ModelDownloadProgress(
+          modelType: modelType,
+          percent: 0.0,
+          status: 'error: $error',
+        ),
       );
       rethrow;
     }

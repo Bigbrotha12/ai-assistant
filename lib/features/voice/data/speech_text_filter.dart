@@ -19,36 +19,84 @@ final class SpeechTextFilter {
 
   /// Known non-speech tag words/phrases (lower-cased, punctuation-free).
   static const Set<String> _tags = <String>{
-    'blank_audio', 'blank audio', 'blankaudio',
-    'music', 'music playing', 'music continues', 'music fades',
-    'humming', 'hums', 'hum',
-    'singing', 'sings',
-    'applause', 'applauding', 'clapping',
-    'laughter', 'laughs', 'laughing', 'chuckles',
-    'sigh', 'sighs', 'sighing',
-    'wind', 'wind blowing', 'wind blowing softly',
-    'silence', 'silent',
-    'noise', 'static', 'static noise',
-    'crosstalk', 'cross talk',
-    'inaudible', 'unintelligible', 'mumbled', 'mumbling',
-    'beep', 'beeping', 'clicks', 'clicking', 'typing',
-    'phone ringing', 'ringtone',
-    'footsteps', 'door slams', 'door closes',
-    'birds chirping', 'bird chirping', 'dog barking', 'dog barks',
-    'breathing', 'breathes', 'breath',
-    'whispering', 'whispers',
-    'pause', 'pauses', 'paused',
-    'coughs', 'coughing', 'clears throat', 'throat clearing',
-    'gasp', 'gasps', 'gasping',
+    'blank_audio',
+    'blank audio',
+    'blankaudio',
+    'music',
+    'music playing',
+    'music continues',
+    'music fades',
+    'humming',
+    'hums',
+    'hum',
+    'singing',
+    'sings',
+    'applause',
+    'applauding',
+    'clapping',
+    'laughter',
+    'laughs',
+    'laughing',
+    'chuckles',
+    'sigh',
+    'sighs',
+    'sighing',
+    'wind',
+    'wind blowing',
+    'wind blowing softly',
+    'silence',
+    'silent',
+    'noise',
+    'static',
+    'static noise',
+    'crosstalk',
+    'cross talk',
+    'inaudible',
+    'unintelligible',
+    'mumbled',
+    'mumbling',
+    'beep',
+    'beeping',
+    'clicks',
+    'clicking',
+    'typing',
+    'phone ringing',
+    'ringtone',
+    'footsteps',
+    'door slams',
+    'door closes',
+    'birds chirping',
+    'bird chirping',
+    'dog barking',
+    'dog barks',
+    'breathing',
+    'breathes',
+    'breath',
+    'whispering',
+    'whispers',
+    'pause',
+    'pauses',
+    'paused',
+    'coughs',
+    'coughing',
+    'clears throat',
+    'throat clearing',
+    'gasp',
+    'gasps',
+    'gasping',
   };
 
-  /// Classic Whisper silence-hallucination whole transcripts (lower-cased).
+  /// Classic Whisper silence-hallucination whole transcripts (raw forms;
+  /// matched after punctuation-normalised lower-casing).
   ///
-  /// Deliberately conservative: only phrases a user would never say into a
-  /// voice assistant ("thanks for watching") plus bare one-word fillers
-  /// Whisper echoes on silence ("the", "you", "ok."). Genuine short speech
-  /// like "thank you" is NOT dropped — a false turn drop is worse than a
-  /// rare artifact slipping through.
+  /// Whisper-tiny's canonical silence/noise fillers are farewells and polite
+  /// pleasantries ("see ya", "thank you very much", "you're welcome") — it
+  /// echoes them when it cannot decode the audio instead of reporting nothing.
+  /// A few deliberately common genuine phrases ("thank you", "hello",
+  /// "how are you") are NOT listed: matching them would drop real, short turns
+  /// — false drops are worse than a rare artifact slipping through. The
+  /// multi-word filler set below is safe to drop: those are almost always
+  /// hallucinations in a voice-assistant context.
   static const List<String> _hallucinationPhrases = <String>[
     'thanks for watching',
     'thank you for watching',
@@ -56,13 +104,48 @@ final class SpeechTextFilter {
     'please subscribe',
     'subscribe to my channel',
     'see you in the next video',
-    'bye.', 'bye!', 'bye',
-    'mm-hmm.', 'hmm.', 'huh.',
-    'the', 'you', 'i', 'a',
-    'ok.', 'okay.', 'okay!',
+    'see ya',
+    'see you',
+    'bye',
+    'bye bye',
+    'goodbye',
+    'thank you sir',
+    'thank you very much',
+    'thank you so much',
+    'thanks a lot',
+    "you're welcome",
+    'you are welcome',
+    'have a great day',
+    'have a nice day',
+    'take care',
+    'no problem',
+    'happy new year',
+    'mm-hmm.',
+    'hmm.',
+    'huh.',
+    'the',
+    'you',
+    'i',
+    'a',
+    'ok.',
+    'okay.',
+    'okay!',
     "i'm sorry.",
     'so.',
   ];
+
+  /// Normalises a transcript for hallucination matching: lower-cased with
+  /// punctuation collapsed to spaces, so "See ya.", "See ya!" and "See ya"
+  /// all compare equal.
+  static String normalizeForMatch(String text) => text
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+
+  static final Set<String> _hallucinations = _hallucinationPhrases
+      .map(normalizeForMatch)
+      .toSet();
 
   /// Max words in a bracketed group for it to be considered a stage tag.
   static const int _maxTagWords = 4;
@@ -87,7 +170,8 @@ final class SpeechTextFilter {
       final words = normalized.split(' ');
       final isKnownTag =
           _tags.contains(normalized) || words.every(_tags.contains);
-      final isShoutyTag = content == content.toUpperCase() &&
+      final isShoutyTag =
+          content == content.toUpperCase() &&
           RegExp(r'^[A-Z0-9_\s]+$').hasMatch(content) &&
           words.length <= _maxTagWords;
       return (isKnownTag || isShoutyTag) ? ' ' : m.group(0)!;
@@ -102,7 +186,8 @@ final class SpeechTextFilter {
   /// silence hallucination rather than user speech.
   static bool isLikelySilenceHallucination(String transcript) {
     final cleaned = stripNonSpeechTags(transcript);
-    if (cleaned.isEmpty) return true;
-    return _hallucinationPhrases.contains(cleaned.toLowerCase().trim());
+    final normalized = normalizeForMatch(cleaned);
+    if (normalized.isEmpty) return true;
+    return _hallucinations.contains(normalized);
   }
 }

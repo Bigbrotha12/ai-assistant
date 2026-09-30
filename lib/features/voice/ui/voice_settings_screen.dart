@@ -5,7 +5,6 @@ import '../data/engine_config.dart';
 import '../data/engine_manager.dart';
 import '../data/engine_manager_provider.dart';
 import '../data/engine_registry.dart';
-import '../data/model_downloader.dart';
 import '../data/voice_runtime_policy_provider.dart';
 import '../data/stt_engine.dart';
 import '../data/voice_settings.dart';
@@ -356,6 +355,37 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
     }
   }
 
+  /// Confirms, then deletes [modelId]'s downloaded files so the model can be
+  /// re-downloaded (e.g. to exercise the download UI again).
+  Future<void> _confirmRemoveModel(
+    BuildContext context,
+    String modelId,
+    String label,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Remove $label model?'),
+        content: Text(
+          'This deletes the downloaded $label model files from this device. '
+          'You can download them again later.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await ref.read(voiceEngineStatusProvider.notifier).deleteModel(modelId);
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -375,10 +405,17 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
                 status:
                     statuses[EngineConfig.whisperTinyId] ??
                     VoiceEngineStatus.notStarted,
-                progress: progress,
+                progress: progress?[EngineConfig.whisperTinyId],
                 onAction: _busy || !decision.allowModelDownload
                     ? null
                     : _downloadAll,
+                onRemove: _busy
+                    ? null
+                    : () => _confirmRemoveModel(
+                        context,
+                        EngineConfig.whisperTinyId,
+                        'Whisper',
+                      ),
               ),
             ),
             const SizedBox(width: 12),
@@ -390,10 +427,17 @@ class _ModelsSectionState extends ConsumerState<_ModelsSection> {
                   status:
                       statuses[EngineConfig.supertonic3Id] ??
                       VoiceEngineStatus.notStarted,
-                  progress: progress,
+                  progress: progress?[EngineConfig.supertonic3Id],
                   onAction: _busy || !decision.allowModelDownload
                       ? null
                       : _downloadAll,
+                  onRemove: _busy
+                      ? null
+                      : () => _confirmRemoveModel(
+                          context,
+                          EngineConfig.supertonic3Id,
+                          'Supertonic 3',
+                        ),
                 ),
               ),
             ],
@@ -423,12 +467,20 @@ class _ModelStatusChip extends StatelessWidget {
     required this.status,
     required this.progress,
     required this.onAction,
+    this.onRemove,
   });
 
   final String label;
   final VoiceEngineStatus status;
-  final ModelDownloadProgress? progress;
+
+  /// Overall progress (0.0–1.0) for THIS model only; null when the model is
+  /// not currently downloading.
+  final double? progress;
   final VoidCallback? onAction;
+
+  /// Shown when the model is ready: deletes its files so it can be
+  /// re-downloaded.
+  final VoidCallback? onRemove;
 
   @override
   Widget build(BuildContext context) {
@@ -441,7 +493,7 @@ class _ModelStatusChip extends StatelessWidget {
     final actionLabel = status == VoiceEngineStatus.failed
         ? 'Retry'
         : 'Download';
-    final percent = progress?.percent;
+    final percent = progress;
 
     final (icon, color, subtitle) = switch (status) {
       VoiceEngineStatus.ready => (
@@ -510,6 +562,17 @@ class _ModelStatusChip extends StatelessWidget {
           ] else if (downloading) ...[
             const SizedBox(height: 8),
             LinearProgressIndicator(value: percent, minHeight: 4),
+          ] else if (status == VoiceEngineStatus.ready && onRemove != null) ...[
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                key: ValueKey('remove-model-$label'),
+                onPressed: onRemove,
+                icon: const Icon(Icons.delete_outline, size: 16),
+                label: const Text('Remove'),
+              ),
+            ),
           ],
         ],
       ),

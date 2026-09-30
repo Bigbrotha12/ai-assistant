@@ -65,7 +65,8 @@ class FakeModelDownloaderAdapter implements HttpClientAdapter {
     if (err != null) {
       throw DioException(requestOptions: options, error: err);
     }
-    final total = reportedTotal ??
+    final total =
+        reportedTotal ??
         chunks.fold<int>(0, (sum, chunk) => sum + chunk.length);
     final headers = <String, List<String>>{};
     if (includeContentLength) {
@@ -137,15 +138,13 @@ void main() {
     return downloader;
   }
 
-  Future<void> download(
-    ModelDownloader downloader, {
-    int? requiredBytes,
-  }) => downloader.downloadModel(
-    modelType: _modelType,
-    url: _modelUrl,
-    destinationPath: tempDir.path,
-    requiredBytes: requiredBytes,
-  );
+  Future<void> download(ModelDownloader downloader, {int? requiredBytes}) =>
+      downloader.downloadModel(
+        modelType: _modelType,
+        url: _modelUrl,
+        destinationPath: tempDir.path,
+        requiredBytes: requiredBytes,
+      );
 
   group('ModelDownloader atomic download', () {
     test('successful download writes final bytes and reaches Ready', () async {
@@ -166,7 +165,14 @@ void main() {
       expect(File(partPath).existsSync(), isFalse);
 
       await Future<void>.delayed(Duration.zero);
-      expect(progress.map((e) => e.status), ['downloading', 'complete']);
+      // An immediate 0% "downloading" event fires on start, then receive
+      // progress, then a final "complete" at 1.0. Every event carries the
+      // model type so consumers can attribute progress per model.
+      expect(progress.first.status, 'downloading');
+      expect(progress.first.percent, 0.0);
+      expect(progress.first.modelType, _modelType);
+      expect(progress.every((event) => event.modelType == _modelType), isTrue);
+      expect(progress.last.status, 'complete');
       expect(progress.last.percent, 1.0);
     });
 
@@ -221,31 +227,34 @@ void main() {
       },
     );
 
-    test('oversized streamed response aborts mid-stream and cleans up', () async {
-      final adapter = FakeModelDownloaderAdapter(
-        chunks: [
-          [1, 2],
-          [3, 4],
-          [5, 6],
-        ],
-        reportedTotal: 4,
-      );
-      final downloader = newDownloader(
-        adapter,
-        requiredBytesTolerance: 1,
-        hardMaxBytes: 5,
-      );
+    test(
+      'oversized streamed response aborts mid-stream and cleans up',
+      () async {
+        final adapter = FakeModelDownloaderAdapter(
+          chunks: [
+            [1, 2],
+            [3, 4],
+            [5, 6],
+          ],
+          reportedTotal: 4,
+        );
+        final downloader = newDownloader(
+          adapter,
+          requiredBytesTolerance: 1,
+          hardMaxBytes: 5,
+        );
 
-      await expectLater(
-        download(downloader, requiredBytes: 4),
-        throwsA(isA<ModelDownloadLimitException>()),
-      );
+        await expectLater(
+          download(downloader, requiredBytes: 4),
+          throwsA(isA<ModelDownloadLimitException>()),
+        );
 
-      expect(adapter.closed, isTrue);
-      expect(downloader.getState(_modelType), isA<Failed>());
-      expect(File(modelPath).existsSync(), isFalse);
-      expect(File(partPath).existsSync(), isFalse);
-    });
+        expect(adapter.closed, isTrue);
+        expect(downloader.getState(_modelType), isA<Failed>());
+        expect(File(modelPath).existsSync(), isFalse);
+        expect(File(partPath).existsSync(), isFalse);
+      },
+    );
 
     test('chunked response without content length is capped', () async {
       final adapter = FakeModelDownloaderAdapter(
@@ -255,10 +264,7 @@ void main() {
         ],
         includeContentLength: false,
       );
-      final downloader = newDownloader(
-        adapter,
-        hardMaxBytes: 5,
-      );
+      final downloader = newDownloader(adapter, hardMaxBytes: 5);
 
       await expectLater(
         download(downloader),

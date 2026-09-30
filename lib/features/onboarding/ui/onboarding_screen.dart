@@ -19,7 +19,6 @@ import '../../auth/ui/auth_flow.dart';
 import '../../voice/data/engine_config.dart';
 import '../../voice/data/engine_manager.dart';
 import '../../voice/data/engine_manager_provider.dart';
-import '../../voice/data/model_downloader.dart';
 import '../../voice/data/voice_settings.dart';
 import '../../voice/ui/voice_settings_providers.dart';
 import '../../../app/widgets/app_buttons.dart';
@@ -438,7 +437,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
           helper: 'Lets the app hear what you say',
           size: '~75 MB',
           status: stt,
-          progress: progress,
+          progress: progress?[EngineConfig.whisperTinyId],
           onAction: _downloading ? null : _downloadModels,
         ),
         const SizedBox(height: AppSpacing.sm),
@@ -446,7 +445,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
           label: 'Text to speech',
           helper: 'Lets the app read replies back to you',
           status: supertonic,
-          progress: progress,
+          progress: progress?[EngineConfig.supertonic3Id],
           // Without a retry action a failed Supertonic download would render
           // a permanently disabled Retry button.
           onAction: _downloading ? null : _retrySupertonicDownload,
@@ -593,33 +592,33 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   /// Anything the user does not need in order to choose is left out; a null
   /// subtitle renders no description at all.
   List<({String title, String? subtitle})> get _stepMeta => [
-        (
-          title: widget.accountDeleted ? 'Account deleted' : 'Sign in',
-          subtitle: widget.accountDeleted
-              ? 'This account is no longer available.'
-              : null,
-        ),
-        (
-          title: 'Language',
-          subtitle: 'The language the app listens and speaks in.',
-        ),
-        (
-          title: 'Voice & models',
-          subtitle: 'Optional. Lets the app listen and speak without internet.',
-        ),
-        (
-          title: 'Review & finish',
-          subtitle: 'Check your setup, then start using the app.',
-        ),
-      ];
+    (
+      title: widget.accountDeleted ? 'Account deleted' : 'Sign in',
+      subtitle: widget.accountDeleted
+          ? 'This account is no longer available.'
+          : null,
+    ),
+    (
+      title: 'Language',
+      subtitle: 'The language the app listens and speaks in.',
+    ),
+    (
+      title: 'Voice & models',
+      subtitle: 'Optional. Lets the app listen and speak without internet.',
+    ),
+    (
+      title: 'Review & finish',
+      subtitle: 'Check your setup, then start using the app.',
+    ),
+  ];
 
   /// The step card bodies, in order.
   List<Widget> get _stepBodies => [
-        _buildAccountStep(),
-        _buildRegionStep(),
-        _buildVoiceStep(),
-        _buildFinishStep(),
-      ];
+    _buildAccountStep(),
+    _buildRegionStep(),
+    _buildVoiceStep(),
+    _buildFinishStep(),
+  ];
 
   /// The sticky bar under the card: one full-width primary action, plus Back
   /// when there is somewhere to go back to.
@@ -646,7 +645,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     //  - Middle steps: nothing to validate, always live.
     final submitting =
         step == _accountStepIndex &&
-            (_authKey.currentState?.isSubmitting ?? false);
+        (_authKey.currentState?.isSubmitting ?? false);
     final enabled = isLast ? !_saving : true;
     return Row(
       children: [
@@ -670,8 +669,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
               step == _accountStepIndex && !_accountReady
                   ? 'Sign in'
                   : isLast
-                      ? 'Get started'
-                      : 'Next',
+                  ? 'Get started'
+                  : 'Next',
             ),
           ),
         ),
@@ -733,9 +732,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
             DecoratedBox(
               decoration: BoxDecoration(
                 border: Border(
-                  top: BorderSide(
-                    color: Theme.of(context).colorScheme.outline,
-                  ),
+                  top: BorderSide(color: Theme.of(context).colorScheme.outline),
                 ),
               ),
               child: Padding(
@@ -818,9 +815,7 @@ class _StepCardState extends State<_StepCard>
               ),
             ],
             const SizedBox(height: AppSpacing.xl),
-            Expanded(
-              child: SingleChildScrollView(child: widget.child),
-            ),
+            Expanded(child: SingleChildScrollView(child: widget.child)),
           ],
         ),
       ),
@@ -845,7 +840,10 @@ class _ModelRow extends StatelessWidget {
   final String? helper;
   final VoiceEngineStatus status;
   final String? size;
-  final ModelDownloadProgress? progress;
+
+  /// Overall progress (0.0–1.0) for THIS model only; null when the model is
+  /// not currently downloading.
+  final double? progress;
   final VoidCallback? onAction;
 
   @override
@@ -859,7 +857,7 @@ class _ModelRow extends StatelessWidget {
     final actionLabel = status == VoiceEngineStatus.failed
         ? 'Retry'
         : 'Download';
-    final percent = progress?.percent;
+    final percent = progress;
 
     final (icon, color, subtitle) = switch (status) {
       VoiceEngineStatus.ready => (
@@ -910,8 +908,9 @@ class _ModelRow extends StatelessWidget {
                 if (helper case final helper?) ...[
                   Text(
                     helper,
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: scheme.onSurfaceVariant),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
                 const SizedBox(height: 2),

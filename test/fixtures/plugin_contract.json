@@ -5,6 +5,7 @@
       "type": "tool",
       "name": "Vikunja",
       "description": "Task management tools",
+      "category": "General",
       "version": "1.4.0",
       "schemaVersion": 1,
       "installed": true,

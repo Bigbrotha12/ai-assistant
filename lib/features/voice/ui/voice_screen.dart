@@ -148,14 +148,20 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   Future<void> _holdEnd() async {
     if (kDebugMode) debugPrint('UI: _holdEnd');
     await _pendingStart;
+    if (!mounted) return;
     final pipeline = ref.read(voiceCapturePipelineProvider);
     try {
       if (pipeline.isRecording) {
-        await pipeline.stopRecording();
         // Hold-to-talk turn boundary: the VAD only flushes after its silence
         // window elapses *while still recording*, which a quick release never
         // satisfies — the buffered utterance must be flushed explicitly here.
+        //
+        // Flush BEFORE stopping: the pipeline's stop tears down the
+        // controller's mic generation and clears its STT buffer
+        // ([VoiceController.stopRecording]), so a flush that runs afterwards
+        // always reads an empty buffer and the hold silently never speaks.
         await ref.read(voiceControllerProvider).flushTranscriptionBuffer();
+        await pipeline.stopRecording();
       }
     } catch (_) {
       // Failures surface through the conversation state; never crash.

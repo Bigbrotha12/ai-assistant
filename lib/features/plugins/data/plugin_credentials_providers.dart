@@ -174,6 +174,11 @@ class ScopedPluginCredentials {
   Future<void> setSelectedAgent(String? id) =>
       _write(() => _store.setSelectedAgent(scope, id));
 
+  /// Exclusively selects [id], writing the backing entry when the agent is
+  /// server-provided (see [PluginCredentialsStore.selectAgent]).
+  Future<void> selectAgent(String? id) =>
+      _write(() => _store.selectAgent(scope, id));
+
   Future<void> setAgentConfig(String pluginId, AgentConfig config) =>
       _write(() => _store.setAgentConfig(scope, pluginId, config));
 

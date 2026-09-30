@@ -610,6 +610,52 @@ void main() {
     expect(controller.state.isRecording, isFalse);
   });
 
+  testWidgets('a hold with buffered audio flushes its utterance on release', (
+    tester,
+  ) async {
+    final stt = FakeSttEngine();
+    final chat = FakeChatClient();
+    final container = buildContainer(chatClient: chat, stt: stt);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final controller = container.read(voiceControllerProvider);
+    final mic =
+        container.read(micCaptureServiceProvider) as FakeMicCaptureService;
+    await controller.startConversation();
+
+    // Press and hold.
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(SpeakButton)),
+    );
+    await settle(tester);
+    expect(controller.state.isRecording, isTrue);
+
+    // Feed speech-level audio so the STT buffer accumulates.
+    mic.emitChunk(List.filled(640, 300));
+    mic.emitChunk(List.filled(640, 300));
+    mic.emitChunk(List.filled(640, 300));
+    await settle(tester);
+
+    // Release: the buffered utterance must be flushed (read) BEFORE the stop
+    // tears down the controller's mic generation and clears its buffer —
+    // otherwise the release flush reads an always-empty buffer and the hold
+    // silently never speaks (regression for the hold-to-talk dead path).
+    await gesture.up();
+    await pumpFrames(tester, 30);
+
+    expect(stt.transcribed, hasLength(1));
+    expect(stt.transcribed.single.length, greaterThan(0));
+    expect(chat.callCount, greaterThan(0));
+
+    await controller.endConversation();
+  });
+
   testWidgets('shows the Working status while the LLM stream is in flight', (
     tester,
   ) async {
@@ -659,16 +705,16 @@ void main() {
         container.read(micCaptureServiceProvider) as FakeMicCaptureService;
     await controller.startConversation();
     // Turn 1 is a flushed utterance whose stream hangs mid-generation.
-    mic.emitChunk([1, 1, 1]);
+    mic.emitChunk([300, 300, 300]);
     await tester.pump();
     await controller.flushTranscriptionBuffer();
     await settle(tester);
 
     // A queued utterance (accepted), then a dropped one: the notice renders.
-    mic.emitChunk([2, 2, 2]);
+    mic.emitChunk([600, 600, 600]);
     await tester.pump();
     await controller.flushTranscriptionBuffer();
-    mic.emitChunk([3, 3, 3]);
+    mic.emitChunk([900, 900, 900]);
     await tester.pump();
     await controller.flushTranscriptionBuffer();
     await settle(tester);

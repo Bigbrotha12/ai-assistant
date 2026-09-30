@@ -23,6 +23,7 @@ const parsed = pluginDefinitionSchema.parse({
   type: "tool",
   name: "Mealie",
   description: "Recipe management for your Mealie instance (homelab).",
+  category: "General",
   baseUrls: [
     {
       id: "mealie-homelab",

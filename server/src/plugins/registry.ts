@@ -58,6 +58,8 @@ export type PluginSummary = {
   type: "tool" | "model" | "agent";
   name: string;
   description: string;
+  /** Optional display grouping for the client's marketplace UI. */
+  category?: string;
   version: string;
   schemaVersion: number;
   installed: boolean;
@@ -289,6 +291,7 @@ function summarizePlugin(
     type: plugin.type,
     name: plugin.name,
     description: plugin.description,
+    ...(plugin.category === undefined ? {} : { category: plugin.category }),
     version: plugin.version,
     schemaVersion: plugin.schemaVersion,
     installed,

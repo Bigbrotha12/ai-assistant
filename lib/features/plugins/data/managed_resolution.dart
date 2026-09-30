@@ -186,11 +186,18 @@ Future<ManagedSelection> resolveManagedSelection({
       'no_credentials',
     );
   }
+  // Account-enabled TOOL plugins only. The account's plugin rows include the
+  // selected agent itself (seeded with `enabled: true` by `ensureDefaultAgent`
+  // / `selectAgent`) — an agent id must never ride `enabled_plugins`, or the
+  // gateway counts it as a requested tool, binds no tool plugin, and the turn
+  // fails with `tools_unavailable` (a requested-but-unbound tool set).
   final enabled =
       config.plugins.entries
           .where(
             (entry) =>
-                entry.value.enabled && !models.any((m) => m.id == entry.key),
+                entry.value.enabled &&
+                entry.value.agent == null &&
+                !models.any((m) => m.id == entry.key),
           )
           .map((entry) => entry.key)
           .toList()

@@ -104,7 +104,9 @@ echo "Using flutter: $FLUTTER_BIN"
 # for tailnet phones over Tailscale), else plain localhost.
 if [ -z "${HOST_FQDN:-}" ]; then
   if command -v tailscale >/dev/null 2>&1; then
-    HOST_FQDN="$(tailscale ip -4 2>/dev/null | head -n1)"
+    # `tailscale ip` can block while the daemon is (re)connecting; never let a
+    # stuck daemon hang the whole dev script.
+    HOST_FQDN="$(timeout 8 tailscale ip -4 2>/dev/null | head -n1 || true)"
   fi
   if [ -n "${HOST_FQDN:-}" ]; then
     echo "HOST_FQDN defaulted to this machine's Tailscale IP: $HOST_FQDN"
@@ -281,7 +283,7 @@ provision_local_gateway() {
   echo "Waiting for gateway health at $HEALTH_URL…"
   HEALTHY=0
   for _ in $(seq 1 30); do
-    if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
       HEALTHY=1
       break
     fi
@@ -348,16 +350,23 @@ resolve_adb() {
 }
 ADB_BIN="$(resolve_adb)"
 
+# `adb connect` to an unreachable phone can block for a very long time — a
+# closed/Tailscale-dropped port makes the handshake time out slowly, which used
+# to hang dev.sh indefinitely. Bound every network-ish adb call so discovery
+# degrades to the guidance path instead of stalling. Overridable via ADB_TIMEOUT.
+ADB_TIMEOUT="${ADB_TIMEOUT:-12}"
+
 # True when the given `adb devices` serial is attached.
 device_connected() {
   [ -n "$ADB_BIN" ] || return 1
-  "$ADB_BIN" devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}' | grep -qxF "$1"
+  timeout "$ADB_TIMEOUT" "$ADB_BIN" devices 2>/dev/null \
+    | awk 'NR>1 && $2=="device" {print $1}' | grep -qxF "$1"
 }
 
 # Android 11+ advertises an `_adb-tls-connect._tcp` service; print its `ip:port`.
 discover_wireless_endpoint() {
   [ -n "$ADB_BIN" ] || return 1
-  "$ADB_BIN" mdns services 2>/dev/null \
+  timeout "$ADB_TIMEOUT" "$ADB_BIN" mdns services 2>/dev/null \
     | awk '$2=="_adb-tls-connect._tcp" {print $NF; exit}'
 }
 
@@ -367,7 +376,7 @@ discover_wireless_endpoint() {
 # showing. Used purely to hand the user an exact command to run.
 discover_pairing_endpoint() {
   [ -n "$ADB_BIN" ] || return 1
-  "$ADB_BIN" mdns services 2>/dev/null \
+  timeout "$ADB_TIMEOUT" "$ADB_BIN" mdns services 2>/dev/null \
     | awk '$2=="_adb-tls-pairing._tcp" {print $NF; exit}'
 }
 
@@ -375,17 +384,17 @@ ensure_wireless_target() {
   device_connected "$FLUTTER_DEVICE" && return 0
 
   local usb_serial raw_endpoint tailnet_endpoint candidate pairing_endpoint
-  usb_serial="$("$ADB_BIN" devices -l 2>/dev/null | awk '/usb:/ && $2=="device" {print $1; exit}')"
+  usb_serial="$(timeout "$ADB_TIMEOUT" "$ADB_BIN" devices -l 2>/dev/null | awk '/usb:/ && $2=="device" {print $1; exit}')"
   if [ -n "$usb_serial" ]; then
     echo "Wireless adb target $FLUTTER_DEVICE not connected; re-enabling TCP mode on USB device $usb_serial…"
-    "$ADB_BIN" -s "$usb_serial" tcpip "${FLUTTER_DEVICE##*:}" >/dev/null
+    timeout "$ADB_TIMEOUT" "$ADB_BIN" -s "$usb_serial" tcpip "${FLUTTER_DEVICE##*:}" >/dev/null
     sleep 2
-    "$ADB_BIN" connect "$FLUTTER_DEVICE" || true
+    timeout "$ADB_TIMEOUT" "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
     device_connected "$FLUTTER_DEVICE" && return 0
   fi
 
   # No USB (or TCP mode did not take): try the active session, then discovery.
-  "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
+  timeout "$ADB_TIMEOUT" "$ADB_BIN" connect "$FLUTTER_DEVICE" >/dev/null 2>&1 || true
   device_connected "$FLUTTER_DEVICE" && return 0
 
   raw_endpoint="$(discover_wireless_endpoint)" || true
@@ -397,7 +406,7 @@ ensure_wireless_target() {
     tailnet_endpoint="${FLUTTER_DEVICE%%:*}:${raw_endpoint##*:}"
 
     for candidate in "$tailnet_endpoint" "$raw_endpoint"; do
-      "$ADB_BIN" connect "$candidate" >/dev/null 2>&1 || true
+      timeout "$ADB_TIMEOUT" "$ADB_BIN" connect "$candidate" >/dev/null 2>&1 || true
       if device_connected "$candidate"; then
         echo "Connected to wireless adb target $candidate."
         FLUTTER_DEVICE="$candidate"
@@ -443,12 +452,16 @@ ensure_wireless_target() {
 case "$FLUTTER_DEVICE" in
   *.*:[0-9]*)
     if [ -z "$ADB_BIN" ]; then
-      # Without adb we cannot discover or repair a wireless target, and the
-      # failure would otherwise surface as an opaque `flutter run -d` error.
-      echo "warning: no adb binary found, so the wireless target $FLUTTER_DEVICE cannot be checked." >&2
-      echo "         Put adb on PATH, set ADB, or add sdk.dir to android/local.properties." >&2
+      # Without adb we cannot discover or repair a wireless target, and a
+      # `flutter run -d <unreachable-serial>` blocks forever waiting for the
+      # device. Fail fast with the fix instead of hanging.
+      echo "error: no adb binary found, so the wireless target $FLUTTER_DEVICE cannot be checked." >&2
+      echo "       Put adb on PATH, set ADB, or add sdk.dir to android/local.properties, then re-run." >&2
+      exit 1
     else
-      ensure_wireless_target || true
+      # ensure_wireless_target prints its own diagnosis + fix on failure; abort
+      # rather than let flutter wait indefinitely for a device that is offline.
+      ensure_wireless_target || exit 1
     fi
     ;;
 esac

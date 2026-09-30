@@ -202,6 +202,42 @@ class PluginCredentialsStore {
         );
       });
 
+
+  /// Exclusively selects the agent [id] for [scope], creating the backing
+  /// plugin entry when the agent is server-provided.
+  ///
+  /// A ready-made agent (gateway template or installed agent plugin) is sent on
+  /// the wire as its string id, but `resolveAgentForSend` only emits it when the
+  /// account carries a matching [AgentConfig] of kind [AgentKind.template].
+  /// Selecting one therefore has to write that entry as well as the selection —
+  /// otherwise the tile highlights but the gateway never receives the agent.
+  /// A custom agent's own config is preserved untouched. Passing null clears
+  /// the selection (the gateway then runs its default supervisor prompt).
+  Future<void> selectAgent(AuthAccountScope scope, String? id) =>
+      _serialized(() async {
+        final config = await _load(scope);
+        final plugins = {...config.plugins};
+        if (id != null && id.trim().isNotEmpty) {
+          final existing = plugins[id];
+          final custom = existing?.agent?.kind == AgentKind.custom;
+          if (!custom) {
+            plugins[id] = PluginConfiguration(
+              credentials: existing?.credentials ?? const {},
+              enabled: existing?.enabled ?? true,
+              agent: AgentConfig(id: id, kind: AgentKind.template),
+            );
+          }
+        }
+        await _save(
+          scope,
+          PluginAccountConfiguration(
+            plugins: plugins,
+            selectedModel: config.selectedModel,
+            selectedAgent: id == null || id.trim().isEmpty ? null : id,
+          ),
+        );
+      });
+
   Future<void> setAgentConfig(
     AuthAccountScope scope,
     String pluginId,

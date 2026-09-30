@@ -5,10 +5,7 @@ import 'package:ai_assistant/features/voice/data/speech_text_filter.dart';
 void main() {
   group('stripNonSpeechTags', () {
     test('strips known bracketed tags', () {
-      expect(
-        SpeechTextFilter.stripNonSpeechTags('[BLANK_AUDIO]'),
-        isEmpty,
-      );
+      expect(SpeechTextFilter.stripNonSpeechTags('[BLANK_AUDIO]'), isEmpty);
       expect(
         SpeechTextFilter.stripNonSpeechTags('(humming) Hello there'),
         'Hello there',
@@ -76,6 +73,30 @@ void main() {
       expect(SpeechTextFilter.isLikelySilenceHallucination('   '), isTrue);
     });
 
+    test('drops the polite filler Whisper echoes over silence/noise', () {
+      for (final phrase in [
+        'See ya',
+        'See you.',
+        'Thank you very much',
+        'Thank you very much.',
+        'Thank you sir!',
+        'Thank you so much.',
+        'Thanks a lot.',
+        "You're welcome.",
+        'You are welcome.',
+        'Bye bye.',
+        'Goodbye.',
+        'Have a great day!',
+        'Happy new year.',
+      ]) {
+        expect(
+          SpeechTextFilter.isLikelySilenceHallucination(phrase),
+          isTrue,
+          reason: '"$phrase" should be dropped as a hallucination',
+        );
+      }
+    });
+
     test('keeps genuine speech — including short real utterances', () {
       expect(
         SpeechTextFilter.isLikelySilenceHallucination('Thank you'),
@@ -89,6 +110,12 @@ void main() {
       );
       expect(
         SpeechTextFilter.isLikelySilenceHallucination('Okay, got it'),
+        isFalse,
+      );
+      expect(
+        SpeechTextFilter.isLikelySilenceHallucination(
+          'Hello, can you hear me?',
+        ),
         isFalse,
       );
     });

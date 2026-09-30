@@ -338,7 +338,7 @@ void main() {
         final conversationId = container.read(activeConversationIdProvider)!;
 
         await controller.startConversation();
-        mic.emitChunk([1, 2, 3]);
+        mic.emitChunk([300, 600, 900]);
         await pumpEventQueue();
         await controller.flushTranscriptionBuffer();
         await settle();

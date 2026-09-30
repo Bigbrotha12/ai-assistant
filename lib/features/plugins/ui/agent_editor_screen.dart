@@ -343,7 +343,7 @@ class _AgentEditorScreenState extends ConsumerState<AgentEditorScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.existing != null ? 'Edit Agent' : 'New Agent'),
+        title: Text(widget.existing != null ? 'Edit Agent' : 'Create Agent'),
       ),
       // Bottom safe area: the Finish section must stay clear of the gesture
       // bar, like the settings About footer.

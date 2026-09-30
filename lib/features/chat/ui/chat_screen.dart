@@ -229,7 +229,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final filesConfigured = ref.watch(filesServiceProvider) is! NoOpFilesClient;
     final showAttachmentRow = filesConfigured || _attachments.isNotEmpty;
 
-    final canSend = !isStreaming && isDbReady && _input.text.trim().isNotEmpty;
+    // While a recovery card (re-auth / verify email) owns the message region,
+    // sending is pointless and would just fail again — keep the composer
+    // inert until the account can actually send.
+    final canSend =
+        !isStreaming &&
+        isDbReady &&
+        !authRequired &&
+        !emailNotVerified &&
+        _input.text.trim().isNotEmpty;
     // The background action is a text-only submit: unavailable while a job is
     // already pending (the chip owns that conversation), while streaming, or
     // when files are selected (the background path carries no attachments).
@@ -257,20 +265,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       body: Column(
         children: [
           if (!settingsValid) _ConfigureBanner(),
-          if (authRequired)
-            ReauthCard(
-              onSuccess: _onReauthSuccess,
-              onDismiss: () => ref
-                  .read(conversationProvider(_conversationId).notifier)
-                  .dismissAuthRequired(),
-            ),
-          if (emailNotVerified)
-            VerifyEmailCard(
-              email: ref.watch(authCredentialsProvider).value?.email,
-              onDismiss: () => ref
-                  .read(conversationProvider(_conversationId).notifier)
-                  .dismissEmailNotVerified(),
-            ),
           if (sentinelNotice != null)
             _SentinelAdvisoryBanner(
               message: sentinelNotice,
@@ -291,17 +285,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   .cancelBackgroundJob(),
             ),
           Expanded(
-            child: MessageList(
-              messages: state?.messages ?? const [],
-              isStreaming: isStreaming,
-              error: authRequired || emailNotVerified ? null : error,
-              isRetryInFlight: state?.isRetryInFlight ?? false,
-              onRetry: () => ref
-                  .read(conversationProvider(_conversationId).notifier)
-                  .retry(),
-              isDbReady: isDbReady,
-              scrollController: _scroll,
-            ),
+            // A recovery card owns a form and the on-screen keyboard, so it
+            // takes the whole remaining region and scrolls. A fixed-height card
+            // in the Column overflowed the moment the keyboard shrank the body.
+            // The chat list is intentionally not shown while re-auth / email
+            // verification blocks sending.
+            child: authRequired
+                ? SingleChildScrollView(
+                    child: ReauthCard(
+                      onSuccess: _onReauthSuccess,
+                      onDismiss: () => ref
+                          .read(conversationProvider(_conversationId).notifier)
+                          .dismissAuthRequired(),
+                    ),
+                  )
+                : emailNotVerified
+                ? SingleChildScrollView(
+                    child: VerifyEmailCard(
+                      email: ref.watch(authCredentialsProvider).value?.email,
+                      onDismiss: () => ref
+                          .read(conversationProvider(_conversationId).notifier)
+                          .dismissEmailNotVerified(),
+                    ),
+                  )
+                : MessageList(
+                    messages: state?.messages ?? const [],
+                    isStreaming: isStreaming,
+                    error: error,
+                    isRetryInFlight: state?.isRetryInFlight ?? false,
+                    onRetry: () => ref
+                        .read(conversationProvider(_conversationId).notifier)
+                        .retry(),
+                    isDbReady: isDbReady,
+                    scrollController: _scroll,
+                  ),
           ),
           _InputBar(
             controller: _input,

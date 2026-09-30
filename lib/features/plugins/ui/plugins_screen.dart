@@ -117,231 +117,235 @@ class _PluginList extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // Keep the scoped handle alive for this screen: the selection write's
+    // `_invalidate()` (which bumps the credentials epoch and refreshes the
+    // list) only fires while that provider's ref is mounted. Without this
+    // subscription the autoDispose handle dies during the write's async gap,
+    // the epoch never advances, and selecting an agent would update storage
+    // while the UI kept showing the previous selection.
+    ref.watch(scopedPluginCredentialsProvider);
     final modelIds = catalog.models.map((model) => model.id).toSet();
     final selected = configuration.selectedModel;
     final selectedAgent = configuration.selectedAgent;
     final templates = ref.watch(agentTemplatesProvider);
-    final customAgents = configuration.plugins.entries
-        .where(
-          (e) =>
-              e.value.agent != null && e.value.agent!.kind == AgentKind.custom,
-        )
-        .toList();
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        const Text(
-          'Plugins are installed globally by an administrator. Model selection, tool enablement, and saved keys apply only to your account on this gateway.',
-        ),
-        const SizedBox(height: 16),
-        Text('Models', style: Theme.of(context).textTheme.titleMedium),
-        if (modelIds.isEmpty)
-          const Text(
-            'No models available. Ask your administrator to install a model plugin.',
-          ),
-        if (selected != null && !modelIds.contains(selected))
-          const Text(
-            'Your selected model was removed or is unavailable. Select another model.',
-          ),
-        for (final plugin in catalog.plugins.where(
-          (plugin) => modelIds.contains(plugin.id),
-        ))
-          _tile(
-            context,
-            plugin,
-            selected == plugin.id
-                ? 'Selected for this account'
-                : plugin.inference!.defaultModel,
-          ),
-        const SizedBox(height: 16),
-        Text('Agents', style: Theme.of(context).textTheme.titleMedium),
-        if (catalog.agents.isEmpty &&
-            (templates.value == null || templates.requireValue.isEmpty) &&
-            customAgents.isEmpty)
-          const Text(
-            'No agents available. Ask your administrator to install an agent plugin.',
-          ),
-        if (catalog.agents.isNotEmpty) ...[
+    final readyAgents = _readyAgents(catalog, templates.value);
+    final customAgents =
+        configuration.plugins.entries
+            .where(
+              (e) =>
+                  e.value.agent != null &&
+                  e.value.agent!.kind == AgentKind.custom,
+            )
+            .toList()
+          ..sort((a, b) => a.key.compareTo(b.key));
+    return RadioGroup<String>(
+      groupValue: selectedAgent,
+      onChanged: (id) => _selectAgent(context, ref, id),
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
           Text(
-            'Installed agent plugins:',
-            style: Theme.of(context).textTheme.titleSmall,
+            'Choose the model, agents, and tools for your account.',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
-          for (final agent in catalog.agents)
-            _agentTile(
-              context,
-              agent,
-              selectedAgent == agent.id,
-              configuration,
+          const SizedBox(height: 16),
+          Text('Models', style: Theme.of(context).textTheme.titleMedium),
+          if (modelIds.isEmpty)
+            const Text(
+              'No models available. Ask your administrator to install a model plugin.',
             ),
-          const SizedBox(height: 12),
-        ],
-        if (templates.isLoading)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 8),
-            child: Text('Loading agent templates...'),
-          )
-        else if (templates.hasError)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 8),
-            child: Text('Could not load agent templates.'),
-          )
-        else if (templates.value != null &&
-            templates.requireValue.isNotEmpty) ...[
-          Text('Templates:', style: Theme.of(context).textTheme.titleSmall),
-          for (final template in templates.requireValue)
-            _templateTile(
-              context,
-              template,
-              selectedAgent == template['id'],
-              onSelect: () async {
-                try {
-                  await ref
-                      .read(scopedPluginCredentialsProvider)
-                      .setSelectedAgent(template['id'] as String?);
-                } catch (_) {
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Could not select template.')),
-                  );
-                }
-              },
-              onDeselect: () async {
-                try {
-                  await ref
-                      .read(scopedPluginCredentialsProvider)
-                      .setSelectedAgent(null);
-                } catch (_) {
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Could not deselect template.'),
-                    ),
-                  );
-                }
-              },
+          if (selected != null && !modelIds.contains(selected))
+            const Text(
+              'Your selected model was removed or is unavailable. Select another model.',
             ),
-          const SizedBox(height: 12),
-        ],
-        if (customAgents.isNotEmpty) ...[
-          Text('Custom agents:', style: Theme.of(context).textTheme.titleSmall),
-          for (final entry in customAgents)
-            _customAgentTile(
+          for (final plugin in catalog.plugins.where(
+            (plugin) => modelIds.contains(plugin.id),
+          ))
+            _tile(
               context,
-              entry.key,
-              entry.value.agent!,
-              selectedAgent == entry.key,
-              onEdit: () =>
-                  _openEditAgentEditor(context, entry.key, entry.value.agent!),
+              plugin,
+              selected == plugin.id
+                  ? 'Selected for this account'
+                  : plugin.inference!.defaultModel,
             ),
-          const SizedBox(height: 12),
-        ],
-        OutlinedButton.icon(
-          onPressed: () => _openNewAgentEditor(context),
-          icon: const Icon(Icons.add),
-          label: const Text('New Agent'),
-        ),
-        const SizedBox(height: 12),
-        Text('Tools', style: Theme.of(context).textTheme.titleMedium),
-        for (final plugin in catalog.plugins.where(
-          (plugin) => plugin.type == 'tool',
-        ))
-          _tile(
-            context,
-            plugin,
-            configuration.plugins[plugin.id]?.enabled == true
-                ? 'Enabled for this account'
-                : 'Disabled for this account',
+          const SizedBox(height: 16),
+          Text('Agents', style: Theme.of(context).textTheme.titleMedium),
+          Text(
+            'The selected agent defines how the assistant behaves.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
-        OutlinedButton(
-          onPressed: () => ref.invalidate(pluginCatalogProvider),
-          child: const Text('Refresh catalog'),
-        ),
-        const SizedBox(height: 40),
-      ],
+          const SizedBox(height: 8),
+          Text('Ready-made', style: Theme.of(context).textTheme.titleSmall),
+          if (templates.isLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('Loading agents…'),
+            )
+          else if (templates.hasError)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'Could not load agents. Refresh the catalog and retry.',
+              ),
+            )
+          else if (readyAgents.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'No ready-made agents yet. Ask your administrator to add one.',
+              ),
+            )
+          else
+            for (final agent in readyAgents)
+              _readyAgentTile(context, ref, agent, selectedAgent == agent.id),
+          const SizedBox(height: 12),
+          Text('Custom-made', style: Theme.of(context).textTheme.titleSmall),
+          if (customAgents.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('You have not created any custom agents yet.'),
+            )
+          else
+            for (final entry in customAgents)
+              _customAgentTile(
+                context,
+                ref,
+                entry.key,
+                entry.value.agent!,
+                selectedAgent == entry.key,
+              ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: () => _openNewAgentEditor(context),
+            icon: const Icon(Icons.add),
+            label: const Text('Create agent'),
+          ),
+          const SizedBox(height: 12),
+          const SizedBox(height: 12),
+          Text('Tools', style: Theme.of(context).textTheme.titleMedium),
+          Text(
+            'Add the tools you want to use, or review the ones you have '
+            'already set up.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const Key('configured-tools'),
+            onPressed: () => _openConfiguredTools(context),
+            icon: const Icon(Icons.tune),
+            label: const Text('Configured tools'),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const Key('tool-marketplace'),
+            onPressed: () => _openToolMarketplace(context),
+            icon: const Icon(Icons.storefront_outlined),
+            label: const Text('Tool marketplace'),
+          ),
+          TextButton.icon(
+            key: const Key('refresh-catalog'),
+            onPressed: () => ref.invalidate(pluginCatalogProvider),
+            icon: const Icon(Icons.refresh),
+            label: const Text('Refresh catalog'),
+          ),
+          const SizedBox(height: 40),
+        ],
+      ),
     );
   }
 
-  Widget _agentTile(
+  Widget _readyAgentTile(
     BuildContext context,
-    AgentDto agent,
+    WidgetRef ref,
+    _ReadyAgent agent,
     bool isSelected,
-    PluginAccountConfiguration configuration,
   ) => _AgentRow(
-    key: ValueKey('agent-${agent.id}'),
+    key: ValueKey('ready-${agent.id}'),
+    id: agent.id,
     name: agent.name,
     selected: isSelected,
     description: agent.description,
     skillCount: agent.skillCount,
-    toolCount: agent.toolGrants.length,
-    model: agent.defaultModel,
-    onTap: () => _openAgentEditor(context, agent, configuration),
+    mcpCount: agent.mcpCount,
+    toolCount: agent.toolCount,
+    model: agent.model,
+    // The whole row selects exclusively; the trailing button (installed agent
+    // plugins only) opens the read-only details page.
+    onTap: () => _selectAgent(context, ref, agent.id),
+    trailing: agent.hasDetail
+        ? IconButton(
+            key: ValueKey('ready-details-${agent.id}'),
+            tooltip: 'Agent details',
+            icon: const Icon(Icons.info_outline),
+            onPressed: () => _openAgentEditor(context, agent.id),
+          )
+        : null,
   );
-
-  Widget _templateTile(
-    BuildContext context,
-    Map<String, dynamic> template,
-    bool isSelected, {
-    VoidCallback? onSelect,
-    VoidCallback? onDeselect,
-  }) {
-    final id = template['id'] as String? ?? '';
-    final name = template['name'] as String? ?? id;
-    final description = template['description'] as String? ?? '';
-    final modelRef = template['defaultModel'] as String?;
-    final toolCount = template['toolGrants'] is List
-        ? (template['toolGrants'] as List).length
-        : 0;
-    final skillCount = template['skillCount'] as int? ?? 0;
-    final mcpCount = (template['mcpNames'] as List?)?.length ?? 0;
-    return _AgentRow(
-      key: ValueKey('template-$id'),
-      name: name,
-      selected: isSelected,
-      description: description,
-      skillCount: skillCount,
-      mcpCount: mcpCount,
-      toolCount: toolCount,
-      model: modelRef,
-      onSelect: onSelect,
-      onDeselect: onDeselect,
-    );
-  }
 
   Widget _customAgentTile(
     BuildContext context,
+    WidgetRef ref,
     String pluginId,
     AgentConfig agent,
-    bool isSelected, {
-    VoidCallback? onEdit,
-  }) => _AgentRow(
+    bool isSelected,
+  ) => _AgentRow(
     key: ValueKey('custom-$pluginId'),
+    id: pluginId,
     name: agent.name.isNotEmpty ? agent.name : pluginId,
-    label: 'Custom',
     selected: isSelected,
     description: agent.description,
     skillCount: agent.skills.length,
     mcpCount: agent.mcpServers.length,
     toolCount: agent.tools.length,
     model: agent.modelRef,
-    // The whole row opens the editor — save and delete live there, so the
-    // list row carries no explicit actions.
-    onTap: onEdit,
+    // Tapping the row selects it; the pencil opens its definition for editing.
+    onTap: () => _selectAgent(context, ref, pluginId),
+    trailing: IconButton(
+      key: ValueKey('custom-edit-$pluginId'),
+      tooltip: 'Edit agent',
+      icon: const Icon(Icons.edit_outlined),
+      onPressed: () => _openEditAgentEditor(context, pluginId, agent),
+    ),
   );
 
-  void _openAgentEditor(
+  Future<void> _selectAgent(
     BuildContext context,
-    AgentDto agent,
-    PluginAccountConfiguration configuration,
-  ) {
+    WidgetRef ref,
+    String? id,
+  ) async {
+    try {
+      await ref.read(scopedPluginCredentialsProvider).selectAgent(id);
+    } catch (_) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not select the agent.')),
+      );
+    }
+  }
+
+  void _openAgentEditor(BuildContext context, String agentId) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => _PluginPage(
-          title: 'Configure agent',
-          builder: (catalog, configuration) => _AgentEditor(
-            key: ValueKey(agent.id),
-            agent: agent,
-            configuration: configuration,
-          ),
+          title: 'Agent details',
+          builder: (catalog, configuration) {
+            for (final agent in catalog.agents) {
+              if (agent.id == agentId) {
+                return _AgentEditor(key: ValueKey(agent.id), agent: agent);
+              }
+            }
+            return const Center(
+              child: Text(
+                'This agent is no longer available. Return to Agents and refresh the catalog.',
+              ),
+            );
+          },
         ),
       ),
     );
@@ -361,6 +365,30 @@ class _PluginList extends ConsumerWidget {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => AgentEditorScreen(existing: agent),
+      ),
+    );
+  }
+
+  void _openConfiguredTools(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _PluginPage(
+          title: 'Configured tools',
+          builder: (catalog, configuration) =>
+              _ConfiguredTools(catalog: catalog, configuration: configuration),
+        ),
+      ),
+    );
+  }
+
+  void _openToolMarketplace(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _PluginPage(
+          title: 'Tool marketplace',
+          builder: (catalog, configuration) =>
+              _ToolMarketplace(catalog: catalog, configuration: configuration),
+        ),
       ),
     );
   }
@@ -408,42 +436,111 @@ class _PluginList extends ConsumerWidget {
       );
 }
 
-/// One agent row for the plugin list. Modern/minimal: name and actions on the
-/// first line, the description at full width underneath, and capability counts
-/// as compact pills on a wrapping line below that.
+/// A server-provided agent as shown in the "Ready-made" list.
 ///
-/// The previous design squeezed the chips (skills / MCP / tools / model) into
-/// the ListTile's `trailing` slot. The row overflowed once an agent had more
-/// than a couple of tools (each pill stole fixed width, Edit/Delete joined in),
-/// and the description lost all width because ListTile hands the trailing slot
-/// a fixed share. Here the description owns the whole row, the pills sit in a
-/// [Wrap] — which wraps to a new line instead of overflowing, no matter how
-/// many skills or tools an agent selects — and pill width is capped so a long
-/// model id can never starve anything else.
+/// Merges the two server sources — gateway agent templates (`/v1/agents`) and
+/// installed agent plugins (`/v1/plugins`) — which overlap for installed
+/// plugins, so an agent is never listed twice.
+class _ReadyAgent {
+  const _ReadyAgent({
+    required this.id,
+    required this.name,
+    required this.description,
+    this.skillCount = 0,
+    this.mcpCount = 0,
+    this.toolCount = 0,
+    this.model,
+    this.hasDetail = false,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final int skillCount;
+  final int mcpCount;
+  final int toolCount;
+  final String? model;
+
+  /// True for an installed agent plugin, which has a read-only details page.
+  final bool hasDetail;
+}
+
+/// Merges [catalog]'s installed agent plugins with the fetched [templates],
+/// keyed by id so the overlap between the two sources yields one row. Template
+/// data wins for the fields it carries (it is the list the gateway actually
+/// resolves a selection against, and it adds MCP/skill counts); plugin-only
+/// agents fall back to their `AgentDto`.
+List<_ReadyAgent> _readyAgents(
+  PluginCatalog catalog,
+  List<Map<String, dynamic>>? templates,
+) {
+  final byId = <String, _ReadyAgent>{};
+  for (final agent in catalog.agents) {
+    byId[agent.id] = _ReadyAgent(
+      id: agent.id,
+      name: agent.name,
+      description: agent.description,
+      skillCount: agent.skillCount,
+      toolCount: agent.toolGrants.length,
+      model: agent.defaultModel,
+      hasDetail: true,
+    );
+  }
+  for (final template in templates ?? const <Map<String, dynamic>>[]) {
+    final id = template['id'];
+    if (id is! String || id.isEmpty) continue;
+    final existing = byId[id];
+    byId[id] = _ReadyAgent(
+      id: id,
+      name: template['name'] as String? ?? existing?.name ?? id,
+      description:
+          template['description'] as String? ?? existing?.description ?? '',
+      skillCount: template['skillCount'] as int? ?? existing?.skillCount ?? 0,
+      mcpCount:
+          (template['mcpNames'] as List?)?.length ?? existing?.mcpCount ?? 0,
+      toolCount:
+          (template['toolGrants'] as List?)?.length ?? existing?.toolCount ?? 0,
+      model: template['defaultModel'] as String? ?? existing?.model,
+      hasDetail: existing?.hasDetail ?? false,
+    );
+  }
+  final list = byId.values.toList()..sort((a, b) => a.id.compareTo(b.id));
+  return list;
+}
+
+/// One selectable agent row. A leading radio makes the account's single
+/// selected agent obvious and exclusive; tapping the row selects it, while an
+/// optional [trailing] action opens the details or editor without changing the
+/// selection.
+///
+/// Modern/minimal: name and actions on the first line, the description at full
+/// width underneath, and capability counts as compact pills on a wrapping line
+/// below that. The previous design squeezed the chips (skills / MCP / tools /
+/// model) into the ListTile's `trailing` slot, which overflowed once an agent
+/// had more than a couple of tools. Here the description owns the whole row and
+/// the pills wrap, so a long model id can never starve anything else.
 class _AgentRow extends StatelessWidget {
   const _AgentRow({
     super.key,
+    required this.id,
     required this.name,
     this.description,
     this.selected = false,
-    this.label,
     this.skillCount = 0,
     this.mcpCount = 0,
     this.toolCount = 0,
     this.model,
     this.onTap,
-    this.onSelect,
-    this.onDeselect,
+    this.trailing,
   });
 
+  /// Selection value for the enclosing [RadioGroup].
+  final String id;
   final String name;
 
   /// Shown unless [selected] (which replaces it with the selected line).
   final String? description;
   final bool selected;
-
-  /// Optional small badge next to the name ("Custom").
-  final String? label;
   final int skillCount;
   final int mcpCount;
   final int toolCount;
@@ -451,12 +548,11 @@ class _AgentRow extends StatelessWidget {
   /// Model reference; rendered as a pill, shortened to its last path segment.
   final String? model;
 
-  /// The whole row opens the editor.
+  /// Selects this agent (the row tap; the radio handles itself via the group).
   final VoidCallback? onTap;
 
-  /// Template select/deselect actions.
-  final VoidCallback? onSelect;
-  final VoidCallback? onDeselect;
+  /// Optional action (details / edit) pinned to the row's end.
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
@@ -468,22 +564,28 @@ class _AgentRow extends StatelessWidget {
         toolCount > 0 ||
         (model?.isNotEmpty ?? false);
     return Material(
-      color: Colors.transparent,
+      color: selected
+          ? scheme.primaryContainer.withValues(alpha: 0.45)
+          : Colors.transparent,
+      borderRadius: BorderRadius.circular(AppRadii.lg),
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(AppRadii.lg),
         child: Padding(
           padding: const EdgeInsets.symmetric(
-            horizontal: AppSpacing.lg,
+            horizontal: AppSpacing.sm,
             vertical: AppSpacing.md,
           ),
-          child: Column(
+          child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
+              Radio<String>(value: id),
+              const SizedBox(width: AppSpacing.xs),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
                       name,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -491,60 +593,42 @@ class _AgentRow extends StatelessWidget {
                         fontWeight: FontWeight.w600,
                       ),
                     ),
-                  ),
-                  if (label != null) ...[
-                    _Pill(
-                      text: label!,
-                      fill: scheme.primaryContainer,
-                      foreground: scheme.onPrimaryContainer,
+                    const SizedBox(height: 2),
+                    Text(
+                      selected
+                          ? 'Selected for this account'
+                          : (description?.isNotEmpty ?? false)
+                          ? description!
+                          : 'No description',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: selected
+                            ? scheme.primary
+                            : scheme.onSurfaceVariant,
+                        fontWeight: selected ? FontWeight.w600 : null,
+                      ),
                     ),
-                    const SizedBox(width: AppSpacing.sm),
-                  ],
-                  if (onSelect != null && onDeselect != null)
-                    TextButton(
-                      onPressed: selected ? onDeselect : onSelect,
-                      child: Text(selected ? 'Deselect' : 'Select'),
-                    ),
-                  // A tappable row advertises itself with a chevron. All other
-                  // actions (delete, save) live inside the editor, so the list
-                  // row carries exactly one affordance.
-                  if (onTap != null && onSelect == null) ...[
-                    const SizedBox(width: AppSpacing.xs),
-                    Icon(
-                      Icons.chevron_right,
-                      size: 20,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ],
-                ],
-              ),
-              const SizedBox(height: 2),
-              Text(
-                selected
-                    ? 'Selected for this account'
-                    : (description?.isNotEmpty ?? false)
-                    ? description!
-                    : 'No description',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: selected ? scheme.primary : scheme.onSurfaceVariant,
-                  fontWeight: selected ? FontWeight.w600 : null,
-                ),
-              ),
-              if (hasCounts) ...[
-                const SizedBox(height: AppSpacing.sm),
-                Wrap(
-                  spacing: AppSpacing.sm,
-                  runSpacing: AppSpacing.sm,
-                  children: [
-                    if (skillCount > 0) _Pill(text: '$skillCount skills'),
-                    if (mcpCount > 0) _Pill(text: '$mcpCount MCP'),
-                    if (toolCount > 0) _Pill(text: '$toolCount tools'),
-                    if (model?.isNotEmpty ?? false)
-                      _Pill(text: _shortModel(model!), dim: true),
+                    if (hasCounts) ...[
+                      const SizedBox(height: AppSpacing.sm),
+                      Wrap(
+                        spacing: AppSpacing.sm,
+                        runSpacing: AppSpacing.sm,
+                        children: [
+                          if (skillCount > 0) _Pill(text: '$skillCount skills'),
+                          if (mcpCount > 0) _Pill(text: '$mcpCount MCP'),
+                          if (toolCount > 0) _Pill(text: '$toolCount tools'),
+                          if (model?.isNotEmpty ?? false)
+                            _Pill(text: _shortModel(model!), dim: true),
+                        ],
+                      ),
+                    ],
                   ],
                 ),
+              ),
+              if (trailing != null) ...[
+                const SizedBox(width: AppSpacing.xs),
+                trailing!,
               ],
             ],
           ),
@@ -561,16 +645,9 @@ class _AgentRow extends StatelessWidget {
 /// Compact count/label pill. Width is capped so a long model id or a big count
 /// can never push a neighbor off its line — the Wrap handles the rest.
 class _Pill extends StatelessWidget {
-  const _Pill({
-    required this.text,
-    this.fill,
-    this.foreground,
-    this.dim = false,
-  });
+  const _Pill({required this.text, this.dim = false});
 
   final String text;
-  final Color? fill;
-  final Color? foreground;
 
   /// Muted colour for model/technical pills; count pills use the primary hue.
   final bool dim;
@@ -586,17 +663,15 @@ class _Pill extends StatelessWidget {
           vertical: 2,
         ),
         decoration: BoxDecoration(
-          color: fill ?? scheme.surfaceContainer,
+          color: scheme.surfaceContainer,
           borderRadius: BorderRadius.circular(AppRadii.lg),
         ),
         child: Text(
           text,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-            color:
-                foreground ?? (dim ? scheme.onSurfaceVariant : scheme.primary),
-          ),
+          style: Theme.of(context).textTheme.labelSmall
+              ?.copyWith(color: dim ? scheme.onSurfaceVariant : scheme.primary),
         ),
       ),
     );
@@ -812,20 +887,13 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
   }
 }
 
-class _AgentEditor extends ConsumerWidget {
-  const _AgentEditor({
-    super.key,
-    required this.agent,
-    required this.configuration,
-  });
+class _AgentEditor extends StatelessWidget {
+  const _AgentEditor({super.key, required this.agent});
 
   final AgentDto agent;
-  final PluginAccountConfiguration configuration;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    ref.watch(scopedPluginCredentialsProvider);
-    final isSelected = configuration.selectedAgent == agent.id;
+  Widget build(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -868,33 +936,317 @@ class _AgentEditor extends ConsumerWidget {
           if (agent.maxTokens != null) Text('Max tokens: ${agent.maxTokens}'),
           Text('Vision: ${agent.visionCapable ? 'Yes' : 'No'}'),
         ],
-        const SizedBox(height: 24),
-        if (isSelected)
-          FilledButton(
-            onPressed: () async {
-              await ref
-                  .read(scopedPluginCredentialsProvider)
-                  .setSelectedAgent(null);
-            },
-            child: const Text('Deselect agent'),
-          )
-        else
-          FilledButton(
-            onPressed: () async {
-              await ref
-                  .read(scopedPluginCredentialsProvider)
-                  .setSelectedAgent(agent.id);
-            },
-            child: const Text('Select agent'),
-          ),
-        if (!isSelected) ...[
-          const SizedBox(height: 12),
-          Text(
-            'The Default agent will be used if you do not select one.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-        ],
+        const SizedBox(height: 40),
       ],
     );
   }
+}
+
+/// Tools the account has set up (a saved key and/or enabled), with their
+/// readiness. A tool the administrator has not installed never appears here.
+class _ConfiguredTools extends ConsumerWidget {
+  const _ConfiguredTools({required this.catalog, required this.configuration});
+
+  final PluginCatalog catalog;
+  final PluginAccountConfiguration configuration;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Keep the scoped handle alive so saving a key or toggling a tool refreshes
+    // this page (and the list behind it) rather than silently writing storage.
+    ref.watch(scopedPluginCredentialsProvider);
+    final tools =
+        catalog.plugins
+            .where(
+              (plugin) =>
+                  plugin.type == 'tool' &&
+                  plugin.installed &&
+                  plugin.isSupported,
+            )
+            .where((plugin) => _hasConfiguration(plugin, configuration))
+            .toList()
+          ..sort((a, b) => a.name.compareTo(b.name));
+    if (tools.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            'No tools set up yet. Open the Tool marketplace to add one.',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        for (final tool in tools)
+          _ToolRow(
+            key: ValueKey('configured-${tool.id}'),
+            tool: tool,
+            status: _toolStatus(tool, configuration),
+            onTap: () => _openToolEditor(context, tool.id),
+          ),
+        const SizedBox(height: 40),
+      ],
+    );
+  }
+}
+
+/// The administrator-curated tool catalog: searchable and grouped by category.
+/// Tapping a tool opens its configuration; a configured tool reads "Ready" in
+/// green.
+class _ToolMarketplace extends ConsumerStatefulWidget {
+  const _ToolMarketplace({required this.catalog, required this.configuration});
+
+  final PluginCatalog catalog;
+  final PluginAccountConfiguration configuration;
+
+  @override
+  ConsumerState<_ToolMarketplace> createState() => _ToolMarketplaceState();
+}
+
+class _ToolMarketplaceState extends ConsumerState<_ToolMarketplace> {
+  final _search = TextEditingController();
+  String _query = '';
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.watch(scopedPluginCredentialsProvider);
+    final tools =
+        widget.catalog.plugins
+            .where(
+              (plugin) =>
+                  plugin.type == 'tool' &&
+                  plugin.installed &&
+                  plugin.isSupported,
+            )
+            .toList()
+          ..sort((a, b) => a.name.compareTo(b.name));
+    final query = _query.trim().toLowerCase();
+    final matches = query.isEmpty
+        ? tools
+        : tools
+              .where(
+                (tool) =>
+                    tool.name.toLowerCase().contains(query) ||
+                    tool.description.toLowerCase().contains(query),
+              )
+              .toList();
+    final grouped = <String, List<PluginDto>>{};
+    for (final tool in matches) {
+      grouped.putIfAbsent(_categoryOf(tool), () => []).add(tool);
+    }
+    final categories = grouped.keys.toList()
+      ..sort((a, b) {
+        if (a == _defaultCategory) return -1;
+        if (b == _defaultCategory) return 1;
+        return a.compareTo(b);
+      });
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Text(
+          'Tools your administrator has made available. Add one to use it.',
+          style: Theme.of(context).textTheme.bodySmall
+              ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 12),
+        // Keep the chrome light for a handful of tools; the filter box only
+        // earns its space once the catalog is long.
+        if (tools.length > 8) ...[
+          TextField(
+            key: const Key('tool-search'),
+            controller: _search,
+            decoration: const InputDecoration(
+              hintText: 'Search tools',
+              prefixIcon: Icon(Icons.search),
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (value) => setState(() => _query = value),
+          ),
+          const SizedBox(height: 8),
+        ],
+        if (tools.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 24),
+            child: Text(
+              'No tools are available yet. Ask your administrator to add some.',
+            ),
+          )
+        else if (matches.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 24),
+            child: Text('No tools match your search.'),
+          )
+        else
+          for (final category in categories) ...[
+            Padding(
+              padding: const EdgeInsets.only(top: 16, bottom: 4),
+              child: Text(
+                category,
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ),
+            for (final tool in grouped[category]!)
+              _ToolRow(
+                key: ValueKey('market-${tool.id}'),
+                tool: tool,
+                status: _toolStatus(tool, widget.configuration),
+                onTap: () => _openToolEditor(context, tool.id),
+              ),
+          ],
+        const SizedBox(height: 40),
+      ],
+    );
+  }
+}
+
+/// A single tool row: name, description, and a status pill — "Ready" in green
+/// when the account has it configured, "Add" when available, "Needs setup"
+/// when a key or the enable toggle is still missing.
+class _ToolRow extends StatelessWidget {
+  const _ToolRow({
+    super.key,
+    required this.tool,
+    required this.status,
+    this.onTap,
+  });
+
+  final PluginDto tool;
+  final _ToolStatus status;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final (label, color) = switch (status) {
+      _ToolStatus.ready => ('Ready', AppColors.accent),
+      _ToolStatus.needsSetup => ('Needs setup', scheme.error),
+      _ToolStatus.available => ('Add', scheme.primary),
+    };
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+      title: Text(tool.name),
+      subtitle: Text(
+        tool.description,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _StatusPill(text: label, color: color),
+          const SizedBox(width: 4),
+          Icon(Icons.chevron_right, size: 20, color: scheme.onSurfaceVariant),
+        ],
+      ),
+      onTap: onTap,
+    );
+  }
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.text, required this.color});
+
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.sm,
+        vertical: 2,
+      ),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(AppRadii.lg),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.labelSmall
+            ?.copyWith(color: color, fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+}
+
+/// Readiness of a tool for this account.
+enum _ToolStatus {
+  /// Enabled and (when required) holding a key: it can actually run.
+  ready,
+
+  /// Some configuration exists but it is not usable yet (enabled without a
+  /// required key, or a key saved while disabled).
+  needsSetup,
+
+  /// No account configuration yet.
+  available,
+}
+
+/// Bucket for tools without a category. Everything ships as "General" for now;
+/// administrators refine the taxonomy over time as more categories appear.
+const _defaultCategory = 'General';
+
+String _categoryOf(PluginDto tool) {
+  final category = tool.category?.trim();
+  return (category == null || category.isEmpty) ? _defaultCategory : category;
+}
+
+bool _hasConfiguration(
+  PluginDto tool,
+  PluginAccountConfiguration configuration,
+) {
+  final entry = configuration.plugins[tool.id];
+  if (entry == null) return false;
+  final hasKey = entry.credentials['apiKey']?.trim().isNotEmpty ?? false;
+  return hasKey || entry.enabled;
+}
+
+_ToolStatus _toolStatus(
+  PluginDto tool,
+  PluginAccountConfiguration configuration,
+) {
+  final entry = configuration.plugins[tool.id];
+  final hasKey = entry?.credentials['apiKey']?.trim().isNotEmpty ?? false;
+  final enabled = entry?.enabled ?? false;
+  final requiresKey = tool.credentials?.required ?? false;
+  if (enabled && (!requiresKey || hasKey)) return _ToolStatus.ready;
+  if (hasKey || enabled) return _ToolStatus.needsSetup;
+  return _ToolStatus.available;
+}
+
+/// Opens the tool's setup page (key + enablement).
+void _openToolEditor(BuildContext context, String pluginId) {
+  Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => _PluginPage(
+        title: 'Tool setup',
+        builder: (catalog, configuration) {
+          final current = catalog.installedPlugin(pluginId);
+          if (current == null || current.type != 'tool') {
+            return const Center(
+              child: Text(
+                'This tool is no longer available. Return and refresh the catalog.',
+              ),
+            );
+          }
+          return _PluginEditor(
+            key: ValueKey(current.id),
+            plugin: current,
+            configuration: configuration,
+          );
+        },
+      ),
+    ),
+  );
 }

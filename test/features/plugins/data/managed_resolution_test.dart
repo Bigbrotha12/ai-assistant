@@ -183,31 +183,58 @@ void main() {
   });
 
   test(
-    'agent modelRef that is not a configured streaming model → '
-    'no_selected_model',
+    'a seeded enabled template agent never leaks into enabledPlugins',
     () async {
+      // `ensureDefaultAgent` / `selectAgent` seed the selected default agent
+      // with `enabled: true`; that id must not ride `enabled_plugins` (the
+      // gateway would count it as a requested tool, bind nothing, and 502
+      // `tools_unavailable` even though the agent has no tools).
+      await plugins.setSelectedAgent(scope, 'voice-assistant');
       await plugins.setAgentConfig(
         scope,
-        'custom',
-        AgentConfig(
-          id: 'custom',
-          kind: AgentKind.custom,
-          modelRef: 'missing',
-        ),
+        'voice-assistant',
+        AgentConfig(id: 'voice-assistant', kind: AgentKind.template),
       );
-      await plugins.setSelectedAgent(scope, 'custom');
-      await expectLater(
-        resolve(models: [_model('text')]),
-        throwsA(
-          isA<StagedInferenceUnavailable>().having(
-            (e) => e.code,
-            'code',
-            'no_selected_model',
-          ),
-        ),
+      await plugins.setEnabled(scope, 'voice-assistant', true);
+      await plugins.setEnabled(scope, 'web', true);
+      await plugins.setCredentials(scope, 'web', {'apiKey': 'w-key'});
+
+      final selection = await resolve(
+        models: [_model('text')],
+        agents: [_agent(id: 'voice-assistant')],
+      );
+      expect(selection.agent, 'voice-assistant');
+      expect(selection.enabledPlugins, ['web']);
+      expect(
+        selection.credentials.provider,
+        containsPair('web', {'apiKey': 'w-key'}),
+      );
+      expect(
+        selection.credentials.provider.containsKey('voice-assistant'),
+        isFalse,
       );
     },
   );
+
+  test('agent modelRef that is not a configured streaming model → '
+      'no_selected_model', () async {
+    await plugins.setAgentConfig(
+      scope,
+      'custom',
+      AgentConfig(id: 'custom', kind: AgentKind.custom, modelRef: 'missing'),
+    );
+    await plugins.setSelectedAgent(scope, 'custom');
+    await expectLater(
+      resolve(models: [_model('text')]),
+      throwsA(
+        isA<StagedInferenceUnavailable>().having(
+          (e) => e.code,
+          'code',
+          'no_selected_model',
+        ),
+      ),
+    );
+  });
 
   test('resolveAgentForSend returns null for missing selection/config', () {
     expect(

@@ -94,6 +94,7 @@ export const toolPluginDefinitionSchema = z.object({
     type: z.literal("tool"),
     name: z.string().trim().min(1),
     description: z.string().trim().min(1),
+    category: z.string().trim().min(1).optional(),
     // A tool plugin with no tools is meaningless; require at least one.
     tools: z.array(toolDefinitionSchema).min(1),
     // Read-only, zero-arg tools the gateway may pre-warm per owner (Phase 4
@@ -113,6 +114,7 @@ export const modelPluginDefinitionSchema = z.object({
     type: z.literal("model"),
     name: z.string().trim().min(1),
     description: z.string().trim().min(1),
+    category: z.string().trim().min(1).optional(),
     inference: inferenceDefinitionSchema,
     baseUrls: z.array(baseUrlAllowlistEntrySchema).optional(),
     credentials: credentialSpecSchema.optional(),
@@ -125,6 +127,7 @@ export const agentPluginDefinitionSchema = z.object({
     type: z.literal("agent"),
     name: z.string().trim().min(1),
     description: z.string().trim().min(1),
+    category: z.string().trim().min(1).optional(),
     systemPrompt: z.string().trim().min(1),
     skills: z
       .array(z.object({
@@ -167,6 +170,7 @@ export const templateAgentDefinitionSchema = z.object({
   type: z.literal("agent"),
   name: z.string().trim().min(1),
   description: z.string().trim().min(1),
+  category: z.string().trim().min(1).optional(),
   systemPrompt: z.string().optional(),
   skills: z.array(z.object({ id: pluginIdSchema })).optional(),
   mcpServers: z.array(z.object({ name: pluginIdSchema })).optional(),
@@ -307,6 +311,12 @@ export interface PluginDefinition {
   /** Display name for client UI */
   name: string;
   description: string;
+  /**
+   * Optional display grouping for the client's tool marketplace. Free-form
+   * (admins may use their own taxonomy); the client buckets unknown/missing
+   * values under "Other". Metadata only — never used for resolution.
+   */
+  category?: string;
 }
 
 export interface ToolPluginDefinition extends PluginDefinition {

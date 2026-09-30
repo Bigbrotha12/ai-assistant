@@ -169,6 +169,37 @@ void main() {
     });
   });
 
+  group('PluginDto category', () {
+    Map<String, dynamic> toolJson() => {
+      'id': 'tool-a',
+      'type': 'tool',
+      'name': 'Tool A',
+      'description': 'A tool',
+      'version': '1.0.0',
+      'schemaVersion': 1,
+      'installed': true,
+      'tools': [
+        {
+          'name': 'run',
+          'description': 'Run',
+          'readOnly': true,
+          'inputSchema': {'type': 'object'},
+        },
+      ],
+    };
+
+    test('parses an optional category', () {
+      final plugin =
+          PluginDto.fromSummaryJson({...toolJson(), 'category': 'General'});
+      expect(plugin.category, 'General');
+    });
+
+    test('leaves category null when absent', () {
+      final plugin = PluginDto.fromSummaryJson(toolJson());
+      expect(plugin.category, isNull);
+    });
+  });
+
   group('PluginDto.isSupported', () {
     test('accepts tool, model, and agent types', () {
       for (final entry in [

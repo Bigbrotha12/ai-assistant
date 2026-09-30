@@ -615,6 +615,46 @@ void main() {
     },
   );
 
+  testWidgets(
+    're-auth card scrolls instead of overflowing under the soft keyboard',
+    (tester) async {
+      final store = FakeSettingsStore(
+        stored: const BackendSettings(host: 'myhost'),
+      );
+      final client = FakeChatClient()
+        ..error = const ChatServerError('HTTP 401', statusCode: 401);
+      await tester.pumpWidget(
+        chatApp(
+          store: store,
+          probe: FakeProbe(),
+          chatStore: FakeChatStore(),
+          client: client,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField), 'Hello');
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.send));
+      await tester.pumpAndSettle();
+      expect(find.byType(ReauthCard), findsOneWidget);
+
+      // Simulate the on-screen keyboard. The body shrinks sharply; the recovery
+      // card must scroll inside the freed space, never overflow the Column.
+      tester.view.viewInsets = const FakeViewPadding(bottom: 360);
+      addTearDown(tester.view.resetViewInsets);
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const Key('auth-email')),
+        'me@example.com',
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.byType(ReauthCard), findsOneWidget);
+    },
+  );
+
   testWidgets('ReauthCard dismiss clears the auth-required state', (
     tester,
   ) async {

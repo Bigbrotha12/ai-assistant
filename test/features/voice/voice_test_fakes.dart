@@ -36,6 +36,9 @@ class FakeEngineManager extends EngineManager {
   Stream<ModelDownloadProgress> get downloadProgress => const Stream.empty();
 
   @override
+  Stream<Map<String, double>> get modelProgress => const Stream.empty();
+
+  @override
   Future<bool> ensureModelsDownloaded({
     void Function(String modelId)? progress,
   }) async => false;
@@ -296,7 +299,10 @@ class FakeSttEngine implements SttEngine {
   Completer<void>? gate;
 
   @override
-  Future<String> transcribe(List<int> pcm16bit, {required int sampleRate}) async {
+  Future<String> transcribe(
+    List<int> pcm16bit, {
+    required int sampleRate,
+  }) async {
     final err = error;
     if (err != null) throw err;
     transcribed.add(List<int>.from(pcm16bit));
@@ -354,8 +360,9 @@ class FakeTtsEngine implements TtsEngine {
       await g.future;
     }
     if (sampleVariants.isNotEmpty) {
-      final clamped =
-          index >= sampleVariants.length ? sampleVariants.length - 1 : index;
+      final clamped = index >= sampleVariants.length
+          ? sampleVariants.length - 1
+          : index;
       return sampleVariants[clamped];
     }
     return samples;
