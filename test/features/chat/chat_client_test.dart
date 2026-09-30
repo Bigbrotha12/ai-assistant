@@ -7,20 +7,52 @@ import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 
 void main() {
   group('isAuthRequiredError (managed auth codes)', () {
-    test('matches PluginClientException unauthorized / credentials_expired / '
-        'no_credentials', () {
-      expect(
-        isAuthRequiredError(const PluginClientException('unauthorized')),
-        isTrue,
-      );
-      expect(
-        isAuthRequiredError(const PluginClientException('credentials_expired')),
-        isTrue,
-      );
+    test(
+      'matches PluginClientException unauthorized / credentials_expired',
+      () {
+        expect(
+          isAuthRequiredError(const PluginClientException('unauthorized')),
+          isTrue,
+        );
+        expect(
+          isAuthRequiredError(
+            const PluginClientException('credentials_expired'),
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test('does NOT match provider-credentials codes (they are plugin-config '
+        'errors, not auth)', () {
       expect(
         isAuthRequiredError(const PluginClientException('no_credentials')),
-        isTrue,
+        isFalse,
       );
+      expect(
+        isAuthRequiredError(const PluginClientException('invalid_credentials')),
+        isFalse,
+      );
+    });
+
+    test('isPluginCredentialsError matches missing/rejected provider keys', () {
+      for (final code in const [
+        'no_credentials',
+        'invalid_credentials',
+        'no_selected_model',
+        'no_capable_model',
+      ]) {
+        expect(
+          isPluginCredentialsError(PluginClientException(code)),
+          isTrue,
+          reason: '"$code" must be a plugin-credentials error',
+        );
+      }
+      expect(
+        isPluginCredentialsError(const PluginClientException('unauthorized')),
+        isFalse,
+      );
+      expect(isPluginCredentialsError(null), isFalse);
     });
 
     test('does NOT match non-auth PluginClientException codes', () {

@@ -234,7 +234,11 @@ void main() {
           script: client,
           sentinelGate: SentinelInputGate(),
         );
-        final container = _container(store: store, client: client, adapter: adapter);
+        final container = _container(
+          store: store,
+          client: client,
+          adapter: adapter,
+        );
         _keepAlive(container, 'c1');
         final notifier = container.read(conversationProvider('c1').notifier);
         await container.read(conversationProvider('c1').future);
@@ -697,7 +701,7 @@ void main() {
         'error banner', () async {
       final store = FakeChatStore(initial: [_existingConversation()]);
       final client = FakeChatClient(
-        error: const PluginClientException('no_credentials'),
+        error: const PluginClientException('unauthorized', statusCode: 401),
       );
       final container = _container(store: store, client: client);
       _keepAlive(container, 'c1');
@@ -712,6 +716,29 @@ void main() {
       expect(state.error, isNull);
       expect(state.failedMessageId, isNotNull);
     });
+
+    test(
+      'a missing provider key surfaces a plugin error, NOT re-auth',
+      () async {
+        final store = FakeChatStore(initial: [_existingConversation()]);
+        final client = FakeChatClient(
+          error: const PluginClientException('no_credentials'),
+        );
+        final container = _container(store: store, client: client);
+        _keepAlive(container, 'c1');
+        final notifier = container.read(conversationProvider('c1').notifier);
+        await container.read(conversationProvider('c1').future);
+
+        await notifier.sendMessage('Hi');
+
+        final state = container.read(conversationProvider('c1')).value!;
+        expect(state.isStreaming, isFalse);
+        // The user IS signed in — the fix is a plugin key, so never re-auth.
+        expect(state.authRequired, isFalse);
+        expect(state.emailNotVerified, isFalse);
+        expect(state.error, isNotNull);
+      },
+    );
 
     test('a managed email_not_verified error surfaces emailNotVerified, never '
         'the re-auth card', () async {

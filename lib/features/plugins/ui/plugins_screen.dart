@@ -13,8 +13,6 @@ import '../data/plugin_credentials_store.dart';
 import '../data/plugin_dto.dart';
 import 'agent_editor_screen.dart';
 
-const _defaultBaseUrlEntry = '__default__';
-
 class PluginsScreen extends StatelessWidget {
   const PluginsScreen({super.key});
 
@@ -26,14 +24,28 @@ class PluginsScreen extends StatelessWidget {
   );
 }
 
-class _PluginPage extends ConsumerWidget {
+class _PluginPage extends ConsumerStatefulWidget {
   const _PluginPage({required this.title, required this.builder});
 
   final String title;
   final Widget Function(PluginCatalog, PluginAccountConfiguration) builder;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_PluginPage> createState() => _PluginPageState();
+}
+
+class _PluginPageState extends ConsumerState<_PluginPage> {
+  /// Last successfully loaded data, so a background refresh (e.g. an agent
+  /// selection bumping the credentials epoch) never unmounts the list into a
+  /// spinner — the transition stays a quiet in-place update. The catalog is
+  /// account-agnostic; the configuration is discarded when the signed-in
+  /// account changes so a new account never briefly sees another's data.
+  PluginCatalog? _catalog;
+  PluginAccountConfiguration? _config;
+  Object? _configKey;
+
+  @override
+  Widget build(BuildContext context) {
     final access = ref.watch(pluginAccessProvider);
     Widget body;
     switch (access) {
@@ -60,9 +72,7 @@ class _PluginPage extends ConsumerWidget {
       case PluginAccess.ready:
         final catalog = ref.watch(pluginCatalogProvider);
         final configuration = ref.watch(pluginCredentialsProvider);
-        if (catalog.isLoading || configuration.isLoading) {
-          body = const Center(child: CircularProgressIndicator());
-        } else if (catalog.hasError || configuration.hasError) {
+        if (catalog.hasError || configuration.hasError) {
           final terminal =
               isAccountDeletedError(catalog.error) ||
               isAccountDeletedError(configuration.error);
@@ -74,14 +84,29 @@ class _PluginPage extends ConsumerWidget {
             },
           );
         } else {
-          body = KeyedSubtree(
-            key: ObjectKey(ref.watch(authCredentialsProvider).value),
-            child: builder(catalog.requireValue, configuration.requireValue),
-          );
+          final authKey = ref.watch(authCredentialsProvider).value;
+          if (!identical(_configKey, authKey)) {
+            // Account changed: never reuse another account's configuration.
+            _configKey = authKey;
+            _config = null;
+          }
+          final catalogValue = catalog.value ?? _catalog;
+          final configValue = configuration.value ?? _config;
+          if (catalogValue == null || configValue == null) {
+            // Genuinely nothing loaded yet (first load).
+            body = const Center(child: CircularProgressIndicator());
+          } else {
+            _catalog = catalogValue;
+            _config = configValue;
+            body = KeyedSubtree(
+              key: ObjectKey(authKey),
+              child: widget.builder(catalogValue, configValue),
+            );
+          }
         }
     }
     return Scaffold(
-      appBar: AppBar(title: Text(title)),
+      appBar: AppBar(title: Text(widget.title)),
       // Bottom safe area so the gesture bar never overlaps the last row of a
       // subsection's scrollable, matching the settings About footer handling.
       body: SafeArea(top: false, child: body),
@@ -642,6 +667,19 @@ class _AgentRow extends StatelessWidget {
       model.contains('/') ? model.substring(model.lastIndexOf('/') + 1) : model;
 }
 
+/// Keeps model ids readable: `provider/model-id` → `model-id`.
+String _shortModelName(String model) =>
+    model.contains('/') ? model.substring(model.lastIndexOf('/') + 1) : model;
+
+/// Shows only enough of the stored key to tell WHICH one is in use — the
+/// `sk-...` prefix and the last 4 chars — never the full secret.
+String _maskKey(String key) {
+  final k = key.trim();
+  if (k.isEmpty) return '';
+  if (k.length <= 8) return '••••••••';
+  return '${k.substring(0, 6)}••••${k.substring(k.length - 4)}';
+}
+
 /// Compact count/label pill. Width is capped so a long model id or a big count
 /// can never push a neighbor off its line — the Wrap handles the rest.
 class _Pill extends StatelessWidget {
@@ -730,18 +768,6 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
     final plugin = widget.plugin;
     final saved = widget.configuration.plugins[plugin.id];
     final hasKey = saved?.credentials['apiKey']?.isNotEmpty ?? false;
-    final savedEntry = saved?.credentials['baseUrlEntry'];
-    final hasBaseUrlOptions =
-        plugin.credentials != null &&
-        plugin.type != 'tool' &&
-        plugin.baseUrls.isNotEmpty;
-    final selectedEntry =
-        savedEntry != null &&
-            plugin.baseUrls.any((instance) => instance.id == savedEntry)
-        ? savedEntry
-        : _defaultBaseUrlEntry;
-    final defaultBaseUrl =
-        '${ref.read(pluginAccountScopeProvider).backendOrigin}/v1';
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -749,16 +775,50 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
         Text(plugin.description),
         const SizedBox(height: 16),
         if (plugin.type == 'model') ...[
-          Text('Model: ${plugin.inference!.defaultModel}'),
-          if (widget.configuration.selectedModel == plugin.id)
-            const Text('Selected for this account')
-          else
-            FilledButton(
-              onPressed: _busy
-                  ? null
-                  : () => _write((store) => store.setSelectedModel(plugin.id)),
-              child: const Text('Select model'),
+          Text('Active model', style: Theme.of(context).textTheme.titleSmall),
+          const SizedBox(height: 4),
+          // Full-width row: model name left, status right. No fill/tint so it
+          // reads as a quiet status line rather than a highlighted chip.
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              border: Border(
+                bottom: BorderSide(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
+              ),
             ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _shortModelName(plugin.inference!.defaultModel),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodyLarge
+                        ?.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                if (widget.configuration.selectedModel == plugin.id)
+                  Text(
+                    'Active',
+                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                      color: Theme.of(context).colorScheme.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  )
+                else
+                  TextButton(
+                    onPressed: _busy
+                        ? null
+                        : () => _write(
+                            (store) => store.setSelectedModel(plugin.id),
+                          ),
+                    child: const Text('Select'),
+                  ),
+              ],
+            ),
+          ),
         ] else
           SwitchListTile(
             title: const Text('Enable for this account'),
@@ -770,113 +830,110 @@ class _PluginEditorState extends ConsumerState<_PluginEditor> {
           ),
         if (plugin.credentials case final credentials?) ...[
           const SizedBox(height: 16),
-          Text(
-            hasKey
-                ? 'API key saved for this account. Leave blank to keep it.'
-                : 'No API key saved for this account.',
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            key: const Key('plugin-api-key'),
-            controller: _keyController,
-            enabled: !_busy,
-            obscureText: true,
-            autocorrect: false,
-            enableSuggestions: false,
-            keyboardType: TextInputType.visiblePassword,
-            decoration: InputDecoration(
-              labelText: credentials.label,
-              helperText: credentials.required
-                  ? 'Required for this plugin'
-                  : 'Optional',
-              border: const OutlineInputBorder(),
-            ),
-            onChanged: (_) => setState(() {}),
-          ),
-          const SizedBox(height: 12),
-          FilledButton(
-            onPressed: _busy || _keyController.text.trim().isEmpty
-                ? null
-                : () {
-                    final fields = {
-                      ...?saved?.credentials,
-                      'apiKey': _keyController.text,
-                    };
-                    _write((store) async {
-                      await store.setCredentials(plugin.id, fields);
-                      if (plugin.type == 'model') {
-                        // Re-read a fresh handle: setCredentials bumps the
-                        // epoch, so the same handle would trip its own
-                        // stale-guard and fail the selection write.
-                        await ref
-                            .read(scopedPluginCredentialsProvider)
-                            .setSelectedModel(plugin.id);
-                      }
-                    });
-                  },
-            child: const Text('Save API key'),
-          ),
-          if (hasKey)
-            TextButton(
-              onPressed: _busy
-                  ? null
-                  : () => _write(
-                      (store) => store.setCredentials(
-                        plugin.id,
-                        {...?saved?.credentials}..remove('apiKey'),
-                      ),
-                    ),
-              child: const Text('Remove saved API key'),
-            ),
-          if (hasBaseUrlOptions) ...[
-            const SizedBox(height: 24),
+          if (hasKey) ...[
             Text(
-              'Base URL instance',
-              style: Theme.of(context).textTheme.titleMedium,
+              'Saved API key',
+              style: Theme.of(context).textTheme.titleSmall,
             ),
-            RadioGroup<String>(
-              groupValue: selectedEntry,
-              onChanged: (value) {
-                if (_busy || value == null) return;
-                if (value == _defaultBaseUrlEntry) {
-                  _write(
-                    (store) => store.setCredentials(
-                      plugin.id,
-                      {...?saved?.credentials}..remove('baseUrlEntry'),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
                     ),
-                  );
-                } else {
-                  _write(
-                    (store) => store.setCredentials(plugin.id, {
-                      ...?saved?.credentials,
-                      'baseUrlEntry': value,
-                    }),
-                  );
-                }
-              },
-              child: Column(
-                children: [
-                  RadioListTile<String>(
-                    key: const Key('plugin-baseurl-default'),
-                    value: _defaultBaseUrlEntry,
-                    title: const Text('(default)'),
-                    subtitle: Text(defaultBaseUrl),
-                    dense: true,
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surfaceContainer,
+                      borderRadius: BorderRadius.circular(AppRadii.lg),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.key,
+                          size: 16,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _maskKey(saved!.credentials['apiKey']!),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.labelLarge
+                                ?.copyWith(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant,
+                                ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  for (final instance in plugin.baseUrls)
-                    RadioListTile<String>(
-                      key: ValueKey('plugin-baseurl-${instance.id}'),
-                      value: instance.id,
-                      title: Text(
-                        instance.label ?? instance.url ?? instance.id,
-                      ),
-                      subtitle: instance.url == null
-                          ? null
-                          : Text(instance.url!),
-                      dense: true,
-                    ),
-                ],
+                ),
+                IconButton(
+                  key: const Key('remove-saved-key'),
+                  tooltip: 'Remove saved API key',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: _busy
+                      ? null
+                      : () => _write(
+                          (store) => store.setCredentials(
+                            plugin.id,
+                            {...saved.credentials}..remove('apiKey'),
+                          ),
+                        ),
+                ),
+                const SizedBox(width: 4),
+              ],
+            ),
+          ] else ...[
+            Text(
+              'No API key saved for this account.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('plugin-api-key'),
+              controller: _keyController,
+              enabled: !_busy,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              keyboardType: TextInputType.visiblePassword,
+              decoration: InputDecoration(
+                labelText: credentials.label,
+                helperText: credentials.required
+                    ? 'Required for this plugin'
+                    : 'Optional',
+                border: const OutlineInputBorder(),
               ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: _busy || _keyController.text.trim().isEmpty
+                  ? null
+                  : () {
+                      final fields = {
+                        ...?saved?.credentials,
+                        'apiKey': _keyController.text,
+                      };
+                      _write((store) async {
+                        await store.setCredentials(plugin.id, fields);
+                        if (plugin.type == 'model') {
+                          // Re-read a fresh handle: setCredentials bumps the
+                          // epoch, so the same handle would trip its own
+                          // stale-guard and fail the selection write.
+                          await ref
+                              .read(scopedPluginCredentialsProvider)
+                              .setSelectedModel(plugin.id);
+                        }
+                      });
+                    },
+              child: const Text('Save API key'),
             ),
           ],
         ],

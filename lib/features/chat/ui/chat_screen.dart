@@ -13,8 +13,11 @@ import '../../../app/widgets/voice_text_mode_pill.dart';
 import '../../attachments/ui/attachment_picker.dart';
 import '../../attachments/data/file_model.dart';
 import '../../auth/ui/auth_flow.dart';
+import '../../chat/data/chat_client.dart';
 import '../../settings/ui/settings_screen.dart';
 import '../../plugins/data/ledger_client.dart';
+import '../../plugins/ui/plugins_screen.dart';
+import '../../plugins/ui/plugin_key_card.dart';
 import '../../voice/ui/voice_screen.dart';
 import './chat_providers.dart';
 import './conversation_list.dart';
@@ -35,6 +38,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _input = TextEditingController();
   final _scroll = ScrollController();
   late String _conversationId;
+
+  /// Guards against popping a second re-auth dialog while one is open.
+  bool _reauthDialogOpen = false;
+
+  /// True once the user dismissed the "fix your model key" card; cleared when
+  /// the underlying error clears so a new failure can surface again.
+  bool _pluginKeyDismissed = false;
 
   /// Files selected for the next message, cleared after a successful send.
   List<AttachmentDraft> _attachments = [];
@@ -74,6 +84,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (selected != null && mounted) {
       ref.read(activeConversationIdProvider.notifier).set(selected);
     }
+  }
+
+  /// Opens the Plugins screen so the user can set/repair the model or tool API
+  /// key (the fix for a `no_credentials` / `invalid_credentials` turn).
+  void _openPlugins() {
+    Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => const PluginsScreen()));
   }
 
   /// Re-authentication succeeded: the [AuthFlow] already minted + persisted a
@@ -199,6 +216,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final error = state?.error;
     final authRequired = state?.authRequired ?? false;
     final emailNotVerified = state?.emailNotVerified ?? false;
+    final pluginCredentialsRequired =
+        !authRequired &&
+        !emailNotVerified &&
+        error != null &&
+        isPluginCredentialsError(error) &&
+        !_pluginKeyDismissed;
     final hasPendingJob = state?.hasPendingJob ?? false;
     final sentinelNotice = state?.sentinelNotice;
 
@@ -208,8 +231,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // `_uploadStatus` always reflects the current conversation.
     ref.listen<AsyncValue<ConversationState>>(
       conversationProvider(_conversationId),
-      (_, next) {
+      (previous, next) {
         _uploadStatus.value = next.value?.attachmentUploads ?? const {};
+        // Re-auth is surfaced as a modal: when the state flips to needing a
+        // fresh sign-in, pop the dialog once (never re-entrant). Success and
+        // dismiss clear the state from inside [showReauthDialog]'s callbacks.
+        final wasAuth = previous?.value?.authRequired ?? false;
+        final nowAuth = next.value?.authRequired ?? false;
+        if (nowAuth && !wasAuth && !_reauthDialogOpen) {
+          _reauthDialogOpen = true;
+          showReauthDialog(
+            context,
+            onSuccess: _onReauthSuccess,
+            onDismiss: () => ref
+                .read(conversationProvider(_conversationId).notifier)
+                .dismissAuthRequired(),
+          ).whenComplete(() {
+            if (mounted) _reauthDialogOpen = false;
+          });
+        }
+        if (next.value?.error == null) _pluginKeyDismissed = false;
       },
     );
 
@@ -237,6 +278,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         isDbReady &&
         !authRequired &&
         !emailNotVerified &&
+        !pluginCredentialsRequired &&
         _input.text.trim().isNotEmpty;
     // The background action is a text-only submit: unavailable while a job is
     // already pending (the chip owns that conversation), while streaming, or
@@ -288,18 +330,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             // A recovery card owns a form and the on-screen keyboard, so it
             // takes the whole remaining region and scrolls. A fixed-height card
             // in the Column overflowed the moment the keyboard shrank the body.
-            // The chat list is intentionally not shown while re-auth / email
-            // verification blocks sending.
-            child: authRequired
-                ? SingleChildScrollView(
-                    child: ReauthCard(
-                      onSuccess: _onReauthSuccess,
-                      onDismiss: () => ref
-                          .read(conversationProvider(_conversationId).notifier)
-                          .dismissAuthRequired(),
-                    ),
-                  )
-                : emailNotVerified
+            // Re-auth signs in via a modal dialog, so the list stays visible;
+            // the other recovery cards render inline here.
+            child: emailNotVerified
                 ? SingleChildScrollView(
                     child: VerifyEmailCard(
                       email: ref.watch(authCredentialsProvider).value?.email,
@@ -308,10 +341,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                           .dismissEmailNotVerified(),
                     ),
                   )
+                : pluginCredentialsRequired
+                ? PluginKeyCard(
+                    onDismiss: () => setState(() => _pluginKeyDismissed = true),
+                    onOpenPlugins: _openPlugins,
+                  )
                 : MessageList(
                     messages: state?.messages ?? const [],
                     isStreaming: isStreaming,
-                    error: error,
+                    // Re-auth and the provider-key card own their surfaces, so
+                    // the generic in-list error banner is suppressed for them.
+                    error: authRequired ? null : error,
                     isRetryInFlight: state?.isRetryInFlight ?? false,
                     onRetry: () => ref
                         .read(conversationProvider(_conversationId).notifier)

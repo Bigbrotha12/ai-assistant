@@ -30,8 +30,7 @@ const parsed = pluginDefinitionSchema.parse({
   schemaVersion: CURRENT_PLUGIN_DEFINITION_SCHEMA_VERSION,
   type: "model",
   name: "OpenRouter",
-  description:
-    "Single API for 400+ models — user supplies their own OpenRouter API key.",
+  description: "Single API for 400+ models.",
   inference: {
     endpoint: baseUrl,
     defaultModel,

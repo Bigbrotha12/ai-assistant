@@ -13,7 +13,6 @@ import 'package:ai_assistant/app/theme_providers.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/app/widgets/speak_button.dart';
-import 'package:ai_assistant/features/auth/ui/auth_flow.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/ui/conversation_list.dart';
@@ -201,7 +200,7 @@ void main() {
     await controller.sendText('hello');
     await settle(tester);
 
-    expect(find.byType(ReauthCard), findsOneWidget);
+    expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
     expect(find.text('Session expired'), findsOneWidget);
   });
 
@@ -227,7 +226,7 @@ void main() {
       await controller.sendText('hello');
       await settle(tester);
 
-      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
       expect(find.text('Session expired'), findsOneWidget);
     },
   );
@@ -251,12 +250,13 @@ void main() {
     await controller.sendText('hello');
     await settle(tester);
 
-    expect(find.byType(ReauthCard), findsOneWidget);
+    expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('reauth-dismiss')));
-    await settle(tester);
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
 
-    expect(find.byType(ReauthCard), findsNothing);
+    expect(find.byKey(const Key('reauth-dialog')), findsNothing);
     expect(controller.state.error, isNull);
     // The session itself is untouched.
     expect(controller.state.isConnected, isTrue);
@@ -281,7 +281,7 @@ void main() {
     await controller.sendText('hello');
     await settle(tester);
 
-    expect(find.byType(ReauthCard), findsNothing);
+    expect(find.byKey(const Key('reauth-dialog')), findsNothing);
     // A non-401 server error renders the generic banner's message.
     expect(find.textContaining('HTTP 503'), findsOneWidget);
   });

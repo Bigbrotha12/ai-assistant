@@ -356,9 +356,9 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('plugin-openrouter')));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Select model'));
+      await tester.tap(find.text('Select'));
       await tester.pumpAndSettle();
-      expect(find.text('Selected for this account'), findsOneWidget);
+      expect(find.text('Active'), findsOneWidget);
       final field = find.byKey(const Key('plugin-api-key'));
       expect(tester.widget<TextField>(field).obscureText, isTrue);
       await tester.enterText(field, 'fake-provider-key');
@@ -368,11 +368,10 @@ void main() {
       ]);
       await tester.tap(find.text('Save API key'));
       await tester.pumpAndSettle();
-      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
-      expect(
-        find.textContaining('API key saved for this account.'),
-        findsOneWidget,
-      );
+      // The input is replaced by a masked view of the saved key once one
+      // exists — never the full secret.
+      expect(find.byKey(const Key('plugin-api-key')), findsNothing);
+      expect(find.textContaining('••••'), findsOneWidget);
       expect(
         adapter.requests.every((request) => request.method == 'GET'),
         isTrue,
@@ -419,7 +418,6 @@ void main() {
         ownerId: 'owner-b',
       )!;
       expect((await store.load(otherScope)).plugins, isEmpty);
-      await tester.enterText(field, 'unsaved-key');
       auth.replace(
         const AuthCredentials(
           apiKey: 'other-fake-key',
@@ -546,45 +544,6 @@ void main() {
     );
     pending.complete(jsonResponse({'plugins': []}));
     await tester.pump();
-  });
-
-  testWidgets('selecting a base URL instance persists baseUrlEntry', (
-    tester,
-  ) async {
-    await mount(tester);
-    await tester.tap(find.byKey(const Key('plugin-openrouter')));
-    await tester.pumpAndSettle();
-    expect(find.text('(default)'), findsOneWidget);
-    expect(
-      find.byKey(const ValueKey('plugin-baseurl-primary')),
-      findsOneWidget,
-    );
-    expect((await store.load(account.accountScope!)).plugins.keys, [
-      'test-agent',
-    ]);
-    final primary = find.byKey(const ValueKey('plugin-baseurl-primary'));
-    await tester.ensureVisible(primary);
-    await tester.pumpAndSettle();
-    await tester.tap(primary);
-    await tester.pumpAndSettle();
-    expect(
-      (await store.load(account.accountScope!))
-          .plugins['openrouter']!
-          .credentials['baseUrlEntry'],
-      'primary',
-    );
-    final fallback = find.byKey(const Key('plugin-baseurl-default'));
-    await tester.ensureVisible(fallback);
-    await tester.pumpAndSettle();
-    await tester.tap(fallback);
-    await tester.pumpAndSettle();
-    expect(
-      (await store.load(account.accountScope!))
-          .plugins['openrouter']!
-          .credentials
-          .containsKey('baseUrlEntry'),
-      isFalse,
-    );
   });
 
   testWidgets('ready-made agent tile selects and opens details', (

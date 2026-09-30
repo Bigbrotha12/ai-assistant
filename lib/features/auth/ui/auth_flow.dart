@@ -24,11 +24,7 @@ import '../data/auth_credentials_store.dart';
 /// in-conversation re-auth card. Renders a bare form (no [Scaffold]); the host
 /// screen supplies the surrounding layout.
 class AuthFlow extends ConsumerStatefulWidget {
-  const AuthFlow({
-    super.key,
-    required this.onSuccess,
-    this.showSubmit = true,
-  });
+  const AuthFlow({super.key, required this.onSuccess, this.showSubmit = true});
 
   /// Invoked after a session was obtained AND its API key was minted and
   /// persisted. Receives the authenticated session (token + email).
@@ -602,6 +598,99 @@ class AuthFlowState extends ConsumerState<AuthFlow> {
           onPressed: _submitting ? null : _switchToSignIn,
           child: const Text('Back to sign in'),
         ),
+      ],
+    );
+  }
+}
+
+/// Shows the re-auth flow as a modal pop-up overlay (chat + voice). Pops on
+/// success or dismiss; [onSuccess]/[onDismiss] are invoked by the host AFTER
+/// the dialog closes so it can retry / clear state exactly once.
+Future<void> showReauthDialog(
+  BuildContext context, {
+  required ValueChanged<AuthSession> onSuccess,
+  VoidCallback? onDismiss,
+  String title = 'Session expired',
+  String message =
+      'Your API key was rejected by the gateway. Sign in again to continue.',
+}) {
+  return showDialog<void>(
+    context: context,
+    // Tapping outside counts as dismiss (clears the auth-required state).
+    barrierDismissible: true,
+    builder: (dialogContext) => AlertDialog(
+      key: const Key('reauth-dialog'),
+      scrollable: true,
+      contentPadding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
+      actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      content: _ReauthDialogBody(
+        title: title,
+        message: message,
+        onSuccess: (session) {
+          Navigator.of(dialogContext).pop();
+          onSuccess(session);
+        },
+        onDismiss: () {
+          Navigator.of(dialogContext).pop();
+          onDismiss?.call();
+        },
+      ),
+    ),
+  );
+}
+
+/// Pop-up (dialog) body for the re-auth flow — the same title/message and
+/// [AuthFlow] as [ReauthCard], excluding the card's outer margin/colour.
+class _ReauthDialogBody extends StatelessWidget {
+  const _ReauthDialogBody({
+    required this.title,
+    required this.message,
+    required this.onSuccess,
+    required this.onDismiss,
+  });
+
+  final String title;
+  final String message;
+  final ValueChanged<AuthSession> onSuccess;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.lock_outline, color: scheme.error),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: theme.textTheme.titleSmall),
+                  const SizedBox(height: 2),
+                  Text(
+                    message,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              key: const Key('reauth-dismiss'),
+              tooltip: 'Dismiss',
+              icon: const Icon(Icons.close),
+              onPressed: onDismiss,
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        AuthFlow(onSuccess: onSuccess),
       ],
     );
   }

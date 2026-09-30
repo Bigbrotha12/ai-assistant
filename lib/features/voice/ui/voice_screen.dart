@@ -22,6 +22,8 @@ import '../../chat/ui/chat_screen.dart';
 import '../../chat/ui/conversation_list.dart';
 import '../../settings/data/settings_providers.dart';
 import '../../settings/ui/settings_screen.dart';
+import '../../plugins/ui/plugin_key_card.dart';
+import '../../plugins/ui/plugins_screen.dart';
 import '../data/engine_config.dart';
 import '../data/engine_errors.dart';
 import '../data/engine_manager.dart';
@@ -58,6 +60,12 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
   /// Mirrors [VoiceCapturePipeline.isRecording] for states where the server
   /// connection is down but local capture is still active.
   bool _localRecording = false;
+
+  /// Guards against popping a second re-auth dialog while one is open.
+  bool _reauthDialogOpen = false;
+
+  /// True once the user dismissed the "fix your model key" prompt.
+  bool _pluginKeyDismissed = false;
 
   /// Errors raised outside the controller (e.g. mic permission before the
   /// pipeline starts) so they surface in the same banner as state errors.
@@ -214,6 +222,12 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
     }
   }
 
+  /// Opens the Plugins screen — the fix for a rejected/missing provider key.
+  void _openPlugins() {
+    Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => const PluginsScreen()));
+  }
+
   void _push(Widget screen) {
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => screen));
   }
@@ -258,11 +272,32 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
   @override
   Widget build(BuildContext context) {
-    ref.listen(voiceConversationStateProvider, (_, next) {
+    ref.listen(voiceConversationStateProvider, (previous, next) {
       final error = next.error;
       if (error != null && isAccountDeletedError(error)) {
         unawaited(ref.read(accountDeletedHandlerProvider).handle(error));
       }
+      // Re-auth is a modal pop-up: pop it once on the false→true transition
+      // (never re-entrant). Success/dismiss flow through [showReauthDialog].
+      final wasAuth =
+          previous != null &&
+          previous.error != null &&
+          isAuthRequiredError(previous.error!);
+      final nowAuth = error != null && isAuthRequiredError(error);
+      if (nowAuth && !wasAuth && !_reauthDialogOpen) {
+        _reauthDialogOpen = true;
+        showReauthDialog(
+          context,
+          onSuccess: (_) => _retryConnection(),
+          onDismiss: () {
+            ref.read(voiceControllerProvider).clearError();
+            setState(() => _localError = null);
+          },
+        ).whenComplete(() {
+          if (mounted) _reauthDialogOpen = false;
+        });
+      }
+      if (error == null) _pluginKeyDismissed = false;
     });
     final state = ref.watch(voiceConversationStateProvider);
     final runtimeDecision = ref.watch(voiceRuntimeDecisionProvider);
@@ -279,6 +314,13 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
         error != null && !accountDeleted && isAuthRequiredError(error);
     final emailNotVerified =
         error != null && !accountDeleted && isEmailNotVerifiedError(error);
+    final pluginCredentialsRequired =
+        error != null &&
+        !accountDeleted &&
+        !authRequired &&
+        !emailNotVerified &&
+        isPluginCredentialsError(error) &&
+        !_pluginKeyDismissed;
     // Mirrors the onboarding gate's configured rule (API key + explicitly
     // stored, valid host), so the banner never disagrees with the gate.
     final configured = isConfigured(
@@ -332,18 +374,9 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
 
             if (error != null)
               authRequired
-                  ? Flexible(
-                      fit: FlexFit.loose,
-                      child: SingleChildScrollView(
-                        child: ReauthCard(
-                          onSuccess: (_) => _retryConnection(),
-                          onDismiss: () {
-                            ref.read(voiceControllerProvider).clearError();
-                            setState(() => _localError = null);
-                          },
-                        ),
-                      ),
-                    )
+                  // Re-auth is a modal pop-up now; the dialog owns this
+                  // surface, so nothing renders inline beneath it.
+                  ? const SizedBox.shrink()
                   : emailNotVerified
                   ? Flexible(
                       fit: FlexFit.loose,
@@ -357,6 +390,19 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                             ref.read(voiceControllerProvider).clearError();
                             setState(() => _localError = null);
                           },
+                        ),
+                      ),
+                    )
+                  : pluginCredentialsRequired
+                  ? Flexible(
+                      fit: FlexFit.loose,
+                      child: SingleChildScrollView(
+                        child: PluginKeyCard(
+                          onDismiss: () {
+                            setState(() => _pluginKeyDismissed = true);
+                            ref.read(voiceControllerProvider).clearError();
+                          },
+                          onOpenPlugins: _openPlugins,
                         ),
                       ),
                     )

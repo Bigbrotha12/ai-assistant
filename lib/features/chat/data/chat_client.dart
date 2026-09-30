@@ -74,8 +74,28 @@ bool isAuthRequiredError(Object error) =>
     error is PluginClientException && error.statusCode == 401 ||
     error is PluginClientException &&
         (error.code == ManagedErrorCodes.unauthorized ||
-            error.code == ManagedErrorCodes.credentialsExpired ||
-            error.code == ManagedErrorCodes.noCredentials);
+            error.code == ManagedErrorCodes.credentialsExpired);
+
+/// True when the turn failed because a MODEL/TOOL provider key is missing or
+/// was rejected — `no_credentials` is raised locally when the selected model
+/// has no stored key, `no_selected_model`/`no_capable_model` mean the model
+/// itself isn't configured, and the gateway answers a wrong/absent provider
+/// key with a 400 `invalid_credentials` envelope.
+///
+/// These are NOT auth failures: the user is signed in; the fix is updating the
+/// key in Plugins, so the UI must surface a plugin-configuration prompt, never
+/// the re-auth flow.
+bool isPluginCredentialsError(Object? error) {
+  if (error is ParallelWaitError) {
+    final nested = error.errors;
+    return nested is Iterable && nested.any(isPluginCredentialsError);
+  }
+  return error is PluginClientException &&
+      (error.code == ManagedErrorCodes.noCredentials ||
+          error.code == ManagedErrorCodes.noSelectedModel ||
+          error.code == ManagedErrorCodes.noCapableModel ||
+          error.code == 'invalid_credentials');
+}
 
 /// True only for the managed `email_not_verified` envelope (C2): the stored
 /// API key is valid but the account's email is unconfirmed, so the UI must

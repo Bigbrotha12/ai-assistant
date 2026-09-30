@@ -16,7 +16,6 @@ import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
 import 'package:ai_assistant/features/settings/data/settings_providers.dart';
 import 'package:ai_assistant/features/attachments/ui/file_attachment_chip.dart';
-import 'package:ai_assistant/features/auth/ui/auth_flow.dart';
 import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/ui/message_bubble.dart';
@@ -595,7 +594,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // A 401 surfaces the re-auth card, not the generic error banner.
-      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
       expect(find.text('Retry'), findsNothing);
       expect(find.text('Session expired'), findsOneWidget);
 
@@ -609,7 +608,7 @@ void main() {
       await tester.tap(find.byKey(const Key('auth-submit')));
       await tester.pumpAndSettle();
 
-      expect(find.byType(ReauthCard), findsNothing);
+      expect(find.byKey(const Key('reauth-dialog')), findsNothing);
       expect(find.text('Hello'), findsOneWidget);
       expect(find.text('Retry'), findsNothing);
     },
@@ -637,7 +636,7 @@ void main() {
       await tester.pump();
       await tester.tap(find.byIcon(Icons.send));
       await tester.pumpAndSettle();
-      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
 
       // Simulate the on-screen keyboard. The body shrinks sharply; the recovery
       // card must scroll inside the freed space, never overflow the Column.
@@ -651,7 +650,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
-      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
     },
   );
 
@@ -678,12 +677,12 @@ void main() {
     await tester.tap(find.byIcon(Icons.send));
     await tester.pumpAndSettle();
 
-    expect(find.byType(ReauthCard), findsOneWidget);
+    expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('reauth-dismiss')));
     await tester.pumpAndSettle();
 
-    expect(find.byType(ReauthCard), findsNothing);
+    expect(find.byKey(const Key('reauth-dialog')), findsNothing);
   });
 
   testWidgets(
@@ -712,7 +711,7 @@ void main() {
       await tester.tap(find.byIcon(Icons.send));
       await tester.pumpAndSettle();
 
-      expect(find.byType(ReauthCard), findsOneWidget);
+      expect(find.byKey(const Key('reauth-dialog')), findsOneWidget);
       expect(find.text('Retry'), findsNothing);
       expect(find.text('Session expired'), findsOneWidget);
     },
