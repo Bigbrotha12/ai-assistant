@@ -28,32 +28,60 @@ class ConversationListScreen extends ConsumerWidget {
           final pending =
               projections.value ?? const <String, LedgerTaskProjection>{};
           return ListView.builder(
+            padding: const EdgeInsets.symmetric(vertical: 8),
             itemCount: items.length,
             itemBuilder: (context, index) {
               final conversation = items[index];
-              return Dismissible(
-                key: ValueKey(conversation.id),
-                direction: DismissDirection.endToStart,
-                background: Container(
-                  color: Theme.of(context).colorScheme.errorContainer,
-                  alignment: Alignment.centerRight,
-                  padding: const EdgeInsets.only(right: 20),
-                  child: Icon(
-                    Icons.delete,
-                    color: Theme.of(context).colorScheme.onErrorContainer,
-                  ),
+              return Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 4,
                 ),
-                confirmDismiss: (_) => _confirmDelete(context),
-                onDismissed: (_) => store.deleteConversation(conversation.id),
-                child: ListTile(
-                  title: Text(conversation.title),
-                  subtitle: Text(_formatTime(conversation.updatedAt)),
-                  trailing: pending[conversation.id] == null
-                      ? null
-                      : _PendingJobIndicator(
-                          projection: pending[conversation.id]!,
-                        ),
-                  onTap: () => Navigator.pop(context, conversation.id),
+                child: Dismissible(
+                  key: ValueKey(conversation.id),
+                  direction: DismissDirection.endToStart,
+                  background: Container(
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.errorContainer,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    alignment: Alignment.centerRight,
+                    padding: const EdgeInsets.only(right: 20),
+                    child: Icon(
+                      Icons.delete,
+                      color: Theme.of(context).colorScheme.onErrorContainer,
+                    ),
+                  ),
+                  confirmDismiss: (_) => _confirmDelete(context),
+                  onDismissed: (_) => store.deleteConversation(conversation.id),
+                  // Card wrapper so each history entry reads as a tappable, delimited row
+                  // rather than blending into its neighbours. Material (not a
+                  // plain Container) so the ListTile's ink/splash paint on it.
+                  child: Material(
+                    color: Theme.of(context).colorScheme.surface,
+                    elevation: 1,
+                    shadowColor: Colors.black.withValues(alpha: 0.15),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                    child: ListTile(
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 2,
+                      ),
+                      title: Text(conversation.title),
+                      subtitle: Text(_formatTime(conversation.updatedAt)),
+                      trailing: pending[conversation.id] == null
+                          ? null
+                          : _PendingJobIndicator(
+                              projection: pending[conversation.id]!,
+                            ),
+                      onTap: () => Navigator.pop(context, conversation.id),
+                    ),
+                  ),
                 ),
               );
             },

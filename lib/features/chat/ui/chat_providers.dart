@@ -763,6 +763,21 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     _pendingAssistantId = null;
     _pendingContent = null;
     _cancelThrottle();
+    // Nothing was streamed: drop the in-memory placeholder so a stop never
+    // leaves an empty assistant bubble in the conversation.
+    if (pendingId != null && partialText.isEmpty) {
+      final cur = state.value;
+      if (cur != null) {
+        _setState(
+          cur.copyWith(
+            messages: [
+              for (final m in cur.messages)
+                if (m.id != pendingId) m,
+            ],
+          ),
+        );
+      }
+    }
     // Abandon the staged turn so a stale pending row never blocks the next
     // send (plan §3: cancel = abandon + partial retention). Best-effort: a
     // failure here must not surface as an error on a user-initiated stop.
@@ -1393,7 +1408,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // stop() already settled the streaming flags and kept the partial.
     if (error is PluginClientException &&
         error.code == ManagedErrorCodes.cancelled) {
-      _upsertPartial(assistantId, _assistantContent(assistantId));
+      _finalizeAssistantPartial(assistantId);
       _setState(
         state.value!.copyWith(
           isStreaming: false,
@@ -1447,7 +1462,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         );
         if (!ref.mounted) return;
         if (cleared) {
-          _upsertPartial(assistantId, _assistantContent(assistantId));
+          _finalizeAssistantPartial(assistantId);
           _setState(
             state.value!.copyWith(
               isStreaming: false,
@@ -1492,7 +1507,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
         }
       } catch (_) {
         // Best-effort escape hatch; still surface the message.
-        _upsertPartial(assistantId, _assistantContent(assistantId));
+        _finalizeAssistantPartial(assistantId);
         _setState(
           state.value!.copyWith(
             isStreaming: false,
@@ -1528,7 +1543,7 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
     // Keep partial content in memory only: the service owns assistant-row
     // persistence (the placeholder was never written), so there is no row to
     // update here. stop() hands the partial to abandonTurn for persistence.
-    _upsertPartial(assistantId, _assistantContent(assistantId));
+    _finalizeAssistantPartial(assistantId);
 
     _setState(
       state.value!.copyWith(
@@ -1541,6 +1556,28 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
       ),
     );
     _clearPendingStream();
+  }
+
+  /// Keeps a non-empty partial for [assistantId] in the in-memory history (so a
+  /// retry can show what was streamed); drops the placeholder entirely when
+  /// nothing was streamed, so a failed or stopped turn never leaves an empty
+  /// assistant bubble behind in the chat.
+  void _finalizeAssistantPartial(String assistantId) {
+    final cur = state.value;
+    if (cur == null) return;
+    final partial = _assistantContent(assistantId);
+    if (partial.isNotEmpty) {
+      _upsertPartial(assistantId, partial);
+      return;
+    }
+    _setState(
+      cur.copyWith(
+        messages: [
+          for (final m in cur.messages)
+            if (m.id != assistantId) m,
+        ],
+      ),
+    );
   }
 
   /// Writes [partialContent] into the in-memory assistant placeholder for

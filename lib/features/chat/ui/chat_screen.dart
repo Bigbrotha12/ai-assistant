@@ -164,30 +164,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
   }
 
-  /// Submits the current input as a BACKGROUND job (plan P3): the service
-  /// POSTs a self-contained snapshot and a poller appends the reply later.
-  /// The input is cleared only once the user message was actually admitted
-  /// (persisted); a rejected submission keeps the text for a fresh attempt.
-  Future<void> _sendBackground() async {
-    final text = _input.text.trim();
-    if (text.isEmpty) return;
-    final state = ref.read(conversationProvider(_conversationId)).value;
-    if (state == null || state.isStreaming || state.hasPendingJob) return;
-    try {
-      await ref
-          .read(conversationProvider(_conversationId).notifier)
-          .submitBackgroundJob(text);
-    } catch (_) {
-      // Fall through: the persistence check decides whether the submission
-      // landed (clearing the input) or was rejected (keeping it).
-    }
-    if (!mounted) return;
-    final persisted = await _isUserMessagePersisted(text);
-    if (!persisted) return;
-    _input.clear();
-    setState(() {});
-  }
-
   /// Hands off to the voice screen via the shared Voice/Text pill. Replaces
   /// this screen so toggling modes never stacks surfaces (Voice→Text→Voice
   /// would otherwise grow the back stack unboundedly).
@@ -280,10 +256,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         !emailNotVerified &&
         !pluginCredentialsRequired &&
         _input.text.trim().isNotEmpty;
-    // The background action is a text-only submit: unavailable while a job is
-    // already pending (the chip owns that conversation), while streaming, or
-    // when files are selected (the background path carries no attachments).
-    final canSendBackground = canSend && !hasPendingJob && _attachments.isEmpty;
 
     return Scaffold(
       appBar: AppBar(
@@ -366,8 +338,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             isDbReady: isDbReady,
             canSend: canSend,
             onSend: _send,
-            onSendBackground: _sendBackground,
-            canSendBackground: canSendBackground,
             onStop: () =>
                 ref.read(conversationProvider(_conversationId).notifier).stop(),
             onChanged: () => setState(() {}),
@@ -383,16 +353,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 : null,
           ),
           // Bottom bar: the shared Voice/Text pill (Text selected) hands off
-          // to the voice screen; the settings gear is pinned right.
+          // to the voice screen; the settings gear is pinned right. No top
+          // padding: the composer's own 8px bottom whitespace separates the
+          // two bars, so the gap matches the composer's top.
           Material(
             color: Theme.of(context).colorScheme.surfaceContainerLow,
             child: SafeArea(
               top: false,
               child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 6,
-                ),
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
@@ -562,9 +531,8 @@ class _PendingJobBar extends StatelessWidget {
   }
 }
 
-/// Bottom input bar: multiline text field with a Send / Stop button, a
-/// background-submit action (plan P3), plus an optional attachment picker row
-/// above it.
+/// Bottom input bar: multiline text field with a Send / Stop button plus an
+/// optional attachment picker row above it.
 class _InputBar extends StatelessWidget {
   const _InputBar({
     required this.controller,
@@ -572,8 +540,6 @@ class _InputBar extends StatelessWidget {
     required this.isDbReady,
     required this.canSend,
     required this.onSend,
-    required this.onSendBackground,
-    required this.canSendBackground,
     required this.onStop,
     required this.onChanged,
     this.attachmentRow,
@@ -584,8 +550,6 @@ class _InputBar extends StatelessWidget {
   final bool isDbReady;
   final bool canSend;
   final VoidCallback onSend;
-  final VoidCallback onSendBackground;
-  final bool canSendBackground;
   final VoidCallback onStop;
   final VoidCallback onChanged;
 
@@ -598,6 +562,17 @@ class _InputBar extends StatelessWidget {
     final tier =
         Theme.of(context).extension<TierTheme>() ??
         const TierTheme(premium: false);
+    // Circular outline so the action reads as a button, not a bare glyph
+    // (especially the stop, which would otherwise look like a black square).
+    final actionStyle = IconButton.styleFrom(
+      shape: const CircleBorder(),
+      side: BorderSide(color: scheme.outlineVariant),
+    );
+    // The mode bar below owns the bottom system inset, so this bar applies NO
+    // SafeArea: its (otherwise sizable) bottom inset used to create a large
+    // gap between the text field and the mode pill — a gap that only
+    // disappeared while the on-screen keyboard was up (which zeroes that
+    // inset). The parent handles any needed top inset via the app bar.
     return Material(
       color: scheme.surface,
       // Hairline divider instead of a cast shadow; premium upgrades it to a
@@ -608,58 +583,50 @@ class _InputBar extends StatelessWidget {
           width: tier.premium ? GoldBand.hairline : 1.0,
         ),
       ),
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (attachmentRow != null) ...[
-                attachmentRow!,
-                const SizedBox(height: 8),
-              ],
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: controller,
-                      enabled: !isStreaming && isDbReady,
-                      minLines: 1,
-                      maxLines: 5,
-                      onChanged: (_) => onChanged(),
-                      textInputAction: TextInputAction.newline,
-                      decoration: const InputDecoration(hintText: 'Message…'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  if (isStreaming)
-                    IconButton(
-                      icon: Icon(Icons.stop, color: scheme.onSurface),
-                      tooltip: 'Stop',
-                      onPressed: onStop,
-                    )
-                  else ...[
-                    IconButton(
-                      key: const Key('send-background'),
-                      icon: Icon(
-                        Icons.schedule_send,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                      tooltip: 'Send in background',
-                      onPressed: canSendBackground ? onSendBackground : null,
-                    ),
-                    IconButton(
-                      icon: Icon(Icons.send, color: scheme.primary),
-                      tooltip: 'Send',
-                      onPressed: canSend ? onSend : null,
-                    ),
-                  ],
-                ],
-              ),
+      child: Padding(
+        // Symmetric 8px so the whitespace below the text field (to the mode
+        // bar) reads the same as above it. The mode bar adds no top padding
+        // of its own, so this gap is all composer surface, not tinted bar.
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (attachmentRow != null) ...[
+              attachmentRow!,
+              const SizedBox(height: 8),
             ],
-          ),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    enabled: !isStreaming && isDbReady,
+                    minLines: 1,
+                    maxLines: 5,
+                    onChanged: (_) => onChanged(),
+                    textInputAction: TextInputAction.newline,
+                    decoration: const InputDecoration(hintText: 'Message…'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                if (isStreaming)
+                  IconButton(
+                    style: actionStyle,
+                    icon: Icon(Icons.stop, color: scheme.onSurface),
+                    tooltip: 'Stop',
+                    onPressed: onStop,
+                  )
+                else
+                  IconButton(
+                    style: actionStyle,
+                    icon: Icon(Icons.send, color: scheme.primary),
+                    tooltip: 'Send',
+                    onPressed: canSend ? onSend : null,
+                  ),
+              ],
+            ),
+          ],
         ),
       ),
     );

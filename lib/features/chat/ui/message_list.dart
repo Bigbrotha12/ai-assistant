@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../../app/theme.dart';
 import './message_bubble.dart';
 import '../data/message_model.dart';
 
@@ -33,8 +34,8 @@ class _MessageListState extends State<MessageList>
     with SingleTickerProviderStateMixin {
   static const double _nearBottomThreshold = 100;
 
-  late final AnimationController _caretController;
-  late final Animation<double> _caretOpacity;
+  late final AnimationController _dotsController;
+  late final Animation<double> _dotsAnimation;
 
   /// True while the scroll position sits within [_nearBottomThreshold] pixels
   /// of the bottom; auto-scroll only fires then, so a user who scrolled up to
@@ -55,14 +56,15 @@ class _MessageListState extends State<MessageList>
   @override
   void initState() {
     super.initState();
-    _caretController = AnimationController(
+    _dotsController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 700),
+      duration: const Duration(milliseconds: 900),
     );
-    _caretOpacity = Tween<double>(begin: 1, end: 0.1).animate(
-      CurvedAnimation(parent: _caretController, curve: Curves.easeInOut),
-    );
-    _syncCaretAnimation();
+    _dotsAnimation = Tween<double>(
+      begin: 0,
+      end: 1,
+    ).animate(CurvedAnimation(parent: _dotsController, curve: Curves.linear));
+    _syncDotsAnimation();
     _attachScrollListener();
   }
 
@@ -93,19 +95,19 @@ class _MessageListState extends State<MessageList>
       oldWidget.scrollController.removeListener(_updateNearBottom);
       _attachScrollListener();
     }
-    _syncCaretAnimation();
+    _syncDotsAnimation();
     _scrollToBottom();
   }
 
-  /// Runs the caret blink animation only while streaming; stopping it lets
+  /// Runs the dots animation only while streaming; stopping it lets
   /// pumpAndSettle (and idle frames) settle when no stream is active.
-  void _syncCaretAnimation() {
+  void _syncDotsAnimation() {
     if (widget.isStreaming) {
-      if (!_caretController.isAnimating) {
-        _caretController.repeat(reverse: true);
+      if (!_dotsController.isAnimating) {
+        _dotsController.repeat();
       }
-    } else if (_caretController.isAnimating) {
-      _caretController
+    } else if (_dotsController.isAnimating) {
+      _dotsController
         ..stop()
         ..value = 0;
     }
@@ -114,7 +116,7 @@ class _MessageListState extends State<MessageList>
   @override
   void dispose() {
     widget.scrollController.removeListener(_updateNearBottom);
-    _caretController.dispose();
+    _dotsController.dispose();
     super.dispose();
   }
 
@@ -159,8 +161,10 @@ class _MessageListState extends State<MessageList>
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
           )
-          .then((_) => _onScrollAnimationDone(target),
-              onError: (_) => _onScrollAnimationDone(target));
+          .then(
+            (_) => _onScrollAnimationDone(target),
+            onError: (_) => _onScrollAnimationDone(target),
+          );
     });
   }
 
@@ -197,6 +201,14 @@ class _MessageListState extends State<MessageList>
         if (m.role != MessageRole.tool) m,
     ];
 
+    // The streaming assistant placeholder (empty content) renders as a
+    // three-dot "typing" bubble while the reply is being generated.
+    final showStreamingDots =
+        widget.isStreaming &&
+        visible.isNotEmpty &&
+        visible.last.role == MessageRole.assistant &&
+        visible.last.content.isEmpty;
+
     return Column(
       children: [
         if (widget.error != null)
@@ -209,15 +221,15 @@ class _MessageListState extends State<MessageList>
           child: ListView.builder(
             controller: widget.scrollController,
             padding: const EdgeInsets.symmetric(vertical: 12),
-            itemCount: visible.length + (widget.isStreaming ? 1 : 0),
+            itemCount: visible.length,
             itemBuilder: (context, index) {
-              if (index < visible.length) {
-                // Stable key by message id: the ListView reconciles children
-                // by runtimeType + index otherwise, so when the streaming
-                // caret (a different widget type) vacates a slot and a
-                // MessageBubble lands on it, the previous element's composited
-                // layer can be repurposed and paint a stale bubble (the last
-                // assistant reply showing up "duplicated" after a new send).
+              // Stable key by message id: the ListView reconciles children
+              // by runtimeType + index otherwise, so when the streaming dots
+              // (a different widget type) vacate a slot and a MessageBubble
+              // lands on it, the previous element's composited layer can be
+              // repurposed and paint a stale bubble (the last assistant reply
+              // showing up "duplicated" after a new send).
+              if (!showStreamingDots || index < visible.length - 1) {
                 return MessageBubble(
                   key: ValueKey('message-${visible[index].id}'),
                   message: visible[index],
@@ -225,9 +237,9 @@ class _MessageListState extends State<MessageList>
               }
               // Distinct key type from MessageBubble so it can never swap
               // layers with a bubble slot during reconciliation.
-              return _StreamingCaret(
-                key: const ValueKey('streaming-caret'),
-                opacity: _caretOpacity,
+              return _StreamingDots(
+                key: const ValueKey('streaming-dots'),
+                animation: _dotsAnimation,
               );
             },
           ),
@@ -237,28 +249,73 @@ class _MessageListState extends State<MessageList>
   }
 }
 
-/// Blinking caret shown after the last assistant message while streaming.
-class _StreamingCaret extends StatelessWidget {
-  const _StreamingCaret({super.key, required this.opacity});
+/// Three-dot "typing" indicator inside an assistant-style bubble with a fixed
+/// width, so the dots animate without expanding the bubble. Shown while the
+/// assistant reply is generating and no text has landed yet.
+class _StreamingDots extends StatelessWidget {
+  const _StreamingDots({super.key, required this.animation});
 
-  final Animation<double> opacity;
+  final Animation<double> animation;
+
+  /// Staggered pulse: each dot reaches full opacity one third of a cycle
+  /// after the previous one, so the three dots ripple left → right.
+  static double _dotOpacity(double t, int index) {
+    final phase = (t - index / 3) % 1.0;
+    final intensity = 1.0 - (phase * 3).clamp(0.0, 1.0);
+    return 0.2 + 0.8 * intensity;
+  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final tier =
+        Theme.of(context).extension<TierTheme>() ??
+        const TierTheme(premium: false);
     return Align(
       alignment: Alignment.centerLeft,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        child: FadeTransition(
-          opacity: opacity,
-          child: Text(
-            '▋',
-            style: TextStyle(
-              color: scheme.primary,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: tier.premium
+              ? AppColors.paperRaised
+              : scheme.surfaceContainerLowest,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomLeft: Radius.circular(4),
+            bottomRight: Radius.circular(16),
+          ),
+          border: Border.all(
+            color: tier.premium ? AppColors.goldBase : scheme.outline,
+          ),
+        ),
+        child: SizedBox(
+          width: 48,
+          child: AnimatedBuilder(
+            animation: animation,
+            builder: (context, _) {
+              final t = animation.value;
+              return Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  for (var i = 0; i < 3; i++)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 3),
+                      child: Container(
+                        width: 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: scheme.onSurfaceVariant.withValues(
+                            alpha: _dotOpacity(t, i),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
           ),
         ),
       ),
