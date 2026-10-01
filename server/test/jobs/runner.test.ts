@@ -2106,6 +2106,60 @@ describe("JobRunner.resumeStuckJobs (restart loss)", () => {
     assert.ok(seen[0]?.some((message) => String(message.content) === "queued snapshot"));
   });
 
+  test("a newer same-plugin pin cannot hijack the credential minted for a resumed job", async (t) => {
+    const { registry } = await makeRegistry(t);
+    const { ledger, clock } = makeLedger();
+    class RacingPinStore extends CredentialPinStore {
+      recoveryHandle?: CredentialPinHandle;
+      newerHandle?: CredentialPinHandle;
+
+      override pin(owner: string, pluginId: string, credentials: Record<string, string>) {
+        const pin = super.pin(owner, pluginId, credentials);
+        if (pluginId === "openrouter" && credentials.apiKey === "recovered-model") {
+          this.recoveryHandle = pin.handle;
+          this.newerHandle = super.pin(owner, pluginId, { apiKey: "newer-model" }).handle;
+        }
+        return pin;
+      }
+    }
+    const pins = new RacingPinStore();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "orphan-pin-race",
+      spec: "{}",
+      jobSpec: storedJobSpec(),
+      payload: storedPayload([new HumanMessage("resume with recovered credentials")]),
+    });
+    ledger.claimTask(task.id, "user-1");
+    clock.advance(20_000);
+    ledger.reconcileOrphans();
+    assert.equal(ledger.getTask(task.id)?.status, "stuck");
+
+    let modelCredentials: Record<string, string> | undefined;
+    const runner = createJobRunner(
+      baseDeps(ledger, registry, pins, {
+        buildModel: (_modelId, _config, context) => {
+          modelCredentials = context.credentials;
+          return new ScriptedChatModel({ responses: [new AIMessage("resumed")] });
+        },
+        credentialSource: () => ({
+          openrouter: { apiKey: "recovered-model" },
+          vikunja: { apiKey: "recovered-tool" },
+        }),
+      }),
+    );
+
+    const result = await runner.resumeStuckJobs();
+    assert.equal(result.outcomes[0]?.outcome, "repinned");
+    assert.deepEqual(modelCredentials, { apiKey: "recovered-model" });
+    assert.ok(pins.recoveryHandle);
+    assert.ok(pins.newerHandle);
+    assert.throws(() => pins.get("user-1", "openrouter", pins.recoveryHandle), isNotFound);
+    assert.deepEqual(pins.get("user-1", "openrouter", pins.newerHandle).credentials, {
+      apiKey: "newer-model",
+    });
+  });
+
   test("a queued row without a durable spec fails instead of fabricating a job", async (t) => {
     const { registry } = await makeRegistry(t);
     const { ledger } = await makeLedger();

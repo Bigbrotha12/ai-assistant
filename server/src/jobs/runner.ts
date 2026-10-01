@@ -1597,9 +1597,10 @@ export class JobRunner {
           outcomes.push(await this.failStuck(task, "credentials_expired"));
           continue;
         }
+        const pinHandles: Record<string, CredentialPinHandle> = {};
         for (const [pluginId, credentials] of Object.entries(reestablished)) {
           if (isDeleting(task.owner)) break;
-          this.deps.pins.pin(task.owner, pluginId, credentials);
+          pinHandles[pluginId] = this.deps.pins.pin(task.owner, pluginId, credentials).handle;
         }
         if (isDeleting(task.owner)) {
           this.deps.pins.releaseOwner(task.owner);
@@ -1632,13 +1633,14 @@ export class JobRunner {
           continue;
         }
         const replay = await this.runJob({
-           owner: task.owner,
-           intentKey: task.intent_key,
-           requestId: task.intent_key,
-           spec: task.spec,
+          owner: task.owner,
+          intentKey: task.intent_key,
+          requestId: task.intent_key,
+          spec: task.spec,
           clientThreadId: task.worker ?? storedSpec.clientThreadId,
           toolPlugins: storedSpec.toolPlugins,
           modelPluginId: storedSpec.modelPluginId,
+          pinHandles,
           modelRequestConfig: storedSpec.modelRequestConfig,
           systemPrompt: storedSpec.systemPrompt,
           mcpServers: storedSpec.mcpServers,
