@@ -50,6 +50,41 @@ describe("cache interceptor", () => {
     assert.equal(results[1]!.outputBytes, Buffer.byteLength("fresh", "utf8"));
   });
 
+  test("does not cache a body-failed result or serve it as a later hit", async (t) => {
+    const cache = makeCache(t);
+    const results: ToolCallResult[] = [];
+    let calls = 0;
+    const pipeline = createToolPipeline({
+      interceptors: [createCacheInterceptor({ cache })],
+      onResult: (_dispatch, result) => results.push(result),
+    });
+    const bodies = makeBodies({
+      plugin: async (dispatch) => {
+        calls += 1;
+        if (calls === 1) {
+          dispatch.bodyFailed = true;
+          return "domain failure";
+        }
+        return "recovered";
+      },
+    });
+
+    assert.equal(await pipeline.dispatch({ call: cacheCall(), bodies }), "domain failure");
+    assert.equal(cache.size, 0, "a body-failed result is not stored");
+    assert.equal(results[0]!.bodyFailed, true);
+    assert.equal(results[0]!.ok, true, "body failure is not a denial");
+    assert.equal(results[0]!.outcome, "ok");
+    assert.equal(results[0]!.errorCode, undefined);
+    assert.equal(results[0]!.fromCache, false);
+
+    assert.equal(await pipeline.dispatch({ call: cacheCall(), bodies }), "recovered");
+    assert.equal(calls, 2, "the subsequent call misses and executes the body");
+    assert.equal(results[1]!.bodyFailed, false);
+    assert.equal(results[1]!.ok, true);
+    assert.equal(results[1]!.errorCode, undefined);
+    assert.equal(results[1]!.fromCache, false);
+  });
+
   test("does not cache a mutating (non-read-only) tool", async (t) => {
     const cache = makeCache(t);
     let calls = 0;
