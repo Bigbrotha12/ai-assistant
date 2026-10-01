@@ -59,7 +59,7 @@ and if the awaited transition can never occur the wait hangs.
 
 **Our equivalent (good).** `McpBinding.getClient` awaits `record.clientPromise`, then
 re-checks `checkMcpSessionExpiry`, `record.evictionStarted`, and `record.closePromise` before
-handing the client back (`agents/mcp.ts:1870-1880`) — because the record can be evicted or
+handing the client back (`agents/mcp.ts:1993-2010`) — because the record can be evicted or
 closed *after* the connect promise resolved. Use that shape. The pipeline's `rawSettled`
 deferred is the same lesson: a bounded race settling must not be read as the raw body having
 settled.
@@ -73,22 +73,31 @@ registries *before* killing children, so late completions stay silent.
 **Why it exists.** Upstream killed children and returned before they exited, leaking
 processes; it also learned the ordering half the hard way.
 
-**Our equivalent — real gap.** `PluginRegistry.disposeWatch` (`plugins/registry.ts:245-260`)
+**Our equivalent — real gaps.** `PluginRegistry.disposeWatch` (`plugins/registry.ts:247-262`)
 is synchronous (`void`): it clears the debounce timer, aborts the watch controller, and closes
 the watcher — but if `hotReload()` was already invoked from the timer callback
-(`plugins/registry.ts:225-232`) that promise is in flight and untracked, so `disposeWatch`
-does not await it. Shutdown compounds this: `cleanup` is typed `() => void`
-(`index.ts:358`) and the watcher is disposed through it (`index.ts:378`), so shutdown cannot
-await a reload either. A reload racing shutdown can leave a dangling mutation of
-plugin-store state after shutdown has begun.
+(`plugins/registry.ts:227-234`) that promise is in flight and untracked, so `disposeWatch`
+does not await it. Shutdown's seam is no longer the problem: `cleanupAsync` accepts and awaits
+the returned disposer promise under a deadline (`shutdown.ts:99-108,126-140`), and shutdown uses it
+for each disposer (`index.ts:437-441`). But that does not make a request-only disposer
+quiescent; the watcher still cannot return the in-flight reload promise. A reload racing
+shutdown can leave a dangling mutation of plugin-store state after shutdown has begun.
+
+`JobRunner.dispose` (`jobs/runner.ts:1673-1688`) is the same class of gap: it is `void`, aborts
+the tracked job controllers, and returns without awaiting their unwind. An aborted run can
+still reach `failJob` and write its error step/status to the ledger
+(`jobs/runner.ts:1524-1532,1821-1853`), while shutdown proceeds to close the ledger
+(`index.ts:459-463`). The awaitable seam therefore means shutdown awaits what a disposer
+returns; it must not be read as “shutdown is now quiescent.”
 
 **Correction to the plan.** Plan §7 also flags `McpBinding.dispose` as this same gap. It is
-not: `disposeBinding` (`agents/mcp.ts:2078-2084`) returns a memoized promise, awaits every
-tracked lease's `closeMcpConnection`, and bounds each close with a force-close timer
-(`agents/mcp.ts:533-594`). Its residual defect is narrower — closes started *outside* dispose
+not: `disposeBinding` (`agents/mcp.ts:2320-2328`) returns a memoized promise, and `closeAll`
+awaits `closeMcpConnection` for every lease still in `records`
+(`agents/mcp.ts:1932-1936`). Each close is bounded by a force-close timer
+(`agents/mcp.ts:623-649`). Its residual defect is narrower — closes started *outside* dispose
 are detached and escape the barrier: `invalidateCurrent` runs `void closeLease(current)`
-(`agents/mcp.ts:1945-1947`), and the connect-failure path runs `void closeMcpConnection(lease)`
-after `removeRecord` (`agents/mcp.ts:1936-1941`). `closeAll` awaits only leases still in
+(`agents/mcp.ts:2075-2077`), and the connect-failure path runs `void closeMcpConnection(lease)`
+after `removeRecord` (`agents/mcp.ts:2066-2070`). `closeAll` awaits only leases still in
 `records`, so a dispose racing one of those returns before the close finishes. That is the fix
 target, not the dispose method itself.
 
