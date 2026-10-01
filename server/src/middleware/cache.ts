@@ -131,6 +131,15 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Deterministic, order-independent SHA-256 hash of decoded tool arguments.
+ * Serializes the recursively canonicalized value as JSON before hashing.
+ */
+export function toolArgsHash(args: Record<string, unknown>): string {
+  const serialized = JSON.stringify(canonicalize(args));
+  return createHash("sha256").update(serialized, "utf8").digest("hex");
+}
+
 export function createToolResultCache(
   opts: CreateToolResultCacheOptions = {},
 ): ToolResultCache {
@@ -206,8 +215,7 @@ export function createToolResultCache(
     },
 
     argsHash(args) {
-      const serialized = JSON.stringify(canonicalize(args));
-      return createHash("sha256").update(serialized, "utf8").digest("hex");
+      return toolArgsHash(args);
     },
 
     invalidateForUser(owner) {
