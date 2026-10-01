@@ -245,6 +245,7 @@ by the client's error taxonomy, not serialized.
 | 400 | `invalid_request` | `message?` | Malformed JSON; missing/unknown/non-model/non-streaming model plugin; missing or empty messages; managed request without a valid `session_id`; session delta whose last message is not a user message; invalid `agent` value (conceptual `invalid_request_error`) |
 | 400 | `invalid_credentials` | `message?` | Missing/invalid model-plugin or granted-tool credentials (conceptual `auth_error`, user-fixable) |
 | 400 | `unsupported` | `message` | Model plugin exists but cannot serve this request (e.g. non-streaming) |
+| 400 | `agent_tool_allowlist_background_unsupported` | `message` | Background admission for an agent whose manifest declares `toolAllowlist`; the allowlist is not yet enforced on the background/job path (Phase 1, fail-closed until plumbed) |
 | 400 | `context_length_exceeded` | `message` | Request exceeds the context budget (`ContextBudgetError`) |
 | 401 | `unauthorized` | — | Missing/invalid gateway key |
 | 403 | `email_not_verified` | — | Valid key, owner's email unconfirmed |

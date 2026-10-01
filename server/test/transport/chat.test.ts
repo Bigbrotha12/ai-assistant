@@ -279,6 +279,8 @@ function buildCatalogs(extraPlugins?: PluginDefinition[]): Catalogs {
         skills: (agent.skills ?? []).map(s => ({ id: s.id, title: s.title, content: s.content })),
         mcpServers: (agent.mcpServers ?? []).map(s => ({ name: s.name, url: s.url, headers: s.headers })),
         tools: (agent.tools ?? []).map(t => ({ pluginId: t.pluginId, required: t.required })),
+        ...(agent.toolAllowlist === undefined ? {} : { toolAllowlist: agent.toolAllowlist }),
+        ...(agent.maxIterations === undefined ? {} : { maxIterations: agent.maxIterations }),
         modelRef: agent.modelRef,
         inference: agent.inference,
       });
@@ -802,6 +804,34 @@ describe("POST /v1/chat/completions — async delegation (background: true, Wave
       message: "messageId required for background requests",
     });
     assert.equal(fake.calls.length, 0);
+  });
+
+  test("an allowlisted agent is rejected fail-closed -> 400 (the durable job spec cannot carry toolAllowlist)", async (t) => {
+    const pins = new CredentialPinStore();
+    const ledger = makeLedger();
+    const fake = makeFakeJobRunner([]);
+    const { app } = await makeApp(
+      t,
+      { pins, ledger, jobRunner: fake as unknown as JobRunner },
+      [agentPlugin({ tools: [], toolAllowlist: [{ name: "list_tasks", readOnly: true }] })],
+    );
+    const res = await postChat(app, chatBody({
+      background: true,
+      messageId: "msg-allowlisted",
+      agent: "kitchen-copilot",
+    }));
+    assert.equal(res.status, 400, "the allowlist assertion must not be silently dropped on the job path");
+    assert.deepEqual(await res.json(), {
+      error: "agent_tool_allowlist_background_unsupported",
+      message: "an agent with a toolAllowlist cannot yet run on the background path",
+    });
+    assert.equal(fake.calls.length, 0, "runJob never delegated");
+    assert.equal(ledger.getTaskByIntentKey("test-user", "msg-allowlisted"), null);
+    assert.throws(
+      () => pins.get("test-user", "openrouter"),
+      (e: unknown) => (e as { code?: string }).code === "pin_not_found",
+      "the 400 is raised before any credential pin",
+    );
   });
 
   test("async path not wired (no runner/ledger/pins) -> 503 background_unavailable", async (t) => {

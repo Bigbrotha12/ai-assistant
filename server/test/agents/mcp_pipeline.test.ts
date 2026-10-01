@@ -306,6 +306,161 @@ describe("mcp → tool pipeline (step 1.11)", () => {
     }
   });
 
+  // --- D6: manifest read-only override (allowTools) -------------------------
+
+  test("D6: an un-annotated tool allowlisted with readOnly:true classifies read-only (its result is cached)", async () => {
+    const calls: string[] = [];
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "read" }] }),
+      callTool: async (params) => {
+        calls.push(params.name);
+        return { content: [{ type: "text", text: "fresh" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [{ name: "declared-server", url: "https://declared.example.com" }],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+        allowTools: [{ name: "read", readOnly: true }],
+      },
+    );
+    try {
+      assert.equal(await binding.tools[0]!.func({}), "fresh");
+      assert.equal(await binding.tools[0]!.func({}), "fresh");
+      assert.equal(calls.length, 1, "the declared read-only tool's result is cached");
+      assert.equal(cache.size, 1);
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
+  test("D6: the override cannot promote a destructiveHint:true tool to read-only (never cached)", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({
+        tools: [{ name: "danger", annotations: { destructiveHint: true } }],
+      }),
+      callTool: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: "applied" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [{ name: "declared-server", url: "https://declared.example.com" }],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+        allowTools: [{ name: "danger", readOnly: true }],
+      },
+    );
+    try {
+      await binding.tools[0]!.func({});
+      await binding.tools[0]!.func({});
+      assert.equal(calls, 2, "a raw destructiveHint:true vetoes the read-only declaration");
+      assert.equal(cache.size, 0);
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
+  test("D6 × M5: the read-only declaration cannot defeat the cross-server destructive AND-merge", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async (server) => ({
+      listTools: async () => ({
+        tools: server.name === "server-a"
+          ? [{ name: "shared" }]
+          : [{ name: "shared", annotations: { destructiveHint: true } }],
+      }),
+      callTool: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: "applied" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [
+        { name: "server-a", url: "https://a.example.com" },
+        { name: "server-b", url: "https://b.example.com" },
+      ],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+        allowTools: [{ name: "shared", readOnly: true }],
+      },
+    );
+    try {
+      assert.equal(binding.tools.length, 1, "the first occurrence binds; the duplicate is skipped");
+      await binding.tools[0]!.func({});
+      await binding.tools[0]!.func({});
+      assert.equal(
+        calls,
+        2,
+        "the destructive occurrence on the second-listed server vetoes read-only",
+      );
+      assert.equal(cache.size, 0, "a name any server declares destructive is never cached");
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
+  test("D6: without the override an un-annotated tool stays mutating (never cached)", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "read" }] }),
+      callTool: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: "value" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [{ name: "declared-server", url: "https://declared.example.com" }],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+      },
+    );
+    try {
+      await binding.tools[0]!.func({});
+      await binding.tools[0]!.func({});
+      assert.equal(calls, 2, "no declaration means the un-annotated tool is never cached");
+      assert.equal(cache.size, 0);
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
   // --- D1 ------------------------------------------------------------------
 
   test("D1: a single owner is capped at the per-owner limit (4) with default budget caps", async () => {

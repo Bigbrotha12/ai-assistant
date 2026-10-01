@@ -101,6 +101,11 @@ export async function loadAgentsCatalog(
       skills: resolvedSkills,
       mcpServers: resolvedMcp,
       tools: template.tools?.map(t => ({ pluginId: t.pluginId, required: t.required })),
+      toolAllowlist: template.toolAllowlist?.map(t => ({
+        name: t.name,
+        ...(t.readOnly === undefined ? {} : { readOnly: t.readOnly }),
+      })),
+      ...(template.maxIterations === undefined ? {} : { maxIterations: template.maxIterations }),
       modelRef: template.modelRef,
       inference: template.inference,
     });
@@ -135,6 +140,11 @@ export function migrateInstalledAgents(
         ...(s.headers === undefined ? {} : { headerRefs: { ...s.headers } }),
       })),
       tools: agent.tools?.map(t => ({ pluginId: t.pluginId, required: t.required })),
+      toolAllowlist: agent.toolAllowlist?.map(t => ({
+        name: t.name,
+        ...(t.readOnly === undefined ? {} : { readOnly: t.readOnly }),
+      })),
+      ...(agent.maxIterations === undefined ? {} : { maxIterations: agent.maxIterations }),
       modelRef: agent.modelRef,
       inference: agent.inference,
     });

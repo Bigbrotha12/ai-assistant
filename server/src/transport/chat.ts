@@ -45,7 +45,7 @@ import { PluginStoreError } from "../plugins/store.ts";
 import type { PluginStore } from "../plugins/store.ts";
 import { isModelPlugin, isToolPlugin, pluginIdSchema } from "../plugins/types.ts";
 import { composeAgentPrompt } from "../agents/skills.ts";
-import type { ModelPluginDefinition } from "../plugins/types.ts";
+import type { AgentToolAllowlistEntry, ModelPluginDefinition } from "../plugins/types.ts";
 import type { Catalogs, ResolvedAgentDef } from "../catalog/index.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
@@ -626,6 +626,8 @@ type ResolvedChat = {
   agentOverride?: {
     systemPrompt: string;
     toolGrants?: { pluginId: string; required: boolean }[];
+    toolAllowlist?: AgentToolAllowlistEntry[];
+    maxIterations?: number;
     inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
     mcpServers?: {
       name: string;
@@ -1007,6 +1009,8 @@ export function resolveChatRequest(
     agentOverride = {
       systemPrompt,
       toolGrants: resolvedAgentDef.tools,
+      toolAllowlist: resolvedAgentDef.toolAllowlist,
+      maxIterations: resolvedAgentDef.maxIterations,
       inference: resolvedAgentDef.inference,
       mcpServers: resolvedAgentDef.mcpServers.map((server) => ({
         ...server,
@@ -1173,6 +1177,11 @@ async function handleSyncStream(
         track: execution.track,
         assertActive: () => assertNotDeleting(owner),
         excludeToolNames: new Set(pluginTools.map((tool) => tool.name)),
+        // Phase 1.1/1.2: agent `toolAllowlist` scopes which MCP tools bind and
+        // carries the D6 read-only declaration. Undefined unless the template
+        // declares one (also undefined WITH a custom-spec override, which omits
+        // the field) → bind everything (legacy behaviour).
+        allowTools: resolved.value.agentOverride?.toolAllowlist,
         duplicateLogPrefix: "[chat]",
       })
     : undefined;
@@ -1206,6 +1215,7 @@ async function handleSyncStream(
       model,
       tools,
       systemPrompt: resolved.value.agentOverride?.systemPrompt,
+      maxIterations: resolved.value.agentOverride?.maxIterations,
       beforeModelCall: () => {
         execution.signal.throwIfAborted();
         if (isDeleting(owner)) throw new AccountDeletedError(owner);
@@ -1561,6 +1571,8 @@ async function handleManagedSessionStream(
           track: execution.track,
           assertActive: () => assertNotDeleting(owner),
           excludeToolNames: new Set(pluginTools.map((tool) => tool.name)),
+          // Phase 1.1/1.2: same agent `toolAllowlist` wiring as the stateless path.
+          allowTools: resolved.agentOverride?.toolAllowlist,
           duplicateLogPrefix: "[chat]",
         })
       : undefined;
@@ -1589,6 +1601,7 @@ async function handleManagedSessionStream(
         model,
         tools,
         systemPrompt: resolved.agentOverride?.systemPrompt,
+        maxIterations: resolved.agentOverride?.maxIterations,
         beforeModelCall: () => {
           execution.signal.throwIfAborted();
           budget.beforeModelCall(owner, "sync");
@@ -1874,6 +1887,23 @@ async function handleBackground(
     clientThreadId,
   } = resolved.value;
   if (isDeleting(owner)) return accountDeletedResponse(c);
+
+  // Phase 1.1 fail-closed: the durable job spec below forwards only
+  // `systemPrompt` and `mcpServers`, and the runner binds MCP with no allowlist
+  // (`jobs/runner.ts`). An allowlisted agent is a security assertion — the
+  // operator excluded every unlisted tool — so until the allowlist is plumbed
+  // into the durable spec it MUST NOT run on the unsupervised background path
+  // (which would otherwise bind the full MCP surface). Entries are rejected
+  // before any credential pinning, so no pin leaks on the 400.
+  if ((resolved.value.agentOverride?.toolAllowlist?.length ?? 0) > 0) {
+    return c.json(
+      {
+        error: "agent_tool_allowlist_background_unsupported",
+        message: "an agent with a toolAllowlist cannot yet run on the background path",
+      },
+      400,
+    );
+  }
 
   // Idempotency key: the client generates `messageId` once per send and reuses
   // it across retries. Missing -> 400 before any admission/pinning.

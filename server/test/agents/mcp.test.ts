@@ -236,6 +236,104 @@ describe("mcp", () => {
     await binding.dispose();
   });
 
+  test("bindMcpServers binds only allowTools-listed names when allowTools is present", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      {
+        "test-server": [
+          { name: "search_recipes", description: "Search" },
+          { name: "add_recipe", description: "Add" },
+          { name: "delete_recipe", description: "Delete" },
+        ],
+      },
+      callLog,
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      {
+        clientFactory: factory,
+        allowTools: [
+          { name: "search_recipes", readOnly: true },
+          { name: "add_recipe" },
+        ],
+      },
+    );
+
+    assert.deepEqual(binding.tools.map((tool) => tool.name), ["search_recipes", "add_recipe"]);
+    await binding.dispose();
+  });
+
+  test("bindMcpServers with allowTools: [] binds nothing", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      {
+        "test-server": [
+          { name: "search_recipes", description: "Search" },
+          { name: "delete_recipe", description: "Delete" },
+        ],
+      },
+      callLog,
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      { clientFactory: factory, allowTools: [] },
+    );
+
+    assert.deepEqual(binding.tools.map((tool) => tool.name), []);
+    await binding.dispose();
+  });
+
+  test("bindMcpServers binds every tool when allowTools is absent (legacy)", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      {
+        "test-server": [
+          { name: "search_recipes", description: "Search" },
+          { name: "delete_recipe", description: "Delete" },
+        ],
+      },
+      callLog,
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      { clientFactory: factory },
+    );
+
+    assert.deepEqual(binding.tools.map((tool) => tool.name), ["search_recipes", "delete_recipe"]);
+    await binding.dispose();
+  });
+
+  test("bindMcpServers silently ignores an allowTools name the server does not expose", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      { "test-server": [{ name: "search_recipes", description: "Search" }] },
+      callLog,
+    );
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "));
+    };
+    try {
+      const binding = await bindMcpServers(
+        [{ name: "test-server", url: "https://mcp.example.com" }],
+        {
+          clientFactory: factory,
+          allowTools: [
+            { name: "search_recipes", readOnly: true },
+            { name: "not_exposed", readOnly: true },
+          ],
+        },
+      );
+
+      assert.deepEqual(binding.tools.map((tool) => tool.name), ["search_recipes"]);
+      assert.deepEqual(warnings, [], "an unexposed allowlist name is silently absent");
+      await binding.dispose();
+    } finally {
+      console.warn = original;
+    }
+  });
+
   test("bindMcpServers skips a failing server without crashing", async () => {
     const callLog: CallRecord[] = [];
     const factory = makeFactory(

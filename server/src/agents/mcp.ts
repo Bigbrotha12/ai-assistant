@@ -38,7 +38,7 @@ import {
 } from "../audit/telemetry.ts";
 import { isMcpHeaderReference } from "../plugins/types.ts";
 import { resolveEnvReference } from "../credentials/env_reference.ts";
-import type { JsonSchema } from "../plugins/types.ts";
+import type { AgentToolAllowlistEntry, JsonSchema } from "../plugins/types.ts";
 import { jsonSchemaToZod } from "../tools/schema.ts";
 
 /**
@@ -1023,6 +1023,18 @@ export type McpBindOptions = {
    * the deleted `mergePluginAndMcpTools` emitted.
    */
   excludeToolNames?: ReadonlySet<string>;
+  /**
+   * Positive per-tool allowlist (Phase 1.1). Semantics: absent/undefined ⇒ bind
+   * every MCP tool (current behaviour, minus `excludeToolNames`); present ⇒ only
+   * the listed names bind. An explicit empty array binds nothing. Unlisted tools
+   * are skipped silently — an out-of-allowlist CALL already fails loudly because
+   * the tool is absent from the bound set. A listed name the server does not
+   * expose is simply absent (no error). An entry's `readOnly: true` is also the
+   * D6 declaration: it promotes a tool only when the server does not mark it
+   * non-read-only (`readOnlyHint: false` / `readOnly: false`) and does not mark
+   * it destructive (`destructiveHint: true`).
+   */
+  allowTools?: readonly AgentToolAllowlistEntry[];
   /** Warning prefix for the MCP-loses-tie message (`[chat]` / `[jobs]`). */
   duplicateLogPrefix?: string;
 };
@@ -1908,6 +1920,13 @@ export async function bindMcpServers(
   // `bindTools`.
   const pluginToolNames = opts?.excludeToolNames;
   const boundToolNames = new Set<string>(pluginToolNames ?? []);
+  // Phase 1.1: positive per-tool allowlist. `allowTools` absent ⇒ bind every
+  // discovered MCP tool (legacy); present ⇒ only listed names bind. The map
+  // also carries the D6 `readOnly` declarations for the classification below.
+  const allowTools = opts?.allowTools;
+  const allowByName = new Map<string, AgentToolAllowlistEntry>(
+    allowTools?.map((entry): [string, AgentToolAllowlistEntry] => [entry.name, entry]),
+  );
   const duplicateLogPrefix = opts?.duplicateLogPrefix ?? "[mcp]";
   const nextAnonymousToolSequence = createAnonymousSequence();
 
@@ -2138,9 +2157,32 @@ export async function bindMcpServers(
 
       }
       const resolvedFingerprint = mcpResolvedCredentialFingerprint(server);
+      // Per-server accounting for NIT 4 observability: allowlisted names this
+      // server did not expose (a name may still match on another server).
+      const matchedAllowNames = new Set<string>();
       for (const tool of listed) {
         if (!tool.name) continue;
-        const safe = isMcpToolSafeToRepeat(tool);
+        // Phase 1.1: out-of-allowlist tools never bind — silent skip, no warning
+        // (an out-of-allowlist CALL fails loudly because the tool is absent from
+        // the bound set). An allowlisted name the server does not expose is
+        // simply absent (no error).
+        if (allowTools !== undefined && !allowByName.has(tool.name)) continue;
+        matchedAllowNames.add(tool.name);
+        // D6: a manifest-declared read-only entry promotes a tool to
+        // safe-to-repeat, but server annotations WIN over the operator
+        // declaration: the operator may still promote a genuinely un-annotated
+        // tool, yet it can never promote one the server marks non-read-only
+        // (`readOnly: false` / `readOnlyHint: false`) or destructive
+        // (`destructiveHint: true`). The raw destructive check is separate
+        // because the AND-merge below collapses un-annotated and destructive to
+        // the same `false` — only an explicitly destructive tool keeps its veto.
+        const entry = allowByName.get(tool.name);
+        const declaredReadOnly = entry?.readOnly === true;
+        const explicitlyNotReadOnly =
+          tool.readOnly === false || tool.annotations?.readOnlyHint === false;
+        const rawDestructive = tool.annotations?.destructiveHint === true;
+        let safe = isMcpToolSafeToRepeat(tool);
+        if (declaredReadOnly && !explicitlyNotReadOnly && !rawDestructive) safe = true;
         toolSafety.set(tool.name, (toolSafety.get(tool.name) ?? true) && safe);
         // Plugin-wins tie-break, exactly as the deleted `mergePluginAndMcpTools`:
         // the first occurrence wins and an MCP duplicate (against a plugin or an
@@ -2299,6 +2341,17 @@ export async function bindMcpServers(
             },
           }),
         );
+      }
+      if (allowTools !== undefined) {
+        let unmatched = 0;
+        for (const name of allowByName.keys()) {
+          if (!matchedAllowNames.has(name)) unmatched += 1;
+        }
+        if (unmatched > 0) {
+          logger.debug(
+            `[mcp] server '${redactForOutbound(server.name)}' exposed none of ${unmatched} allowlisted tool name(s)`,
+          );
+        }
       }
       disposers.push(dispose);
     } catch (err) {

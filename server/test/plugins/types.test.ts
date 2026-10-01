@@ -132,6 +132,11 @@ describe("plugin definition schemas", () => {
           { id: "recipes", title: "Recipes", content: "## Recipe tips\n..." },
         ],
         tools: [{ pluginId: "mealie", required: true }],
+        toolAllowlist: [
+          { name: "search_recipes", readOnly: true },
+          { name: "add_recipe" },
+        ],
+        maxIterations: 0,
         modelRef: "open-router",
         inference: { temperature: 0.3, maxTokens: 2048, visionCapable: true },
         baseUrls: [{ id: "mealie-api", url: "https://mealie.example.com" }],
@@ -139,6 +144,42 @@ describe("plugin definition schemas", () => {
       }),
     );
     assert.equal(parsed.success, true);
+    if (parsed.success && parsed.data.type === "agent") {
+      assert.equal(parsed.data.toolAllowlist?.length, 2);
+      assert.equal(parsed.data.toolAllowlist?.[0]?.name, "search_recipes");
+      assert.equal(parsed.data.toolAllowlist?.[0]?.readOnly, true);
+      assert.equal(parsed.data.toolAllowlist?.[1]?.name, "add_recipe");
+      assert.equal(parsed.data.toolAllowlist?.[1]?.readOnly, undefined);
+      assert.equal(parsed.data.maxIterations, 0);
+    }
+  });
+
+  test("agent plugin rejects maxIterations: -1", () => {
+    assert.equal(
+      pluginDefinitionSchema.safeParse(minimalAgent({ maxIterations: -1 })).success,
+      false,
+    );
+  });
+
+  test("agent plugin rejects maxIterations: 1.5 (must be an integer)", () => {
+    assert.equal(
+      pluginDefinitionSchema.safeParse(minimalAgent({ maxIterations: 1.5 })).success,
+      false,
+    );
+  });
+
+  test("agent plugin rejects duplicate toolAllowlist names", () => {
+    assert.equal(
+      pluginDefinitionSchema.safeParse(
+        minimalAgent({
+          toolAllowlist: [
+            { name: "search_recipes", readOnly: true },
+            { name: "search_recipes" },
+          ],
+        }),
+      ).success,
+      false,
+    );
   });
 
   test("agent plugin missing systemPrompt fails", () => {
