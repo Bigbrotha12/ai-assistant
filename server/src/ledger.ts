@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Database as DatabaseType } from "better-sqlite3";
 import { redactForOutbound } from "./redact.ts";
+import {
+  GOAL_MESSAGE_DELETE_TRIGGER_SQL,
+  GOAL_REFUSAL_DELETE_TRIGGER_SQL,
+  migrateGoals,
+} from "./goals/migrate.ts";
 
 export const TASK_STATUSES = [
   "queued",
@@ -61,8 +66,8 @@ export const LEDGER_GENESIS_PREFIX = "ledger-genesis:";
 
 /**
  * Result of {@link Ledger.purgeOwnerData} (M12 account deletion).
- * Reports the ledger scope only; extend it with goal-table counts when those
- * tables are introduced by migration v9.
+ * Reports the ledger and v9 goal-table scopes: every row owned by the purged
+ * owner is deleted and counted here.
  */
 export type OwnerPurgeResult = {
   /** Non-terminal tasks transitioned to `cancelled` before the delete, with
@@ -70,6 +75,16 @@ export type OwnerPurgeResult = {
   cancelled: { id: string; from: TaskStatus }[];
   /** Number of `ledger_task` rows removed for the owner (all statuses). */
   deletedTasks: number;
+  /** Number of `goal` rows removed for the owner (all statuses). */
+  deletedGoals: number;
+  /** Number of `goal_step` rows removed for the owner's goals. */
+  deletedGoalSteps: number;
+  /** Number of `goal_message` rows removed for the owner's goals. */
+  deletedGoalMessages: number;
+  /** Number of `goal_mutation` rows removed for the owner's goals. */
+  deletedGoalMutations: number;
+  /** Number of `goal_refusal` rows removed for the owner's goals. */
+  deletedGoalRefusals: number;
 };
 
 export type LedgerConfig = {
@@ -509,9 +524,9 @@ function canonicalStepContent(step: {
 }
 
 /** Migration list index 0 == schema version 1. */
-type Migration = (db: DatabaseType) => void;
+export type Migration = (db: DatabaseType) => void;
 
-const LEDGER_MIGRATIONS: readonly Migration[] = [
+export const LEDGER_MIGRATIONS: readonly Migration[] = [
   // v1 — initial ledger schema.
   // intentKey is stored raw. Canonical form semantics + unique constraint are
   // finalized in Phase 6 (M12); do NOT add a unique constraint here yet.
@@ -681,11 +696,32 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
         ON ledger_task(worker, owner, status, spec, created_ts DESC, id DESC);
     `);
   },
+  // v9 — goal-loop tables (Phase 2.1). All five tables; goal_mutation /
+  // goal_refusal stay empty until Phase 6 but are real, checkable tables.
+  // DDL lives in the goals module (migrateGoals) so the goal domain owns its
+  // schema; this entry only wires it into the ledger's single user_version
+  // owner (PRAGMA user_version is per-DB — one owner only).
+  (db) => {
+    migrateGoals(db);
+  },
 ];
+
+// The migration list is fixed once the module is loaded: a consumer must not
+// be able to splice a step into a running upgrade path.
+Object.freeze(LEDGER_MIGRATIONS);
 
 export const CURRENT_LEDGER_VERSION = LEDGER_MIGRATIONS.length;
 
-/** Applies `migrations` to bring `db` up to `targetVersion` (idempotent). */
+/**
+ * Applies `migrations` to bring `db` up to `targetVersion` (idempotent).
+ *
+ * Each version is applied CRASH-ATOMICALLY: the migration and its
+ * `PRAGMA user_version = v` commit inside ONE `db.transaction`, so a crash
+ * mid-version rolls both back (SQLite DDL and `user_version` are
+ * transactional) and the next run resumes at the same version instead of
+ * wedging on half-applied DDL. Per-version (not whole-chain) transactions
+ * keep long upgrades progressing.
+ */
 export function applyMigrations(
   db: DatabaseType,
   migrations: readonly Migration[],
@@ -699,8 +735,10 @@ export function applyMigrations(
         `no migration registered for ledger schema version ${v}`,
       );
     }
-    migration(db);
-    db.pragma(`user_version = ${v}`);
+    db.transaction(() => {
+      migration(db);
+      db.pragma(`user_version = ${v}`);
+    })();
   }
 }
 
@@ -1651,9 +1689,10 @@ export class Ledger {
   }
 
   /**
-   * M12 account-deletion purge: removes EVERY row owned by [owner] — tasks,
-   * steps and chain — and returns what happened so the caller (the better-auth
-   * `deleteUser` cascade in auth.ts) can observe the cleanup.
+   * M12 account-deletion purge: removes EVERY row owned by [owner] — ledger
+   * tasks/steps/chain AND the v9 goal tables (goal, goal_step, goal_message,
+   * goal_mutation, goal_refusal) — and returns what happened so the caller
+   * (the better-auth `deleteUser` cascade in auth.ts) can observe the cleanup.
    *
    * Before any delete, every NON-terminal task of the owner is transitioned to
    * `cancelled` through the legal state machine (`queued`/`running` go
@@ -1665,14 +1704,18 @@ export class Ledger {
    * result is the only observable evidence that the cancel-before-delete
    * ordering held.
    *
-   * The 4 append-only triggers would abort the child deletes, so — following
-   * `purgeTerminalTasks` exactly — the two DELETE guards are dropped, the
-   * chain/step/task rows deleted (children first), and the guards recreated,
-   * all inside ONE transaction: a failure rolls the trigger recreation back
-   * with the deletes. Self-scoped: every statement is keyed by [owner], so a
-   * purge never touches another owner's rows. Idempotent: purging an owner
-   * with no task rows still runs the transaction and leaves the DELETE guards
-   * installed, ready for other owner-scoped data to be purged here later.
+   * The append-only triggers would abort the child deletes, so — following
+   * `purgeTerminalTasks` exactly — the DELETE guards are dropped, the child
+   * rows deleted before their parents, and the guards recreated, all inside
+   * ONE transaction: a failure rolls the trigger recreation back with the
+   * deletes. Ledger rows (keyed by task_id/owner) and goal rows (owner-scoped
+   * through `goal.owner`) are independent, so their order inside the
+   * transaction is immaterial; the goal cleanup is kept next to the ledger
+   * cleanup so every destructive drop/delete/recreate reads together.
+   *
+   * Self-scoped: every statement is keyed by [owner], so a purge never touches
+   * another owner's rows. Idempotent: purging an owner with no task or goal
+   * rows still runs the transaction and leaves every DELETE guard installed.
    */
   purgeOwnerData(owner: string): OwnerPurgeResult {
     const tasks = this.db
@@ -1684,6 +1727,11 @@ export class Ledger {
     const result: OwnerPurgeResult = {
       cancelled: [],
       deletedTasks: tasks.length,
+      deletedGoals: 0,
+      deletedGoalSteps: 0,
+      deletedGoalMessages: 0,
+      deletedGoalMutations: 0,
+      deletedGoalRefusals: 0,
     };
     const purge = this.db.transaction(() => {
       for (const task of tasks) {
@@ -1707,6 +1755,51 @@ export class Ledger {
         .prepare(`DELETE FROM ledger_step WHERE task_id IN (${placeholders})`)
         .run(...ids);
       this.db.prepare("DELETE FROM ledger_task WHERE owner = ?").run(owner);
+
+      // Goal-domain cleanup (v9). Goal rows are owner-scoped through
+      // `goal.owner` and share no rows with ledger_task, so this could run
+      // before or after the ledger deletes; it sits here so the destructive
+      // section reads together. Drop the goal DELETE guards FIRST — they would
+      // abort the child deletes; the UPDATE guards do not block DELETEs and
+      // stay in place.
+      this.db.exec("DROP TRIGGER IF EXISTS goal_message_append_only_delete");
+      this.db.exec("DROP TRIGGER IF EXISTS goal_refusal_append_only_delete");
+      // Children first, each via an IN-subquery evaluated against the still
+      // present `goal` rows. No id list is materialised, so there is no `IN ()`
+      // hazard when the owner has no goals and no placeholder list that grows
+      // with the goal count; with no goals every child delete changes 0 rows.
+      result.deletedGoalMutations = this.db
+        .prepare(
+          `DELETE FROM goal_mutation
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoalRefusals = this.db
+        .prepare(
+          `DELETE FROM goal_refusal
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoalMessages = this.db
+        .prepare(
+          `DELETE FROM goal_message
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoalSteps = this.db
+        .prepare(
+          `DELETE FROM goal_step
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoals = this.db
+        .prepare("DELETE FROM goal WHERE owner = ?")
+        .run(owner).changes;
+      // Recreate the two DELETE guards from the shared DDL constants that
+      // `goals/migrate.ts` defines, so a later drop/recreate never drifts.
+      this.db.exec(GOAL_MESSAGE_DELETE_TRIGGER_SQL);
+      this.db.exec(GOAL_REFUSAL_DELETE_TRIGGER_SQL);
+
       this.db.exec(`
         CREATE TRIGGER ledger_step_append_only_delete
         BEFORE DELETE ON ledger_step

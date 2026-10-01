@@ -6,6 +6,7 @@ import {
   LedgerError,
   migrateLedger,
   applyMigrations,
+  LEDGER_MIGRATIONS,
   CURRENT_LEDGER_VERSION,
   heartbeatIntervalMs,
   projectPublicTaskProgress,
@@ -1422,7 +1423,7 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
-    assert.equal(CURRENT_LEDGER_VERSION, 8);
+    assert.equal(CURRENT_LEDGER_VERSION, 9);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -1442,18 +1443,23 @@ describe("migration", () => {
     assert.deepEqual(tables, ["ledger_chain", "ledger_step", "ledger_task"]);
   });
 
-  test("v7-v8 migrations add job-spec storage and the metadata window index from v6", () => {
+  test("v7-v9 migrations add job-spec storage, the metadata window index, and the goal tables from v6", () => {
     const db = new Database(":memory:");
     migrateLedger(db);
     db.exec("DROP INDEX idx_tasks_status_updated");
     db.exec("DROP INDEX idx_ledger_task_metadata_window");
     db.exec("ALTER TABLE ledger_task DROP COLUMN job_spec");
+    // A genuine v6 DB predates the goal-loop tables; the goal tables (and their
+    // append-only triggers, dropped with them) must be removed too so the re-run
+    // from v6 is a faithful simulation. Dropping a table drops its triggers.
+    for (const name of ["goal_message", "goal_refusal", "goal_step", "goal_mutation", "goal"]) {
+      db.exec(`DROP TABLE ${name}`);
+    }
     db.pragma("user_version = 6");
     assert.equal(db.pragma("user_version", { simple: true }), 6);
 
     migrateLedger(db);
 
-    assert.equal(db.pragma("user_version", { simple: true }), 8);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const columns = db
       .prepare("PRAGMA table_info(ledger_task)")
@@ -1464,6 +1470,17 @@ describe("migration", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get("idx_ledger_task_metadata_window");
     assert.deepEqual(metadataIndex, { name: "idx_ledger_task_metadata_window" });
+    const goalTables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'goal_%'")
+      .all()
+      .map((row) => (row as { name: string }).name)
+      .sort();
+    assert.deepEqual(goalTables, [
+      "goal_message",
+      "goal_mutation",
+      "goal_refusal",
+      "goal_step",
+    ]);
   });
 
 
@@ -1631,5 +1648,70 @@ describe("migration", () => {
       /UNIQUE/i,
       "the unique (owner, intent_key) index must be in force after migration",
     );
+  });
+
+  test("v9 migration creates the goal tables on a populated v8 DB and preserves v8 data", () => {
+    // Bring a fresh DB up to v8 through the REAL migration list (the first
+    // eight entries are pre-goal), seed v8 data, then run the real v9 step.
+    const db = new Database(":memory:") as DatabaseType;
+    applyMigrations(db, LEDGER_MIGRATIONS.slice(0, 8), 8);
+    assert.equal(db.pragma("user_version", { simple: true }), 8);
+
+    const insertTask = db.prepare(
+      `INSERT INTO ledger_task
+         (id, owner, intent_key, spec, status, created_ts, updated_ts,
+          last_heartbeat_ts, fence_token)
+       VALUES (@id, @owner, @intentKey, @spec, 'queued', @ts, @ts, 0, '')`,
+    );
+    insertTask.run({ id: "t1", owner: "o", intentKey: "k1", spec: "s1", ts: 1 });
+    insertTask.run({ id: "t2", owner: "o", intentKey: "k2", spec: "s2", ts: 2 });
+
+    migrateLedger(db);
+
+    assert.equal(
+      db.pragma("user_version", { simple: true }),
+      CURRENT_LEDGER_VERSION,
+    );
+
+    const tables = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
+           ('goal','goal_step','goal_message','goal_mutation','goal_refusal')`,
+      )
+      .all()
+      .map((row) => (row as { name: string }).name)
+      .sort();
+    assert.deepEqual(tables, [
+      "goal",
+      "goal_message",
+      "goal_mutation",
+      "goal_refusal",
+      "goal_step",
+    ]);
+
+    const triggers = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger'
+           AND name LIKE 'goal%append_only%'`,
+      )
+      .all()
+      .map((row) => (row as { name: string }).name)
+      .sort();
+    assert.deepEqual(triggers, [
+      "goal_message_append_only_delete",
+      "goal_message_append_only_update",
+      "goal_refusal_append_only_delete",
+      "goal_refusal_append_only_update",
+    ]);
+
+    const survived = db
+      .prepare(
+        "SELECT id, owner, intent_key, spec, status FROM ledger_task ORDER BY id",
+      )
+      .all();
+    assert.deepEqual(survived, [
+      { id: "t1", owner: "o", intent_key: "k1", spec: "s1", status: "queued" },
+      { id: "t2", owner: "o", intent_key: "k2", spec: "s2", status: "queued" },
+    ]);
   });
 });

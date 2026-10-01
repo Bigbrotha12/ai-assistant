@@ -112,6 +112,58 @@ function seedOwnerTasks(
 }
 
 /**
+ * One owner's goal-domain rows (v9): a single `goal` plus one row in every
+ * child table. Raw SQL on purpose — the goal accessors live in `src/goals/`
+ * (phase 2 sibling step) and these tests only need real rows for the purge to
+ * cascade over. Returns the inserted ids so a test can assert each table is
+ * emptied.
+ */
+function seedGoalRows(
+  db: DatabaseType,
+  owner: string,
+): {
+  goalId: string;
+  stepId: string;
+  messageId: string;
+  mutationId: string;
+  refusalId: string;
+} {
+  const ts = 1_000_000;
+  const goalId = `goal-${owner}`;
+  db.prepare(
+    `INSERT INTO goal
+       (id, owner, instruction, status, token_budget, created_ts, updated_ts,
+        idempotency_key)
+     VALUES (?, ?, 'do the thing', 'queued', 1000, ?, ?, 'idem-1')`,
+  ).run(goalId, owner, ts, ts);
+  const stepId = `step-${owner}`;
+  db.prepare(
+    `INSERT INTO goal_step
+       (id, goal_id, seq, kind, status, mutating, tokens, created_ts)
+     VALUES (?, ?, 0, 'plan', 'running', 0, 0, ?)`,
+  ).run(stepId, goalId, ts);
+  const messageId = `msg-${owner}`;
+  db.prepare(
+    `INSERT INTO goal_message
+       (id, goal_id, seq, role, content_json, created_ts)
+     VALUES (?, ?, 0, 'user', '"hi"', ?)`,
+  ).run(messageId, goalId, ts);
+  const mutationId = `mut-${owner}`;
+  db.prepare(
+    `INSERT INTO goal_mutation
+       (id, goal_id, plugin_id, tool, args_hash, state, created_ts)
+     VALUES (?, ?, 'plugin', 'tool', 'hash', 'pending', ?)`,
+  ).run(mutationId, goalId, ts);
+  const refusalId = `ref-${owner}`;
+  db.prepare(
+    `INSERT INTO goal_refusal
+       (id, goal_id, step_seq, tool, reason, created_ts)
+     VALUES (?, ?, 0, 'tool', 'unauthorized', ?)`,
+  ).run(refusalId, goalId, ts);
+  return { goalId, stepId, messageId, mutationId, refusalId };
+}
+
+/**
  * Throwaway better-auth instance mirroring src/auth.ts over a temp SQLite DB,
  * with the production apiKey options and `createAccountDeletionHooks` wired to
  * an in-memory Ledger + a temp-path NotifyStore — so a real
@@ -336,6 +388,11 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
           { id: seeded.stuck, from: "stuck" },
         ],
         deletedTasks: 5,
+        deletedGoals: 0,
+        deletedGoalSteps: 0,
+        deletedGoalMessages: 0,
+        deletedGoalMutations: 0,
+        deletedGoalRefusals: 0,
       },
     ]);
 
@@ -778,6 +835,12 @@ describe("Ledger.purgeOwnerData (owner-scoped account purge)", () => {
       action: "B",
       result: "keep",
     });
+    // Victim owns one row in every v9 goal table; the purged counts must
+    // reflect each one and nothing may survive.
+    const seededGoals = seedGoalRows(db, "other");
+    // A SECOND owner's whole goal cluster: the purge is owner-scoped and must
+    // leave it untouched (the task-side bystander is asserted below).
+    const bystanderGoals = seedGoalRows(db, "bystander");
 
     const result = ledger.purgeOwnerData("other");
     assert.deepEqual(result, {
@@ -787,6 +850,11 @@ describe("Ledger.purgeOwnerData (owner-scoped account purge)", () => {
         { id: seeded.stuck, from: "stuck" },
       ],
       deletedTasks: 5,
+      deletedGoals: 1,
+      deletedGoalSteps: 1,
+      deletedGoalMessages: 1,
+      deletedGoalMutations: 1,
+      deletedGoalRefusals: 1,
     });
 
     // Every victim row is gone (tasks, steps, chain); terminal tasks were
@@ -797,6 +865,57 @@ describe("Ledger.purgeOwnerData (owner-scoped account purge)", () => {
     assert.equal(countAll(db, "ledger_task"), 1);
     assert.equal(countAll(db, "ledger_step"), 1);
     assert.equal(countAll(db, "ledger_chain"), 1);
+
+    // The victim's whole goal cluster is gone (accessors are a sibling phase,
+    // so assert directly against the tables).
+    const purgedGoalRows: [string, string][] = [
+      ["goal", seededGoals.goalId],
+      ["goal_step", seededGoals.stepId],
+      ["goal_message", seededGoals.messageId],
+      ["goal_mutation", seededGoals.mutationId],
+      ["goal_refusal", seededGoals.refusalId],
+    ];
+    for (const [table, id] of purgedGoalRows) {
+      assert.equal(countRows(db, table, "id", id), 0, `${table} ${id} purged`);
+    }
+    // Exactly the bystander's goal cluster remains in each table.
+    assert.equal(countAll(db, "goal"), 1);
+    assert.equal(countAll(db, "goal_step"), 1);
+    assert.equal(countAll(db, "goal_message"), 1);
+    assert.equal(countAll(db, "goal_mutation"), 1);
+    assert.equal(countAll(db, "goal_refusal"), 1);
+
+    // The bystander's whole goal cluster survives untouched (goal-side
+    // bystander; the task-side one is asserted below).
+    const bystanderGoalRows: [string, string][] = [
+      ["goal", bystanderGoals.goalId],
+      ["goal_step", bystanderGoals.stepId],
+      ["goal_message", bystanderGoals.messageId],
+      ["goal_mutation", bystanderGoals.mutationId],
+      ["goal_refusal", bystanderGoals.refusalId],
+    ];
+    for (const [table, id] of bystanderGoalRows) {
+      assert.equal(
+        countRows(db, table, "id", id),
+        1,
+        `${table} ${id} must survive the purge`,
+      );
+    }
+
+    // The two goal DELETE guards were recreated in the transaction.
+    const goalDeleteTriggers = (
+      db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='trigger'
+             AND name IN ('goal_message_append_only_delete','goal_refusal_append_only_delete')
+           ORDER BY name`,
+        )
+        .all() as { name: string }[]
+    ).map((t) => t.name);
+    assert.deepEqual(goalDeleteTriggers, [
+      "goal_message_append_only_delete",
+      "goal_refusal_append_only_delete",
+    ]);
 
     // The bystander's running task + step + chain survive untouched.
     assert.equal(ledger.getTask(bystanderTask.id)?.status, "running");
@@ -839,6 +958,11 @@ describe("Ledger.purgeOwnerData (owner-scoped account purge)", () => {
     assert.deepEqual(ledger.purgeOwnerData("other"), {
       cancelled: [],
       deletedTasks: 0,
+      deletedGoals: 0,
+      deletedGoalSteps: 0,
+      deletedGoalMessages: 0,
+      deletedGoalMutations: 0,
+      deletedGoalRefusals: 0,
     });
     assert.equal(
       (
@@ -858,11 +982,19 @@ describe("Ledger.purgeOwnerData (owner-scoped account purge)", () => {
     // though this owner has no task rows. The purge must restore it rather
     // than take the former zero-task early return.
     db.exec("DROP TRIGGER ledger_step_append_only_delete");
+    // A task-less owner still owns goals; the goal cleanup must reach them.
+    const seededGoals = seedGoalRows(db, "nobody");
 
     assert.deepEqual(ledger.purgeOwnerData("nobody"), {
       cancelled: [],
       deletedTasks: 0,
+      deletedGoals: 1,
+      deletedGoalSteps: 1,
+      deletedGoalMessages: 1,
+      deletedGoalMutations: 1,
+      deletedGoalRefusals: 1,
     });
+    assert.equal(countRows(db, "goal", "id", seededGoals.goalId), 0);
     const triggers = (
       db
         .prepare(

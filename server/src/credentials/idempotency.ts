@@ -1,5 +1,6 @@
 import type { Ledger, StepRow, TaskRow } from "../ledger.ts";
 import { redactForOutbound } from "../redact.ts";
+import { isUniqueConstraintViolation } from "../sqlite_errors.ts";
 
 /**
  * Idempotency — Phase 2, Wave B (rebuild, correct).
@@ -12,8 +13,10 @@ import { redactForOutbound } from "../redact.ts";
  *    existing task when one exists and otherwise creates it. It is NOT a raw
  *    INSERT — the ledger's v4 unique index on (owner, intent_key) means a
  *    concurrent writer can win the race, so the create is wrapped and a
- *    SQLITE_CONSTRAINT violation re-reads the existing row instead of 500ing
- *    (the old raw `createTask` 500ed on a repeat).
+ *    UNIQUE-constraint violation (classified narrowly in
+ *    `src/sqlite_errors.ts`) re-reads the existing row instead of 500ing
+ *    (the old raw `createTask` 500ed on a repeat). Any OTHER constraint
+ *    abort surfaces as a real error — it is not an idempotent hit.
  *
  * 2. TOOL-CALL REPLAY DEDUPE. A checkpoint-resumed worker must NEVER re-execute
  *    a tool whose result was already persisted. `recordToolResult` appends a
@@ -52,16 +55,6 @@ export interface HasToolResultInput {
   taskId: string;
   owner: string;
   toolCallId: string;
-}
-
-/** better-sqlite3 surfaces UNIQUE/CHECK/trigger aborts with a `SQLITE_CONSTRAINT*` code. */
-function isUniqueConstraintViolation(e: unknown): boolean {
-  return (
-    typeof e === "object" &&
-    e !== null &&
-    typeof (e as { code?: unknown }).code === "string" &&
-    (e as { code: string }).code.startsWith("SQLITE_CONSTRAINT")
-  );
 }
 
 /**
