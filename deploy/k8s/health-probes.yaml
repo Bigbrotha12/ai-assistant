@@ -18,6 +18,18 @@
 spec:
   template:
     spec:
+      # Grace period for SIGTERM -> SIGKILL on this pod. Keep it ABOVE the
+      # gateway's worst-case shutdown time or a fully-wedged teardown gets
+      # SIGKILL'd before the sentinel shadow flush and `ledger.close()` run —
+      # the steps shutdown's non-unref'd deadline timer exists to protect.
+      #
+      # Worst case (server/src/shutdown.ts): 15s shared disposer budget
+      # (SHUTDOWN_TEARDOWN_BUDGET_MS, one deadline for all six disposers) +
+      # 2s sentinel flush = 17s. The 5s request-drain grace runs concurrently
+      # with the disposers and is fully absorbed. 45s leaves 28s of headroom
+      # (~2.6x the worst case) for signal delivery, CPU throttling under load,
+      # and late-settle logging before the runtime reaches for SIGKILL.
+      terminationGracePeriodSeconds: 45
       containers:
         - name: gateway
           livenessProbe:

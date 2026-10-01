@@ -2,7 +2,11 @@
 
 `health-probes.yaml` is the existing strategic-merge patch for the gateway
 container's liveness and readiness probes. It is applied by ops to the existing
-Deployment; it does not define the complete Deployment.
+Deployment; it does not define the complete Deployment. It also pins
+`spec.template.spec.terminationGracePeriodSeconds: 45` — deliberately above the
+gateway's worst-case shutdown time (15s shared teardown budget + 2s sentinel
+flush = 17s; see `server/src/shutdown.ts`), so a wedged teardown is never
+SIGKILL'd before the flush and ledger close complete.
 
 ## Required replica contract
 

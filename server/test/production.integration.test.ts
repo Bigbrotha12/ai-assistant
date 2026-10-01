@@ -236,8 +236,15 @@ test("production boot shares phase 4 services and uses scoped model credentials"
   assert.equal(calls.length, 1);
 
   assert.equal((await fetchApp(new Request("http://localhost/"))).status, 200);
+  // `cleanupAsync` awaits each disposer, so teardown is interleaved across
+  // microtask boundaries. "tool cache" is the LAST disposer before
+  // `await serverClosed`; resolving a deferred from its wrapper makes the wait
+  // deterministic (all five pre-serverClosed disposers have run) without
+  // awaiting the full shutdown, whose serverClosed fallback is 5s.
+  let signalDisposersRan!: () => void;
+  const disposersRan = new Promise<void>((resolve) => { signalDisposersRan = resolve; });
   const disposeCache = chat.toolCache!.dispose.bind(chat.toolCache);
-  chat.toolCache!.dispose = () => { cleanup.push("cache"); disposeCache(); };
+  chat.toolCache!.dispose = () => { cleanup.push("cache"); signalDisposersRan(); disposeCache(); };
   registry.disposeWatch = () => { cleanup.push("watch"); throw new Error("test cleanup failure"); };
   const errors: unknown[][] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args); });
@@ -247,8 +254,14 @@ test("production boot shares phase 4 services and uses scoped model credentials"
   // Shutdown stops the listener first (so nothing new can touch the stores),
   // then disposes services; the mock server.close never invokes its callback,
   // so the checkpoint-store/ledger close steps stay pending past this point.
+  await disposersRan;
   assert.deepEqual(cleanup, ["server", "runner", "watch", "cache"]);
-  assert.deepEqual(errors, [["gateway: plugin watcher cleanup failed"]]);
+  // `cleanupAsync` logs the failure cause alongside the message (the old
+  // synchronous seam dropped the error), so the captured call carries the
+  // thrown Error as a second argument. Errors compare by name + message.
+  assert.deepEqual(errors, [
+    ["gateway: plugin watcher cleanup failed", new Error("test cleanup failure")],
+  ]);
   assert.deepEqual(chat.warmups!.schedule(call), { ok: false, reason: "disposed" });
   const rejected = await fetchApp(new Request("http://localhost/"));
   assert.equal(rejected.status, 503);

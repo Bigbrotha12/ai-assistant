@@ -12,6 +12,7 @@ import { createSentinelService } from "./sentinel/service.ts";
 import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
+import { cleanupAsync, createShutdownBudget } from "./shutdown.ts";
 import { createLedgerRoutes, ledger } from "./ledger.routes.ts";
 import { createNtfyNotificationHook, notifyEgressConfigWarning } from "./notify/hook.ts";
 import { createNotifyRoutes } from "./notify/routes.ts";
@@ -400,16 +401,32 @@ const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
   console.log(`ai-assistant gateway listening on http://localhost:${info.port}`);
 });
 const SENTINEL_SHADOW_FLUSH_TIMEOUT_MS = 2_000;
-const cleanup = (name: string, dispose: () => void) => {
-  try {
-    dispose();
-  } catch {
-    console.error(`gateway: ${name} cleanup failed`);
-  }
-};
+// Teardown goes through `cleanupAsync` (src/shutdown.ts), which awaits each
+// disposer under a deadline. Keep this seam awaitable (DEFENSIVE_PATTERNS.md
+// §4) so promise-returning disposers can be awaited; this alone does not make
+// shutdown quiescent. A returned promise is genuinely awaited (a rejection is
+// logged and contained, never aborting the remaining steps), and the deadline
+// keeps a wedged disposer from hanging shutdown. Known residual gaps, tracked
+// separately: `PluginRegistry.disposeWatch` (src/plugins/registry.ts:247-262)
+// is synchronous and cannot await an in-flight `hotReload()`
+// (src/plugins/registry.ts:227-234); `JobRunner.dispose`
+// (src/jobs/runner.ts:1674-1687) is also synchronous, aborts tracked job
+// controllers, and returns without awaiting their unwind. An aborted run may
+// still reach its failure path and write to the ledger while shutdown advances
+// toward `ledger.close()`. The seam means shutdown awaits what a disposer
+// returns; it must not be read as "shutdown is now quiescent." A disposer that
+// returns `void` gains nothing from the awaitable seam.
 const shutdown = async (): Promise<void> => {
   if (stopping) return;
   stopping = true;
+  // ONE shared teardown budget for this shutdown, computed as an absolute
+  // deadline right here: every disposer below receives only the time still
+  // remaining, so a fully-wedged teardown is bounded by a single wall-clock
+  // deadline (SHUTDOWN_TEARDOWN_BUDGET_MS + the 2s flush below) instead of six
+  // additive per-disposer windows. That total must stay below the pod's
+  // `terminationGracePeriodSeconds` (deploy/k8s/health-probes.yaml) or a wedge
+  // gets SIGKILL'd before the sentinel flush and ledger close run.
+  const budget = createShutdownBudget();
   // Stop accepting new requests first; the `stopping` middleware 503s anything
   // new while in-flight requests drain. Bound the drain so a long-lived SSE
   // stream can't hang shutdown forever.
@@ -417,11 +434,11 @@ const shutdown = async (): Promise<void> => {
     server.close(() => resolve());
     setTimeout(resolve, 5_000).unref?.();
   });
-  cleanup("warmups", () => warmups.dispose());
-  cleanup("jobs", () => jobRunner?.dispose());
-  cleanup("session store", () => sessionStore.dispose());
-  cleanup("plugin watcher", () => pluginRegistry.disposeWatch());
-  cleanup("tool cache", () => toolCache.dispose());
+  await cleanupAsync("warmups", () => warmups.dispose(), budget);
+  await cleanupAsync("jobs", () => jobRunner?.dispose(), budget);
+  await cleanupAsync("session store", () => sessionStore.dispose(), budget);
+  await cleanupAsync("plugin watcher", () => pluginRegistry.disposeWatch(), budget);
+  await cleanupAsync("tool cache", () => toolCache.dispose(), budget);
   await serverClosed;
   // Drain queued shadow reports before closing the ledger, but never let a stuck report block shutdown.
   let shadowFlushTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -439,8 +456,11 @@ const shutdown = async (): Promise<void> => {
   } finally {
     if (shadowFlushTimeout !== undefined) clearTimeout(shadowFlushTimeout);
   }
-  // Close the ledger DB once no request can touch it anymore.
-  cleanup("ledger", () => ledger.close());
+  // Close the ledger DB once no request can touch it anymore. Must stay AFTER
+  // the sentinel flush above: flushing writes to the ledger. Gets the budget
+  // remainder too — if the earlier steps consumed everything, it still runs and
+  // is contained rather than hanging shutdown.
+  await cleanupAsync("ledger", () => ledger.close(), budget);
 };
 process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);
