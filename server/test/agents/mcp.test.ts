@@ -1599,6 +1599,52 @@ describe("mcp", () => {
     await connected.close();
   });
 
+  test("default SSE factory's callTool wrapper preserves MCP `isError`", async () => {
+    // The SDK's `callTool` result carries `isError` for an in-band tool
+    // failure; the wrapper must forward it (not drop it) so the pipeline seam
+    // can classify the dispatch as a body failure instead of a clean success.
+    const connected = await defaultSseClientFactory(
+      { name: "is-error", url: "https://is-error.example.com/mcp" },
+      {
+        trustedHosts: [],
+        lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      },
+      {
+        createAgent: () => ({ destroy: async () => {} }),
+        createTransport: () => ({ close: async () => {} }),
+        createClient: () => ({
+          connect: async () => {},
+          listTools: async () => ({ tools: [] }),
+          callTool: async (params) =>
+            params.name === "failing"
+              ? { content: [{ type: "text", text: "domain failure" }], isError: true }
+              : params.name === "explicit-ok"
+                ? { content: [{ type: "text", text: "fine" }], isError: false }
+                : { content: [{ type: "text", text: "fine" }] },
+          close: async () => {},
+        }),
+      },
+    );
+    try {
+      const failed = await connected.callTool({ name: "failing", arguments: {} });
+      assert.equal(failed.isError, true, "isError: true survives the wrapper");
+      assert.deepEqual(failed.content, [{ type: "text", text: "domain failure" }]);
+
+      const explicitOk = await connected.callTool({ name: "explicit-ok", arguments: {} });
+      assert.equal(explicitOk.isError, false, "an explicit isError: false is preserved as false");
+
+      const clean = await connected.callTool({ name: "clean", arguments: {} });
+      assert.deepEqual(clean.content, [{ type: "text", text: "fine" }]);
+      assert.equal(
+        "isError" in clean,
+        false,
+        "a result without isError keeps its exact old shape (no key added)",
+      );
+    } finally {
+      await connected.close();
+    }
+  });
+
   // --- MCP-seam SSRF enforcement (plan step 2.4 coverage gap) -----------
   //
   // Step 2.4 moved MCP's SSE egress behind `EgressClient.openPinned`, but the

@@ -37,6 +37,13 @@ export type AuditEventInput = {
   status?: string | number;
   cacheHit?: boolean;
   ownerBound?: boolean;
+  /**
+   * The body ran and returned, but the tool reported an in-band domain failure
+   * in its result (e.g. MCP `isError`). A distinct fact from `errorCode` (a
+   * denial or thrown failure code) and from `outcome` (how the dispatch
+   * settled); emitted only when true so clean records keep their old shape.
+   */
+  bodyFailed?: boolean;
   circuitState?: AuditCircuitState;
   direction?: "input" | "tool_result" | "output";
   verdict?: "allow" | "flag" | "block";
@@ -184,6 +191,7 @@ function makeRecord(input: AuditEventInput): Record<string, unknown> | undefined
     ["outputBytes", input.outputBytes],
     ["cacheHit", input.cacheHit],
     ["ownerBound", input.ownerBound],
+    ["bodyFailed", input.bodyFailed],
     ["shadow", input.shadow],
   ] as const) {
     if (value === undefined) continue;

@@ -115,6 +115,13 @@ export type McpTool = {
 
 export type McpCallResult = {
   content?: { type?: string; text?: string }[];
+  /**
+   * MCP `isError`: the RPC transport succeeded but the tool reported a domain
+   * failure inside its result body. This is NOT a denial and NOT a thrown
+   * transport error, so it is carried as its own orthogonal field rather than
+   * being collapsed into an error code (DEFENSIVE_PATTERNS §1).
+   */
+  isError?: boolean;
 };
 
 export const DEFAULT_MCP_MAX_CONNECTIONS_PER_SERVER = 4;
@@ -1397,6 +1404,21 @@ function callResultBytes(value: unknown): number {
   return byteLength(redactForOutbound(content.map((item) => item.text ?? "").join("\n")));
 }
 
+/**
+ * True when a settled call result reports an IN-BAND tool failure (MCP
+ * `isError`). `runMcpOperation` is generic over the result value, so the flag
+ * is read structurally; anything without a literal `isError: true` is not a
+ * body failure. A denial or a transport failure never reaches this predicate —
+ * those throw and are audited by the catch path below.
+ */
+function mcpCallResultIsError(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { isError?: unknown }).isError === true
+  );
+}
+
 type McpAuditEvent = "mcp.connect" | "mcp.list" | "mcp.tool";
 
 function emitMcpAudit(event: AuditEventInput): void {
@@ -1511,10 +1533,16 @@ async function runMcpOperation<T>(
       initialCircuitState,
       state,
     );
+    // A result carrying MCP `isError` means the transport succeeded (the
+    // circuit and permits count it as such) but the TOOL reported a domain
+    // failure in its body. The audit must not record that as `outcome: "ok"`.
+    // The fact rides its own `bodyFailed` field — `errorCode` stays unset
+    // because nothing was denied or thrown (DEFENSIVE_PATTERNS §1).
+    const bodyFailed = mcpCallResultIsError(value);
     emitMcpAudit({
       event: options.event,
       kind: "mcp",
-      outcome: "ok",
+      outcome: bodyFailed ? "error" : "ok",
       owner,
       server: server.name,
       tool: options.tool,
@@ -1525,6 +1553,8 @@ async function runMcpOperation<T>(
       cacheHit: options.cacheHit,
       ownerBound: owner !== undefined,
       circuitState: state,
+      // Conditional so a clean call's audit record is byte-identical to before.
+      ...(bodyFailed ? { bodyFailed: true } : {}),
     });
     return value;
   } catch (err) {
@@ -1760,7 +1790,12 @@ export async function defaultSseClientFactory(
       const r = await runRpc("invoke", () =>
         client.callTool(params, undefined, { timeout: rpcTimeoutMs }),
       );
-      return { content: r.content as McpCallResult["content"] };
+      // Preserve the SDK's in-band failure flag; a result without `isError`
+      // keeps its exact previous shape (no `isError` key).
+      return {
+        content: r.content as McpCallResult["content"],
+        ...(r.isError === undefined ? {} : { isError: r.isError }),
+      };
     },
      close: closeClient,
      forceClose,
@@ -2204,6 +2239,13 @@ export async function bindMcpServers(
                     onFailure: invalidateCurrent,
                     outputBytes: callResultBytes,
                   }).then((result) => {
+                    // Capture the structured result's in-band failure flag
+                    // BEFORE it is flattened to text below: the body still
+                    // RESOLVES (a domain failure is neither a denial nor a
+                    // throw), so `bodyFailed` is the pipeline's only chance to
+                    // classify this dispatch as "executed but the tool reported
+                    // a failure" (DEFENSIVE_PATTERNS §1).
+                    dispatch.bodyFailed = result.isError === true;
                     // Post-execution tombstone re-check: do not cache a result
                     // produced after the owner began deleting (mirrors plugin sync).
                     if (channel !== "job") opts?.assertActive?.();
