@@ -59,7 +59,11 @@ export const DEFAULT_LEASE_EXPIRY_MS = 60_000;
 
 export const LEDGER_GENESIS_PREFIX = "ledger-genesis:";
 
-/** Result of {@link Ledger.purgeOwnerData} (M12 account deletion). */
+/**
+ * Result of {@link Ledger.purgeOwnerData} (M12 account deletion).
+ * Reports the ledger scope only; extend it with goal-table counts when those
+ * tables are introduced by migration v9.
+ */
 export type OwnerPurgeResult = {
   /** Non-terminal tasks transitioned to `cancelled` before the delete, with
    *  the status each held when the purge started. */
@@ -1667,7 +1671,8 @@ export class Ledger {
    * all inside ONE transaction: a failure rolls the trigger recreation back
    * with the deletes. Self-scoped: every statement is keyed by [owner], so a
    * purge never touches another owner's rows. Idempotent: purging an owner
-   * with no rows is a no-op (triggers are not even touched).
+   * with no task rows still runs the transaction and leaves the DELETE guards
+   * installed, ready for other owner-scoped data to be purged here later.
    */
   purgeOwnerData(owner: string): OwnerPurgeResult {
     const tasks = this.db
@@ -1680,8 +1685,6 @@ export class Ledger {
       cancelled: [],
       deletedTasks: tasks.length,
     };
-    if (tasks.length === 0) return result;
-
     const purge = this.db.transaction(() => {
       for (const task of tasks) {
         if (TERMINAL_TASK_STATUSES.includes(task.status)) continue;
@@ -1938,4 +1941,3 @@ export class Ledger {
     this.db.close();
   }
 }
-

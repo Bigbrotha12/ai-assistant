@@ -852,11 +852,24 @@ describe("Ledger.purgeOwnerData (owner-scoped account purge)", () => {
     );
   });
 
-  test("purging an owner with no rows is a no-op", () => {
-    const { ledger } = makeLedgerHarness();
+  test("purging an owner with no ledger tasks still runs the transaction", () => {
+    const { db, ledger } = makeLedgerHarness();
+    // Removing a DELETE guard makes transaction execution observable even
+    // though this owner has no task rows. The purge must restore it rather
+    // than take the former zero-task early return.
+    db.exec("DROP TRIGGER ledger_step_append_only_delete");
+
     assert.deepEqual(ledger.purgeOwnerData("nobody"), {
       cancelled: [],
       deletedTasks: 0,
     });
+    const triggers = (
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'ledger_%' ORDER BY name",
+        )
+        .all() as { name: string }[]
+    ).map((t) => t.name);
+    assert.deepEqual(triggers, LEDGER_TRIGGERS);
   });
 });
