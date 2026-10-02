@@ -18,6 +18,8 @@ import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import {
   GOAL_MAX_CONCURRENT_PER_OWNER,
   GOAL_MAX_STEPS,
+  GOAL_SETUP_DEADLINE_MS,
+  GOAL_STEP_LEASE_MS,
 } from "../../src/goals/constants.ts";
 import { buildControlTools } from "../../src/goals/control.ts";
 import { GoalLedger } from "../../src/goals/ledger.ts";
@@ -308,6 +310,10 @@ function failureReason(h: Harness, goalId: string): string | null {
   return h.goalLedger.getGoal(goalId)?.failure_reason ?? null;
 }
 
+function pauseReason(h: Harness, goalId: string): string | null {
+  return h.goalLedger.getGoal(goalId)?.pause_reason ?? null;
+}
+
 /**
  * Raw mutation insert (M2 rows can only exist via tests until `reserve` lands
  * in Phase 6) — the `effectState` input the L12 guard reads.
@@ -511,7 +517,7 @@ describe("GoalRunner recovery and credentials", () => {
     assert.equal(goalStatus(h, goal.id), "queued");
   });
 
-  test("credentials_required: absent or expired pins fail the goal; it never hangs", async (t) => {
+  test("credentials_required: absent or expired pins PAUSE the goal (M3); it never hangs", async (t) => {
     const h = makeHarness();
     const mcp = fakeMcp();
     const runner = makeRunner(t, h, {
@@ -519,7 +525,7 @@ describe("GoalRunner recovery and credentials", () => {
       buildModel: () =>
         new ScriptedChatModel({ responses: [new AIMessage("hello")] }),
     });
-    // A: no registry entry at all (the M2 restart story — the registry is
+    // A: no registry entry at all (the restart story — the D8 registry is
     // in-memory and dies with the process). B: a registered handle whose pin
     // has expired (minted 16 minutes ago, past the store's 15-min TTL). Both
     // goals are admitted just before the claim so no OTHER bound can fire
@@ -541,12 +547,64 @@ describe("GoalRunner recovery and credentials", () => {
     h.scheduler.fireAll();
     await runner.drainInFlight();
 
+    // M3 (D8): a credentials setup failure PAUSES the goal
+    // `paused(credentials_required)` — resumable via re-credentialing — and
+    // the lease-guarded pause clears the lease. No fail, no hang.
     for (const goal of [goalA, goalB]) {
-      assert.equal(goalStatus(h, goal.id), "failed");
-      assert.match(failureReason(h, goal.id) ?? "", /credentials/);
+      assert.equal(goalStatus(h, goal.id), "paused");
+      assert.equal(pauseReason(h, goal.id), "credentials_required");
+      assert.equal(failureReason(h, goal.id), null, "a pause never carries a failure_reason");
+      const goalRow = h.goalLedger.getGoal(goal.id)!;
+      assert.equal(goalRow.lease_owner, null);
+      assert.equal(goalRow.lease_token, null);
       assert.equal(steps(h, goal.id).length, 1);
       assert.equal(steps(h, goal.id)[0]?.status, "terminal");
     }
+    assert.equal(mcp.calls.length, 0);
+  });
+
+  test("restart: a re-claimed goal with no pin pauses credentials_required instead of failing (M3 acceptance)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("hello")] }),
+    });
+    // "Previous process": a claimed goal mid-step with a persisted running
+    // step — then the process dies (nothing else is written).
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-restart-pause",
+      registerPin: false,
+    });
+    h.goalLedger.claimGoal(goal.id, "owner-1");
+    h.goalLedger.insertGoalStep(goal.id, "owner-1", { kind: "model" });
+    assert.equal(goalStatus(h, goal.id), "running");
+
+    // "Boot": the step lease is dead; the running goal is requeued.
+    const result = await runner.resumeStuckGoals();
+    assert.equal(result.processed, 1);
+    assert.equal(result.requeued, 1);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+    assert.equal(goalStatus(h, goal.id), "queued");
+
+    // The re-claim finds the in-memory pin registry empty (pins died with the
+    // process) and PAUSES the goal for re-credentialing — no spin, no fail.
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "credentials_required");
+    assert.equal(failureReason(h, goal.id), null);
+    const goalRow = h.goalLedger.getGoal(goal.id)!;
+    assert.equal(goalRow.lease_owner, null);
+    assert.equal(goalRow.lease_token, null);
+    // One step per claim: the orphan (seq 1, terminal at boot) and the
+    // re-claim's step (seq 2), closed terminal by the pause.
+    const goalSteps = steps(h, goal.id);
+    assert.equal(goalSteps.length, 2);
+    assert.equal(goalSteps[0]?.status, "terminal");
+    assert.equal(goalSteps[1]?.status, "terminal");
     assert.equal(mcp.calls.length, 0);
   });
 });
@@ -1044,5 +1102,18 @@ describe("GoalRunner read-only invariant (3.5)", () => {
       "read_only_invariant_violation: write_tool",
     );
     assert.equal(mcp.calls.length, 0);
+  });
+});
+
+describe("GoalRunner boot invariant (4.6)", () => {
+  // The runner's constructor asserts this relationship against the constants
+  // (fail loudly at construction if a misconfigured lease cannot outlive the
+  // worst-case round: setup deadline + conservative nominal round + margin).
+  test("the step lease outlives setup deadline + conservative round", () => {
+    assert.ok(
+      GOAL_STEP_LEASE_MS > GOAL_SETUP_DEADLINE_MS + 840_000,
+      `GOAL_STEP_LEASE_MS (${GOAL_STEP_LEASE_MS}ms) must exceed ` +
+        `GOAL_SETUP_DEADLINE_MS + 840s (${GOAL_SETUP_DEADLINE_MS + 840_000}ms)`,
+    );
   });
 });

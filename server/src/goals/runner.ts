@@ -46,6 +46,7 @@ import {
   GOAL_RECLAIM_BACKOFF_MAX_MS,
   GOAL_RECLAIM_BACKOFF_MS,
   GOAL_SETUP_DEADLINE_MS,
+  GOAL_STEP_LEASE_MS,
 } from "./constants.ts";
 import { buildControlTools as defaultBuildControlTools } from "./control.ts";
 import type { GoalControlToolContext } from "./control.ts";
@@ -77,8 +78,9 @@ export type { GoalControlToolContext } from "./control.ts";
  *      `GOAL_MAX_STEPS`, wall clock from ADMISSION, no-progress — failing the
  *      goal `failed(<reason>)` via `transitGoal` (lease-guarded),
  *   3. resolves the agent snapshot + model plugin + credential pins + tool
- *      bindings under the `GOAL_SETUP_DEADLINE_MS` wait-race (a lost race is
- *      an ACCEPTED M2 leak — `resolvePins` has no signal),
+ *      bindings under the `GOAL_SETUP_DEADLINE_MS` wait-race (a lost race
+ *      aborts the step controller, and the resolver signal seam (4.7)
+ *      settles the abandoned setup with an `AbortError`),
  *   4. runs the graph (`maxIterations = 1`); `beforeModelCall` re-checks the
  *      goal's `running` + lease (throwing [GoalTerminalSignal] when a control
  *      tool already committed), renews the lease and re-checks the wall clock
@@ -105,9 +107,10 @@ export type { GoalControlToolContext } from "./control.ts";
  *
  * Boot recovery ({@link GoalRunner.resumeStuckGoals}): at boot EVERY persisted
  * step lease is dead (single replica) — interrupted steps are marked terminal
- * and `running` goals are requeued so the next claim starts a FRESH step. M2's
- * restart then fails the re-claimed goal `credentials_required` (the in-memory
- * registry is empty); real restart-resume is D8/Phase 4.
+ * and `running` goals are requeued so the next claim starts a FRESH step.
+ * Restart-resume (D8/Phase 4): the re-claimed goal's setup finds the in-memory
+ * registry empty and PAUSES it `paused(credentials_required)` — re-credential
+ * via resume, not a failure, not a spin.
  */
 export type GoalRunnerDeps = {
   goalLedger: GoalLedger;
@@ -213,6 +216,17 @@ export class GoalRunner {
   private disposed = false;
 
   constructor(deps: GoalRunnerDeps) {
+    // Boot-asserted invariant (plan §Step lease/bounds arithmetic): the step
+    // lease must outlive the worst-case round — setup deadline (120s) +
+    // conservative nominal round (840s) + margin. 1800 > 960 holds with 840s
+    // of margin. A misconfigured lease that is too short would let a slow
+    // round lose its lease mid-step; fail loudly at construction instead.
+    if (GOAL_STEP_LEASE_MS <= GOAL_SETUP_DEADLINE_MS + 840_000) {
+      throw new Error(
+        `GOAL_STEP_LEASE_MS (${GOAL_STEP_LEASE_MS}ms) must exceed ` +
+          `GOAL_SETUP_DEADLINE_MS + 840s (${GOAL_SETUP_DEADLINE_MS + 840_000}ms)`,
+      );
+    }
     this.deps = deps;
     this.now = deps.now ?? Date.now;
     // D10: an isolated budget (own pool + own model-call window) unless the
@@ -470,9 +484,11 @@ export class GoalRunner {
 
       // ── 2. Setup under the wait-race (3.8): model + pins + bindings before
       //    any model call. A timeout FAILS the goal `failed(setup_timeout)` —
-      //    M2 has no pause machinery — and abandons the losing promise (an
-      //    ACCEPTED M2 leak; `resolvePins` has no signal).
-      const setupPromise = this.setupGoalStep(goal, signal, execution)
+      //    M2 has no pause machinery — and abandons the losing promise. The
+      //    4.7 resolver signal seam (aborted controller + `raceWithSignal`)
+      //    settles that abandoned setup with an `AbortError`; the underlying
+      //    DNS query is not cancelled, but nothing awaits it anymore.
+      const setupPromise = this.setupGoalStep(goal, signal, execution, step.seq)
         .then((value) => ({ kind: "ready" as const, value }))
         .catch((error: unknown) => ({ kind: "error" as const, error }));
       const outcome = await waitRace(
@@ -491,6 +507,13 @@ export class GoalRunner {
         return;
       }
       if (outcome === SETUP_TIMED_OUT) {
+        // 4.7 (plan R8): abort the step controller so the setup the wait-race
+        // just abandoned settles promptly — the resolver-level signal seam
+        // (`ssrf.ts` `raceWithSignal` + egress `resolvePins`) turns a hung DNS
+        // resolve into an `AbortError` instead of a pending promise the runner
+        // abandoned. The underlying query is not cancelled (DNS is not
+        // AbortSignal-cancellable); nothing awaits it anymore.
+        controller.abort(new GoalSetupError("setup_timeout"));
         void setupPromise.then((late) => {
           if (late.kind === "ready") void late.value.mcpBinding?.dispose().catch(() => {});
         });
@@ -498,14 +521,23 @@ export class GoalRunner {
         return;
       }
       if (outcome.kind === "error") {
-        this.failGoalStep(
-          goalId,
-          owner,
-          step.seq,
-          leaseOwner,
-          leaseToken,
-          setupFailureReasonOf(outcome.error),
-        );
+        // M3 restart-pause mapping (D8): a credentials failure — the RAM-only
+        // lease registry is empty after a restart, or a pin lapsed — PAUSES
+        // the goal `paused(credentials_required)` instead of failing it: the
+        // goal re-credentials via resume rather than dying or spinning. Every
+        // other setup violation still terminates `failed(...)`.
+        if (isCredentialsSetupError(outcome.error)) {
+          this.pauseGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken);
+        } else {
+          this.failGoalStep(
+            goalId,
+            owner,
+            step.seq,
+            leaseOwner,
+            leaseToken,
+            setupFailureReasonOf(outcome.error),
+          );
+        }
         return;
       }
       const { model, tools, mcpBinding: binding, agent } = outcome.value;
@@ -829,21 +861,55 @@ export class GoalRunner {
     this.releaseGoalPin(goalId);
   }
 
+  /**
+   * M3 restart-pause mapping (D8): close the step and pause the goal
+   * `paused(credentials_required)`. The D8 credential lease is RAM-only, so
+   * after a restart the `goalPins` registry is empty and the re-claimed goal
+   * pauses for re-credentialing instead of failing — L1's restart-resume
+   * (plan §Restart pause mapping): pause, not fail, and no spin. The
+   * lease-guarded CAS clears the lease, exactly like a control-tool pause.
+   */
+  private pauseGoalStep(
+    goalId: string,
+    owner: string,
+    stepSeq: number,
+    leaseOwner: string,
+    leaseToken: string,
+  ): void {
+    try {
+      this.deps.goalLedger.markStepTerminal(goalId, owner, stepSeq, leaseOwner, leaseToken);
+      this.deps.goalLedger.transitGoal(goalId, owner, {
+        next: "paused",
+        reason: "credentials_required",
+        leaseOwner,
+        leaseToken,
+      });
+    } catch (err) {
+      if (!(err instanceof GoalError && err.code === "GOAL_INVALID_TRANSITION")) {
+        console.warn(`[goals] failed to pause goal ${goalId} for credentials:`, err);
+      }
+    }
+    this.releaseGoalPin(goalId);
+  }
+
   // ------------------------------------------------------------------ setup
 
   /**
    * Model + credential-pins + tool bindings for one step. Pins are resolved
    * through a [PinStoreCredentialResolver] over the goal's OWN registered
-   * handles (3.2) — absent/expired handles fail `credentials_required`
-   * (`CredentialPinError`/`JobError` map there), never hang.
+   * handles (3.2) — absent/expired handles raise `credentials_required`
+   * (`CredentialPinError`/`JobError` map there), which the step loop pauses
+   * the goal on (M3 restart-pause mapping), never hang.
    */
   private async setupGoalStep(
     goal: GoalRow,
     signal: AbortSignal,
     execution: TrackedExecution,
+    stepSeq: number,
   ): Promise<GoalSetupValue> {
     const owner = goal.owner;
     const goalId = goal.id;
+    const leaseToken = goal.lease_token ?? "";
     const agent = parseAgentSnapshot(goal.agent_snapshot);
     // 3.5 fail-loud start check (declared surface, BEFORE any model build or
     // tool bind). The effective MCP surface is `allowlist ∩ readOnly`; the
@@ -886,7 +952,9 @@ export class GoalRunner {
     // Handle-addressed reads throw `credentials_expired`/`pin_not_found`
     // (absent) or `CredentialPinError` (expired) — both map to
     // `credentials_required` at the call site. `channel: "job"` because the
-    // shared selector's channel union is widened in Phase 4.1.
+    // goal channel's credential resolution uses the pin store (the same
+    // fingerprint derivation as the job channel); the `CredentialRequest`
+    // union is not widened.
     const modelCredential = resolver.resolve({
       owner,
       pluginId: modelPluginId,
@@ -913,13 +981,16 @@ export class GoalRunner {
 
     const executor = this.deps.executor ?? this.createDefaultExecutor();
     const assertActive = () => assertNotDeleting(owner);
-    // ONE sync-shaped engine per step (`serialize → cache → budget →
-    // execution`, channel "sync-managed" — the correct pre-goal-channel shape
-    // for owner-scoped stateful work; there is no fence yet), shared by the
-    // plugin and MCP bindings below.
-    const pipeline: ToolPipeline = buildPipelineForChannel("sync-managed", {
+    // ONE goal-channel engine per step (`fence → serialize → cache → budget →
+    // execution`, plan M3), shared by the plugin and MCP bindings below. The
+    // fence closes over THIS step's goal row + lease token; `stepSeq`/
+    // `goalLeaseToken` ride every `ToolCall` (set by the binders below).
+    const pipeline: ToolPipeline = buildPipelineForChannel("goal", {
+      goalLedger: this.deps.goalLedger,
+      goalId,
       budget: this.budget,
       ...(this.deps.toolCache === undefined ? {} : { cache: this.deps.toolCache }),
+      assertActive,
     });
 
     // Plugin tools (the agent's `tools` plugin ids), if any. Their credentials
@@ -930,7 +1001,10 @@ export class GoalRunner {
         ? bindPluginTools(this.deps.registry, executor, pluginIds, {
             owner,
             requestId: goalId,
-            channel: "sync-managed",
+            channel: "goal",
+            goalId,
+            stepSeq,
+            goalLeaseToken: leaseToken,
             credentialsResolver: resolver,
             pipeline,
             budget: this.budget,
@@ -966,7 +1040,10 @@ export class GoalRunner {
           )?.[0];
           return pinEntry?.pinned === undefined ? undefined : [...pinEntry.pinned];
         },
-        channel: "sync-managed",
+        channel: "goal",
+        goalId,
+        stepSeq,
+        goalLeaseToken: leaseToken,
         pipeline,
         budget: this.budget,
         ...(this.deps.toolCache === undefined
@@ -1057,13 +1134,13 @@ export class GoalRunner {
   // -------------------------------------------------------- boot recovery
 
   /**
-   * Boot recovery (plan §Recovery — one flow, M2 shape): at boot EVERY
-   * persisted step lease is dead. For each `running` goal: mark its current
+   * Boot recovery (plan §Recovery — one flow): at boot EVERY persisted step
+   * lease is dead (single replica). For each `running` goal: mark its current
    * (last non-terminal) step terminal, then CAS `running -> queued`
-   * (lease-agnostic — M2 has no adopted mutations) so the next claim starts a
-   * FRESH step. The re-claimed goal then fails `credentials_required` (the
-   * `goalPins` registry is in-memory and empty after a restart) — M2 does not
-   * satisfy L1's restart-resume (that is D8/Phase 4).
+   * (lease-agnostic — no adopted mutations yet) so the next claim starts a
+   * FRESH step. The re-claimed goal then pauses `credentials_required` (the
+   * `goalPins` registry is in-memory and empty after a restart) — L1's
+   * restart-resume per D8/Phase 4: pause, not fail, and no spin.
    *
    * Errors are contained PER GOAL: recovery must never abort boot.
    */
@@ -1265,9 +1342,22 @@ async function waitRace<T>(
 }
 
 /**
- * Wire `failureReason` for a setup error (M2: bound/setup violations TERMINATE
- * the goal — the pause taxonomy is M3). Credentials failures must "mention
- * credentials" (WIRE_SPEC: `failureReason` is how the client sees them).
+ * True when a setup error is a credentials failure — the M3 restart-pause
+ * mapping (D8) pauses the goal `credentials_required` instead of failing it.
+ */
+function isCredentialsSetupError(error: unknown): boolean {
+  if (error instanceof CredentialPinError) return true;
+  if (error instanceof GoalSetupError) {
+    return error.failureReason.startsWith("credentials_required");
+  }
+  return false;
+}
+
+/**
+ * Wire `failureReason` for a setup error (M3: bound/setup violations still
+ * TERMINATE the goal; only credentials failures pause). Credentials failures
+ * must "mention credentials" (WIRE_SPEC: `failureReason` is how the client
+ * sees them).
  */
 function setupFailureReasonOf(error: unknown): string {
   const message = redactForOutbound(errorMessageOf(error));

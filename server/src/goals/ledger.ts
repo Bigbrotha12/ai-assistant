@@ -797,6 +797,22 @@ export class GoalLedger {
   }
 
   /**
+   * One step by `(goalId, seq)`, or `undefined` when absent. The goal fence
+   * reads this to check the per-step terminal flag (set by the control tools
+   * via {@link markStepTerminal}) — a step marked terminal refuses further tool
+   * calls even while the goal row is still `running`.
+   */
+  getStep(goalId: string, seq: number): GoalStepRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT id, goal_id, seq, kind, status, mutating, message_from_seq,
+                message_to_seq, tokens, created_ts
+          FROM goal_step WHERE goal_id = ? AND seq = ?`,
+      )
+      .get(goalId, seq) as GoalStepRow | undefined;
+  }
+
+  /**
    * Queued goals, oldest-first (`created_ts`, `id`) — the claim scan's input.
    * `LIMIT ?` bounds one claim pass; the runner claims in this order.
    */

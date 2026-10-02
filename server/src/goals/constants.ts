@@ -33,12 +33,21 @@ export const GOAL_MAX_NO_PROGRESS_STEPS = 3;
 export const GOAL_MAX_WALL_CLOCK_MS = 10 * 60_000;
 /**
  * Setup wait-race deadline: model resolution + pin resolution + MCP binding
- * BEFORE `graph.invoke`. A wait-race, NOT a cancellation — `resolvePins` has
- * no signal and DNS lookup is not AbortSignal-cancellable; the lost resolve
- * promise is an ACCEPTED M2 leak (plan §bounds), tightened in 4.7. A
- * violation fails the goal `failed(setup_timeout)` — it never hangs.
+ * BEFORE `graph.invoke`. A wait-race, NOT a full cancellation: on timeout the
+ * runner aborts the step controller and the resolver signal seam (4.7,
+ * plan R8) settles the abandoned setup with an `AbortError`. The underlying
+ * DNS query is not AbortSignal-cancellable and may complete in the
+ * background; nothing awaits it anymore. A violation fails the goal
+ * `failed(setup_timeout)` — it never hangs.
  */
 export const GOAL_SETUP_DEADLINE_MS = 120_000;
+/**
+ * D8 credential lease (plan F1): the goal pin store's flat TTL. A goal holds
+ * its credentials for the whole run — the run itself is bounded by the wall
+ * clock (10 min M2 / 1h M3), so 3h is generous headroom. Instance-scoped,
+ * constructor TTL, no `pins.ts` change, no renewal.
+ */
+export const GOAL_PIN_TTL_MS = 3 * 60 * 60 * 1000;
 /**
  * Re-claim pacing (plan §Step lifecycle): a step attempt rejected before any
  * model call backs off the goal's next re-claim by this base delay,

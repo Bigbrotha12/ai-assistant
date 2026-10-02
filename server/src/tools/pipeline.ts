@@ -90,7 +90,7 @@ export type ToolCall = {
    */
   readonly signal?: AbortSignal;
 
-  readonly channel: "sync-stateless" | "sync-managed" | "job" | "warmup";
+  readonly channel: "sync-stateless" | "sync-managed" | "job" | "goal" | "warmup";
 
   /**
    * Model tool-call id. REQUIRED by `replay`/`fence`: ledger dedupe is keyed on
@@ -117,6 +117,19 @@ export type ToolCall = {
   readonly taskId?: string;
   readonly fenceToken?: string;
   readonly allowMutatingRetry?: boolean;
+
+  /**
+   * Goal channel only. The goal fence reads these to verify the call's step
+   * is still live: `goalId` selects the goal row, `goalLeaseToken` must match
+   * the row's `lease_token`, and `stepSeq` selects the `goal_step` row whose
+   * per-step terminal flag (set by the control tools) must be unset.
+   * `goalAuthorised`/`goalPluginId` are M4 (`authorize`) fields.
+   */
+  readonly goalId?: string;
+  readonly stepSeq?: number;
+  readonly goalLeaseToken?: string;
+  readonly goalAuthorised?: boolean;
+  readonly goalPluginId?: string;
 };
 
 /**

@@ -166,6 +166,7 @@ type PinResolutionOptions = {
   readonly mode: Mode | undefined;
   readonly lookup: LookupFn | undefined;
   readonly subject: string;
+  readonly signal?: AbortSignal;
 };
 
 /**
@@ -185,6 +186,7 @@ async function resolvePinsInternal(
   return resolveAndValidateHost(normalizeHostname(parsed.hostname), {
     trustedHosts: opts.trustedHosts,
     lookup: opts.lookup,
+    ...(opts.signal === undefined ? {} : { signal: opts.signal }),
   });
 }
 
@@ -209,6 +211,14 @@ export type ResolvePinsOptions = {
   readonly lookup?: LookupFn;
   /** Policy subject used only in validation error messages. */
   readonly subject?: string;
+  /**
+   * Abort signal raced against the DNS lookup (plan R8). When the signal
+   * fires first, the lookup promise rejects with an `AbortError` — the caller
+   * stops waiting. The underlying query is not cancelled (DNS is not
+   * AbortSignal-cancellable); this seam lets a bounded caller abandon a hung
+   * resolve instead of leaking the pending promise.
+   */
+  readonly signal?: AbortSignal;
 };
 
 /**
@@ -235,6 +245,7 @@ export async function resolvePins(
     mode: opts.mode,
     lookup: opts.lookup,
     subject: opts.subject ?? "egress",
+    ...(opts.signal === undefined ? {} : { signal: opts.signal }),
   });
 }
 

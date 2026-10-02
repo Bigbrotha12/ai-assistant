@@ -61,7 +61,15 @@ export type BindPluginToolsOptions = {
    * binding cannot silently masquerade as another channel (the shared audit sink
    * keys off it).
    */
-  channel: "sync-stateless" | "sync-managed";
+  channel: "sync-stateless" | "sync-managed" | "goal";
+  /**
+   * Goal channel only: the per-step goal context the goal fence reads. The
+   * runner passes these (they are constant for one step); `buildCall` sets them
+   * on every `ToolCall` so the fence can verify the call's step is still live.
+   */
+  goalId?: string;
+  stepSeq?: number;
+  goalLeaseToken?: string;
   /**
    * Per-request credential source (plan §5 Phase 3, steps 3.2/3.5). When
    * provided it is the SOLE source of a tool call's credentials + fingerprint,
@@ -186,6 +194,18 @@ export function bindPluginTools(
           credentialFingerprint: fingerprint,
           ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
           channel: options.channel,
+          // Goal channel: the per-step fence context. The runner passes these
+          // as bind options (constant for one step); they ride every call so
+          // the goal fence can verify the step is still live.
+          ...(options.channel === "goal"
+            ? {
+                ...(options.goalId === undefined ? {} : { goalId: options.goalId }),
+                ...(options.stepSeq === undefined ? {} : { stepSeq: options.stepSeq }),
+                ...(options.goalLeaseToken === undefined
+                  ? {}
+                  : { goalLeaseToken: options.goalLeaseToken }),
+              }
+            : {}),
           ...(ctx.toolCallId === undefined ? {} : { toolCallId: ctx.toolCallId }),
           actionId: ctx.actionId,
           timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_HANDLER_TIMEOUT_MS,

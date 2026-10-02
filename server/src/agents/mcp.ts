@@ -1005,11 +1005,15 @@ export type McpBindOptions = {
    * Channel the MCP calls belong to. `warmup` is not a valid MCP channel.
    * Defaults to `sync-stateless`.
    */
-  channel?: "sync-stateless" | "sync-managed" | "job";
+  channel?: "sync-stateless" | "sync-managed" | "job" | "goal";
   /** Job channel: task-fence fields carried on the `ToolCall`. */
   taskId?: string;
   fenceToken?: string;
   allowMutatingRetry?: boolean;
+  /** Goal channel: per-step goal-fence context carried on the `ToolCall`. */
+  goalId?: string;
+  stepSeq?: number;
+  goalLeaseToken?: string;
   /** Job channel: task-fence re-check, also supplied to the `fence` interceptor. */
   assertActive?: () => void;
   /** Channel-owned tracked execution (job/sync `settle()` draining). */
@@ -1958,7 +1962,9 @@ export async function bindMcpServers(
       ? undefined
       : [...server.pinnedIps];
     let retainedPinsPromise: Promise<readonly string[] | undefined> | undefined;
-    const resolvePinsForBinding = async (): Promise<readonly string[] | undefined> => {
+    const resolvePinsForBinding = async (
+      signal?: AbortSignal,
+    ): Promise<readonly string[] | undefined> => {
       if (retainedPins !== undefined) return retainedPins;
       const configuredPinOption = opts?.resolvePins ?? opts?.pinnedIps;
       if (configuredPinOption !== undefined) {
@@ -1998,6 +2004,12 @@ export async function bindMcpServers(
             mode: opts?.mode,
             lookup: opts?.lookup,
             subject: "mcp",
+            // 4.7 (plan R8): race the DNS resolve against the binding's
+            // channel+session signal so an abandoned binding (a goal setup
+            // that lost its wait-race, a request abort, a dispose) stops the
+            // pending resolve instead of leaking the promise. The underlying
+            // query is not cancelled; only the awaiting chain settles.
+            ...(signal === undefined ? {} : { signal }),
           });
           retainedPins = pins;
           return pins;
@@ -2047,7 +2059,7 @@ export async function bindMcpServers(
         ? AbortSignal.any([opts.signal, lease.record.sessionAbortController.signal])
         : lease.record.sessionAbortController.signal;
       const rawFactoryPromise = Promise.resolve().then(async () => {
-        const pinnedIps = await resolvePinsForBinding();
+        const pinnedIps = await resolvePinsForBinding(factorySignal);
         return factory(server, {
           trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
           lookup: opts?.lookup,
@@ -2215,9 +2227,9 @@ export async function bindMcpServers(
             nextAnonymousToolSequence,
             prepare: (ctx) => {
               // Sync account-deletion tombstone, mirroring the plugin channel's
-              // `buildCall` pre-check (the job channel's fence interceptor owns
-              // this instead). Runs before `serialize`/`cache` via `dispatch`.
-              if (channel !== "job") opts?.assertActive?.();
+              // `buildCall` pre-check (the job/goal channels' fence interceptors
+              // own this instead). Runs before `serialize`/`cache` via `dispatch`.
+              if (channel !== "job" && channel !== "goal") opts?.assertActive?.();
               const { bodies, scope: bodyScope } = makeToolBodies({
                 source: "mcp",
                 channelLabel: "mcp",
@@ -2290,7 +2302,8 @@ export async function bindMcpServers(
                     dispatch.bodyFailed = result.isError === true;
                     // Post-execution tombstone re-check: do not cache a result
                     // produced after the owner began deleting (mirrors plugin sync).
-                    if (channel !== "job") opts?.assertActive?.();
+                    // The goal channel's fence interceptor owns this instead.
+                    if (channel !== "job" && channel !== "goal") opts?.assertActive?.();
                     const content = result.content ?? [];
                     return content.map((item) => item.text ?? "").join("\n");
                   }),
@@ -2334,6 +2347,17 @@ export async function bindMcpServers(
                       ...(opts?.allowMutatingRetry === undefined
                         ? {}
                         : { allowMutatingRetry: opts.allowMutatingRetry }),
+                    }
+                  : {}),
+                // Goal channel: the per-step fence context, mirroring the plugin
+                // binder's `buildCall`. The runner passes these as bind options.
+                ...(channel === "goal"
+                  ? {
+                      ...(opts?.goalId === undefined ? {} : { goalId: opts.goalId }),
+                      ...(opts?.stepSeq === undefined ? {} : { stepSeq: opts.stepSeq }),
+                      ...(opts?.goalLeaseToken === undefined
+                        ? {}
+                        : { goalLeaseToken: opts.goalLeaseToken }),
                     }
                   : {}),
               };

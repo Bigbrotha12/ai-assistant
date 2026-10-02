@@ -681,3 +681,61 @@ describe("egress policy http carve-out (MCP)", () => {
     );
   });
 });
+
+/**
+ * The plan R8 signal seam (4.7): `resolveAndValidateHost` races the DNS lookup
+ * against an optional `AbortSignal`. The underlying query is NOT cancellable
+ * (node:dns is not AbortSignal-aware) — when the signal fires first the
+ * returned promise rejects with an `AbortError` and the awaiting chain settles,
+ * which is what lets the runner abandon a hung setup without leaking the
+ * pending promise.
+ */
+describe("resolveAndValidateHost signal race (4.7)", () => {
+  test("a pre-aborted signal rejects with an AbortError without awaiting the lookup", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("step aborted"));
+    let lookupStarted = false;
+    const lookup: LookupFn = () => {
+      lookupStarted = true;
+      // Never resolves: proves the rejection comes from the signal, not
+      // from the lookup being awaited.
+      return new Promise<LookupAddress[]>(() => {});
+    };
+    await assert.rejects(
+      resolveAndValidateHost("example.com", { lookup, signal: controller.signal }),
+      (e: unknown) => e instanceof Error && e.name === "AbortError",
+    );
+    assert.equal(
+      lookupStarted,
+      true,
+      "the lookup starts eagerly (argument evaluation) but is never awaited",
+    );
+  });
+
+  test("a pending lookup settles with an AbortError when the signal fires first", async () => {
+    const controller = new AbortController();
+    const pending: LookupFn = () =>
+      new Promise((resolve) => {
+        // A hung DNS query: resolves well after the abort fires.
+        setTimeout(() => resolve([{ address: "1.1.1.1", family: 4 }]), 50);
+      });
+    const promise = resolveAndValidateHost("example.com", {
+      lookup: pending,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(new Error("step aborted")), 5);
+    await assert.rejects(
+      promise,
+      (e: unknown) => e instanceof Error && e.name === "AbortError",
+    );
+  });
+
+  test("a lookup that wins the race is unaffected by a live (never-aborted) signal", async () => {
+    const controller = new AbortController();
+    const pinned = await resolveAndValidateHost("example.com", {
+      lookup: fakeLookup([{ address: "1.1.1.1", family: 4 }]),
+      signal: controller.signal,
+    });
+    assert.deepEqual(pinned, ["1.1.1.1"]);
+  });
+});

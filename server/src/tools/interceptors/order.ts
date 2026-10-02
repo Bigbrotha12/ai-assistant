@@ -1,3 +1,4 @@
+import type { GoalLedger } from "../../goals/ledger.ts";
 import type { Ledger } from "../../ledger.ts";
 import type { BudgetManager } from "../../middleware/budget.ts";
 import type { ToolResultCache } from "../../middleware/cache.ts";
@@ -5,6 +6,7 @@ import { createBudgetInterceptor } from "./budget.ts";
 import { createCacheInterceptor } from "./cache.ts";
 import { createExecutionInterceptor } from "./execution.ts";
 import { createFenceInterceptor } from "./fence.ts";
+import { createGoalFenceInterceptor } from "./goal_fence.ts";
 import { createReplayInterceptor } from "./replay.ts";
 import { createSerializeInterceptor } from "./serialize.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
@@ -112,6 +114,63 @@ export function createSyncToolInterceptors(
   opts: SyncToolInterceptorOptions,
 ): ToolInterceptor[] {
   return [
+    createSerializeInterceptor(),
+    createCacheInterceptor(
+      opts.cache === undefined ? {} : { cache: opts.cache },
+    ),
+    createBudgetInterceptor(
+      opts.budget === undefined ? {} : { budget: opts.budget },
+    ),
+    createExecutionInterceptor(),
+  ];
+}
+
+/**
+ * The canonical goal-channel interceptor order, outer→inner (plan M3).
+ *
+ * The goal channel is the job order minus `replay` (a step is never re-run —
+ * F3a — so there is no per-step ledger to dedupe against; the `goal_mutation`
+ * ledger is the sole at-most-once guard and arrives in M4 as `reserve`):
+ *   - `fence` first preserves the job path's error precedence — a
+ *     `GOAL_LEASE_CONFLICT` from the fence must win over a
+ *     `tool_args_too_large` from serialization.
+ *   - `budget` OUTSIDE `execution` is what makes quarantine possible (plan D7),
+ *     exactly as in the job/sync orders.
+ *
+ * There is no goal `replay` interceptor and (in M3) no `authorize`/`reserve` —
+ * those land in M4, which inserts them into this order.
+ */
+export const GOAL_TOOL_INTERCEPTOR_ORDER = [
+  "fence",
+  "serialize",
+  "cache",
+  "budget",
+  "execution",
+] as const;
+
+export type GoalToolInterceptorOptions = {
+  ledger: GoalLedger;
+  goalId: string;
+  budget?: BudgetManager;
+  cache?: ToolResultCache;
+  /** Goal fence's account-deletion tombstone, also used as `beforeBody` guard. */
+  assertActive?: () => void;
+};
+
+/**
+ * Builds the ordered goal-channel interceptor list. `budget`/`cache` are
+ * optional so a test or a degraded composition can omit them; the order is
+ * identical either way.
+ */
+export function createGoalToolInterceptors(
+  opts: GoalToolInterceptorOptions,
+): ToolInterceptor[] {
+  return [
+    createGoalFenceInterceptor({
+      ledger: opts.ledger,
+      goalId: opts.goalId,
+      ...(opts.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
+    }),
     createSerializeInterceptor(),
     createCacheInterceptor(
       opts.cache === undefined ? {} : { cache: opts.cache },

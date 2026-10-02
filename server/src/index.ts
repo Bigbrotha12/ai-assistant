@@ -12,6 +12,7 @@ import { createSentinelService } from "./sentinel/service.ts";
 import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner, JobRunnerDeps } from "./jobs/runner.ts";
+import { GOAL_PIN_TTL_MS } from "./goals/constants.ts";
 import { createGoalRunner } from "./goals/runner.ts";
 import type { GoalRunner } from "./goals/runner.ts";
 import { createGoalRoutes } from "./goals/routes.ts";
@@ -343,7 +344,7 @@ try {
 // (`credentialFingerprint` per pin) keep goal entries isolated from job/sync
 // entries.
 try {
-  goalPins = new CredentialPinStore();
+  goalPins = new CredentialPinStore({ maxLifetimeMs: GOAL_PIN_TTL_MS });
   goalRunner = createGoalRunner({
     goalLedger,
     registry: pluginRegistry,

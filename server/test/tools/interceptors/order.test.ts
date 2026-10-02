@@ -1,12 +1,15 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  GOAL_TOOL_INTERCEPTOR_ORDER,
   JOB_TOOL_INTERCEPTOR_ORDER,
   SYNC_TOOL_INTERCEPTOR_ORDER,
+  createGoalToolInterceptors,
   createJobToolInterceptors,
   createSyncToolInterceptors,
 } from "../../../src/tools/interceptors/order.ts";
 import { bindPluginTools } from "../../../src/agents/orchestrator.ts";
+import { buildPipelineForChannel } from "../../../src/tools/channel.ts";
 import { createToolResultCache } from "../../../src/middleware/cache.ts";
 import { createBudgetManager } from "../../../src/middleware/budget.ts";
 import { credentialFingerprint } from "../../../src/plugins/credential.ts";
@@ -14,8 +17,10 @@ import {
   DEFAULT_TOOL_ARGS_MAX_BYTES,
   ToolResourceError,
 } from "../../../src/tool_bounds.ts";
+import { GoalError } from "../../../src/goals/errors.ts";
+import type { GoalLedger } from "../../../src/goals/ledger.ts";
 import type { ToolPluginDefinition } from "../../../src/plugins/types.ts";
-import { makeLedger } from "../support.ts";
+import { makeBodies, makeCall, makeLedger } from "../support.ts";
 
 describe("job interceptor order", () => {
   test("the factory emits exactly the documented canonical order", () => {
@@ -171,5 +176,79 @@ describe("sync binding dispatches in the factory order (m2)", () => {
     assert.equal(result, "CACHED-SHOULD-SERVE", "the cache hit is served outside budget");
     release();
     await inFlight;
+  });
+});
+
+/** A goal ledger stub — the goal fence reads it only at dispatch time. */
+function fakeGoalLedger(): GoalLedger {
+  return {
+    getGoal: () => null,
+    getStep: () => undefined,
+  } as unknown as GoalLedger;
+}
+
+describe("goal interceptor order (4.4)", () => {
+  test("the factory emits exactly the documented canonical order", () => {
+    const interceptors = createGoalToolInterceptors({
+      ledger: fakeGoalLedger(),
+      goalId: "goal-1",
+    });
+    assert.deepEqual(
+      interceptors.map((interceptor) => interceptor.name),
+      [...GOAL_TOOL_INTERCEPTOR_ORDER],
+    );
+  });
+
+  test("load-bearing pairings: fence<serialize, budget<execution, and no replay", () => {
+    const names = createGoalToolInterceptors({
+      ledger: fakeGoalLedger(),
+      goalId: "goal-1",
+    }).map((interceptor) => interceptor.name);
+    assert.ok(
+      names.indexOf("fence") < names.indexOf("serialize"),
+      "a GOAL_LEASE_CONFLICT must win over tool_args_too_large",
+    );
+    assert.ok(
+      names.indexOf("budget") < names.indexOf("execution"),
+      "budget must wrap execution for quarantine to fire",
+    );
+    assert.ok(!names.includes("replay"), "a step is never re-run (F3a)");
+  });
+
+  test("buildPipelineForChannel('goal') requires a goal ledger and a goal id", () => {
+    assert.throws(
+      () => buildPipelineForChannel("goal", {}),
+      /goal ledger/,
+    );
+    assert.throws(
+      () => buildPipelineForChannel("goal", { goalLedger: fakeGoalLedger() }),
+      /goal id/,
+    );
+  });
+
+  test("GOAL_LEASE_CONFLICT wins over tool_args_too_large through the real goal pipeline", async () => {
+    const ledger = {
+      getGoal: () => ({ status: "paused", lease_token: null }),
+      getStep: () => undefined,
+    } as unknown as GoalLedger;
+    const pipeline = buildPipelineForChannel("goal", {
+      goalLedger: ledger,
+      goalId: "goal-1",
+    });
+    await assert.rejects(
+      pipeline.dispatch({
+        call: makeCall({
+          channel: "goal",
+          goalId: "goal-1",
+          stepSeq: 1,
+          goalLeaseToken: "lease-1",
+          args: { blob: "x".repeat(DEFAULT_TOOL_ARGS_MAX_BYTES + 1) },
+        }),
+        bodies: makeBodies(),
+      }),
+      (error: unknown) =>
+        error instanceof GoalError && error.code === "GOAL_LEASE_CONFLICT",
+      "the fence's GOAL_LEASE_CONFLICT must precede serialize's tool_args_too_large",
+    );
   });
 });
