@@ -29,21 +29,26 @@
  *
  * The arithmetic this pins (kept in sync with `index.ts` and
  * `deploy/k8s/health-probes.yaml`):
- *  - Six disposers share this budget. `serverClosed`'s 5s request-drain grace
- *    runs concurrently with the first five disposers and is fully absorbed.
+ *  - Seven disposers share this budget. `serverClosed`'s 5s request-drain
+ *    grace runs concurrently with the first six disposers and is fully
+ *    absorbed. The `goals` disposer is the FIRST promise-returning one
+ *    (`GoalRunner.dispose` aborts its in-flight steps and awaits their
+ *    unwind) — it may consume the remainder but cannot extend it.
  *  - The 2s sentinel shadow flush runs after the budget's deadline has had its
  *    chance at the disposers, so worst-case total shutdown is
- *    BUDGET + flush = 15s + 2s = 17s. (`ledger.close()` is the last disposer
- *    and is bounded by whatever budget remains, so it cannot extend past
- *    BUDGET + flush either.)
+ *    BUDGET + flush = 15s + 2s = 17s — UNCHANGED by the async goal disposer,
+ *    because the budget is one absolute deadline, not a per-disposer window
+ *    (adding a disposer can only consume the remainder, never grow it).
+ *    (`ledger.close()` is the last disposer and is bounded by whatever budget
+ *    remains, so it cannot extend past BUDGET + flush either.)
  *  - `deploy/k8s/health-probes.yaml` pins `terminationGracePeriodSeconds: 45`
  *    — 28s of headroom over the 17s worst case — so a fully-wedged teardown is
  *    never SIGKILL'd mid-flush.
  *
  * 15s is ~3x the old single-disposer window (5s), which is generous for the
- * current production disposers (all synchronous) with room for future async
- * teardown (e.g. a goal runner) while keeping the total well under the pod
- * grace period.
+ * production disposers and absorbed by the async goal teardown (the first
+ * promise-returning disposer landed with the goal runner) while keeping the
+ * total well under the pod grace period.
  */
 export const SHUTDOWN_TEARDOWN_BUDGET_MS = 15_000;
 

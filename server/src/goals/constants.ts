@@ -9,3 +9,41 @@ export const GOAL_STEP_LEASE_MS = 1_800_000;
 /** Message-log compaction bounds (plan §Storage). */
 export const GOAL_MESSAGE_MAX = 200;
 export const GOAL_MESSAGE_KEEP_RECENT = 20;
+
+// ── Phase 3.1 / 3.8: M2 global bounds (plan §Global bounds + §Step lease) ──
+
+/**
+ * Total steps per goal, across runs. The runner inserts the step row first
+ * (its `seq` is the steps-run count) and refuses the step when
+ * `seq > GOAL_MAX_STEPS`, failing the goal `failed(step_cap_exceeded)`.
+ */
+export const GOAL_MAX_STEPS = 10;
+/**
+ * Consecutive steps with no new `goal_message` append before the goal fails
+ * `failed(no_progress)`. Measured as trailing steps whose input range still
+ * equals the log's max seq — i.e. steps started since the last append.
+ */
+export const GOAL_MAX_NO_PROGRESS_STEPS = 3;
+/**
+ * M2 wall clock, anchored at ADMISSION (`goal.created_ts`), NOT
+ * `run_started_ts` (M3's per-run anchor). Sharing the pin's admission
+ * instant keeps `setup-wait + round ≤ 540s < 10 min < 15 min pin` regardless
+ * of queue latency (waves 3.8).
+ */
+export const GOAL_MAX_WALL_CLOCK_MS = 10 * 60_000;
+/**
+ * Setup wait-race deadline: model resolution + pin resolution + MCP binding
+ * BEFORE `graph.invoke`. A wait-race, NOT a cancellation — `resolvePins` has
+ * no signal and DNS lookup is not AbortSignal-cancellable; the lost resolve
+ * promise is an ACCEPTED M2 leak (plan §bounds), tightened in 4.7. A
+ * violation fails the goal `failed(setup_timeout)` — it never hangs.
+ */
+export const GOAL_SETUP_DEADLINE_MS = 120_000;
+/**
+ * Re-claim pacing (plan §Step lifecycle): a step attempt rejected before any
+ * model call backs off the goal's next re-claim by this base delay,
+ * exponential up to [GOAL_RECLAIM_BACKOFF_MAX_MS]. Reset after a step that
+ * reached a model call.
+ */
+export const GOAL_RECLAIM_BACKOFF_MS = 1_000;
+export const GOAL_RECLAIM_BACKOFF_MAX_MS = 30_000;

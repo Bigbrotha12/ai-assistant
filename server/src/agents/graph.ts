@@ -14,6 +14,16 @@ import { boundToolResultContent } from "../tool_bounds.ts";
 
 export const MAX_TOOL_ROUNDS = 5;
 
+/**
+ * The canned assistant turn emitted when `toolRounds >= maxIterations`. Tagged
+ * via `additional_kwargs[TOOL_ROUND_LIMIT_MARKER]` so durable consumers that
+ * persist the conversation (the goal runner) can exclude it — it is
+ * orchestrator scaffolding, not model output.
+ */
+export const TOOL_ROUND_LIMIT_MESSAGE =
+  "Tool round limit reached. No further tools were run.";
+export const TOOL_ROUND_LIMIT_MARKER = "tool_round_limit";
+
 export const AgentStateAnnotation = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     reducer: (left, right) => left.concat(right),
@@ -107,7 +117,17 @@ export function createAgentGraph({
   ): Promise<AgentUpdate> => {
     config.signal?.throwIfAborted();
     if (state.toolRounds >= maxIterations) {
-      return { messages: [new AIMessage("Tool round limit reached. No further tools were run.")] };
+      return {
+        messages: [
+          new AIMessage({
+            content: TOOL_ROUND_LIMIT_MESSAGE,
+            // Tagged so a durable consumer (the goal runner) can exclude this
+            // synthetic turn-closer from its persisted conversation log: it is
+            // scaffolding, not something the model said.
+            additional_kwargs: { synthetic: TOOL_ROUND_LIMIT_MARKER },
+          }),
+        ],
+      };
     }
     const input = [new SystemMessage(effectiveSystemPrompt), ...state.messages];
     const messages = prepareMessages ? await prepareMessages(input, config) : input;

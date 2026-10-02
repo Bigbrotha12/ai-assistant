@@ -12,8 +12,11 @@ import { isUniqueConstraintViolation } from "../sqlite_errors.ts";
 import type {
   GoalEffectState,
   GoalMessageRow,
+  GoalMutationRow,
   GoalRow,
   GoalStatus,
+  GoalStepKind,
+  GoalStepRow,
   GoalTransitionTarget,
 } from "./types.ts";
 import { GOAL_TRANSITION_TARGETS } from "./types.ts";
@@ -62,6 +65,14 @@ export interface PauseGoalParams {
   reason?: string;
   question?: string;
   summary?: string;
+  /**
+   * Terminal `failed` reason (WIRE_SPEC §12: `failureReason` is how an M2
+   * `failed(credentials_required)` reaches the client — M2 has no pause to
+   * carry it). Written ONLY when `next === 'failed'` (a `CASE` in the UPDATE);
+   * any other transition clears `failure_reason`. Prefer {@link
+   * GoalLedger.transitGoal}, the runner-facing wrapper over this primitive.
+   */
+  failureReason?: string;
   /** Lease proof held by the caller (the runner knows its own lease). Must be
    *  supplied TOGETHER with [leaseToken] (or both omitted — then the CAS omits
    *  the lease WHERE clauses). A half-fence is rejected: `claimGoal` stamps
@@ -76,6 +87,30 @@ export interface AppendGoalMessageInput {
   content?: unknown;
   toolCalls?: unknown[];
   toolCallId?: string;
+}
+
+/**
+ * Parameters for {@link GoalLedger.transitGoal} — the runner-facing CAS
+ * transition out of `running`, identical to [PauseGoalParams] minus the
+ * internal `nowOverride`. `failureReason` is the WIRE_SPEC `failureReason`
+ * (`present iff terminal failed`).
+ */
+export interface TransitGoalParams {
+  next: GoalTransitionTarget;
+  reason?: string;
+  question?: string;
+  summary?: string;
+  failureReason?: string;
+  leaseOwner?: string;
+  leaseToken?: string;
+}
+
+export interface InsertGoalStepInput {
+  kind: GoalStepKind;
+  mutating?: boolean;
+  messageFromSeq?: number;
+  messageToSeq?: number;
+  tokens?: number;
 }
 
 export class GoalLedger {
@@ -239,7 +274,10 @@ export class GoalLedger {
    * write to a single statement so composition stays trivial). A successful
    * `pauseGoal` clears `lease_owner`/`lease_token`/`lease_expiry` (the
    * paused goal holds no step lease); other transitions keep the columns
-   * verbatim per the plan's CAS.
+   * verbatim per the plan's CAS. `failure_reason` is written only for
+   * `next === 'failed'` (CASE-in-UPDATE, see {@link PauseGoalParams.failureReason});
+   * every other transition clears it. The runner-facing wrapper with the
+   * failure-reason semantics is {@link GoalLedger.transitGoal}.
    *
    * Lease proof is all-or-nothing: [PauseGoalParams.leaseOwner] and
    * [PauseGoalParams.leaseToken] must be supplied TOGETHER, each adding its
@@ -278,6 +316,7 @@ export class GoalLedger {
       reason: params.reason ?? null,
       question: params.question ?? null,
       summary: params.summary ?? null,
+      failureReason: params.failureReason ?? null,
       now,
     };
     // Lease proof (all-or-nothing, validated above): both halves add their
@@ -297,6 +336,7 @@ export class GoalLedger {
         `UPDATE goal
          SET status = @next, pause_reason = @reason,
              pause_question = @question, result_summary = @summary,
+             failure_reason = CASE WHEN @next = 'failed' THEN @failureReason ELSE NULL END,
              lease_owner = CASE WHEN @next = 'paused' THEN NULL ELSE lease_owner END,
              lease_token = CASE WHEN @next = 'paused' THEN NULL ELSE lease_token END,
              lease_expiry = CASE WHEN @next = 'paused' THEN NULL ELSE lease_expiry END,
@@ -327,11 +367,49 @@ export class GoalLedger {
   }
 
   /**
-   * Extends a held step lease by one `GOAL_STEP_LEASE_MS` window — expiry
-   * ONLY, the token is never rotated (the plan test: "renewal extends expiry
-   * without rotating the token"). The runner renews before each model call,
-   * so the lease bounds exactly one round. `changes === 0` raises
-   * `GOAL_LEASE_CONFLICT`.
+   * Runner-facing CAS transition out of `running` — a thin guard wrapper over
+   * {@link GoalLedger.pauseGoal} (all guards and lease semantics live there;
+   * `next` is narrowed to [GoalTransitionTarget] and runtime-checked). Adds
+   * the WIRE_SPEC failure-reason rule on top: `next === 'failed'` writes
+   * `failure_reason = failureReason` (the plan's quoted control-tool SQL
+   * omits this column — this is the required completion, and it is how an M2
+   * `failed(credentials_required)` reaches the client), while any other
+   * transition clears `failure_reason` to NULL. `result_summary` stays
+   * unconditional exactly as in `pauseGoal`.
+   *
+   * Deliberately single-statement (no transaction of its own) so control
+   * tools can compose it with their message-log append inside ONE
+   * `db.transaction`.
+   */
+  transitGoal(
+    goalId: string,
+    owner: string,
+    params: TransitGoalParams,
+  ): boolean {
+    return this.pauseGoal(goalId, owner, {
+      next: params.next,
+      ...(params.reason === undefined ? {} : { reason: params.reason }),
+      ...(params.question === undefined ? {} : { question: params.question }),
+      ...(params.summary === undefined ? {} : { summary: params.summary }),
+      ...(params.failureReason === undefined
+        ? {}
+        : { failureReason: params.failureReason }),
+      ...(params.leaseOwner === undefined ? {} : { leaseOwner: params.leaseOwner }),
+      ...(params.leaseToken === undefined ? {} : { leaseToken: params.leaseToken }),
+    });
+  }
+
+  /**
+   * Extends a held step lease's `lease_expiry` by one `GOAL_STEP_LEASE_MS`
+   * window — expiry ONLY, the token is never rotated (the plan test: "renewal
+   * extends expiry without rotating the token"). The runner renews before each
+   * model call, so the renewal cadence is per round.
+   *
+   * Enforcement is the lease TOKEN, not the timestamp: the CAS WHERE clause
+   * below, plus the runner's `beforeModelCall` re-read, are what reject a
+   * superseded runner. `lease_expiry` is currently WRITE-ONLY (no accessor or
+   * sweep consults it) and is reserved for a future stale-runner reaper.
+   * `changes === 0` raises `GOAL_LEASE_CONFLICT`.
    *
    * No post-UPDATE token re-check: the CAS WHERE clause already pins
    * `lease_token`, so on a synchronous single connection a re-read here is
@@ -595,5 +673,446 @@ export class GoalLedger {
       )
       .get(owner) as { c: number };
     return row.c;
+  }
+
+  /**
+   * Owner-scoped idempotency lookup — the admission route's pre-pin existence
+   * probe. Distinct from {@link getOrCreateGoal}'s internal read (which is
+   * not exposed): the route must know a repeat submit BEFORE minting a pin, so
+   * a re-get never double-pins (Phase 3.6). Returns `undefined` when the owner
+   * has no goal for [idempotencyKey].
+   */
+  getGoalByIdempotencyKey(
+    owner: string,
+    idempotencyKey: string,
+  ): GoalRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM goal WHERE owner = ? AND idempotency_key = ?")
+      .get(owner, idempotencyKey) as GoalRow | undefined;
+  }
+
+  /**
+   * Cancels a LIVE goal (Phase 3.6): `queued | running | paused -> cancelled`
+   * in ONE guarded statement, clearing the step-lease columns. This is
+   * deliberately NOT a step-lease CAS — a `queued` goal has a NULL lease and
+   * the route holds no lease token — so the guard is ownership + live status.
+   *
+   * `changes === 0` re-reads to classify the miss: a missing row is
+   * `GOAL_NOT_FOUND` (the route turns it into 404), a terminal row is
+   * `GOAL_INVALID_TRANSITION` (the route maps it to `409 goal_not_cancellable`).
+   * A cross-owner id is refused up front as `GOAL_FORBIDDEN` (the route's
+   * owner-scoped read normally catches it first).
+   */
+  cancelGoal(goalId: string, owner: string): GoalRow {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    const now = this.now();
+    const cancel = this.db.transaction((): boolean => {
+      const result = this.db
+        .prepare(
+          `UPDATE goal
+           SET status = 'cancelled', lease_owner = NULL, lease_token = NULL,
+               lease_expiry = NULL, updated_ts = @now
+           WHERE id = @id AND owner = @owner
+             AND status IN ('queued', 'running', 'paused')`,
+        )
+        .run({ id: goalId, owner, now });
+      if (result.changes === 0) return false;
+      // Close any in-flight step too. Boot recovery only repairs RUNNING goals
+      // ("last non-terminal step"), so a step left `running` under a cancelled
+      // goal would never be closed. The runner's unwind is the normal path;
+      // this is the crash-safe backstop and also covers a cancel that races a
+      // long tool call (the goal flips terminal before the runner next checks).
+      this.db
+        .prepare(
+          "UPDATE goal_step SET status = 'terminal' WHERE goal_id = @id AND status = 'running'",
+        )
+        .run({ id: goalId });
+      return true;
+    });
+    if (!cancel()) {
+      const current = this.db
+        .prepare("SELECT * FROM goal WHERE id = ?")
+        .get(goalId) as GoalRow | undefined;
+      if (!current) {
+        throw new GoalError("GOAL_NOT_FOUND", `goal ${goalId} not found`);
+      }
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        `goal ${goalId} is ${current.status} and cannot be cancelled`,
+      );
+    }
+    return this.requireGoal(goalId);
+  }
+
+  /**
+   * Every `unresolved` mutation of the goal, oldest-first — the WIRE_SPEC §12
+   * `unresolvedMutations` list and the M4 `resolveMutations` input. Empty
+   * until Phase 6 records mutations; the GET shape still surfaces the field.
+   */
+  listUnresolvedMutations(goalId: string): GoalMutationRow[] {
+    return this.db
+      .prepare(
+        `SELECT id, goal_id, plugin_id, tool, args_hash, state, step_seq,
+                created_ts
+         FROM goal_mutation
+         WHERE goal_id = ? AND state = 'unresolved'
+         ORDER BY created_ts, id`,
+      )
+      .all(goalId) as GoalMutationRow[];
+  }
+
+  // ------------------------------------------- Phase 3.1 runner accessors
+
+  /**
+   * Unguarded single-goal read — the RUNNER owns the ownership decision (it
+   * works with the row it claimed; routes must keep using their own
+   * owner-scoped reads).
+   */
+  getGoal(goalId: string): GoalRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM goal WHERE id = ?")
+      .get(goalId) as GoalRow | undefined;
+  }
+
+  /** Full durable message log, `seq` ASC — the step input-vector source. */
+  listGoalMessages(goalId: string): GoalMessageRow[] {
+    return this.db
+      .prepare(
+        `SELECT id, goal_id, seq, role, content_json, tool_calls_json,
+                tool_call_id, created_ts
+         FROM goal_message WHERE goal_id = ? ORDER BY seq ASC`,
+      )
+      .all(goalId) as GoalMessageRow[];
+  }
+
+  /** All steps of the goal, `seq` ASC (the last row's `seq` is the step count). */
+  listGoalSteps(goalId: string): GoalStepRow[] {
+    return this.db
+      .prepare(
+        `SELECT id, goal_id, seq, kind, status, mutating, message_from_seq,
+                message_to_seq, tokens, created_ts
+         FROM goal_step WHERE goal_id = ? ORDER BY seq ASC`,
+      )
+      .all(goalId) as GoalStepRow[];
+  }
+
+  /**
+   * Queued goals, oldest-first (`created_ts`, `id`) — the claim scan's input.
+   * `LIMIT ?` bounds one claim pass; the runner claims in this order.
+   */
+  listQueuedGoals(limit = 50): GoalRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM goal WHERE status = 'queued'
+         ORDER BY created_ts, id LIMIT ?`,
+      )
+      .all(limit) as GoalRow[];
+  }
+
+  /**
+   * `running` goals (lease-bearing) — boot recovery's input and the claim
+   * pass's per-owner concurrency count. Small by construction (admission cap
+   * per owner), so no limit.
+   */
+  listRunningGoals(): GoalRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM goal WHERE status = 'running' ORDER BY created_ts, id`,
+      )
+      .all() as GoalRow[];
+  }
+
+  /**
+   * Persists the step a claim is about to run: `seq` from the last row (+1,
+   * else 1) — the `appendStep` idiom, so compaction-free step tables never
+   * collide (`UNIQUE (goal_id, seq)`) — status `'running'`, timestamped,
+   * ownership-guarded. The row is born `running` and lives through the step
+   * (boot recovery finds it via "last non-terminal"); the runner marks it
+   * terminal with {@link markStepTerminal}. `messageFromSeq`/`messageToSeq`
+   * record the message-log range the step READS (its input slice); `tokens`
+   * is for callers that know the spend upfront (the runner tracks measured
+   * spend on the goal row via {@link addGoalTokens}).
+   */
+  insertGoalStep(
+    goalId: string,
+    owner: string,
+    input: InsertGoalStepInput,
+  ): GoalStepRow {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    const last = this.db
+      .prepare(
+        "SELECT seq FROM goal_step WHERE goal_id = ? ORDER BY seq DESC LIMIT 1",
+      )
+      .get(goalId) as { seq: number } | undefined;
+    const row: GoalStepRow = {
+      id: randomUUID(),
+      goal_id: goalId,
+      seq: last ? last.seq + 1 : 1,
+      kind: input.kind,
+      status: "running",
+      mutating: input.mutating === true ? 1 : 0,
+      message_from_seq: input.messageFromSeq ?? null,
+      message_to_seq: input.messageToSeq ?? null,
+      tokens: input.tokens ?? 0,
+      created_ts: this.now(),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO goal_step
+           (id, goal_id, seq, kind, status, mutating, message_from_seq,
+            message_to_seq, tokens, created_ts)
+         VALUES
+           (@id, @goalId, @seq, @kind, 'running', @mutating, @fromSeq,
+            @toSeq, @tokens, @createdTs)`,
+      )
+      .run({
+        id: row.id,
+        goalId: row.goal_id,
+        seq: row.seq,
+        kind: row.kind,
+        mutating: row.mutating,
+        fromSeq: row.message_from_seq,
+        toSeq: row.message_to_seq,
+        tokens: row.tokens,
+        createdTs: row.created_ts,
+      });
+    return row;
+  }
+
+  /**
+   * Marks one step `'terminal'` — ONE guarded statement, NO internal
+   * transaction, so a caller (the Phase 3.3 control tools) can compose it
+   * inside its own `db.transaction` alongside its message-log append + CAS.
+   * Scoped to the row (`status = 'running'` — idempotent: a second call
+   * returns false) plus, when BOTH lease halves are supplied, the goal's
+   * current lease (a superseded runner cannot close a step it no longer
+   * owns). A half-fence is rejected outright (same rule as `pauseGoal`).
+   * Returns false when nothing matched (already terminal, or lease lost).
+   */
+  markStepTerminal(
+    goalId: string,
+    owner: string,
+    stepSeq: number,
+    leaseOwner?: string,
+    leaseToken?: string,
+  ): boolean {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    const hasLeaseOwner = leaseOwner !== undefined;
+    const hasLeaseToken = leaseToken !== undefined;
+    if (hasLeaseOwner !== hasLeaseToken) {
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        "leaseOwner and leaseToken must be supplied together",
+      );
+    }
+    const bind: Record<string, unknown> = {
+      goalId,
+      owner,
+      stepSeq,
+    };
+    let leaseClauses = "";
+    if (leaseOwner !== undefined && leaseToken !== undefined) {
+      leaseClauses = " AND g.lease_owner = @leaseOwner AND g.lease_token = @leaseToken";
+      bind.leaseOwner = leaseOwner;
+      bind.leaseToken = leaseToken;
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE goal_step
+         SET status = 'terminal'
+         WHERE goal_id = @goalId AND seq = @stepSeq AND status = 'running'
+           AND EXISTS (
+             SELECT 1 FROM goal g
+             WHERE g.id = @goalId AND g.owner = @owner${leaseClauses}
+           )`,
+      )
+      .run(bind);
+    return result.changes > 0;
+  }
+
+  /**
+   * Adds [delta] to the goal's `tokens_spent` and returns the new total
+   * (ownership-guarded, single statement). Per-goal token-budget ENFORCEMENT
+   * is M5 (plan §Milestones ▸M5); M2 only tracks spend.
+   */
+  addGoalTokens(goalId: string, owner: string, delta: number): number {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    if (!Number.isSafeInteger(delta) || delta < 0) {
+      throw new RangeError("addGoalTokens: delta must be a non-negative safe integer");
+    }
+    this.db
+      .prepare(
+        `UPDATE goal
+         SET tokens_spent = tokens_spent + @delta, updated_ts = @now
+         WHERE id = @id AND owner = @owner`,
+      )
+      .run({ id: goalId, owner, delta, now: this.now() });
+    return this.requireGoal(goalId).tokens_spent;
+  }
+
+  /**
+   * Step chaining CAS (Phase 3's documented owner of `running -> queued`):
+   * releases the step lease in the same statement and is guarded by the
+   * caller's lease halves — a control tool that already moved the goal (or a
+   * superseded runner) makes the CAS a no-op (`false`), never an overwrite.
+   * `pauseGoal` deliberately rejects `queued` as a target; this is the ONLY
+   * accessor that re-queues a running goal mid-loop.
+   */
+  chainGoal(
+    goalId: string,
+    owner: string,
+    leaseOwner: string,
+    leaseToken: string,
+  ): boolean {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    const result = this.db
+      .prepare(
+        `UPDATE goal
+         SET status = 'queued', lease_owner = NULL, lease_token = NULL,
+             lease_expiry = NULL, updated_ts = @now
+         WHERE id = @id AND owner = @owner AND status = 'running'
+           AND lease_owner = @leaseOwner AND lease_token = @leaseToken`,
+      )
+      .run({
+        id: goalId,
+        owner,
+        leaseOwner,
+        leaseToken,
+        now: this.now(),
+      });
+    return result.changes > 0;
+  }
+
+  /**
+   * Boot-recovery CAS (plan §Recovery): `running -> queued`, lease-agnostic —
+   * at boot EVERY persisted step lease is dead (single replica), so there is
+   * no live lease to fence against and M2 has no adopted mutations to
+   * process. Clears the stale lease columns in the same statement. Returns
+   * false when the goal already moved.
+   */
+  requeueGoal(goalId: string, owner: string): boolean {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    const result = this.db
+      .prepare(
+        `UPDATE goal
+         SET status = 'queued', lease_owner = NULL, lease_token = NULL,
+             lease_expiry = NULL, updated_ts = @now
+         WHERE id = @id AND owner = @owner AND status = 'running'`,
+      )
+      .run({ id: goalId, owner, now: this.now() });
+    return result.changes > 0;
+  }
+
+  // ------------------------------------------- Phase 3.3 control-tool accessors
+
+  /**
+   * Runs [fn] inside ONE better-sqlite3 transaction and returns its result.
+   * The Phase 3.3 control tools compose their message-log append + transition
+   * CAS + step-terminal flag through this seam, so a CAS miss (a superseded
+   * lease / an already-moved goal) rolls the WHOLE round back — the control
+   * tool's own message is never left behind. The accessors it calls may open
+   * their own transactions (`appendGoalMessage` does); better-sqlite3 nests
+   * them as SAVEPOINTs, so the outer scope still commits/rolls back atomically.
+   */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  /**
+   * Replaces the goal's todo list (`update_plan`'s second write — the
+   * todo-list progress channel, L3). ONE guarded statement, NO internal
+   * transaction, so the control tool composes it with its message-log append.
+   * The CAS is `status='running'` + the caller's lease halves when supplied;
+   * `false` means the goal already moved / the lease was superseded and the
+   * caller must roll its transaction back. `todos` is JSON-encoded verbatim.
+   */
+  setGoalTodos(
+    goalId: string,
+    owner: string,
+    todos: readonly unknown[],
+    leaseOwner?: string,
+    leaseToken?: string,
+  ): boolean {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    const hasLeaseOwner = leaseOwner !== undefined;
+    const hasLeaseToken = leaseToken !== undefined;
+    if (hasLeaseOwner !== hasLeaseToken) {
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        "leaseOwner and leaseToken must be supplied together",
+      );
+    }
+    const bind: Record<string, unknown> = {
+      goalId,
+      owner,
+      todos: JSON.stringify(todos),
+      now: this.now(),
+    };
+    let leaseClauses = "";
+    if (leaseOwner !== undefined && leaseToken !== undefined) {
+      leaseClauses = " AND lease_owner = @leaseOwner AND lease_token = @leaseToken";
+      bind.leaseOwner = leaseOwner;
+      bind.leaseToken = leaseToken;
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE goal
+         SET todos = @todos, updated_ts = @now
+         WHERE id = @goalId AND owner = @owner AND status = 'running'${leaseClauses}`,
+      )
+      .run(bind);
+    return result.changes > 0;
+  }
+
+  /**
+   * Records a step's measured token spend on its `goal_step` row (the Phase
+   * 3.6 GET step shape exposes `tokens`; `insertGoalStep` seeds 0 and the
+   * runner otherwise tracks spend only on the goal's `tokens_spent`, so
+   * without this every step would read 0). ONE guarded statement, NO internal
+   * transaction: scoped `goal_id` + `seq` + owner (plus the caller's lease
+   * halves when supplied, mirroring {@link markStepTerminal}). `false` means
+   * no matching step/owner/lease — the caller ignores it during bookkeeping.
+   */
+  updateStepTokens(
+    goalId: string,
+    owner: string,
+    stepSeq: number,
+    tokens: number,
+    leaseOwner?: string,
+    leaseToken?: string,
+  ): boolean {
+    this.requireOwnership(this.requireGoal(goalId), owner);
+    if (!Number.isSafeInteger(tokens) || tokens < 0) {
+      throw new RangeError(
+        "updateStepTokens: tokens must be a non-negative safe integer",
+      );
+    }
+    const hasLeaseOwner = leaseOwner !== undefined;
+    const hasLeaseToken = leaseToken !== undefined;
+    if (hasLeaseOwner !== hasLeaseToken) {
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        "leaseOwner and leaseToken must be supplied together",
+      );
+    }
+    const bind: Record<string, unknown> = { goalId, owner, stepSeq, tokens };
+    let leaseClauses = "";
+    if (leaseOwner !== undefined && leaseToken !== undefined) {
+      leaseClauses = " AND g.lease_owner = @leaseOwner AND g.lease_token = @leaseToken";
+      bind.leaseOwner = leaseOwner;
+      bind.leaseToken = leaseToken;
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE goal_step
+         SET tokens = @tokens
+         WHERE goal_id = @goalId AND seq = @stepSeq
+           AND EXISTS (
+             SELECT 1 FROM goal g
+             WHERE g.id = @goalId AND g.owner = @owner${leaseClauses}
+           )`,
+      )
+      .run(bind);
+    return result.changes > 0;
   }
 }

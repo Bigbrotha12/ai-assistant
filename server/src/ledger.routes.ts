@@ -8,6 +8,7 @@ import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
 import { accountDeletedResponse, keyGateResponse, requireApiKey } from "./api_key.ts";
 import { AccountDeletedError, isDeleting } from "./account_deletion.ts";
+import { GoalLedger } from "./goals/ledger.ts";
 import {
   Ledger,
   LedgerError,
@@ -46,6 +47,12 @@ export const ledger = new Ledger(ledgerDb, {
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,
   terminalRetentionMs: env.LEDGER_RETENTION_MS,
 });
+// The goal loop's accessor surface (Phase 3.1) over the SAME ledger DB —
+// `migrateLedger` above already ran the v9 goal DDL (`goals/migrate.ts` is
+// part of its migration list), so the tables exist before this constructs.
+// Single home beside `ledger`, mirroring its shape; the runner/routes consume
+// this export (the raw `ledgerDb` stays module-private).
+export const goalLedger = new GoalLedger(ledgerDb);
 // One-time startup orphan reconciliation: tasks left `running` by a crash or
 // restart with a lapsed lease / stale heartbeat become `stuck` before the
 // server accepts requests, so they can be resumed instead of lying false-stuck.

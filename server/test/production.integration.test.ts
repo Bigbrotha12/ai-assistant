@@ -6,6 +6,8 @@ import { test } from "node:test";
 import { Hono } from "hono";
 import type { ChatRoutesOptions } from "../src/transport/chat.ts";
 import type { JobRunnerDeps } from "../src/jobs/runner.ts";
+import type { GoalRunnerDeps } from "../src/goals/runner.ts";
+import type { GoalRoutesOptions } from "../src/goals/routes.ts";
 import type { BuildModelInput } from "../src/transport/model.ts";
 import type { ToolPluginDefinition } from "../src/plugins/types.ts";
 
@@ -90,6 +92,8 @@ test("production context config validates limits and warmups default off", () =>
 test("production boot shares phase 4 services and uses scoped model credentials", async (t) => {
   let chat!: ChatRoutesOptions;
   let runner!: JobRunnerDeps;
+  let goalRunnerDeps!: GoalRunnerDeps;
+  let goalRoutesOptions!: GoalRoutesOptions;
   let modelInput!: BuildModelInput;
   let fetchApp!: Hono["fetch"];
   let executorOptions: Record<string, unknown> = {};
@@ -133,7 +137,25 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     },
     "./ledger.routes.ts": {
       ledger: { close() {} },
+      goalLedger: { close() {} },
       createLedgerRoutes: () => new Hono(),
+    },
+    "./goals/runner.ts": {
+      createGoalRunner: (deps: GoalRunnerDeps) => {
+        goalRunnerDeps = deps;
+        return {
+          async resumeStuckGoals() {},
+          async dispose() { cleanup.push("goals"); },
+          abortOwner() {},
+          releaseGoalPinsForOwner() {},
+        };
+      },
+    },
+    "./goals/routes.ts": {
+      createGoalRoutes: (options: GoalRoutesOptions) => {
+        goalRoutesOptions = options;
+        return new Hono();
+      },
     },
     "./plugins/index.ts": { createPluginWiring: () => ({ registry, store }) },
     "./plugins/routes.ts": { createPluginRoutes: () => new Hono() },
@@ -189,6 +211,16 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     }
   });
   await import("../src/index.ts");
+  // Goal wiring (Phase 3): a DEDICATED budget (D10) and a DEDICATED pin store
+  // (3.2) — never the job/chat instances — and its routes are mounted.
+  assert.ok(goalRoutesOptions, "goal routes must be mounted when the runner wires");
+  assert.equal(goalRunnerDeps.registry, registry);
+  assert.equal(goalRunnerDeps.trustedHosts, environment.PLUGINS_TRUSTED_HOSTS);
+  assert.ok(goalRunnerDeps.budget);
+  assert.notEqual(goalRunnerDeps.budget, chat.budget);
+  assert.ok(goalRunnerDeps.pins);
+  assert.notEqual(goalRunnerDeps.pins, chat.pins);
+  assert.equal(goalRoutesOptions.pins, goalRunnerDeps.pins);
   assert.equal(runner.budget, chat.budget);
   // No checkpointer / thread locks / context manager are wired anymore: the
   // runner is fully stateless and the chat options carry none of them.
@@ -255,7 +287,7 @@ test("production boot shares phase 4 services and uses scoped model credentials"
   // then disposes services; the mock server.close never invokes its callback,
   // so the checkpoint-store/ledger close steps stay pending past this point.
   await disposersRan;
-  assert.deepEqual(cleanup, ["server", "runner", "watch", "cache"]);
+  assert.deepEqual(cleanup, ["server", "runner", "goals", "watch", "cache"]);
   // `cleanupAsync` logs the failure cause alongside the message (the old
   // synchronous seam dropped the error), so the captured call carries the
   // thrown Error as a second argument. Errors compare by name + message.
