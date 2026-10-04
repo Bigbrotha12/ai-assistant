@@ -153,8 +153,85 @@ export function buildControlTools(
     },
   });
 
-  return [updatePlan, goalComplete];
+  // Phase 5.1 (plan §Control tools): `goal_blocked` is the model's ONLY way to
+  // ask the user a question. It is structurally identical to `goal_complete`
+  // (append + lease-guarded CAS + step flag in ONE transaction) and differs
+  // only in the target: `running -> paused` with reason `needs_user_input` and
+  // the question, which the CAS both stores in `pause_question` AND leaves in
+  // the durable log — so a resume can rebuild the full conversation with the
+  // question and its answer both in context (plan §"The question survives").
+  //
+  // Pausing clears the lease (the plan's CAS), so the step ends here: the
+  // runner's post-invoke re-read sees a goal that is no longer `running` and
+  // persists NOTHING from the round, exactly as for `goal_complete`.
+  const goalBlocked = new DynamicStructuredTool({
+    name: "goal_blocked",
+    description:
+      "Pause the goal and ask the user a question you cannot answer yourself. " +
+      "`question` must be specific and self-contained — it is the only thing " +
+      "the user sees, so it must carry every detail they need to decide. The " +
+      "goal stops until they answer via resume.",
+    schema: z.object({
+      question: z
+        .string()
+        .describe(
+          "The question to put to the user. Self-contained: include the " +
+            "specific options or facts they need to choose.",
+        ),
+    }),
+    func: async ({ question }) => {
+      try {
+        goalLedger.transaction(() => {
+          // (1) The question is durable in the conversation log — this is
+          // what makes the resume context complete, not just `pause_question`.
+          goalLedger.appendGoalMessage(goalId, owner, {
+            role: "assistant",
+            content: { question },
+          });
+          // (2) Close the step BEFORE the pause CAS. Order matters: pausing
+          // CLEARS the lease columns, and `markStepTerminal`'s optional lease
+          // fence matches on them — so closing after the CAS would miss its own
+          // fence and silently leave the step `running`. While the lease is
+          // still live the fence proves this step owns the goal.
+          goalLedger.markStepTerminal(goalId, owner, stepSeq, leaseOwner, leaseToken);
+          // (3) CAS `running -> paused` with the typed reason + question in the
+          // same transaction; a miss throws and rolls the message + step close
+          // back with it.
+          goalLedger.pauseGoal(goalId, owner, {
+            next: "paused",
+            reason: "needs_user_input",
+            question,
+            leaseOwner,
+            leaseToken,
+          });
+        });
+        return JSON.stringify({ ok: true, status: "paused", reason: "needs_user_input" });
+      } catch (error) {
+        if (isControlCasMiss(error)) {
+          return JSON.stringify({
+            ok: false,
+            reason: "goal_no_longer_running",
+          });
+        }
+        throw error;
+      }
+    },
+  });
+
+  return [updatePlan, goalComplete, goalBlocked];
 }
+
+/**
+ * The control tools' wire names. The runner feeds this to BOTH tool channels:
+ * the MCP binder's `excludeToolNames` and the plugin-tool list handed to the
+ * graph, so neither channel can shadow a control tool with a same-named tool of
+ * its own (Phase 5.1).
+ */
+export const CONTROL_TOOL_NAMES = [
+  "update_plan",
+  "goal_complete",
+  "goal_blocked",
+] as const;
 
 /**
  * True for the expected "the guarded CAS did not match" errors — a

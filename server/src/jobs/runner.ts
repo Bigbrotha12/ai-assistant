@@ -403,14 +403,40 @@ export class ToolExecutor implements ToolCallHandler {
   }
 }
 
-/** Notification seam (Phase 5 wires the real ntfy push; no-op for now). */
+/**
+ * Notification seam. Two arms, one per runner: a completed JOB pushes its
+ * summary; a GOAL that paused or failed pushes its typed reason (Phase 5.5,
+ * plan L9). Both are optional on their runner deps and default to the no-op
+ * below, so a wiring without NOTIFY_BASE_URL stays silent.
+ *
+ * The goal arm lives on the job hook because they share ONE egress path: the
+ * same ntfy base URL, the same per-owner topic/credential lookup, and the same
+ * NOTIFY trust list. Duplicating that would mean two egress clients (two SSRF
+ * policy surfaces) for one configured target.
+ */
 export interface NotificationHook {
   notifyJobComplete(owner: string, taskId: string, summary: string): void | Promise<void>;
+  /**
+   * A goal left the loop needing the user. OPTIONAL so a job-only push target
+   * (or a test double) does not have to grow an arm it never uses; the goal
+   * runner falls back to its own no-op when it is absent. `status` is `paused`
+   * or `failed`; `reason` is the typed pause reason or the failure reason. Both
+   * arms receive no credential material — and the goal arm additionally
+   * receives NO instruction/question text, so a push can never leak goal
+   * content to a third-party service.
+   */
+  notifyGoalStopped?(
+    owner: string,
+    goalId: string,
+    status: "paused" | "failed",
+    reason: string,
+  ): void | Promise<void>;
 }
 
-/** Default: no-op. The real ntfy target resolution lands in Phase 5/6. */
+/** Default: no-op for both arms. */
 export const noopNotificationHook: NotificationHook = {
   notifyJobComplete() {},
+  notifyGoalStopped() {},
 };
 
 export type JobInput = Record<string, unknown> | null;

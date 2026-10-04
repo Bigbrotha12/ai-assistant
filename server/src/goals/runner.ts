@@ -25,8 +25,9 @@ import { CredentialPinError } from "../credentials/pins.ts";
 import { env } from "../env.ts";
 import { JobError } from "../jobs/errors.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
-import type { JobRunnerDeps } from "../jobs/runner.ts";
+import type { JobRunnerDeps, NotificationHook } from "../jobs/runner.ts";
 import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
+import { ContextBudgetError } from "../middleware/context.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { SentinelShadowSink } from "../sentinel/shadow.ts";
@@ -48,7 +49,10 @@ import {
   GOAL_SETUP_DEADLINE_MS,
   GOAL_STEP_LEASE_MS,
 } from "./constants.ts";
-import { buildControlTools as defaultBuildControlTools } from "./control.ts";
+import {
+  CONTROL_TOOL_NAMES,
+  buildControlTools as defaultBuildControlTools,
+} from "./control.ts";
 import type { GoalControlToolContext } from "./control.ts";
 import { parseAgentSnapshot } from "./agent_snapshot.ts";
 import type { GoalAgentSnapshot } from "./agent_snapshot.ts";
@@ -58,7 +62,8 @@ import {
   goalMessageToAppendInput,
   goalMessagesToBaseMessages,
 } from "./messages.ts";
-import type { GoalRow, GoalStepRow } from "./types.ts";
+import { GOAL_PAUSE_REASONS } from "./types.ts";
+import type { GoalPauseReason, GoalRow, GoalStepRow } from "./types.ts";
 
 export { GoalTerminalSignal } from "./errors.ts";
 export { GoalError } from "./errors.ts";
@@ -164,7 +169,25 @@ export type GoalRunnerDeps = {
    * tests may override to script a control transition.
    */
   buildControlTools?: (context: GoalControlToolContext) => StructuredToolInterface[];
-};
+  /**
+   * Phase 5.5 notification seam (plan L9). Fired when a goal leaves the running
+   * loop WITHOUT completing — a pause (it needs the user) or a failure — and
+   * only when that transition actually COMMITTED. Never for `complete` (the
+   * result is already in the log) and never for a cancel (the user asked for
+   * it).
+   *
+   * Fire-and-forget by design, and deliberately NOT the same as
+   * `JobRunner.notify`, which its own task awaits inside a try/catch. Here the
+   * push is also not tracked in `inFlight`: a push failure must not change the
+   * goal's durable outcome, and third-party egress stays off the step's critical
+   * path AND out of the shutdown budget. The consequence is explicit rather
+   * than inherited: a push still in flight when `dispose()` runs is detached —
+   * shutdown does not wait for it, so it is cut short when the process exits,
+   * and the hook (which swallows its own errors) is what keeps that orphan
+   * silent. Production wires the same ntfy hook as the job path.
+   */
+  notification?: NotificationHook;
+}
 
 /**
  * The M2 effective tool surface for MCP binding: the agent's allowlist
@@ -187,6 +210,25 @@ type GoalSetupValue = {
   mcpBinding?: McpBinding;
   agent: GoalAgentSnapshot;
 };
+
+/**
+ * How a step ended (Phase 5.2/5.4): a terminal `failed(<reason>)` or a
+ * resumable `paused(<reason>)`.
+ *
+ * The `paused` arm's `reason` is the TYPED [GoalPauseReason] union, which is
+ * also what `pauseGoal` validates — so the classifier and the wire vocabulary
+ * are one and the same (plan §Pause reasons). The `failed` arm carries the full
+ * wire string (`"<reason>: <message>"`), which is how M2's `failure_reason`
+ * detail reaches the client.
+ */
+type GoalStopOutcome =
+  | { readonly kind: "paused"; readonly reason: GoalPauseReason }
+  | { readonly kind: "failed"; readonly reason: string };
+
+/** True when [value] is a member of the closed pause-reason union. */
+function isGoalPauseReason(value: string): value is GoalPauseReason {
+  return (GOAL_PAUSE_REASONS as readonly string[]).includes(value);
+}
 
 const SETUP_TIMED_OUT = Symbol("goal-setup-timeout");
 /** Setup was abandoned because the runner's step controller aborted (dispose or
@@ -274,6 +316,13 @@ export class GoalRunner {
     if (!entry || entry.owner !== goal.owner) {
       entry = { owner: goal.owner, handles: {} };
       this.goalPins.set(goalId, entry);
+    }
+    const registered = entry.handles[pluginId];
+    if (registered !== undefined && registered !== handle) {
+      // Overwriting would strand the previous handle in the pin STORE for the
+      // full pin TTL (a resume re-credentials a goal that may still carry a
+      // stale admission handle): release it as it is replaced.
+      this.deps.pins.release(entry.owner, pluginId, registered);
     }
     entry.handles[pluginId] = handle;
   }
@@ -468,26 +517,39 @@ export class GoalRunner {
       });
 
       if (step.seq > GOAL_MAX_STEPS) {
-        this.failGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, "step_cap_exceeded");
+        this.stopGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, {
+          kind: "failed",
+          reason: "step_cap_exceeded",
+        });
         return;
       }
-      if (this.now() - goal.created_ts > GOAL_MAX_WALL_CLOCK_MS) {
-        this.failGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, "wall_clock_exceeded");
+      // 5.2 per-RUN wall clock, anchored at `run_started_ts` (stamped on the first
+      // claim of this run; the row just came back from `claimGoal`, so it is
+      // always set here). A goal resumed after a long wait gets a fresh budget.
+      if (this.now() - this.runStartedAt(goal) > GOAL_MAX_WALL_CLOCK_MS) {
+        this.stopGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, {
+          kind: "paused",
+          reason: "wall_clock_exceeded",
+        });
         return;
       }
       if (noProgressSteps >= GOAL_MAX_NO_PROGRESS_STEPS) {
-        this.failGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, "no_progress");
+        this.stopGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, {
+          kind: "paused",
+          reason: "no_progress",
+        });
         return;
       }
 
       const execution = createTrackedExecution(signal);
 
       // ── 2. Setup under the wait-race (3.8): model + pins + bindings before
-      //    any model call. A timeout FAILS the goal `failed(setup_timeout)` —
-      //    M2 has no pause machinery — and abandons the losing promise. The
-      //    4.7 resolver signal seam (aborted controller + `raceWithSignal`)
-      //    settles that abandoned setup with an `AbortError`; the underlying
-      //    DNS query is not cancelled, but nothing awaits it anymore.
+      //    any model call. A timeout PAUSES the goal `paused(setup_timeout)`
+      //    (5.2: a bound violation is resumable, not terminal) and abandons the
+      //    losing promise. The 4.7 resolver signal seam (aborted controller +
+      //    `raceWithSignal`) settles that abandoned setup with an `AbortError`;
+      //    the underlying DNS query is not cancelled, but nothing awaits it
+      //    anymore.
       const setupPromise = this.setupGoalStep(goal, signal, execution, step.seq)
         .then((value) => ({ kind: "ready" as const, value }))
         .catch((error: unknown) => ({ kind: "error" as const, error }));
@@ -517,27 +579,27 @@ export class GoalRunner {
         void setupPromise.then((late) => {
           if (late.kind === "ready") void late.value.mcpBinding?.dispose().catch(() => {});
         });
-        this.failGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, "setup_timeout");
+        this.stopGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, {
+          kind: "paused",
+          reason: "setup_timeout",
+        });
         return;
       }
       if (outcome.kind === "error") {
-        // M3 restart-pause mapping (D8): a credentials failure — the RAM-only
-        // lease registry is empty after a restart, or a pin lapsed — PAUSES
-        // the goal `paused(credentials_required)` instead of failing it: the
-        // goal re-credentials via resume rather than dying or spinning. Every
-        // other setup violation still terminates `failed(...)`.
-        if (isCredentialsSetupError(outcome.error)) {
-          this.pauseGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken);
-        } else {
-          this.failGoalStep(
-            goalId,
-            owner,
-            step.seq,
-            leaseOwner,
-            leaseToken,
-            setupFailureReasonOf(outcome.error),
-          );
-        }
+        // M3 restart-pause mapping (D8): a setup error is classified by
+        // `setupFailureOutcomeOf` — a credentials failure (the RAM-only lease
+        // registry is empty after a restart, or a pin lapsed) and every other
+        // reason on the plan's pause-reason list PAUSE the goal so the client
+        // can re-credential or resume; everything else stays terminal
+        // `failed(<reason>)`.
+        this.stopGoalStep(
+          goalId,
+          owner,
+          step.seq,
+          leaseOwner,
+          leaseToken,
+          setupFailureOutcomeOf(outcome.error),
+        );
         return;
       }
       const { model, tools, mcpBinding: binding, agent } = outcome.value;
@@ -560,7 +622,17 @@ export class GoalRunner {
       const graph = createAgentGraph({
         model,
         tools: [
-          ...tools,
+          // Phase 5.1: the control tools are authoritative on THIS channel.
+          // `bindPluginTools` dedupes only *within* the plugin set and
+          // `bindMcpServers` gets `excludeToolNames`, so a granted plugin
+          // exposing a tool literally named `goal_complete` / `goal_blocked` /
+          // `update_plan` is the one remaining way a duplicate name reaches
+          // `ToolNode` — the model could then reach the plugin's `func`
+          // instead of the control tool and the goal would never pause or
+          // complete. Drop the plugin namesake; the control tool below wins.
+          ...tools.filter(
+            (tool) => !(CONTROL_TOOL_NAMES as readonly string[]).includes(tool.name),
+          ),
           ...(mcpBinding?.tools ?? []),
           ...controlTools,
         ],
@@ -681,6 +753,15 @@ export class GoalRunner {
           console.warn(
             `[goals] goal ${goalId} left 'running' during its step; output round not chained`,
           );
+          // A control tool committed during the round. `goal_blocked` is a
+          // pause that NEEDS THE USER and no other path announces it (the
+          // step-end CAS is a documented no-op, not a transition of ours), so
+          // push here — gated on `paused`, which keeps `goal_complete` and the
+          // user's cancel silent exactly as the contract requires.
+          const moved = this.deps.goalLedger.getGoal(goalId);
+          if (moved?.status === "paused" && moved.pause_reason !== null) {
+            this.notifyGoalStopped(goalId, owner, "paused", moved.pause_reason);
+          }
         }
       }
     } catch (error) {
@@ -734,9 +815,12 @@ export class GoalRunner {
     }
     this.budget.beforeModelCall(owner, "async");
     this.deps.goalLedger.renewGoalLease(goalId, owner, leaseOwner, leaseToken);
-    if (this.now() - current.created_ts > GOAL_MAX_WALL_CLOCK_MS) {
-      this.failGoalStep(goalId, owner, stepSeq, leaseOwner, leaseToken, "wall_clock_exceeded");
-      throw new GoalTerminalSignal(goalId, "failed");
+    if (this.now() - this.runStartedAt(current) > GOAL_MAX_WALL_CLOCK_MS) {
+      this.stopGoalStep(goalId, owner, stepSeq, leaseOwner, leaseToken, {
+        kind: "paused",
+        reason: "wall_clock_exceeded",
+      });
+      throw new GoalTerminalSignal(goalId, "paused");
     }
     markModelCall();
   }
@@ -799,6 +883,17 @@ export class GoalRunner {
   }
 
   /**
+   * Phase 5.2 per-run wall-clock anchor: `goal.run_started_ts`, stamped by
+   * `claimGoal` on the first claim of a run. Falls back to `created_ts` ONLY for
+   * a row whose anchor is somehow NULL (a pre-5.2 row, or a direct read
+   * outside the claim pass) — that keeps the bound finite rather than letting a
+   * NULL anchor disable it silently.
+   */
+  private runStartedAt(goal: GoalRow): number {
+    return goal.run_started_ts ?? goal.created_ts;
+  }
+
+  /**
    * L12 step-end guard: pauses the goal `needs_mutation_resolution` instead of
    * chaining when `effectState` is `unknown` (any `pending`/`unresolved`
    * mutation — Phase 6 rows; "do not chain", plan §Step lifecycle #6). Uses the
@@ -820,6 +915,15 @@ export class GoalRunner {
         leaseOwner,
         leaseToken,
       });
+      // This pause never routes through `stopGoalStep`, so it announces itself:
+      // a goal waiting on the user's resolution of an unknown mutation is
+      // exactly the `paused` push plan L9 asks for.
+      this.notifyGoalStopped(
+        goalId,
+        owner,
+        "paused",
+        "needs_mutation_resolution",
+      );
       return true;
     } catch (err) {
       if (
@@ -836,60 +940,88 @@ export class GoalRunner {
     }
   }
 
-  /** Step failure: close the step and fail the goal `failed(<reason>)`. */
-  private failGoalStep(
+  /**
+   * Close the step and move the goal to its typed outcome (Phase 5.2/5.4):
+   * `paused(<reason>)` when the outcome is one of [GOAL_PAUSE_REASONS] — a
+   * RESUMABLE pause the client re-credentials or answers and continues from —
+   * `failed(<reason>)` otherwise.
+   *
+   * Every caller states the outcome explicitly (Phase 5.4); there is no second
+   * string vocabulary to keep in sync. The plan's own split (§Global bounds +
+   * §Pause reasons):
+   *
+   * - pause: `setup_timeout`, `budget_exhausted`, `wall_clock_exceeded`,
+   *   `context_overflow`, `no_progress`, `credentials_required`,
+   *   `missing_capability`.
+   * - fail: `step_cap_exceeded` (the total-step budget is spent — a resume
+   *   cannot buy more steps), and every setup/setup-failure reason that is not
+   *   on the pause list (e.g. `read_only_invariant_violation`,
+   *   `invalid_agent_snapshot`), which are terminal by construction.
+   *
+   * The push fires ONLY when the transition committed: a CAS miss means some
+   * other actor already moved the goal — a cancel the user asked for, an
+   * account deletion — and the notification contract forbids pushing for those.
+   */
+  private stopGoalStep(
     goalId: string,
     owner: string,
     stepSeq: number,
     leaseOwner: string,
     leaseToken: string,
-    failureReason: string,
+    outcome: GoalStopOutcome,
   ): void {
+    let committed = false;
     try {
       this.deps.goalLedger.markStepTerminal(goalId, owner, stepSeq, leaseOwner, leaseToken);
-      this.deps.goalLedger.transitGoal(goalId, owner, {
-        next: "failed",
-        failureReason,
-        leaseOwner,
-        leaseToken,
-      });
+      if (outcome.kind === "paused") {
+        this.deps.goalLedger.transitGoal(goalId, owner, {
+          next: "paused",
+          reason: outcome.reason,
+          leaseOwner,
+          leaseToken,
+        });
+      } else {
+        this.deps.goalLedger.transitGoal(goalId, owner, {
+          next: "failed",
+          failureReason: outcome.reason,
+          leaseOwner,
+          leaseToken,
+        });
+      }
+      committed = true;
     } catch (err) {
       if (!(err instanceof GoalError && err.code === "GOAL_INVALID_TRANSITION")) {
-        console.warn(`[goals] failed to fail goal ${goalId}:`, err);
+        console.warn(`[goals] failed to stop goal ${goalId} (${outcome.reason}):`, err);
       }
     }
+    // Deliberately unconditional (unlike the push below): releasing is
+    // idempotent, and on a lost CAS the actor that won the race has usually
+    // released already — never releasing would strand a credential pin for the
+    // full pin TTL.
     this.releaseGoalPin(goalId);
+    if (committed) {
+      this.notifyGoalStopped(goalId, owner, outcome.kind, outcome.reason);
+    }
   }
 
   /**
-   * M3 restart-pause mapping (D8): close the step and pause the goal
-   * `paused(credentials_required)`. The D8 credential lease is RAM-only, so
-   * after a restart the `goalPins` registry is empty and the re-claimed goal
-   * pauses for re-credentialing instead of failing — L1's restart-resume
-   * (plan §Restart pause mapping): pause, not fail, and no spin. The
-   * lease-guarded CAS clears the lease, exactly like a control-tool pause.
+   * Phase 5.5: announce a pause/failure to the owner's push channel. Swallows
+   * its own errors (a failed push never rewrites the goal's durable outcome) and
+   * never awaits — see [GoalRunnerDeps.notification].
    */
-  private pauseGoalStep(
+  private notifyGoalStopped(
     goalId: string,
     owner: string,
-    stepSeq: number,
-    leaseOwner: string,
-    leaseToken: string,
+    status: "paused" | "failed",
+    reason: string,
   ): void {
-    try {
-      this.deps.goalLedger.markStepTerminal(goalId, owner, stepSeq, leaseOwner, leaseToken);
-      this.deps.goalLedger.transitGoal(goalId, owner, {
-        next: "paused",
-        reason: "credentials_required",
-        leaseOwner,
-        leaseToken,
+    const notify = this.deps.notification?.notifyGoalStopped;
+    if (notify === undefined) return;
+    void Promise.resolve()
+      .then(() => notify.call(this.deps.notification, owner, goalId, status, reason))
+      .catch((err) => {
+        console.warn(`[goals] notification hook failed for goal ${goalId}:`, err);
       });
-    } catch (err) {
-      if (!(err instanceof GoalError && err.code === "GOAL_INVALID_TRANSITION")) {
-        console.warn(`[goals] failed to pause goal ${goalId} for credentials:`, err);
-      }
-    }
-    this.releaseGoalPin(goalId);
   }
 
   // ------------------------------------------------------------------ setup
@@ -1054,7 +1186,18 @@ export class GoalRunner {
         trackUntil: (run, maxDurationMs) => {
           void execution.trackUntil(run, maxDurationMs);
         },
-        excludeToolNames: new Set(pluginTools.map((tool) => tool.name)),
+        // Phase 5.1: the control-tool names join the plugin-tool names in the
+        // MCP exclusion set. An MCP server exposing a tool literally named
+        // `goal_blocked` / `goal_complete` / `update_plan` would otherwise
+        // shadow the real control tool — the model would call the wrong `func`
+        // and the goal would never pause or complete. The control tools are
+        // authoritative, so the MCP namesake is dropped. (`excludeToolNames` is
+        // `bindMcpServers`-only; the same drop for PLUGIN tools happens where
+        // the graph's `tools` array is assembled — see runStep §3.)
+        excludeToolNames: new Set([
+          ...pluginTools.map((tool) => tool.name),
+          ...CONTROL_TOOL_NAMES,
+        ]),
         allowTools: effectiveAllowlist,
         duplicateLogPrefix: "[goals]",
       });
@@ -1190,9 +1333,10 @@ export class GoalRunner {
     for (const goal of this.deps.goalLedger.listRunningGoals()) {
       if (goal.owner !== owner) continue;
       try {
+        // No pause reason: `cancelled` is a terminal status, not a pause (Phase 5.2's
+        // validation rejects a reason on any non-paused transition).
         this.deps.goalLedger.transitGoal(goal.id, owner, {
           next: "cancelled",
-          reason: "account_deleted",
         });
       } catch (err) {
         console.warn(`[goals] failed to cancel goal ${goal.id} on deletion:`, err);
@@ -1342,31 +1486,57 @@ async function waitRace<T>(
 }
 
 /**
- * True when a setup error is a credentials failure — the M3 restart-pause
- * mapping (D8) pauses the goal `credentials_required` instead of failing it.
+ * Phase 5.4 (plan M3): map a setup error to the outcome its reason implies.
+ * The reason strings are the plan's own vocabulary, and the classifier is the
+ * CLOSED [GOAL_PAUSE_REASONS] union itself (via [stopOutcomeOf]): a bare reason
+ * on that list becomes a typed PAUSE, anything else stays a terminal
+ * `failed(<reason>: <message>)` with the message preserved for the client.
+ * There is no second set to keep in sync — that drift is what silently
+ * degraded pauses to `failed(...)` before this became structured.
+ *
+ * This also folds the M3 restart-pause mapping (D8) in: a credentials failure —
+ * `CredentialPinError`, a `GoalSetupError` already spelling
+ * `credentials_required`, or the `JobError("credentials_expired")` a resumed
+ * goal reaches after a restart wipes the RAM-only pin registry — maps to
+ * `paused(credentials_required)`, so the goal re-credentials via resume rather
+ * than dying or spinning.
  */
-function isCredentialsSetupError(error: unknown): boolean {
-  if (error instanceof CredentialPinError) return true;
-  if (error instanceof GoalSetupError) {
-    return error.failureReason.startsWith("credentials_required");
+function setupFailureOutcomeOf(error: unknown): GoalStopOutcome {
+  const message = redactForOutbound(errorMessageOf(error));
+  if (error instanceof CredentialPinError) return stopOutcomeOf(`credentials_required: ${message}`);
+  if (error instanceof GoalSetupError) return stopOutcomeOf(error.failureReason);
+  // A missing model build / plugin is a CAPABILITY gap, not a transient fault:
+  // the goal pauses `missing_capability` and resumes once the plugin is set up,
+  // instead of dying on a configuration the user can fix.
+  if (error instanceof JobError) {
+    if (error.code === "credentials_expired") {
+      return stopOutcomeOf(`credentials_required: ${message}`);
+    }
+    if (error.code === "plugin_unavailable") return stopOutcomeOf(`missing_capability: ${message}`);
+    if (error.code === "budget_exhausted") return stopOutcomeOf(`budget_exhausted: ${message}`);
+    if (error.code === "context_length_exceeded") {
+      return stopOutcomeOf(`context_overflow: ${message}`);
+    }
+    return stopOutcomeOf(`${error.code}: ${message}`);
   }
-  return false;
+  if (error instanceof AccountDeletedError) return stopOutcomeOf(`cancelled: ${message}`);
+  if (error instanceof BudgetExhaustedError) return stopOutcomeOf(`budget_exhausted: ${message}`);
+  if (error instanceof ContextBudgetError) return stopOutcomeOf(`context_overflow: ${message}`);
+  return stopOutcomeOf(`setup_failed: ${message}`);
 }
 
 /**
- * Wire `failureReason` for a setup error (M3: bound/setup violations still
- * TERMINATE the goal; only credentials failures pause). Credentials failures
- * must "mention credentials" (WIRE_SPEC: `failureReason` is how the client
- * sees them).
+ * Split a `"<reason>: <message>"` wire string (or a bare reason) into its
+ * outcome: `paused(<reason>)` when the bare reason is a [GoalPauseReason],
+ * `failed(<whole string>)` otherwise — so the message survives exactly on the
+ * terminal path, where WIRE_SPEC §12's `failureReason` carries it.
  */
-function setupFailureReasonOf(error: unknown): string {
-  const message = redactForOutbound(errorMessageOf(error));
-  if (error instanceof CredentialPinError) return `credentials_required: ${message}`;
-  if (error instanceof GoalSetupError) return error.failureReason;
-  if (error instanceof JobError) return `${error.code}: ${message}`;
-  if (error instanceof AccountDeletedError) return `cancelled: ${message}`;
-  if (error instanceof BudgetExhaustedError) return `budget_exhausted: ${message}`;
-  return `setup_failed: ${message}`;
+function stopOutcomeOf(wire: string): GoalStopOutcome {
+  const colon = wire.indexOf(":");
+  const reason = colon === -1 ? wire : wire.slice(0, colon);
+  return isGoalPauseReason(reason)
+    ? { kind: "paused", reason }
+    : { kind: "failed", reason: wire };
 }
 
 function errorMessageOf(error: unknown): string {

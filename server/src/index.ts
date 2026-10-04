@@ -360,6 +360,19 @@ try {
     // M1: periodic pin GC; the claim timer also sweeps.
     sweepIntervalMs: 60_000,
     shadowReporter: sentinelShadowReporter,
+    // 5.5 (plan L9): push on `paused`/terminal so a backgrounded goal that
+    // needs the user announces itself. The SAME ntfy hook the job path uses —
+    // one NOTIFY_BASE_URL, one egress client, one trust list. Empty
+    // NOTIFY_BASE_URL (the default) makes it a silent no-op, exactly as for
+    // jobs. Deliberately NOT fired for `complete` (the result is in the log the
+    // user reads) or `cancelled` (they asked for it).
+    notification: createNtfyNotificationHook({
+      store: notifyStore,
+      baseUrl: env.NOTIFY_BASE_URL,
+      // Admin-vouched ntfy hosts (private-range bypass + production http:
+      // carve-out), scoped to notify egress only.
+      trustedHosts: env.NOTIFY_TRUSTED_HOSTS,
+    }),
   });
   // Boot recovery (plan §Recovery): every persisted step lease is dead at
   // boot — interrupted steps are marked terminal and `running` goals are

@@ -15,11 +15,12 @@ import type { CredentialPin } from "../../src/credentials/pins.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import { GOAL_MAX_CONCURRENT_PER_OWNER } from "../../src/goals/constants.ts";
 import { GoalLedger } from "../../src/goals/ledger.ts";
+import { GoalError } from "../../src/goals/errors.ts";
 import { createGoalRoutes } from "../../src/goals/routes.ts";
 import { createGoalRunner } from "../../src/goals/runner.ts";
 import type { GoalRunner } from "../../src/goals/runner.ts";
 import type { GoalRow } from "../../src/goals/types.ts";
-import { migrateLedger } from "../../src/ledger.ts";
+import { migrateLedger, PUBLIC_TASK_SPEC_MAX_BYTES } from "../../src/ledger.ts";
 import type { PluginRegistry } from "../../src/plugins/registry.ts";
 import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
 
@@ -641,5 +642,541 @@ describe("goal routes — POST /v1/goals/:id/cancel", () => {
       .listGoalSteps(goalId)
       .find((row) => row.seq === step.seq);
     assert.equal(closed?.status, "terminal");
+  });
+});
+
+/** Puts an admitted goal into `paused(needs_user_input)` with a live question. */
+async function pauseGoal(
+  app: Hono,
+  goalLedger: GoalLedger,
+  overrides: Record<string, unknown> = {},
+): Promise<string> {
+  const res = await postGoal(app, { clientGoalId: `pause-${Math.random()}`, ...overrides });
+  assert.equal(res.status, 201);
+  const { goalId } = (await res.json()) as PostBody;
+  const claimed = goalLedger.claimGoal(goalId, "user-1");
+  goalLedger.appendGoalMessage(goalId, "user-1", {
+    role: "assistant",
+    content: { question: "high protein?" },
+  });
+  goalLedger.pauseGoal(goalId, "user-1", {
+    next: "paused",
+    reason: "needs_user_input",
+    question: "high protein?",
+    leaseOwner: "user-1",
+    leaseToken: claimed.lease_token!,
+  });
+  return goalId;
+}
+
+describe("goal routes — POST /v1/goals/:id/resume (5.1)", () => {
+  test("resume re-pins, appends the durable answer, and requeues", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "yes, high protein, no shellfish",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "queued");
+    // The answered question is cleared — the client must stop offering it.
+    assert.equal(row.pause_reason, null);
+    assert.equal(row.pause_question, null);
+    // The next claim starts a FRESH run's clock.
+    assert.equal(row.run_started_ts, null);
+
+    // The answer is durable, after the question: question and answer both in
+    // context for the next step (plan §"The question survives").
+    const messages = goalLedger.listGoalMessages(goalId);
+    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user"]);
+    assert.equal(JSON.parse(messages[2]!.content_json), "yes, high protein, no shellfish");
+
+    // A NEW credential handle was minted and registered for the goal.
+    assert.equal(pins.pinCalls.length, 2);
+    assert.doesNotThrow(() => pins.get("user-1", "openrouter"));
+    // …and the STALE admission handle the paused goal still carried in the
+    // runner registry is released as it is overwritten — otherwise it would
+    // sit in the pin store for the full TTL.
+    assert.ok(
+      pins.releaseCalls.some((call) => call.handle === pins.pinCalls[0]!.handle),
+      `the replaced admission pin must be released; ` +
+        `released=${JSON.stringify(pins.releaseCalls)}`,
+    );
+  });
+
+  test("resume of a non-paused goal is 409 goal_not_resumable", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody; // still queued
+
+    const attempt = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "hello",
+        credentials: { openrouter: { apiKey: "sk" } },
+      }),
+    });
+    assert.equal(attempt.status, 409);
+    assert.deepEqual(await attempt.json(), { error: "goal_not_resumable" });
+    // A refused resume appends nothing.
+    assert.equal(goalLedger.listGoalMessages(goalId).length, 1);
+  });
+
+  test("a resume without credentials is 400 and does not requeue", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ answer: "yes" }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(goalLedger.listGoalMessages(goalId).length, 2);
+  });
+
+  test("resume is owner-scoped and auth-gated", async (t) => {
+    const { app, goalLedger, goalRunner, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+
+    const denied = makeApp(
+      t,
+      async () => ({ ok: false as const, reason: "bad_key" as const }),
+    );
+    const unauth = await denied.app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ answer: "x", credentials: { openrouter: { apiKey: "k" } } }),
+    });
+    assert.equal(unauth.status, 401);
+
+    const intruder = new Hono();
+    intruder.route(
+      "/v1",
+      createGoalRoutes({
+        goalLedger,
+        goalRunner,
+        pins,
+        resolveAgent: async () => mealieAgent,
+        verifyKey: async () => ({ ok: true as const, owner: "intruder" }),
+      }),
+    );
+    const crossOwner = await intruder.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ answer: "x", credentials: { openrouter: { apiKey: "k" } } }),
+    });
+    assert.equal(crossOwner.status, 404);
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+  });
+});
+
+describe("goal routes — GET /v1/goals + DELETE (5.3)", () => {
+  test("list returns the owner's goals newest-first with paging headers", async (t) => {
+    const { app } = makeApp(t);
+    const first = (await (await postGoal(app, { clientGoalId: "a" })).json()) as PostBody;
+    const second = (await (await postGoal(app, { clientGoalId: "b" })).json()) as PostBody;
+
+    const res = await app.request("/v1/goals", { headers: auth });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { goals: { goalId: string; canResume: boolean }[] };
+    assert.deepEqual(body.goals.map((g) => g.goalId), [second.goalId, first.goalId]);
+    assert.equal(res.headers.get("x-ledger-page-limit"), "50");
+    assert.equal(res.headers.get("x-ledger-next-offset"), null);
+    assert.equal(body.goals[0]!.canResume, false);
+
+    // Paging: a 1-item page reports a next offset.
+    const page = await app.request("/v1/goals?limit=1", { headers: auth });
+    const pageBody = (await page.json()) as { goals: { goalId: string }[] };
+    assert.equal(pageBody.goals.length, 1);
+    assert.equal(pageBody.goals[0]!.goalId, second.goalId);
+    assert.equal(page.headers.get("x-ledger-next-offset"), "1");
+
+    const second_page = await app.request("/v1/goals?limit=1&offset=1", { headers: auth });
+    const secondBody = (await second_page.json()) as { goals: { goalId: string }[] };
+    assert.deepEqual(secondBody.goals.map((g) => g.goalId), [first.goalId]);
+  });
+
+  test("list status filter and invalid query are 400-free / 400 respectively", async (t) => {
+    const { app } = makeApp(t);
+    await postGoal(app, { clientGoalId: "a" });
+
+    const filtered = await app.request("/v1/goals?status=queued", { headers: auth });
+    const filteredBody = (await filtered.json()) as { goals: unknown[] };
+    assert.equal(filtered.status, 200);
+    assert.equal(filteredBody.goals.length, 1);
+
+    const none = await app.request("/v1/goals?status=complete", { headers: auth });
+    assert.equal(((await none.json()) as { goals: unknown[] }).goals.length, 0);
+
+    assert.equal((await app.request("/v1/goals?status=bogus", { headers: auth })).status, 400);
+    assert.equal((await app.request("/v1/goals?limit=0", { headers: auth })).status, 400);
+    assert.equal((await app.request("/v1/goals?limit=999", { headers: auth })).status, 400);
+    assert.equal((await app.request("/v1/goals?offset=-1", { headers: auth })).status, 400);
+    assert.equal((await app.request("/v1/goals?limit=abc", { headers: auth })).status, 400);
+  });
+
+  test("list is owner-scoped and never leaks another owner's goals", async (t) => {
+    const { app, goalLedger, goalRunner, pins } = makeApp(t);
+    await postGoal(app, { clientGoalId: "mine" });
+
+    const intruder = new Hono();
+    intruder.route(
+      "/v1",
+      createGoalRoutes({
+        goalLedger,
+        goalRunner,
+        pins,
+        resolveAgent: async () => mealieAgent,
+        verifyKey: async () => ({ ok: true as const, owner: "intruder" }),
+      }),
+    );
+    const res = await intruder.request("/v1/goals", { headers: auth });
+    assert.equal(res.status, 200);
+    assert.deepEqual(((await res.json()) as { goals: unknown[] }).goals, []);
+  });
+
+  test("delete removes a terminal goal and every child row", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody;
+    goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.insertGoalStep(goalId, "user-1", { kind: "model", mutating: false });
+    goalLedger.transitGoal(goalId, "user-1", { next: "complete", summary: "done" });
+
+    const del = await app.request(`/v1/goals/${goalId}`, {
+      method: "DELETE",
+      headers: auth,
+    });
+    assert.equal(del.status, 204);
+    assert.equal(goalLedger.getGoal(goalId), undefined);
+    for (const table of ["goal_step", "goal_message"]) {
+      const { n } = db
+        .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE goal_id = ?`)
+        .get(goalId) as { n: number };
+      assert.equal(n, 0, `${table} rows must be deleted`);
+    }
+    // The write-once triggers are RESTORED after the drop-and-recreate, so the
+    // table protects itself again. Probed on a FRESH goal: the deleted goal's row
+    // is gone, and `goal_message.goal_id` references `goal(id)`, so a probe
+    // message under the deleted id would fail the FK check instead.
+    const probe = (await (await postGoal(app, { clientGoalId: "probe" })).json()) as PostBody;
+    db.prepare(
+      `INSERT INTO goal_message
+         (id, goal_id, seq, role, content_json, created_ts)
+       VALUES ('m-probe', ?, 2, 'user', '"probe"', ?)`,
+    ).run(probe.goalId, EPOCH);
+    assert.throws(
+      () => db.prepare("DELETE FROM goal_message WHERE id = 'm-probe'").run(),
+      /append.only/i,
+      "the append-only DELETE trigger must be back after deleteGoal",
+    );
+  });
+
+  test("delete of a LIVE goal is 409 goal_not_deletable (cancel first)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody;
+
+    const del = await app.request(`/v1/goals/${goalId}`, { method: "DELETE", headers: auth });
+    assert.equal(del.status, 409);
+    assert.deepEqual(await del.json(), { error: "goal_not_deletable" });
+    assert.ok(goalLedger.getGoal(goalId), "the goal survives the refusal");
+
+    // Paused is also live: cancel is required first.
+    goalLedger.claimGoal(goalId, "user-1");
+    const claimed = goalLedger.getGoal(goalId)!;
+    goalLedger.pauseGoal(goalId, "user-1", {
+      next: "paused",
+      reason: "credentials_required",
+      leaseOwner: "user-1",
+      leaseToken: claimed.lease_token!,
+    });
+    const paused = await app.request(`/v1/goals/${goalId}`, { method: "DELETE", headers: auth });
+    assert.equal(paused.status, 409);
+  });
+
+  test("delete is owner-scoped and auth-gated", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody;
+    goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.transitGoal(goalId, "user-1", {
+      next: "complete",
+      summary: "done",
+      leaseOwner: "user-1",
+      leaseToken: goalLedger.getGoal(goalId)!.lease_token!,
+    });
+
+    const denied = makeApp(
+      t,
+      async () => ({ ok: false as const, reason: "bad_key" as const }),
+    );
+    assert.equal(
+      (await denied.app.request(`/v1/goals/${goalId}`, { method: "DELETE", headers: auth })).status,
+      401,
+    );
+    assert.ok(goalLedger.getGoal(goalId), "the goal survives an unauthorized delete");
+  });
+});
+
+/** Every trigger name currently defined on the shared database. */
+function triggerNames(db: Database.Database): string[] {
+  return (
+    db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+      .all() as { name: string }[]
+  ).map((row) => row.name);
+}
+
+describe("goal routes — Phase 5 review regressions", () => {
+  test("a resume that loses the CAS releases the pin IT minted (5.1)", async (t) => {
+    const { app, db, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+    // A paused row still carrying a lease is exactly what `resumeGoal`'s CAS
+    // refuses (`AND lease_owner IS NULL`), so the resume loses after the pin
+    // was minted and before it was registered with the runner.
+    db.prepare(
+      "UPDATE goal SET lease_owner = 'someone', lease_token = 'tok' WHERE id = ?",
+    ).run(goalId);
+
+    const mintedBefore = pins.pinCalls.length;
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "hello",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), { error: "goal_not_resumable" });
+
+    assert.equal(pins.pinCalls.length, mintedBefore + 1, "resume minted one pin");
+    const minted = pins.pinCalls[pins.pinCalls.length - 1]!.handle;
+    assert.ok(
+      pins.releaseCalls.some((call) => call.handle === minted),
+      `the newly minted handle must be released, not a stale registry entry; ` +
+        `released=${JSON.stringify(pins.releaseCalls)}`,
+    );
+    // Nothing durable changed: still paused, no answer appended.
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(goalLedger.listGoalMessages(goalId).length, 2);
+  });
+
+  test("a resume that throws rolls back the pin too, with ITS code (5.1, 4)", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+    const original = goalLedger.resumeGoal.bind(goalLedger);
+    goalLedger.resumeGoal = () => {
+      throw new GoalError("GOAL_INVALID_TRANSITION", "forced failure");
+    };
+    let res: Response;
+    try {
+      res = await app.request(`/v1/goals/${goalId}/resume`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({
+          answer: "hello",
+          credentials: { openrouter: { apiKey: "sk-resumed" } },
+        }),
+      });
+    } finally {
+      goalLedger.resumeGoal = original;
+    }
+
+    assert.equal(res!.status, 409);
+    // NOT `goal_not_cancellable`: the mapper's invalid-transition code comes
+    // from the route that caught it.
+    assert.deepEqual(await res!.json(), { error: "goal_not_resumable" });
+    const minted = pins.pinCalls[pins.pinCalls.length - 1]!.handle;
+    assert.ok(
+      pins.releaseCalls.some((call) => call.handle === minted),
+      "the minted pin is released on the throw path as well",
+    );
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+  });
+
+  test("a FAILED delete never leaves the write-once triggers dropped (5.3)", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody;
+    goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.transitGoal(goalId, "user-1", { next: "complete", summary: "done" });
+
+    const guardsBefore = triggerNames(db);
+    assert.ok(guardsBefore.includes("goal_message_append_only_delete"));
+    assert.ok(guardsBefore.includes("goal_refusal_append_only_delete"));
+
+    // Poison the parent delete so every DELETE inside `deleteGoal` throws
+    // mid-way — the DROP TRIGGER statements must roll back WITH it, or one
+    // failed delete disarms the append-only invariant process-wide.
+    db.exec(
+      "CREATE TRIGGER goal_delete_poison BEFORE DELETE ON goal " +
+        "BEGIN SELECT RAISE(ABORT, 'poisoned'); END",
+    );
+    const guardsWithPoison = triggerNames(db).sort();
+    try {
+      const del = await app.request(`/v1/goals/${goalId}`, {
+        method: "DELETE",
+        headers: auth,
+      });
+      assert.equal(del.status, 500);
+      assert.deepEqual(await del.json(), { error: "internal" });
+
+      assert.deepEqual(
+        triggerNames(db).sort(),
+        guardsWithPoison,
+        "both append-only guards must survive a failed delete",
+      );
+      assert.ok(guardsWithPoison.includes("goal_message_append_only_delete"));
+      assert.ok(guardsWithPoison.includes("goal_refusal_append_only_delete"));
+      assert.ok(goalLedger.getGoal(goalId), "the goal survives the failed delete");
+
+      // And the guard still refuses a real message delete afterwards.
+      const probe = (await (
+        await postGoal(app, { clientGoalId: "guard-probe" })
+      ).json()) as PostBody;
+      db.prepare(
+        `INSERT INTO goal_message
+           (id, goal_id, seq, role, content_json, created_ts)
+         VALUES ('m-guard-probe', ?, 2, 'user', '"probe"', ?)`,
+      ).run(probe.goalId, EPOCH);
+      assert.throws(
+        () => db.prepare("DELETE FROM goal_message WHERE id = 'm-guard-probe'").run(),
+        /append.only/i,
+        "the write-once invariant is still enforced",
+      );
+    } finally {
+      db.exec("DROP TRIGGER goal_delete_poison");
+    }
+  });
+
+  test("a mid-delete invalid transition reports goal_not_deletable (5.3)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody;
+    goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.transitGoal(goalId, "user-1", {
+      next: "complete",
+      summary: "done",
+      leaseOwner: "user-1",
+      leaseToken: goalLedger.getGoal(goalId)!.lease_token!,
+    });
+
+    const original = goalLedger.deleteGoal.bind(goalLedger);
+    goalLedger.deleteGoal = () => {
+      throw new GoalError("GOAL_INVALID_TRANSITION", "not terminal");
+    };
+    let del: Response;
+    try {
+      del = await app.request(`/v1/goals/${goalId}`, { method: "DELETE", headers: auth });
+    } finally {
+      goalLedger.deleteGoal = original;
+    }
+
+    assert.equal(del!.status, 409);
+    // NOT `goal_not_cancellable` — each route names its own refusal.
+    assert.deepEqual(await del!.json(), { error: "goal_not_deletable" });
+    assert.ok(goalLedger.getGoal(goalId));
+  });
+
+  test("the list carries pauseQuestion so a paused goal can be rendered (5.3)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const pausedId = await pauseGoal(app, goalLedger);
+    await postGoal(app, { clientGoalId: "queued-for-list" });
+
+    const res = await app.request("/v1/goals", { headers: auth });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      goals: {
+        goalId: string;
+        pauseReason: string | null;
+        pauseQuestion: string | null;
+        canResume: boolean;
+      }[];
+    };
+    const paused = body.goals.find((goal) => goal.goalId === pausedId)!;
+    assert.equal(paused.pauseReason, "needs_user_input");
+    assert.equal(paused.pauseQuestion, "high protein?", "the list alone drives the resume flow");
+    assert.equal(paused.canResume, true);
+    for (const goal of body.goals) {
+      if (goal.goalId === pausedId) continue;
+      assert.equal(goal.pauseQuestion, null, "no question without a needs_user_input pause");
+    }
+  });
+
+  test("resume respects the per-owner admission cap (429 busy)", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger); // a paused goal holds no slot
+    for (let i = 0; i < GOAL_MAX_CONCURRENT_PER_OWNER; i++) {
+      const queued = await postGoal(app, { clientGoalId: `cap-${i}` });
+      assert.equal(queued.status, 201);
+    }
+
+    const mintedBefore = pins.pinCalls.length;
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "yes",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 429);
+    assert.deepEqual(await res.json(), {
+      error: "busy",
+      message: "goal concurrency limit reached",
+    });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(
+      pins.pinCalls.length,
+      mintedBefore,
+      "a capped resume never mints a pin",
+    );
+  });
+
+  test("answer takes the same bound as instruction (5.1)", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+    const mintedBefore = pins.pinCalls.length;
+
+    const oversized = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "a".repeat(PUBLIC_TASK_SPEC_MAX_BYTES + 1),
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(oversized.status, 413);
+    assert.deepEqual(await oversized.json(), { error: "request_too_large" });
+
+    // Control characters (newlines included) are refused exactly as the
+    // admission route refuses a multi-line `instruction`.
+    const controlChar = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "line one\nline two",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(controlChar.status, 400);
+    assert.deepEqual(await controlChar.json(), { error: "invalid_request" });
+
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(goalLedger.listGoalMessages(goalId).length, 2, "no answer was written");
+    assert.equal(pins.pinCalls.length, mintedBefore, "a refused answer never mints a pin");
   });
 });

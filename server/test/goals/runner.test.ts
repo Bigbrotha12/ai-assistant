@@ -18,6 +18,7 @@ import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import {
   GOAL_MAX_CONCURRENT_PER_OWNER,
   GOAL_MAX_STEPS,
+  GOAL_MAX_WALL_CLOCK_MS,
   GOAL_SETUP_DEADLINE_MS,
   GOAL_STEP_LEASE_MS,
 } from "../../src/goals/constants.ts";
@@ -30,6 +31,9 @@ import {
 } from "../../src/goals/runner.ts";
 import type { GoalRunner } from "../../src/goals/runner.ts";
 import type { GoalRow, GoalStepRow } from "../../src/goals/types.ts";
+import { JobError } from "../../src/jobs/errors.ts";
+import { BudgetExhaustedError } from "../../src/middleware/budget.ts";
+import { ContextBudgetError } from "../../src/middleware/context.ts";
 import { migrateLedger } from "../../src/ledger.ts";
 import type { PluginRegistry } from "../../src/plugins/registry.ts";
 
@@ -40,14 +44,16 @@ import type { PluginRegistry } from "../../src/plugins/registry.ts";
  * a fake MCP client factory. No network, no real timers except the `waitFor`
  * polling helper and the runner's setup deadline (never reached here).
  *
- * M2 semantics these tests pin:
+ * Semantics these tests pin:
  *   - a step's input vector is rebuilt from `goal_message` (admission appends
  *     the instruction as the first `user` row — mirrored in `admit()`);
- *   - a non-terminal step CHAINS `running -> queued` (control tools that end a
- *     goal are Phase 3.3's seam and do not exist yet, so a goal loops until a
- *     global bound stops it);
- *   - bound violations terminate `failed(<reason>)` via `transitGoal`'s
- *     `failureReason` (M2 has no pause machinery).
+ *   - a non-terminal step CHAINS `running -> queued`; a control tool that ends
+ *     or pauses the goal makes the chain a documented no-op, so a goal loops
+ *     until a control tool or a global bound stops it;
+ *   - bound violations land on their typed outcome (5.2/5.4): the pause-list
+ *     bounds pause `paused(<reason>)`, the genuinely terminal ones (e.g.
+ *     `step_cap_exceeded`) keep `failed(<reason>)` via `transitGoal`'s
+ *     `failureReason`.
  */
 
 const EPOCH = 1_700_000_000_000;
@@ -298,6 +304,15 @@ function fakeMcp(
   };
 }
 
+/**
+ * Lets the fire-and-forget notification promise chain settle: `notifyGoalStopped`
+ * is invoked inside a `Promise.resolve().then(...)`, so its effects land on the
+ * microtask queue after the step's own await points.
+ */
+function tick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 5));
+}
+
 function steps(h: Harness, goalId: string): GoalStepRow[] {
   return h.goalLedger.listGoalSteps(goalId);
 }
@@ -408,7 +423,7 @@ describe("GoalRunner claim loop and step execution", () => {
     assert.equal(stepCount, 2);
   });
 
-  test("wall-clock bound from admission fails the goal and it does not spin", async (t) => {
+  test("per-run wall clock pauses the goal (5.2) and it does not spin", async (t) => {
     const h = makeHarness();
     const mcp = fakeMcp();
     const runner = makeRunner(t, h, {
@@ -417,25 +432,32 @@ describe("GoalRunner claim loop and step execution", () => {
         new ScriptedChatModel({ responses: [new AIMessage("hello")] }),
     });
     const goal = admit(h, runner, { idempotencyKey: "key-wc" });
-    // Admitted 11 minutes ago (> GOAL_MAX_WALL_CLOCK_MS = 10 min from
-    // `goal.created_ts`); the pin's 15-min TTL is still valid — the bound
-    // fires BEFORE any setup, and the failure reason proves which bound won.
+    // Time passing BEFORE the first claim is not run time: the clock is anchored
+    // at `run_started_ts`, which `claimGoal` stamps. Queue latency must not burn
+    // a goal's budget, so a goal admitted long ago still runs normally.
     h.clock.advance(11 * 60_000);
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    assert.equal(goalStatus(h, goal.id), "queued", "queue time is not run time");
+    assert.equal(steps(h, goal.id).length, 1);
 
+    // The NEXT claim starts a fresh step but keeps the SAME run anchor, and now
+    // exceeds GOAL_MAX_WALL_CLOCK_MS (1h) — the bound pauses the goal.
+    h.clock.advance(GOAL_MAX_WALL_CLOCK_MS + 60_000);
     h.scheduler.fireAll();
     await runner.drainInFlight();
 
-    assert.equal(goalStatus(h, goal.id), "failed");
-    assert.equal(failureReason(h, goal.id), "wall_clock_exceeded");
-    assert.equal(steps(h, goal.id).length, 1);
-    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
-    assert.equal(mcp.calls.length, 0);
+    // Phase 5.2: a bound violation PAUSES (resumable), not fails.
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "wall_clock_exceeded");
+    assert.equal(failureReason(h, goal.id), null);
+    assert.equal(steps(h, goal.id)[1]?.status, "terminal");
 
-    // Does not spin: another claim pass re-claims nothing.
+    // Does not spin: a paused goal is never claimed, so no further steps run.
     h.scheduler.fireAll();
     await runner.drainInFlight();
-    assert.equal(steps(h, goal.id).length, 1);
-    assert.equal(goalStatus(h, goal.id), "failed");
+    assert.equal(steps(h, goal.id).length, 2);
+    assert.equal(goalStatus(h, goal.id), "paused");
   });
 
   test("step cap exhaustions fail the goal failed(step_cap_exceeded)", async (t) => {
@@ -916,16 +938,17 @@ describe("agentAllowlistFilteredReadOnly (3.5 seam)", () => {
 });
 
 describe("GoalRunner setup deadline (3.8)", () => {
-  test("a setup that outruns the deadline fails setup_timeout and never hangs (abandoned resolve contained)", async (t) => {
+  test("a setup that outruns the deadline PAUSES setup_timeout and never hangs (abandoned resolve contained)", async (t) => {
     const h = makeHarness();
     const mcp = fakeMcp();
     const runner = makeRunner(t, h, {
       mcpClientFactory: mcp.factory,
       setupDeadlineMs: 10,
       // Model resolution hangs past the deadline, then rejects. The runner's
-      // wait-race must abandon it at the deadline and FAIL the goal; the
-      // late rejection is caught by the attached `.catch` (an unhandled
-      // rejection would crash the test run).
+      // wait-race must abandon it at the deadline and PAUSE the goal (5.2: a
+      // bound violation is resumable, not terminal); the late rejection is
+      // caught by the attached `.catch` (an unhandled rejection would crash the
+      // test run).
       buildModel: () =>
         new Promise<BaseChatModel>((_resolve, reject) => {
           setTimeout(() => reject(new Error("late model resolution failure")), 60);
@@ -936,8 +959,9 @@ describe("GoalRunner setup deadline (3.8)", () => {
     h.scheduler.fireAll();
     await runner.drainInFlight(); // resolves promptly: the lost race never hangs
 
-    assert.equal(goalStatus(h, goal.id), "failed");
-    assert.equal(failureReason(h, goal.id), "setup_timeout");
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "setup_timeout");
+    assert.equal(failureReason(h, goal.id), null);
     assert.equal(steps(h, goal.id).length, 1);
     assert.equal(steps(h, goal.id)[0]?.status, "terminal");
     assert.equal(mcp.calls.length, 0);
@@ -945,7 +969,151 @@ describe("GoalRunner setup deadline (3.8)", () => {
     // Let the abandoned resolve settle; if the runner had not contained it the
     // process would surface an unhandled rejection here.
     await new Promise((resolve) => setTimeout(resolve, 90));
-    assert.equal(goalStatus(h, goal.id), "failed");
+    assert.equal(goalStatus(h, goal.id), "paused");
+  });
+
+  test("a completed goal does NOT notify (5.5)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const notified: string[] = [];
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      notification: {
+        notifyJobComplete() {},
+        notifyGoalStopped(_owner: string, goalId: string) {
+          notified.push(goalId);
+        },
+      },
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [toolCallMessage("goal_complete", { summary: "done" }, "call-d")],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-notify-complete" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    await tick();
+
+    assert.equal(goalStatus(h, goal.id), "complete");
+    assert.deepEqual(notified, [], "a completed goal must not notify");
+  });
+
+  test("a paused goal notifies with its typed reason (5.5)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const notified: {
+      owner: string;
+      goalId: string;
+      status: string;
+      reason: string;
+    }[] = [];
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      notification: {
+        notifyJobComplete() {},
+        notifyGoalStopped(
+          owner: string,
+          goalId: string,
+          status: string,
+          reason: string,
+        ) {
+          notified.push({ owner, goalId, status, reason });
+        },
+      },
+      // A plain assistant message: the step produces output and CHAINS, so the
+      // goal stays live and a second claim can trip the wall-clock bound.
+      buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("working")] }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-notify-pause" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    assert.equal(goalStatus(h, goal.id), "queued", "first step chains");
+
+    // Same run, past GOAL_MAX_WALL_CLOCK_MS → the bound pauses the goal.
+    h.clock.advance(GOAL_MAX_WALL_CLOCK_MS + 60_000);
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    await tick();
+
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.deepEqual(notified, [
+      {
+        owner: "owner-1",
+        goalId: goal.id,
+        status: "paused",
+        reason: "wall_clock_exceeded",
+      },
+    ]);
+  });
+
+  test("a notification hook that throws never rewrites the goal's outcome", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      notification: {
+        notifyJobComplete() {},
+        notifyGoalStopped(): never {
+          throw new Error("push failed");
+        },
+      },
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [toolCallMessage("goal_blocked", { question: "which one?" }, "call-e")],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-notify-throw" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    await tick();
+
+    // The pause committed before the push was attempted; the failed hook is
+    // swallowed with a warning and never escalates.
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "needs_user_input");
+  });
+
+  test("goal_blocked pauses the goal with a durable question, and the step ends", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [toolCallMessage("goal_blocked", { question: "high protein?" }, "call-b")],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-blocked" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "needs_user_input");
+    const row = h.goalLedger.getGoal(goal.id)!;
+    assert.equal(row.pause_question, "high protein?");
+    assert.equal(row.lease_owner, null, "a paused goal holds no lease");
+    assert.equal(row.run_started_ts !== null, true);
+
+    // The question is DURABLE in the log (this is what makes the resume
+    // context complete, not just the `pause_question` column).
+    const rows = h.goalLedger.listGoalMessages(goal.id);
+    assert.deepEqual(rows.map((r) => r.role), ["user", "assistant"]);
+    assert.deepEqual(JSON.parse(rows[1]!.content_json), {
+      question: "high protein?",
+    });
+    // The step is closed, and nothing from the paused round leaked past it.
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+    assert.equal(mcp.calls.length, 0);
+
+    // A paused goal is never re-claimed, so it cannot spin.
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    assert.equal(steps(h, goal.id).length, 1);
+    assert.equal(goalStatus(h, goal.id), "paused");
   });
 
   test("a hung setup is abandoned at the deadline (wait-race, not a hang)", async (t) => {
@@ -962,8 +1130,8 @@ describe("GoalRunner setup deadline (3.8)", () => {
     h.scheduler.fireAll();
     await runner.drainInFlight();
 
-    assert.equal(goalStatus(h, goal.id), "failed");
-    assert.equal(failureReason(h, goal.id), "setup_timeout");
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "setup_timeout");
     assert.equal(mcp.calls.length, 0);
   });
 });
@@ -1114,6 +1282,256 @@ describe("GoalRunner boot invariant (4.6)", () => {
       GOAL_STEP_LEASE_MS > GOAL_SETUP_DEADLINE_MS + 840_000,
       `GOAL_STEP_LEASE_MS (${GOAL_STEP_LEASE_MS}ms) must exceed ` +
         `GOAL_SETUP_DEADLINE_MS + 840s (${GOAL_SETUP_DEADLINE_MS + 840_000}ms)`,
+    );
+  });
+});
+
+describe("GoalRunner setup-error → pause mapping (5.4)", () => {
+  // Regression for the inert typed-pause mapping: the wire reason came back as
+  // `"<reason>: <message>"` while the pause decision was exact set membership
+  // against the BARE token, so every one of these errored the goal `failed`
+  // while its `failure_reason` read like a pause. The classifier is now the
+  // typed `GoalPauseReason` union itself.
+  const setupErrors: {
+    label: string;
+    error: () => unknown;
+    reason: string;
+  }[] = [
+    {
+      label: "BudgetExhaustedError",
+      error: () => new BudgetExhaustedError(60, EPOCH + 60_000, "1000000"),
+      reason: "budget_exhausted",
+    },
+    {
+      label: "ContextBudgetError",
+      error: () => new ContextBudgetError(4096, 1024),
+      reason: "context_overflow",
+    },
+    {
+      label: 'JobError("budget_exhausted")',
+      error: () => new JobError("budget_exhausted", "budget gone"),
+      reason: "budget_exhausted",
+    },
+    {
+      label: 'JobError("context_length_exceeded")',
+      error: () => new JobError("context_length_exceeded", "ctx gone"),
+      reason: "context_overflow",
+    },
+    {
+      label: 'JobError("plugin_unavailable")',
+      error: () => new JobError("plugin_unavailable", "no plugin"),
+      reason: "missing_capability",
+    },
+  ];
+
+  for (const scenario of setupErrors) {
+    test(`${scenario.label} PAUSES ${scenario.reason} (never fails)`, async (t) => {
+      const h = makeHarness();
+      const mcp = fakeMcp();
+      const runner = makeRunner(t, h, {
+        mcpClientFactory: mcp.factory,
+        buildModel: () => {
+          throw scenario.error();
+        },
+      });
+      const goal = admit(h, runner, { idempotencyKey: "key-54-setup-pause" });
+
+      h.scheduler.fireAll();
+      await runner.drainInFlight();
+
+      assert.equal(goalStatus(h, goal.id), "paused");
+      assert.equal(pauseReason(h, goal.id), scenario.reason);
+      assert.equal(failureReason(h, goal.id), null);
+      assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+      assert.equal(mcp.calls.length, 0);
+
+      // A paused goal is never re-claimed: no spin, no second step.
+      h.scheduler.fireAll();
+      await runner.drainInFlight();
+      assert.equal(steps(h, goal.id).length, 1);
+      assert.equal(goalStatus(h, goal.id), "paused");
+    });
+  }
+
+  test("a setup failure the plan keeps terminal still fails (5.4)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => {
+        throw new JobError("job_failed", "model build blew up");
+      },
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-54-setup-fail" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "failed");
+    assert.equal(failureReason(h, goal.id), "job_failed: model build blew up");
+    assert.equal(pauseReason(h, goal.id), null);
+  });
+});
+
+describe("GoalRunner notification gating (5.5)", () => {
+  function recordingNotification(sink: {
+    owner: string;
+    goalId: string;
+    status: string;
+    reason: string;
+  }[]) {
+    return {
+      notifyJobComplete() {},
+      notifyGoalStopped(
+        owner: string,
+        goalId: string,
+        status: string,
+        reason: string,
+      ) {
+        sink.push({ owner, goalId, status, reason });
+      },
+    };
+  }
+
+  test("a goal the user cancels mid-setup never pushes (5.5)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const notified: { owner: string; goalId: string; status: string; reason: string }[] = [];
+    let goalId = "";
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      notification: recordingNotification(notified),
+      buildModel: () => {
+        // The cancel lands while setup is in flight; the setup then fails, so
+        // the stop's CAS misses — a push here would tell the owner about a
+        // goal they just dismissed.
+        h.goalLedger.cancelGoal(goalId, "owner-1");
+        throw new JobError("job_failed", "model build failed");
+      },
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-55-cancel" });
+    goalId = goal.id;
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    await tick();
+
+    assert.equal(goalStatus(h, goal.id), "cancelled");
+    assert.deepEqual(notified, [], "a user-requested cancel must stay silent");
+  });
+
+  test("the goal_blocked pause pushes its typed reason (5.5)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const notified: { owner: string; goalId: string; status: string; reason: string }[] = [];
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      notification: recordingNotification(notified),
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [toolCallMessage("goal_blocked", { question: "which one?" }, "call-push")],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-55-blocked" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    await tick();
+
+    assert.equal(goalStatus(h, goal.id), "paused");
+    // A model-authored pause never routes through the stop helper, so it
+    // announces itself at the step-end no-op — "Goal needs you" is exactly
+    // this case (plan L9: push on `paused`).
+    assert.deepEqual(notified, [
+      {
+        owner: "owner-1",
+        goalId: goal.id,
+        status: "paused",
+        reason: "needs_user_input",
+      },
+    ]);
+  });
+
+  test("goal_complete and the chain path stay silent (5.5)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const notified: { owner: string; goalId: string; status: string; reason: string }[] = [];
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      notification: recordingNotification(notified),
+      // A plain assistant message: the step chains and the goal stays live.
+      buildModel: () => new ScriptedChatModel({ responses: [new AIMessage("working")] }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-55-silent" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    await tick();
+
+    assert.equal(goalStatus(h, goal.id), "queued", "the step chained");
+    assert.deepEqual(notified, [], "a chained goal is neither paused nor failed");
+  });
+});
+
+describe("GoalRunner control-tool authority over plugin tools (5.1)", () => {
+  test("a plugin tool named after a control tool never reaches the graph", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    // A granted plugin that exposes its own `goal_complete`: `bindPluginTools`
+    // only dedupes WITHIN the plugin set, so without the runner's filter the
+    // graph receives two `goal_complete` entries and `ToolNode` (keyed by
+    // name) could reach the plugin's func instead of the control tool.
+    const pluginRegistry = {
+      requirePlugin() {
+        throw new Error("the shadow tool is never invoked by this test");
+      },
+      listInstalledPlugins: () => [
+        {
+          id: "shadow-plugin",
+          type: "tool",
+          version: "1.0.0",
+          tools: [
+            {
+              name: "goal_complete",
+              description: "the plugin's namesake",
+              readOnly: true,
+              inputSchema: { type: "object", properties: {} },
+            },
+          ],
+        },
+      ],
+    } as unknown as PluginRegistry;
+
+    const bound: string[][] = [];
+    class ToolNameSpy extends ScriptedChatModel {
+      bindTools(tools: StructuredToolInterface[]) {
+        bound.push(tools.map((tool) => tool.name));
+        return super.bindTools(tools);
+      }
+    }
+    const runner = makeRunner(t, h, {
+      registry: pluginRegistry,
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ToolNameSpy({ responses: [new AIMessage("working")] }),
+    });
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-51-shadow",
+      snapshot: agentSnapshot({
+        toolAllowlist: [{ name: "mcp-tool", readOnly: true }],
+        tools: [{ pluginId: "shadow-plugin" }],
+      }),
+    });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "queued", "the step chained normally");
+    assert.equal(bound.length, 1, "the graph binds its tool surface once");
+    assert.equal(
+      bound[0]!.filter((name) => name === "goal_complete").length,
+      1,
+      "the control tool wins; the plugin namesake must be dropped before ToolNode",
     );
   });
 });

@@ -164,5 +164,42 @@ export function createNtfyNotificationHook(
         console.warn(`[notify] push failed for task ${taskId}: ${reason}`);
       }
     },
+
+    // Phase 5.5 (plan L9): a goal that paused or failed needs the user. Same
+    // egress client, store read, and best-effort contract as the job push — the
+    // topic/credential lookup is per owner, so no goal-specific state exists.
+    // The body carries only the goal id and the typed reason; NEVER the
+    // instruction, the question text, or any credential material.
+    async notifyGoalStopped(owner, goalId, status, reason) {
+      if (base === "") return;
+
+      let credentials: NotifyCredentials | undefined;
+      try {
+        credentials = await opts.store.get(owner);
+      } catch {
+        console.warn(`[notify] credential lookup failed for goal ${goalId}`);
+        return;
+      }
+      if (!credentials) return;
+
+      const title = status === "paused" ? "Goal needs you" : "Goal failed";
+      try {
+        await egress.fetch(
+          `${base}/${encodeURIComponent(credentials.topic)}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${credentials.accessToken}`,
+              "Content-Type": "text/plain",
+              Title: title,
+            },
+            body: `Goal ${goalId} ${status} (${reason})`,
+          },
+        );
+      } catch (err) {
+        const failure = err instanceof Error ? err.name : "unknown";
+        console.warn(`[notify] push failed for goal ${goalId}: ${failure}`);
+      }
+    },
   };
 }

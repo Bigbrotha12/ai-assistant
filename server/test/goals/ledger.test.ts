@@ -232,7 +232,7 @@ describe("GoalLedger.pauseGoal", () => {
     assert.equal(
       ledger.pauseGoal(goal.id, "owner-1", {
         next: "paused",
-        reason: "needs_input",
+        reason: "needs_user_input",
         question: "which flight?",
         summary: "reached a fork",
         leaseOwner: "owner-1",
@@ -243,7 +243,7 @@ describe("GoalLedger.pauseGoal", () => {
 
     const row = readGoal(db, goal.id);
     assert.equal(row.status, "paused");
-    assert.equal(row.pause_reason, "needs_input");
+    assert.equal(row.pause_reason, "needs_user_input");
     assert.equal(row.pause_question, "which flight?");
     assert.equal(row.result_summary, "reached a fork");
     assert.equal(row.lease_owner, null, "paused goal holds no lease");
@@ -279,6 +279,7 @@ describe("GoalLedger.pauseGoal", () => {
       () =>
         ledger.pauseGoal(goal.id, "owner-1", {
           next: "paused",
+          reason: "credentials_required",
           leaseOwner: "owner-1",
           leaseToken: "wrong-token",
         }),
@@ -288,6 +289,7 @@ describe("GoalLedger.pauseGoal", () => {
 
     ledger.pauseGoal(goal.id, "owner-1", {
       next: "paused",
+      reason: "credentials_required",
       leaseOwner: "owner-1",
       leaseToken: claimed.lease_token!,
     });
@@ -295,6 +297,7 @@ describe("GoalLedger.pauseGoal", () => {
       () =>
         ledger.pauseGoal(goal.id, "owner-1", {
           next: "paused",
+          reason: "credentials_required",
           leaseOwner: "owner-1",
           leaseToken: claimed.lease_token!,
         }),
@@ -366,6 +369,7 @@ describe("GoalLedger.pauseGoal", () => {
       ).run(goal.id, JSON.stringify("hello"), EPOCH);
       ledger.pauseGoal(goal.id, "owner-1", {
         next: "paused",
+        reason: "credentials_required",
         leaseOwner: "owner-1",
         leaseToken: claimed.lease_token!,
       });
@@ -390,6 +394,7 @@ describe("GoalLedger.pauseGoal", () => {
           ).run(goal.id, JSON.stringify("hello"), EPOCH);
           ledger.pauseGoal(goal.id, "owner-1", {
             next: "paused",
+            reason: "setup_timeout",
             leaseOwner: "owner-1",
             leaseToken: "wrong-token",
           });
@@ -405,6 +410,78 @@ describe("GoalLedger.pauseGoal", () => {
       "the message insert must roll back with the failed pause",
     );
     assert.equal(readGoal(db, goal.id).status, "running");
+  });
+});
+
+describe("GoalLedger.resumeGoal", () => {
+  test("appends the durable answer and requeues paused -> queued atomically", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    ledger.claimGoal(goal.id, "owner-1");
+    const claimed = readGoal(db, goal.id);
+    ledger.appendGoalMessage(goal.id, "owner-1", {
+      role: "assistant",
+      content: { question: "which flight?" },
+    });
+    ledger.pauseGoal(goal.id, "owner-1", {
+      next: "paused",
+      reason: "needs_user_input",
+      question: "which flight?",
+      leaseOwner: "owner-1",
+      leaseToken: claimed.lease_token!,
+    });
+
+    ledger.resumeGoal(goal.id, "owner-1", "the 8am one");
+
+    const row = readGoal(db, goal.id);
+    assert.equal(row.status, "queued");
+    assert.equal(row.pause_reason, null, "the answered prompt is cleared");
+    assert.equal(row.pause_question, null);
+    assert.equal(row.run_started_ts, null, "the next claim starts a fresh run");
+    const messages = readMessages(db, goal.id);
+    assert.equal(messages.at(-1)!.role, "user");
+    assert.equal(contentOf(messages.at(-1)!), "the 8am one");
+  });
+
+  test("a refused resume appends NOTHING even without a caller transaction (5.1)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    ledger.claimGoal(goal.id, "owner-1");
+    const claimed = readGoal(db, goal.id);
+    ledger.pauseGoal(goal.id, "owner-1", {
+      next: "paused",
+      reason: "needs_user_input",
+      question: "which flight?",
+      leaseOwner: "owner-1",
+      leaseToken: claimed.lease_token!,
+    });
+    // A paused row that still carries a lease is the CAS refusal case — and
+    // this call deliberately has NO route-level `transaction(...)` around it:
+    // atomicity must not be caller-dependent. A `false` return (the old
+    // contract) would let `appendGoalMessage`'s own transaction COMMIT the
+    // answer onto a goal that never resumed, leaving the log with an answer to
+    // a question the user was never shown.
+    db.prepare(
+      "UPDATE goal SET lease_owner = 'someone', lease_token = 'tok' WHERE id = ?",
+    ).run(goal.id);
+    const messagesBefore = readMessages(db, goal.id).length;
+
+    assert.throws(
+      () => ledger.resumeGoal(goal.id, "owner-1", "the 8am one"),
+      (error: unknown) =>
+        error instanceof GoalError && error.code === "GOAL_INVALID_TRANSITION",
+      "a lost CAS is classified, not swallowed",
+    );
+
+    assert.equal(
+      readMessages(db, goal.id).length,
+      messagesBefore,
+      "the answer rolled back with the refused resume",
+    );
+    const row = readGoal(db, goal.id);
+    assert.equal(row.status, "paused");
+    assert.equal(row.pause_reason, "needs_user_input");
+    assert.equal(row.pause_question, "which flight?");
   });
 });
 
@@ -771,7 +848,7 @@ describe("GoalLedger.countActiveGoals", () => {
 
     const paused = seedGoal(ledger, "o1", "paused");
     ledger.claimGoal(paused.id, "o1");
-    ledger.pauseGoal(paused.id, "o1", { next: "paused" });
+    ledger.pauseGoal(paused.id, "o1", { next: "paused", reason: "needs_mutation_resolution" });
 
     const complete = seedGoal(ledger, "o1", "complete");
     ledger.claimGoal(complete.id, "o1");

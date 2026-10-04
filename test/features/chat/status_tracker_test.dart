@@ -5,7 +5,9 @@ import 'package:ai_assistant/features/chat/data/status_tracker.dart'
     show StatusTracker, statusPhraseForError, ackPhrases, stillWorkingPhrases,
     domainPhrases, defaultDomainPhrases, authErrorPhrases, serverErrorPhrases,
     networkErrorPhrases, pendingErrorPhrases, verifyEmailPhrases,
-    accountDeletedPhrases, noModelPhrases, toolsUnavailablePhrases;
+    accountDeletedPhrases, noModelPhrases, toolsUnavailablePhrases,
+    goalNotResumablePhrases, goalNotCancellablePhrases, goalNotDeletablePhrases,
+    backgroundAllowlistPhrases;
 import 'package:ai_assistant/features/plugins/data/managed_error_codes.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -554,6 +556,57 @@ void main() {
       expect(phrase, isNot(anyOf(serverErrorPhrases)));
     });
 
+    // Goal lifecycle (Phase 3.6). Each maps to its own copy and NEVER to the
+    // generic server phrase: all three are state refusals whose resolution is
+    // known, so "please try again" would be actively wrong.
+    test('goal phrase for goal_not_resumable', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.goalNotResumable,
+          statusCode: 409,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(goalNotResumablePhrases));
+      expect(phrase, isNot(anyOf(serverErrorPhrases)));
+    });
+
+    test('goal phrase for goal_not_cancellable', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.goalNotCancellable,
+          statusCode: 409,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(goalNotCancellablePhrases));
+      expect(phrase, isNot(anyOf(serverErrorPhrases)));
+    });
+
+    test('goal phrase for goal_not_deletable', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.goalNotDeletable,
+          statusCode: 409,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(goalNotDeletablePhrases));
+      expect(phrase, isNot(anyOf(serverErrorPhrases)));
+    });
+
+    test('background phrase for agent_tool_allowlist_background_unsupported', () {
+      final phrase = statusPhraseForError(
+        const PluginClientException(
+          ManagedErrorCodes.agentToolAllowlistBackgroundUnsupported,
+          statusCode: 400,
+        ),
+        random: Random(42),
+      );
+      expect(phrase, anyOf(backgroundAllowlistPhrases));
+      expect(phrase, isNot(anyOf(serverErrorPhrases)));
+    });
+
     test('server phrase for reconcile_required (fallback)', () {
       final phrase = statusPhraseForError(
         const PluginClientException(ManagedErrorCodes.reconcileRequired),
@@ -592,6 +645,37 @@ void main() {
       expect(
         safePluginErrorCode(const {'error': 'fence_conflict'}),
         'server_error',
+      );
+    });
+
+    // Forward-registered goal codes (Phase 3.6). These lock the allowlist half
+    // of the contract: without them the gateway's 409 would degrade to
+    // `server_error` and the goal UI could not tell "already finished" from a
+    // genuine fault.
+    for (final code in const [
+      ManagedErrorCodes.goalNotResumable,
+      ManagedErrorCodes.goalNotCancellable,
+      ManagedErrorCodes.goalNotDeletable,
+      ManagedErrorCodes.agentToolAllowlistBackgroundUnsupported,
+    ]) {
+      test('preserves $code', () {
+        expect(safePluginErrorCode({'error': code}), code);
+        // Nested envelopes are unwrapped the same way.
+        expect(
+          safePluginErrorCode({
+            'error': {'code': code},
+          }),
+          code,
+        );
+      });
+    }
+
+    test('a goal code still degrades nothing when nested under `type`', () {
+      expect(
+        safePluginErrorCode(const {
+          'error': {'type': ManagedErrorCodes.goalNotDeletable},
+        }),
+        ManagedErrorCodes.goalNotDeletable,
       );
     });
   });

@@ -32,6 +32,17 @@ class PluginClientException implements Exception {
 //   (`server/src/ledger.routes.ts`); the ledger client only cancels and reads.
 // - `not_configured` — `server/src/notify/routes.ts`; `notif_client.dart`
 //   reaches it through its own `Dio`, never through [PluginHttp].
+//
+// FORWARD-REGISTERED EXCEPTION (goal surface, Phase 3.6). The four codes at the
+// bottom of the set are real server emitters — `goal_not_resumable` /
+// `goal_not_cancellable` / `goal_not_deletable` from
+// `server/src/goals/routes.ts`, `agent_tool_allowlist_background_unsupported`
+// from the background-admission guard at `server/src/transport/chat.ts:1901` —
+// but NEITHER has a reachable client path yet: the goal client is the next
+// client slice, and the app does not yet combine an `agent` override with
+// `background: true`. They are registered now, each with a client-path test, so
+// neither slice has to widen this allowlist later. Strictly they belong with
+// their callers; drop them from here if that ordering changes.
 const _safeCodes = {
   'unauthorized',
   'unsupported',
@@ -68,6 +79,11 @@ const _safeCodes = {
   'auth_error',
   'session_missing',
   'request_too_large',
+  // Forward-registered — see the exception note above.
+  'goal_not_resumable',
+  'goal_not_cancellable',
+  'goal_not_deletable',
+  'agent_tool_allowlist_background_unsupported',
 };
 
 String safePluginErrorCode(Object? envelope) {

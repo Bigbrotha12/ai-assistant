@@ -27,6 +27,8 @@ import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import {
   PUBLIC_STEP_ID_MAX_BYTES,
+  PUBLIC_TASK_PAGE_DEFAULT_LIMIT,
+  PUBLIC_TASK_PAGE_MAX_LIMIT,
   PUBLIC_TASK_SPEC_MAX_BYTES,
 } from "../ledger.ts";
 
@@ -40,6 +42,7 @@ import type { GoalLedger } from "./ledger.ts";
 import type { GoalRunner } from "./runner.ts";
 import {
   GOAL_LIVE_STATUSES,
+  GOAL_STATUSES,
   GOAL_TERMINAL_STATUSES,
 } from "./types.ts";
 import type { GoalRow, GoalStatus } from "./types.ts";
@@ -319,11 +322,226 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
         effectState: goalLedger.effectState(id),
       });
     } catch (error) {
-      return goalError(c, error);
+      return goalError(c, error, "goal_not_cancellable");
+    }
+  });
+
+  // ── Phase 5.1 resume: re-credential + answer, atomically. ──
+  routes.post("/goals/:id/resume", async (c) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    const id = c.req.param("id");
+    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
+    if (idError !== null) return publicFieldError(c, idError);
+    const goal = goalLedger.getGoal(id);
+    if (!goal || goal.owner !== owner) {
+      return c.json({ error: "not_found" }, 404);
+    }
+    // Only a paused goal is resumable; a live or terminal goal is the
+    // §5.1 `goal_not_resumable` refusal (never an implicit cancel/retry).
+    if (goal.status !== "paused") {
+      return c.json({ error: "goal_not_resumable" }, 409);
+    }
+
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid_request" }, 400);
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return c.json({ error: "invalid_request" }, 400);
+    }
+    const record = body as Record<string, unknown>;
+    // `answer` is user text written straight into the durable message log, so
+    // it takes the same bound `instruction` takes at admission: non-empty,
+    // control-free, byte-capped (413 `request_too_large` past the cap).
+    const answer = record["answer"];
+    const answerError = publicTextError(
+      answer,
+      PUBLIC_TASK_SPEC_MAX_BYTES,
+      false,
+    );
+    if (answerError !== null) return publicFieldError(c, answerError);
+    const answerText = answer as string;
+
+    // Admission-cap parity with `POST /goals`: a paused goal holds no slot, so
+    // resuming is exactly where an owner could otherwise drift past
+    // `GOAL_MAX_CONCURRENT_PER_OWNER` by cycling pause/resume. 429 `busy` is
+    // the same retryable refusal admission gives (the claim gate still bounds
+    // concurrent execution either way).
+    if (goalLedger.countActiveGoals(owner) >= GOAL_MAX_CONCURRENT_PER_OWNER) {
+      return c.json(
+        { error: "busy", message: "goal concurrency limit reached" },
+        429,
+      );
+    }
+
+    // Credentials are re-supplied because the D8 lease is RAM-only: after a
+    // restart (or once the 3h TTL lapses) the goal has no usable handle, which
+    // is exactly why it paused. Model plugin parity with admission.
+    const credentials = resolveModelCredentials(
+      record,
+      goal.pinned_model ?? "",
+      opts.registry,
+    );
+    if (!credentials.ok) return credentials.response;
+
+    // Pin + register BEFORE the CAS so the goal can never become `queued`
+    // without a handle to spend. A refused resume releases the handle THIS
+    // route minted — straight from the store: it is not in the runner's
+    // `goalPins` registry yet, so `releaseGoalPin` would drain a stale entry
+    // (or nothing) and strand the new one for the full pin TTL.
+    const modelPluginId = goal.pinned_model ?? "";
+    let handle: CredentialPinHandle;
+    try {
+      handle = pins.pin(owner, modelPluginId, credentials.credentials).handle;
+    } catch {
+      return c.json({ error: "invalid_credentials" }, 400);
+    }
+    try {
+      // ONE transaction: append the durable answer + CAS `paused -> queued`
+      // requiring `lease_owner IS NULL` (plan §"Resume is atomic"). A lost CAS
+      // (or a goal that moved on) THROWS from inside it, so the answer rolls
+      // back with it — nothing durable changes on a refused resume.
+      goalLedger.transaction(() => goalLedger.resumeGoal(id, owner, answerText));
+    } catch (error) {
+      // This handle never reached the runner's registry — release it from the
+      // STORE (see above), then let the mapper answer.
+      pins.release(owner, modelPluginId, handle);
+      return goalError(c, error, "goal_not_resumable");
+    }
+    try {
+      goalRunner.registerGoalPin(id, modelPluginId, handle);
+    } catch (error) {
+      // The pin is registered under the goal id; without it the claim would
+      // pause on `credentials_required` again. Cancel rather than leave a goal
+      // queued that can only fail.
+      goalLedger.cancelGoal(id, owner);
+      goalRunner.releaseGoalPin(id);
+      pins.release(owner, modelPluginId, handle);
+      throw error;
+    }
+    return c.json({ goalId: id, status: "queued" });
+  });
+
+  // ── Phase 5.3 list + delete. ──
+  routes.get("/goals", async (c) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+
+    const status = c.req.query("status");
+    let statusFilter: GoalStatus | undefined;
+    if (status !== undefined) {
+      if (!(GOAL_STATUSES as readonly string[]).includes(status)) {
+        return c.json({ error: "invalid_request" }, 400);
+      }
+      statusFilter = status as GoalStatus;
+    }
+    const page = goalPageQuery(c);
+    if (page === null) return c.json({ error: "invalid_request" }, 400);
+
+    const { goals, nextOffset } = goalLedger.listGoals(owner, {
+      ...(statusFilter === undefined ? {} : { status: statusFilter }),
+      limit: page.limit,
+      offset: page.offset,
+    });
+    // Same `nextOffset` convention as the ledger list: page metadata rides in
+    // headers, never in the body (WIRE_SPEC §12).
+    c.header("x-ledger-page-limit", String(page.limit));
+    c.header("x-ledger-page-offset", String(page.offset));
+    if (nextOffset !== null) {
+      c.header("x-ledger-next-offset", String(nextOffset));
+    }
+    return c.json({
+      goals: goals.map((goal) => ({
+        goalId: goal.id,
+        status: goal.status,
+        instruction: goal.instruction,
+        pauseReason: goal.pause_reason,
+        // Same gate as `goalDetail`: a `needs_user_input` pause without its
+        // question cannot be rendered, so the list alone must be able to drive
+        // the resume flow (no per-goal `GET` just to show the prompt).
+        pauseQuestion:
+          goal.pause_reason === "needs_user_input" ? goal.pause_question : null,
+        resultSummary: goal.result_summary,
+        failureReason: goal.status === "failed" ? goal.failure_reason : null,
+        tokenBudget: goal.token_budget,
+        tokensSpent: goal.tokens_spent,
+        canCancel: (GOAL_LIVE_STATUSES as readonly string[]).includes(goal.status),
+        canResume: goal.status === "paused",
+        terminal: (GOAL_TERMINAL_STATUSES as readonly string[]).includes(goal.status),
+        createdAt: new Date(goal.created_ts).toISOString(),
+        updatedAt: new Date(goal.updated_ts).toISOString(),
+      })),
+    });
+  });
+
+  routes.delete("/goals/:id", async (c) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) return keyGateResponse(c, auth);
+    const owner = auth.owner;
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    const id = c.req.param("id");
+    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
+    if (idError !== null) return publicFieldError(c, idError);
+    const goal = goalLedger.getGoal(id);
+    if (!goal || goal.owner !== owner) {
+      return c.json({ error: "not_found" }, 404);
+    }
+    // Only a TERMINAL goal is deletable (WIRE_SPEC §12): cancel a live one
+    // first, so a delete can never discard running work.
+    if (!(GOAL_TERMINAL_STATUSES as readonly string[]).includes(goal.status)) {
+      return c.json({ error: "goal_not_deletable" }, 409);
+    }
+    try {
+      // A terminal goal already released its pin, but a terminal goal created
+      // before a restart may still hold a stale registry entry.
+      goalRunner.releaseGoalPin(id);
+      goalLedger.deleteGoal(id, owner);
+      return c.body(null, 204);
+    } catch (error) {
+      return goalError(c, error, "goal_not_deletable");
     }
   });
 
   return routes;
+}
+
+/**
+ * `GET /v1/goals` paging query (`WIRE_SPEC §12`: "follow
+ * `ledger.routes.ts:479-506`"), reusing the ledger list's caps so a goal list
+ * cannot be used to read more per page than a task list can.
+ */
+function goalPageQuery(c: Context): { limit: number; offset: number } | null {
+  const rawLimit = c.req.query("limit");
+  let limit = PUBLIC_TASK_PAGE_DEFAULT_LIMIT;
+  if (rawLimit !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(rawLimit)) return null;
+    const parsed = Number(rawLimit);
+    if (
+      !Number.isSafeInteger(parsed) ||
+      parsed < 1 ||
+      parsed > PUBLIC_TASK_PAGE_MAX_LIMIT
+    ) {
+      return null;
+    }
+    limit = parsed;
+  }
+
+  const rawOffset = c.req.query("offset");
+  let offset = 0;
+  if (rawOffset !== undefined) {
+    if (!/^(0|[1-9][0-9]*)$/.test(rawOffset)) return null;
+    const parsed = Number(rawOffset);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) return null;
+    offset = parsed;
+  }
+  return { limit, offset };
 }
 
 /**
@@ -553,16 +771,26 @@ function parseJsonArray(json: string | null): unknown[] {
 
 /**
  * `GoalError -> HTTP` mapper, mirroring `ledgerError`: a cross-owner or
- * unknown goal is `404 not_found` (no leak), a non-live (terminal) cancel is
- * `409 goal_not_cancellable`, and a lease fence miss is `409`.
+ * unknown goal is `404 not_found` (no leak) and a lease fence miss is `409`.
+ *
+ * [invalidTransition] is supplied BY THE ROUTE, not hardcoded: the same
+ * `GOAL_INVALID_TRANSITION` means a different refusal on each surface
+ * (`goal_not_cancellable` on cancel, `goal_not_resumable` on resume,
+ * `goal_not_deletable` on delete) and the Dart side registers all three with
+ * distinct copy — defaulting it to one of them would silently lie from a
+ * pre-check that got relaxed or a TOCTOU window.
  */
-function goalError(c: Context, error: unknown): Response {
+function goalError(
+  c: Context,
+  error: unknown,
+  invalidTransition: "goal_not_cancellable" | "goal_not_resumable" | "goal_not_deletable",
+): Response {
   if (error instanceof GoalError) {
     if (error.code === "GOAL_NOT_FOUND" || error.code === "GOAL_FORBIDDEN") {
       return c.json({ error: "not_found" }, 404);
     }
     if (error.code === "GOAL_INVALID_TRANSITION") {
-      return c.json({ error: "goal_not_cancellable" }, 409);
+      return c.json({ error: invalidTransition }, 409);
     }
     if (error.code === "GOAL_LEASE_CONFLICT") {
       return c.json({ error: "goal_lease_conflict" }, 409);

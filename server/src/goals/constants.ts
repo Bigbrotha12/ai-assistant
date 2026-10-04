@@ -25,20 +25,24 @@ export const GOAL_MAX_STEPS = 10;
  */
 export const GOAL_MAX_NO_PROGRESS_STEPS = 3;
 /**
- * M2 wall clock, anchored at ADMISSION (`goal.created_ts`), NOT
- * `run_started_ts` (M3's per-run anchor). Sharing the pin's admission
- * instant keeps `setup-wait + round ≤ 540s < 10 min < 15 min pin` regardless
- * of queue latency (waves 3.8).
+ * Phase 5.2 wall clock, measured PER RUN from `goal.run_started_ts` (the first
+ * claim of the current run), replacing M2's admission-anchored 10 min. A run is
+ * the span between claiming a `paused` goal again and the goal leaving the
+ * loop, so time spent WAITING for the user — possibly across a restart — no
+ * longer burns a goal's budget; only unattended execution does. 1h is
+ * comfortably above `setup-wait (120s) + step lease` and under the D8 pin TTL
+ * (`GOAL_PIN_TTL_MS`, 3h), so credentials cannot lapse mid-run.
  */
-export const GOAL_MAX_WALL_CLOCK_MS = 10 * 60_000;
+export const GOAL_MAX_WALL_CLOCK_MS = 60 * 60_000;
 /**
  * Setup wait-race deadline: model resolution + pin resolution + MCP binding
  * BEFORE `graph.invoke`. A wait-race, NOT a full cancellation: on timeout the
  * runner aborts the step controller and the resolver signal seam (4.7,
  * plan R8) settles the abandoned setup with an `AbortError`. The underlying
  * DNS query is not AbortSignal-cancellable and may complete in the
- * background; nothing awaits it anymore. A violation fails the goal
- * `failed(setup_timeout)` — it never hangs.
+ * background; nothing awaits it anymore. A violation PAUSES the goal
+ * `paused(setup_timeout)` (5.2: a bound violation is resumable) — it never
+ * hangs.
  */
 export const GOAL_SETUP_DEADLINE_MS = 120_000;
 /**

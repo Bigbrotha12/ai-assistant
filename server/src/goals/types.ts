@@ -67,6 +67,33 @@ export const GOAL_REFUSAL_REASONS = [
 ] as const;
 export type GoalRefusalReason = (typeof GOAL_REFUSAL_REASONS)[number];
 
+/**
+ * Typed pause reasons (Phase 5.2, plan §Pause reasons). A `paused` goal
+ * ALWAYS carries one of these in `pause_reason` — the union is closed and
+ * validated by `pauseGoal`, so the client can branch on it instead of pattern-
+ * matching a free string. Grouped by who pauses:
+ *
+ * - model-authored: `needs_user_input` (the `goal_blocked` control tool).
+ * - runner bounds: `setup_timeout`, `budget_exhausted`, `context_overflow`,
+ *   `wall_clock_exceeded`, `no_progress`, `needs_mutation_resolution`.
+ * - setup/credential: `credentials_required`, `missing_capability`.
+ *
+ * `needs_authorization` is deliberately absent — L6 rules it out of v1 (the
+ * Phase 6 `authorize` interceptor refuses instead of pausing).
+ */
+export const GOAL_PAUSE_REASONS = [
+  "needs_user_input",
+  "credentials_required",
+  "missing_capability",
+  "budget_exhausted",
+  "setup_timeout",
+  "context_overflow",
+  "wall_clock_exceeded",
+  "no_progress",
+  "needs_mutation_resolution",
+] as const;
+export type GoalPauseReason = (typeof GOAL_PAUSE_REASONS)[number];
+
 export interface GoalRow {
   id: string;
   owner: string;

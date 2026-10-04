@@ -7,7 +7,10 @@ import {
   GOAL_STEP_LEASE_MS,
 } from "./constants.ts";
 import { GoalError } from "./errors.ts";
-import { GOAL_MESSAGE_DELETE_TRIGGER_SQL } from "./migrate.ts";
+import {
+  GOAL_MESSAGE_DELETE_TRIGGER_SQL,
+  GOAL_REFUSAL_DELETE_TRIGGER_SQL,
+} from "./migrate.ts";
 import { isUniqueConstraintViolation } from "../sqlite_errors.ts";
 import type {
   GoalEffectState,
@@ -19,7 +22,12 @@ import type {
   GoalStepRow,
   GoalTransitionTarget,
 } from "./types.ts";
-import { GOAL_TRANSITION_TARGETS } from "./types.ts";
+import {
+  GOAL_PAUSE_REASONS,
+  GOAL_STATUSES,
+  GOAL_TERMINAL_STATUSES,
+  GOAL_TRANSITION_TARGETS,
+} from "./types.ts";
 
 /**
  * Goal ledger accessors (Phase 2.2) — the read/write surface over the v9
@@ -230,8 +238,14 @@ export class GoalLedger {
    * `running` in ONE guarded CAS. The CAS re-checks
    * `owner + status='queued'` in its WHERE clause, so a concurrent claim
    * cannot both win — the loser sees `changes === 0` and raises
-   * `GOAL_INVALID_TRANSITION` naming the transition. `run_started_ts` is
-   * deliberately NOT touched (M3 owns it; M2 anchors its clock at admission).
+   * `GOAL_INVALID_TRANSITION` naming the transition.
+   *
+   * Phase 5.2 stamps `run_started_ts` on the FIRST claim of a run and leaves it
+   * alone on the claims that follow (`COALESCE`): a "run" is the unattended span
+   * from claiming a freshly-resumed goal until the goal leaves the loop, so the
+   * per-run wall clock must not reset on every chained step. `resumeGoal` clears
+   * the column, which is what starts the next run's clock.
+   *
    * The returned row (with `lease_token`) is what the Phase 3 runner holds
    * and must present on `renewGoalLease` / `pauseGoal`.
    */
@@ -245,7 +259,8 @@ export class GoalLedger {
       .prepare(
         `UPDATE goal
          SET status = 'running', lease_owner = @owner, lease_token = @token,
-             lease_expiry = @expiry, updated_ts = @now
+             lease_expiry = @expiry, updated_ts = @now,
+             run_started_ts = COALESCE(run_started_ts, @now)
          WHERE id = @id AND owner = @owner AND status = 'queued'`,
       )
       .run({ id: goalId, owner, token, expiry: now + GOAL_STEP_LEASE_MS, now });
@@ -306,6 +321,46 @@ export class GoalLedger {
       throw new GoalError(
         "GOAL_INVALID_TRANSITION",
         "leaseOwner and leaseToken must be supplied together",
+      );
+    }
+    // Phase 5.2: a `paused` goal ALWAYS carries a typed reason from the closed
+    // [GoalPauseReason] union (plan §Pause reasons), and ONLY a pause carries
+    // one — `needs_authorization` is excluded there and `M4+`'s
+    // `needs_mutation_resolution` is included, so the union is the contract.
+    // Validating here (rather than at each caller) is what makes the client-side
+    // `switch` on `pause_reason` exhaustive. The question is required for
+    // `needs_user_input` and forbidden otherwise: a stale question surviving on
+    // a non-question pause would be replayed to the user.
+    if (next === "paused") {
+      if (
+        params.reason === undefined ||
+        !(GOAL_PAUSE_REASONS as readonly string[]).includes(params.reason)
+      ) {
+        throw new GoalError(
+          "GOAL_INVALID_TRANSITION",
+          `goal ${goalId} cannot pause without a typed reason from ` +
+            `${GOAL_PAUSE_REASONS.join("|")}`,
+        );
+      }
+      const hasQuestion =
+        params.question !== undefined && params.question.trim() !== "";
+      if (params.reason === "needs_user_input") {
+        if (!hasQuestion) {
+          throw new GoalError(
+            "GOAL_INVALID_TRANSITION",
+            `goal ${goalId} cannot pause needs_user_input without a question`,
+          );
+        }
+      } else if (hasQuestion) {
+        throw new GoalError(
+          "GOAL_INVALID_TRANSITION",
+          `goal ${goalId} pause reason ${params.reason} cannot carry a question`,
+        );
+      }
+    } else if (params.reason !== undefined && params.reason !== null) {
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        `goal ${goalId} transition to ${next} cannot carry a pause reason`,
       );
     }
     const now = params.nowOverride ?? this.now();
@@ -742,6 +797,156 @@ export class GoalLedger {
       );
     }
     return this.requireGoal(goalId);
+  }
+
+  /**
+   * Resumes a `paused` goal (Phase 5.1, plan §Control tools ▸"Resume is
+   * atomic"): ONE transaction appends the durable user `goal_message` (the
+   * answer) and CASes `paused -> queued`. The CAS requires `lease_owner IS
+   * NULL` — a paused goal holds no lease, so a live lease column means the row
+   * is NOT actually paused (or a runner is mid-step) and the resume is refused
+   * rather than stealing it. `pause_reason`/`pause_question` are CLEARED: the
+   * question is answered, and leaving them would make the client keep offering
+   * a resolved prompt.
+   *
+   * Compose this with any per-row transition (Phase 6's `resolveMutations`)
+   * inside one `transaction(...)`; it opens its OWN transaction on top of that
+   * wrapper (better-sqlite3 nests it as a SAVEPOINT), so the append + CAS stay
+   * atomic for EVERY caller — `appendGoalMessage` would otherwise commit the
+   * answer on its own. The answer is appended BEFORE the CAS, and a refused
+   * resume classifies the miss (like {@link cancelGoal}) and THROWS *from
+   * inside* the transaction, which is what makes "rolls the message back with
+   * it" true: a `false` return — or a throw after the transaction committed —
+   * would leave the answer durable on a goal that never resumed.
+   *
+   * Does NOT touch step state (recovery/§Effect state is derived from mutation
+   * rows) and does NOT re-establish credentials — the route mints the new pin
+   * and re-registers it BEFORE calling this, so a goal can never become
+   * `queued` without a credential handle to spend.
+   */
+  resumeGoal(goalId: string, owner: string, answer: string): void {
+    this.db.transaction(() => {
+      this.requireOwnership(this.requireGoal(goalId), owner);
+      const now = this.now();
+      this.appendGoalMessage(goalId, owner, {
+        role: "user",
+        content: answer,
+      });
+      const result = this.db
+        .prepare(
+          `UPDATE goal
+           SET status = 'queued', pause_reason = NULL, pause_question = NULL,
+               lease_expiry = NULL, run_started_ts = NULL, updated_ts = @now
+           WHERE id = @id AND owner = @owner AND status = 'paused'
+             AND lease_owner IS NULL`,
+        )
+        .run({ id: goalId, owner, now });
+      if (result.changes > 0) return;
+      // Classify the miss INSIDE the transaction: the throw is what rolls the
+      // answer above back with the refused resume (a classify-after-commit
+      // would leave the append durable — see the regression test).
+      const current = this.db
+        .prepare("SELECT * FROM goal WHERE id = ?")
+        .get(goalId) as GoalRow | undefined;
+      if (!current) {
+        throw new GoalError("GOAL_NOT_FOUND", `goal ${goalId} not found`);
+      }
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        `goal ${goalId} is ${current.status} with ` +
+          `${current.lease_owner === null ? "no" : "a live"} lease and cannot be resumed`,
+      );
+    })();
+  }
+
+  /**
+   * Owner-scoped goal listing (Phase 5.3, WIRE_SPEC §12 `GET /v1/goals`) with
+   * the `nextOffset` pagination convention of `Ledger.listPublicTasks` (no
+   * total: fetch `limit + 1` and report the next offset only when a full page
+   * came back). Newest-first so a list reads as reverse-chronological.
+   *
+   * The `status`/paging RangeErrors below are a programmatic guard for callers
+   * inside this repo, NOT a wire mapping: the route validates both before it
+   * gets here and answers `400 invalid_request` itself (it has no `catch`).
+   */
+  listGoals(
+    owner: string,
+    options: { status?: GoalStatus; limit: number; offset: number },
+  ): { goals: GoalRow[]; nextOffset: number | null } {
+    const limit = options.limit;
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError("listGoals: limit must be a positive safe integer");
+    }
+    const offset = options.offset;
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new RangeError("listGoals: offset must be a non-negative integer");
+    }
+    const clauses = ["owner = @owner"];
+    const bind: Record<string, unknown> = { owner, limit: limit + 1, offset };
+    if (options.status !== undefined) {
+      if (!(GOAL_STATUSES as readonly string[]).includes(options.status)) {
+        throw new RangeError(`listGoals: unknown status '${options.status}'`);
+      }
+      clauses.push("status = @status");
+      bind.status = options.status;
+    }
+    const rows = this.db
+      .prepare(
+        // `rowid` is the tie-break, not `id`: two goals created in the same
+        // millisecond would otherwise be ordered by their random uuid — stable
+        // across requests but NOT reverse-chronological, which is the point of
+        // the sort (and what makes a list flip between refreshes meaningless).
+        `SELECT * FROM goal WHERE ${clauses.join(" AND ")}
+         ORDER BY created_ts DESC, rowid DESC
+         LIMIT @limit OFFSET @offset`,
+      )
+      .all(bind) as GoalRow[];
+    const hasMore = rows.length > limit;
+    const goals = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      goals,
+      nextOffset: hasMore ? offset + limit : null,
+    };
+  }
+
+  /**
+   * Deletes a goal and all of its child rows (Phase 5.3, WIRE_SPEC §12
+   * `DELETE /v1/goals/:id`). Only a TERMINAL goal is deletable — the route owns
+   * the `409 goal_not_deletable` refusal so the client is told to cancel first;
+   * this accessor enforces the same rule defensively and throws
+   * `GOAL_INVALID_TRANSITION` rather than silently deleting live work.
+   *
+   * Ordered parent-last, mirroring `purgeOwnerData`'s child-before-parent
+   * deletion, and wrapped in ONE transaction like `purgeOwnerData`: the two
+   * write-once triggers are DDL, so SQLite rolls their DROP back with the
+   * deletes when anything throws. Without that wrapper a single failed DELETE
+   * would leave both append-only guards dropped for the life of the process —
+   * a per-goal failure silently disarming a process-wide durability invariant.
+   */
+  deleteGoal(goalId: string, owner: string): void {
+    const goal = this.requireGoal(goalId);
+    this.requireOwnership(goal, owner);
+    if (!(GOAL_TERMINAL_STATUSES as readonly string[]).includes(goal.status)) {
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        `goal ${goalId} is ${goal.status} and cannot be deleted`,
+      );
+    }
+    this.db.transaction(() => {
+      // The write-once triggers on goal_message/goal_refusal (Phase 2.1) refuse
+      // DELETE outright, exactly as `purgeOwnerData` must drop-and-recreate them.
+      this.db.exec("DROP TRIGGER IF EXISTS goal_message_append_only_delete");
+      const del = this.db.prepare("DELETE FROM goal_message WHERE goal_id = ?");
+      this.db.exec("DROP TRIGGER IF EXISTS goal_refusal_append_only_delete");
+      const delRefusal = this.db.prepare("DELETE FROM goal_refusal WHERE goal_id = ?");
+      this.db.prepare("DELETE FROM goal_step WHERE goal_id = ?").run(goalId);
+      this.db.prepare("DELETE FROM goal_mutation WHERE goal_id = ?").run(goalId);
+      del.run(goalId);
+      delRefusal.run(goalId);
+      this.db.prepare("DELETE FROM goal WHERE id = ?").run(goalId);
+      this.db.exec(GOAL_MESSAGE_DELETE_TRIGGER_SQL);
+      this.db.exec(GOAL_REFUSAL_DELETE_TRIGGER_SQL);
+    })();
   }
 
   /**
