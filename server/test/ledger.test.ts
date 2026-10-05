@@ -1423,7 +1423,7 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
-    assert.equal(CURRENT_LEDGER_VERSION, 10);
+    assert.equal(CURRENT_LEDGER_VERSION, 11);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -1433,6 +1433,16 @@ describe("migration", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get("idx_ledger_task_metadata_window") as { name: string } | undefined;
     assert.equal(metadataIndex?.name, "idx_ledger_task_metadata_window");
+    // v11: the goal_mutation lookup indexes exist on a fresh DB.
+    for (const name of [
+      "idx_goal_mutation_goal_tool_hash",
+      "idx_goal_mutation_goal_state",
+    ]) {
+      const index = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(name) as { name: string } | undefined;
+      assert.equal(index?.name, name, `${name} must exist after migrateLedger`);
+    }
     const tables = db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ledger_%'",
@@ -1486,6 +1496,59 @@ describe("migration", () => {
     ]);
   });
 
+
+  test("v11 adds the goal_mutation lookup indexes and upgrades a v10 DB with rows preserved", () => {
+    const db = new Database(":memory:");
+    migrateLedger(db);
+    // Simulate a v10 DB: drop the v11 indexes, rewind user_version, and seed a
+    // goal_mutation row the migration must leave untouched.
+    db.exec("DROP INDEX idx_goal_mutation_goal_tool_hash");
+    db.exec("DROP INDEX idx_goal_mutation_goal_state");
+    db.prepare(
+      `INSERT INTO goal
+         (id, owner, instruction, status, token_budget, tokens_spent, created_ts,
+          updated_ts, idempotency_key)
+       VALUES ('g_v10', 'o', 'i', 'queued', 1, 0, 1, 1, 'k')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO goal_mutation
+         (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+       VALUES ('m_v10', 'g_v10', 'p', 'create', 'h', 'unresolved', 1, 1)`,
+    ).run();
+    db.pragma("user_version = 10");
+    assert.equal(db.pragma("user_version", { simple: true }), 10);
+
+    migrateLedger(db);
+
+    assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
+    for (const name of [
+      "idx_goal_mutation_goal_tool_hash",
+      "idx_goal_mutation_goal_state",
+    ]) {
+      const index = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(name) as { name: string } | undefined;
+      assert.equal(index?.name, name, `${name} must exist after the v10 -> v11 upgrade`);
+    }
+    const row = db
+      .prepare(
+        "SELECT id, goal_id, tool, args_hash, state FROM goal_mutation WHERE id = 'm_v10'",
+      )
+      .get() as {
+      id: string;
+      goal_id: string;
+      tool: string;
+      args_hash: string;
+      state: string;
+    };
+    assert.deepEqual(row, {
+      id: "m_v10",
+      goal_id: "g_v10",
+      tool: "create",
+      args_hash: "h",
+      state: "unresolved",
+    });
+  });
 
   test("migration is idempotent and preserves data on re-run", () => {
     const db = new Database(":memory:");

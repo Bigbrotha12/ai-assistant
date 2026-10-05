@@ -32,6 +32,11 @@ const kGoalTokenBudget = 200000;
 /// Every call re-reads the credentials STORE rather than a cached selection:
 /// a revoked key must never ride an admission, mirroring the managed chat
 /// path's resolve-fresh-per-dispatch rule.
+///
+/// **Known limitation:** app-admitted goals send no `authorisedTools` and are
+/// read-only; the server supports the field (Phase 6, tested), so the resume /
+/// mutation-resolution UI is reachable only for goals an API client admits,
+/// until the app can name an agent's MCP tools (a server-exposed list / picker).
 class GoalTrigger {
   GoalTrigger(this._ref);
 
@@ -74,7 +79,8 @@ class GoalTrigger {
       throw const PluginClientException(ManagedErrorCodes.noSelectedModel);
     }
     final credentials = config.plugins[modelId]?.credentials;
-    if (credentials == null || (credentials['apiKey']?.trim().isEmpty ?? true)) {
+    if (credentials == null ||
+        (credentials['apiKey']?.trim().isEmpty ?? true)) {
       throw const PluginClientException(ManagedErrorCodes.noCredentials);
     }
     final agent = _agentId(config);
@@ -84,15 +90,17 @@ class GoalTrigger {
       throw const PluginClientException('invalid_request');
     }
 
-    return _ref.read(goalClientProvider).submit(
-      gatewayKey: gatewayKey,
-      instruction: text,
-      agent: agent,
-      modelPluginId: modelId,
-      tokenBudget: kGoalTokenBudget,
-      clientGoalId: const Uuid().v4(),
-      modelCredentials: credentials,
-    );
+    return _ref
+        .read(goalClientProvider)
+        .submit(
+          gatewayKey: gatewayKey,
+          instruction: text,
+          agent: agent,
+          modelPluginId: modelId,
+          tokenBudget: kGoalTokenBudget,
+          clientGoalId: const Uuid().v4(),
+          modelCredentials: credentials,
+        );
   }
 
   Future<PluginAccountConfiguration> _load() {
@@ -113,18 +121,16 @@ class GoalTrigger {
   }
 }
 
-final goalTriggerProvider = Provider<GoalTrigger>(
-  (ref) => GoalTrigger(ref),
-);
+final goalTriggerProvider = Provider<GoalTrigger>((ref) => GoalTrigger(ref));
 
 /// `GET /v1/goals`. AutoDispose releases it when nothing observes it, but
 /// [goalAttentionProvider] keeps it alive for the session; `showGoalsOverlay`
 /// therefore invalidates it on every open so the overlay still renders a fresh
 /// first page rather than the retained snapshot.
-final goalListProvider = AsyncNotifierProvider.autoDispose<
-  GoalListNotifier,
-  GoalListPage
->(GoalListNotifier.new);
+final goalListProvider =
+    AsyncNotifierProvider.autoDispose<GoalListNotifier, GoalListPage>(
+      GoalListNotifier.new,
+    );
 
 /// First page of the owner's goals + append-only paging. Read-only: nothing
 /// here mutates a goal, and a failed `loadMore` keeps the rows already loaded
@@ -218,3 +224,111 @@ class GoalDetailNotifier extends AsyncNotifier<GoalDetail> {
     }
   }
 }
+
+/// The mutating goal surface the goals UI drives (Phase 7 follow-up): cancel,
+/// delete, and resume. Each call re-reads the gateway key and the plugin
+/// credentials STORE fresh — a revoked key must never ride a mutation, the same
+/// resolve-fresh-per-dispatch rule [GoalTrigger] follows.
+///
+/// Every successful mutation invalidates [goalListProvider] and the goal's
+/// [goalDetailProvider] so the overlay and the todo view refetch. Attention
+/// recomputes on its own: `goalAttentionProvider` watches the list.
+class GoalActions {
+  GoalActions(this._ref);
+
+  final Ref _ref;
+
+  /// `POST /v1/goals/:id/cancel`.
+  Future<GoalCancelResult> cancel(String goalId) async {
+    final gatewayKey = await _gatewayKey();
+    final result = await _ref
+        .read(goalClientProvider)
+        .cancel(goalId, gatewayKey: gatewayKey);
+    _invalidate(goalId);
+    return result;
+  }
+
+  /// `DELETE /v1/goals/:id` — terminal goals only (the server 204s).
+  Future<void> delete(String goalId) async {
+    final gatewayKey = await _gatewayKey();
+    await _ref.read(goalClientProvider).delete(goalId, gatewayKey: gatewayKey);
+    _invalidate(goalId);
+  }
+
+  /// `POST /v1/goals/:id/resume`, credentialed with the goal's OWN pinned
+  /// model.
+  ///
+  /// [answer] is required (client-side) when the goal paused on
+  /// `needs_user_input`; for any other pause it passes through and is omitted
+  /// from the wire body when null/blank. [resolveMutations] and [tokenBudget]
+  /// are optional and forwarded only when provided.
+  Future<GoalResumed> resume(
+    String goalId, {
+    String? answer,
+    List<GoalMutationResolutionInput>? resolveMutations,
+    int? tokenBudget,
+  }) async {
+    final detail = await _ref.read(goalDetailProvider(goalId).future);
+    if (detail.pauseReason == 'needs_user_input' &&
+        (answer == null || answer.trim().isEmpty)) {
+      throw const PluginClientException('invalid_request');
+    }
+    final credentials = await _resumeCredentials(detail.modelPluginId);
+    final gatewayKey = await _gatewayKey();
+    final resumed = await _ref
+        .read(goalClientProvider)
+        .resume(
+          goalId,
+          gatewayKey: gatewayKey,
+          answer: answer,
+          credentials: credentials,
+          resolveMutations: resolveMutations,
+          tokenBudget: tokenBudget,
+        );
+    _invalidate(goalId);
+    return resumed;
+  }
+
+  /// Gateway key from the same source [GoalTrigger] uses: the loaded
+  /// better-auth session's key, or `no_credentials` (never a
+  /// `missing_gateway_key` transport error) when absent/blank.
+  Future<String> _gatewayKey() async {
+    final auth = await _ref.read(authCredentialsProvider.future);
+    final gatewayKey = auth?.apiKey ?? '';
+    if (gatewayKey.trim().isEmpty) {
+      throw const PluginClientException(ManagedErrorCodes.noCredentials);
+    }
+    return gatewayKey;
+  }
+
+  /// The goal's pinned model credentials, read fresh from the account store and
+  /// shaped as §12's `{<modelPluginId>: {…stored fields…}}`.
+  ///
+  /// This sends ONLY that one plugin's entry — never every plugin the account
+  /// has configured. A goal with no pinned model (an older gateway), or a
+  /// pinned model whose stored entry has no non-blank `apiKey`, refuses with
+  /// `no_credentials` so the UI can point the user at Plugins.
+  Future<Map<String, Map<String, String>>> _resumeCredentials(
+    String? modelPluginId,
+  ) async {
+    final modelId = modelPluginId?.trim();
+    if (modelId == null || modelId.isEmpty) {
+      throw const PluginClientException(ManagedErrorCodes.noCredentials);
+    }
+    final scope = _ref.read(pluginAccountScopeProvider);
+    final config = await _ref.read(pluginCredentialsStoreProvider).load(scope);
+    final stored = config.plugins[modelId]?.credentials;
+    if (stored == null || (stored['apiKey']?.trim().isEmpty ?? true)) {
+      throw const PluginClientException(ManagedErrorCodes.noCredentials);
+    }
+    return {modelId: Map<String, String>.from(stored)};
+  }
+
+  void _invalidate(String goalId) {
+    if (!_ref.mounted) return;
+    _ref.invalidate(goalListProvider);
+    _ref.invalidate(goalDetailProvider(goalId));
+  }
+}
+
+final goalActionsProvider = Provider<GoalActions>((ref) => GoalActions(ref));

@@ -642,12 +642,15 @@ Credentials travel in the request body and are never persisted.
 ```
 
 Submit-time errors only: `400 invalid_request`, `400 invalid_credentials`,
-`401 unauthorized`, `403 email_not_verified`, and `403 account_deleted`.
+`401 unauthorized`, `403 email_not_verified`, `403 account_deleted`, and
+`429 busy` (`retry-after`; the per-owner concurrency cap is full, retryable).
 
 ### `GET /v1/goals?status=&limit=&offset=`
 
 `status` is a validated enum. `limit` and `offset` follow `ledger.routes.ts:479-506`;
 pagination uses the `nextOffset` convention without a total (`ledger.ts:915-938`).
+Each list item carries the same goal fields the detail exposes, including
+`modelPluginId` (the goal's pinned model plugin, `null` when none was pinned).
 
 ### `GET /v1/goals/:id`
 
@@ -658,6 +661,7 @@ pagination uses the `nextOffset` convention without a total (`ledger.ts:915-938`
   "resultSummary": null, "failureReason": null,
   "instruction":"…", "todos":[…],
   "tokenBudget":200000, "tokensSpent":41230,
+  "modelPluginId":"openrouter",
   "effectState":"none_known|completed_steps_only|unknown",
   "canCancel":true, "canResume":true, "terminal":false,
   "unresolvedMutations":[{"tool":"create_mealplan","argsHash":"…"}],
@@ -671,12 +675,14 @@ pagination uses the `nextOffset` convention without a total (`ledger.ts:915-938`
 present iff terminal `complete`. `failureReason` is present iff terminal `failed` (this is
 how an M2 `failed(credentials_required)` reaches the client, since M2 has no pause to carry
 it). `unresolvedMutations` is non-empty whenever any `unresolved` mutation exists.
+`modelPluginId` is the goal's pinned model plugin, or `null` when it was admitted without
+one; the resume request keys its `credentials` by this value.
 
 ### `POST /v1/goals/:id/resume`
 
 ```jsonc
 { "credentials": { "openrouter": { "apiKey": "…" } },
-  "answer": "no shellfish, and skip dessert",
+  "answer": "no shellfish, and skip dessert",              // required iff needs_user_input
   "tokenBudget": 400000,                                     // optional raise
   "resolveMutations": [{ "tool": "create_mealplan", "argsHash": "…",
                          "resolution": "not_applied" }] }   // M4+
@@ -684,15 +690,24 @@ it). `unresolvedMutations` is non-empty whenever any `unresolved` mutation exist
 { "goalId":"g_…", "status":"queued" }
 ```
 
-`not_applied` is a **user assertion** (no idempotency key is sent to the target, no
-query-before-write), surfaced in the confirmation copy (R18). `tokenBudget` is optional:
-it raises a paused goal's per-goal token budget (the client's "continue with more" after
-`paused(budget_exhausted)`); it must be an integer strictly greater than the goal's
-current budget (and greater than `tokensSpent`), and its absence leaves the budget
-unchanged.
+`answer` is **required only when the pause asked a question** — i.e. when the goal's
+`pauseReason == "needs_user_input"` (a question must be answered; a missing answer is
+`400 invalid_request`). For every other pause reason (`credentials_required`,
+`budget_exhausted`, `needs_mutation_resolution`) it is **optional**: when present it must
+still be non-empty and byte-bounded like `instruction` (`413 request_too_large` past the
+same cap); unlike every other public text field, `answer` is **multi-line** — it accepts
+U+000A (`\n`), since the resume sheet's answer input is multi-line (`minLines 3` /
+`maxLines 6`), while every other C0 control and DEL is still `400 invalid_request`. When
+absent nothing is appended to the goal's message log. `not_applied` is a **user assertion**
+(no idempotency key is sent to the target, no query-before-write), surfaced in the
+confirmation copy (R18). `tokenBudget` is optional: it raises a paused goal's per-goal
+token budget (the client's "continue with more" after `paused(budget_exhausted)`); it must
+be an integer strictly greater than the goal's current budget (and greater than
+`tokensSpent`), and its absence leaves the budget unchanged.
 
-Errors: `404 not_found`, `409 goal_not_resumable`, `400 invalid_credentials`, and
-`400 invalid_request`.
+Errors: `404 not_found`, `409 goal_not_resumable`, `400 invalid_credentials`,
+`400 invalid_request`, `413 request_too_large`, and `429 busy` (`retry-after`; the
+per-owner concurrency cap is full, retryable).
 
 ### `POST /v1/goals/:id/cancel`
 

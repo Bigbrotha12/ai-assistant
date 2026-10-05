@@ -525,6 +525,40 @@ describe("GoalLedger.resumeGoal", () => {
     assert.equal(row.pause_reason, "needs_user_input");
     assert.equal(row.pause_question, "which flight?");
   });
+
+  test("an omitted answer appends NOTHING and still CASes paused -> queued", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    ledger.claimGoal(goal.id, "owner-1");
+    const claimed = readGoal(db, goal.id);
+    ledger.appendGoalMessage(goal.id, "owner-1", {
+      role: "assistant",
+      content: { question: "which flight?" },
+    });
+    ledger.pauseGoal(goal.id, "owner-1", {
+      next: "paused",
+      reason: "needs_user_input",
+      question: "which flight?",
+      leaseOwner: "owner-1",
+      leaseToken: claimed.lease_token!,
+    });
+    const messagesBefore = readMessages(db, goal.id).length;
+
+    // No answer: the credential/budget/mutation rescue path. Nothing is
+    // appended, but the CAS still requeues and clears the pause columns.
+    ledger.resumeGoal(goal.id, "owner-1");
+
+    assert.equal(
+      readMessages(db, goal.id).length,
+      messagesBefore,
+      "no answer row is written when none was supplied",
+    );
+    const row = readGoal(db, goal.id);
+    assert.equal(row.status, "queued");
+    assert.equal(row.pause_reason, null, "the resized pause is cleared");
+    assert.equal(row.pause_question, null);
+    assert.equal(row.run_started_ts, null);
+  });
 });
 
 describe("GoalLedger.raiseGoalBudget", () => {

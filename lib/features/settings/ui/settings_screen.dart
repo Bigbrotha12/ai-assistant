@@ -34,9 +34,11 @@ import '../../voice/ui/voice_settings_screen.dart';
 import '../../attachments/ui/files_screen.dart';
 import '../../auth/ui/sign_in_screen.dart';
 import '../../auth/ui/verify_email_card.dart';
+import '../../notifications/data/notif_provider.dart';
 import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_http.dart';
 import '../../plugins/ui/plugins_screen.dart';
+import 'notifications_settings_screen.dart';
 
 /// App home screen: configure the gateway host for account services and
 /// verify connectivity (auth on the gateway; inference/vision against the
@@ -1064,6 +1066,23 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 trailing: const Icon(Icons.chevron_right),
                 onTap: () => Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const PluginsScreen()),
+                ),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                key: const Key('settings-notifications'),
+                leading: const Icon(Icons.notifications_outlined),
+                title: const Text('Notifications'),
+                subtitle: Text(
+                  ref.watch(notifBaseUrlProvider).isEmpty
+                      ? 'Not available in this build'
+                      : 'Push alerts for goals and background jobs',
+                ),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const NotificationsSettingsScreen(),
+                  ),
                 ),
               ),
             ],

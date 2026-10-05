@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -25,6 +26,34 @@ class _CaptureAdapter implements HttpClientAdapter {
 
   @override
   void close({bool force = false}) {}
+}
+
+/// Returns a different response body for each successive request, so a test can
+/// model a dead stream followed by a successful reconnect.
+class _ScriptedAdapter implements HttpClientAdapter {
+  _ScriptedAdapter(this.bodies);
+
+  final List<ResponseBody Function()> bodies;
+  final List<RequestOptions> requests = [];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests.add(options);
+    return bodies[requests.length - 1]();
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+Future<void> _drain() async {
+  for (var i = 0; i < 4; i++) {
+    await Future<void>.delayed(Duration.zero);
+  }
 }
 
 void main() {
@@ -108,6 +137,63 @@ void main() {
       final req = adapter.requests.single;
       expect(req.uri.path, '/alerts/json');
       expect(req.headers.containsKey('Authorization'), isFalse);
+    });
+
+    test('a stream error frees the topic and allows a re-subscribe', () async {
+      final adapter = _ScriptedAdapter([
+        () => ResponseBody(Stream<Uint8List>.error(StateError('boom')), 200),
+        () => ResponseBody.fromString('', 200),
+      ]);
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = NtfyNotifClient(baseUrl: base, dio: dio);
+      addTearDown(client.dispose);
+
+      await client.subscribe('alerts');
+      await _drain();
+      // A dead stream must not leave `_subs` holding the topic: the second
+      // subscribe has to open a fresh request rather than early-return.
+      await client.subscribe('alerts');
+      await _drain();
+
+      expect(adapter.requests, hasLength(2));
+    });
+
+    test('a stream error is contained (no unhandled async error)', () async {
+      final adapter = _ScriptedAdapter([
+        () => ResponseBody(Stream<Uint8List>.error(StateError('boom')), 200),
+      ]);
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = NtfyNotifClient(baseUrl: base, dio: dio);
+      addTearDown(client.dispose);
+
+      final uncaught = <Object>[];
+      await runZonedGuarded(() async {
+        await client.subscribe('alerts');
+        await _drain();
+      }, (error, _) => uncaught.add(error));
+
+      expect(uncaught, isEmpty);
+    });
+
+    test('a completed stream frees the topic and allows a re-subscribe',
+        () async {
+      final adapter = _ScriptedAdapter([
+        () => ResponseBody.fromString('', 200),
+        () => ResponseBody.fromString('', 200),
+      ]);
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = NtfyNotifClient(baseUrl: base, dio: dio);
+      addTearDown(client.dispose);
+
+      await client.subscribe('alerts');
+      await _drain();
+      await client.subscribe('alerts');
+      await _drain();
+
+      expect(adapter.requests, hasLength(2));
     });
   });
 }

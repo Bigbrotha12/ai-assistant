@@ -17,6 +17,7 @@ import { env } from "../env.ts";
 import {
   isRecord,
   publicFieldError,
+  publicProseTextError,
   publicTextError,
 } from "../http/public_fields.ts";
 import {
@@ -81,6 +82,17 @@ import type {
  * only the structural credential shape is enforced and the runner fails
  * `plugin_unavailable`/`credentials_required` on claim.
  */
+/**
+ * `POST /v1/goals` / `resume` concurrency-cap backoff hint, in seconds. §5.1
+ * requires `retry-after` on every 429. The goal cap frees when a RUNNING goal
+ * finishes, which is not predictable from here — so this is a HINT a client
+ * respects before re-checking the cap, NOT an ETA: a goal may finish sooner (the
+ * retry then succeeds) or the cap may still be full (the client backs off
+ * again). Chat's rate limiter has a measured refill window to quote; goal
+ * admission has no equivalent, hence the fixed conservative value.
+ */
+const GOAL_BUSY_RETRY_AFTER_SECONDS = 30;
+
 export type GoalRoutesOptions = {
   /** Test seam; defaults to the real `requireApiKey` from `api_key.ts`. */
   verifyKey?: VerifyApiKeyFn;
@@ -218,10 +230,7 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     //    cap; a paused goal holds no slot. §5.1 `busy` is concurrent-capacity
     //    and retryable.
     if (goalLedger.countActiveGoals(owner) >= GOAL_MAX_CONCURRENT_PER_OWNER) {
-      return c.json(
-        { error: "busy", message: "goal concurrency limit reached" },
-        429,
-      );
+      return goalBusy(c);
     }
 
     // 4. Agent resolution — chat convention: a missing template id is
@@ -388,17 +397,31 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
       return c.json({ error: "invalid_request" }, 400);
     }
     const record = body as Record<string, unknown>;
-    // `answer` is user text written straight into the durable message log, so
-    // it takes the same bound `instruction` takes at admission: non-empty,
-    // control-free, byte-capped (413 `request_too_large` past the cap).
+    // `answer` is user prose written straight into the durable message log, so
+    // when supplied it takes the same bound `instruction` takes at admission —
+    // non-empty, byte-capped (413 `request_too_large` past the cap) — with ONE
+    // deliberate difference: the answer field is multi-line (the client sheet
+    // invites `\n`), so `publicProseTextError` admits U+000A while still
+    // refusing every other C0 control and DEL. It is REQUIRED only when the
+    // pause actually asked a question (`needs_user_input`); the other pausable
+    // reasons — `credentials_required`, `budget_exhausted`,
+    // `needs_mutation_resolution` — pose none, so demanding an answer there
+    // would force a fabricated `user` row into the durable log for every
+    // credential refresh / budget raise. When optional and absent,
+    // `publicProseTextError(undefined, ...)` would refuse it, so the guard is
+    // applied ONLY on a supplied value: `undefined` -> no append, per
+    // `resumeGoal`.
     const answer = record["answer"];
-    const answerError = publicTextError(
-      answer,
-      PUBLIC_TASK_SPEC_MAX_BYTES,
-      false,
-    );
-    if (answerError !== null) return publicFieldError(c, answerError);
-    const answerText = answer as string;
+    const answerRequired = goal.pause_reason === "needs_user_input";
+    let answerText: string | undefined;
+    if (answerRequired || answer !== undefined) {
+      const answerError = publicProseTextError(
+        answer,
+        PUBLIC_TASK_SPEC_MAX_BYTES,
+      );
+      if (answerError !== null) return publicFieldError(c, answerError);
+      answerText = answer as string;
+    }
 
     // Phase 6 (WIRE_SPEC §12): the client resolves the goal's
     // previously-`unresolved` mutations ATOMICALLY with the resume (plan
@@ -509,10 +532,19 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     // the same retryable refusal admission gives (the claim gate still bounds
     // concurrent execution either way).
     if (goalLedger.countActiveGoals(owner) >= GOAL_MAX_CONCURRENT_PER_OWNER) {
-      return c.json(
-        { error: "busy", message: "goal concurrency limit reached" },
-        429,
-      );
+      return goalBusy(c);
+    }
+
+    // S2: a blank pinned model must be refused on BOTH credential paths. With a
+    // registry `requirePlugin("")` already 400s; without one
+    // `structuralModelCredentials(body, "")` would accept a
+    // `credentials: {"": …}` object and mint a pin under plugin id `""` — a goal
+    // that can never spend. Guard explicitly so the registry-free path is
+    // symmetric with the registry path. `trim` decides emptiness only; the raw
+    // pinned id is preserved for resolution, matching admission.
+    const modelPluginId = goal.pinned_model ?? "";
+    if (modelPluginId.trim() === "") {
+      return c.json({ error: "invalid_request" }, 400);
     }
 
     // Credentials are re-supplied because the D8 lease is RAM-only: after a
@@ -520,7 +552,7 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     // is exactly why it paused. Model plugin parity with admission.
     const credentials = resolveModelCredentials(
       record,
-      goal.pinned_model ?? "",
+      modelPluginId,
       opts.registry,
     );
     if (!credentials.ok) return credentials.response;
@@ -530,7 +562,6 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     // route minted — straight from the store: it is not in the runner's
     // `goalPins` registry yet, so `releaseGoalPin` would drain a stale entry
     // (or nothing) and strand the new one for the full pin TTL.
-    const modelPluginId = goal.pinned_model ?? "";
     let handle: CredentialPinHandle;
     try {
       handle = pins.pin(owner, modelPluginId, credentials.credentials).handle;
@@ -538,15 +569,15 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
       return c.json({ error: "invalid_credentials" }, 400);
     }
     try {
-      // ONE transaction: append the durable answer + CAS `paused -> queued`
-      // requiring `lease_owner IS NULL` (plan §"Resume is atomic"), then apply
-      // the user's mutation resolutions — `resumeGoal` and `resolveMutations`
-      // each open their own transaction (nested here as better-sqlite3
-      // SAVEPOINTs under this wrapper), so the answer, the CAS, the raised
-      // budget (Phase 7), and the resolutions commit or roll back TOGETHER. A
-      // lost CAS (a goal that moved on) or a resolution that stopped matching
-      // (`GOAL_INVALID_TRANSITION`) THROWS from inside, so nothing durable
-      // changes on a refused resume.
+      // ONE transaction: append the durable answer (when one was supplied) +
+      // CAS `paused -> queued` requiring `lease_owner IS NULL` (plan §"Resume is
+      // atomic"), then apply the user's mutation resolutions — `resumeGoal` and
+      // `resolveMutations` each open their own transaction (nested here as
+      // better-sqlite3 SAVEPOINTs under this wrapper), so the answer, the CAS,
+      // the raised budget (Phase 7), and the resolutions commit or roll back
+      // TOGETHER. A lost CAS (a goal that moved on) or a resolution that stopped
+      // matching (`GOAL_INVALID_TRANSITION`) THROWS from inside, so nothing
+      // durable changes on a refused resume.
       goalLedger.transaction(() => {
         goalLedger.resumeGoal(id, owner, answerText);
         // Phase 7: raise the per-goal budget (after the CAS so the raise only
@@ -654,6 +685,7 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
         failureReason: goal.status === "failed" ? goal.failure_reason : null,
         tokenBudget: goal.token_budget,
         tokensSpent: goal.tokens_spent,
+        modelPluginId: goal.pinned_model ?? null,
         canCancel: (GOAL_LIVE_STATUSES as readonly string[]).includes(goal.status),
         canResume: goal.status === "paused",
         terminal: (GOAL_TERMINAL_STATUSES as readonly string[]).includes(goal.status),
@@ -762,6 +794,7 @@ function goalDetail(goalLedger: GoalLedger, goal: GoalRow): {
   todos: unknown[];
   tokenBudget: number;
   tokensSpent: number;
+  modelPluginId: string | null;
   effectState: string;
   canCancel: boolean;
   canResume: boolean;
@@ -788,6 +821,7 @@ function goalDetail(goalLedger: GoalLedger, goal: GoalRow): {
     todos: parseJsonArray(goal.todos),
     tokenBudget: goal.token_budget,
     tokensSpent: goal.tokens_spent,
+    modelPluginId: goal.pinned_model ?? null,
     effectState: goalLedger.effectState(goal.id),
     canCancel,
     canResume: goal.status === "paused",
@@ -897,6 +931,17 @@ function invalidCredentials(): Response {
     status: 400,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * §5.1 `429 busy` with the REQUIRED `retry-after` header (the goal cap is
+ * concurrent-capacity and retryable, exactly as chat's `busy()` helper treats
+ * it). Flat envelope, no `message`: §5.1 lists no extra field for `busy`.
+ */
+function goalBusy(c: Context): Response {
+  const res = c.json({ error: "busy" }, 429);
+  res.headers.set("retry-after", String(GOAL_BUSY_RETRY_AFTER_SECONDS));
+  return res;
 }
 
 function inferenceUnavailable(): Response {

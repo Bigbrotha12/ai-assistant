@@ -76,17 +76,33 @@ class NtfyNotifClient implements NotifClient {
     final body = response.data;
     if (body == null) return;
 
+    // A stream that ends or errors must free the topic. Otherwise `_subs` keeps
+    // a dead entry, every later `subscribe` early-returns, and the topic can
+    // never reconnect — e.g. the lifecycle-resume path after a dropped SSE
+    // connection. Releasing the entry lets the next subscribe open a fresh
+    // stream; the error is contained here (never rethrown) so a broken stream
+    // cannot surface as an uncaught async error.
+    late final StreamSubscription<String> sub;
+    void release() {
+      if (identical(_subs[topic], sub)) _subs.remove(topic);
+    }
+
     // ntfy's /json endpoint emits a stream of JSON events, one per line.
-    final sub = body.stream
+    sub = body.stream
         .cast<List<int>>()
         .transform(const Utf8Decoder())
         .transform(const LineSplitter())
-        .listen((line) {
-      final message = parseNtfyEvent(line);
-      if (message != null) {
-        _controller.add(message);
-      }
-    });
+        .listen(
+      (line) {
+        final message = parseNtfyEvent(line);
+        if (message != null) {
+          _controller.add(message);
+        }
+      },
+      onError: (Object _) => release(),
+      onDone: release,
+      cancelOnError: true,
+    );
     _subs[topic] = sub;
   }
 

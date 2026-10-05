@@ -313,6 +313,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       },
     );
 
+    // In-app surfacing of push notifications happens at the app root
+    // ([NotifSurfacer] in `main.dart`) so it works on every screen and only
+    // once; this screen no longer listens.
+
     // Map each selected draft to its upload job (by local path) so the row can
     // look up a status overlay; drafts still being composed have none.
     final uploadStatus = state?.attachmentUploads ?? const {};

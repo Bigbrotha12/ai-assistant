@@ -17,6 +17,9 @@ import type { Context } from "hono";
 /** C0 controls + DEL: never valid in a public text field. */
 export const PUBLIC_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 
+/** C0 controls + DEL EXCEPT `\n` (U+000A): valid only in a prose field. */
+export const PUBLIC_PROSE_CONTROL_CHARACTERS = /[\u0000-\u0009\u000b-\u001f\u007f]/;
+
 /** The §5.1 flat error envelope a rejected public field maps to. */
 export type PublicFieldError = "invalid_request" | "request_too_large";
 
@@ -43,6 +46,33 @@ export function publicTextError(
     return "invalid_request";
   }
   if (identifier && (value === "." || value === "..")) {
+    return "invalid_request";
+  }
+  return exceedsByteLimit(value, maxBytes) ? "request_too_large" : null;
+}
+
+/**
+ * Validates a multi-line public prose field. Identical to {@link publicTextError}
+ * with `identifier: false` EXCEPT U+000A (`\n`) is allowed; every other C0
+ * control and DEL is still refused.
+ *
+ * Prose differs from other public fields (which stay control-free) because a
+ * legitimate user-authored answer is routinely multi-line: the resume sheet's
+ * answer input is explicitly multi-line (minLines 3 / maxLines 6), so pressing
+ * Enter must not yield a bare 400. Only the line feed is admitted — a stray C0
+ * control or DEL remains `invalid_request`. Returns `invalid_request` for a
+ * non-string or all-whitespace value too, and `request_too_large` past
+ * [maxBytes].
+ */
+export function publicProseTextError(
+  value: unknown,
+  maxBytes: number,
+): PublicFieldError | null {
+  if (
+    typeof value !== "string" ||
+    value.trim() === "" ||
+    PUBLIC_PROSE_CONTROL_CHARACTERS.test(value)
+  ) {
     return "invalid_request";
   }
   return exceedsByteLimit(value, maxBytes) ? "request_too_large" : null;

@@ -27,6 +27,7 @@ import 'package:ai_assistant/features/plugins/data/managed_conversation_reposito
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_store.dart';
 import 'package:ai_assistant/features/settings/data/account_export.dart';
+import 'package:ai_assistant/features/settings/ui/notifications_settings_screen.dart';
 import 'package:ai_assistant/features/settings/ui/settings_screen.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_screen.dart';
@@ -1591,6 +1592,30 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byType(VoiceSettingsScreen), findsOneWidget);
+    });
+  });
+
+  group('notifications entry', () {
+    testWidgets('opens the NotificationsSettingsScreen', (tester) async {
+      await tester.pumpWidget(
+        settingsApp(
+          tester,
+          store: FakeSettingsStore(),
+          filesClient: NoOpFilesClient(),
+          fileCache: FakeFileCache(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.scrollUntilVisible(
+        find.text('Notifications'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.text('Notifications'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(NotificationsSettingsScreen), findsOneWidget);
     });
   });
 }

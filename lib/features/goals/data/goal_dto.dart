@@ -39,6 +39,53 @@ class GoalSubmitted {
   final String createdAt;
 }
 
+/// `POST /v1/goals/:id/cancel` (`WIRE_SPEC §12`) — the cancelled goal, the
+/// status it came from, and the effect state observed at cancel time.
+///
+/// Only [goalId] and [status] are required identity fields; [previousStatus]
+/// and [effectState] are server-derived and parsed defensively (absent on an
+/// older gateway, or on a shape that omits them).
+class GoalCancelResult {
+  const GoalCancelResult({
+    required this.goalId,
+    required this.status,
+    required this.previousStatus,
+    required this.effectState,
+  });
+
+  factory GoalCancelResult.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    return GoalCancelResult(
+      goalId: pluginJsonString(json['goalId']),
+      status: pluginJsonString(json['status']),
+      previousStatus: _nullableString(json['previousStatus']),
+      effectState: _nullableString(json['effectState']),
+    );
+  }
+
+  final String goalId;
+  final String status;
+  final String? previousStatus;
+  final String? effectState;
+}
+
+/// `POST /v1/goals/:id/resume` → `200` (`WIRE_SPEC §12`): the goal accepted the
+/// resume and is `queued` again.
+class GoalResumed {
+  const GoalResumed({required this.goalId, required this.status});
+
+  factory GoalResumed.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    return GoalResumed(
+      goalId: pluginJsonString(json['goalId']),
+      status: pluginJsonString(json['status']),
+    );
+  }
+
+  final String goalId;
+  final String status;
+}
+
 /// One `steps` entry of `GET /v1/goals/:id`.
 class GoalStep {
   const GoalStep({
@@ -81,6 +128,36 @@ class GoalMutation {
   final String argsHash;
 }
 
+/// One `resolveMutations` entry of `POST /v1/goals/:id/resume` (`WIRE_SPEC
+/// §12`): the user's stated resolution for a `(tool, argsHash)` the detail
+/// listed as unresolved.
+///
+/// `not_applied` is a **user assertion**, not a server-verified fact (no
+/// idempotency key is sent to the target and no query-before-write is done), so
+/// the confirmation copy (R18) is what distinguishes it.
+class GoalMutationResolutionInput {
+  const GoalMutationResolutionInput({
+    required this.tool,
+    required this.argsHash,
+    required this.resolution,
+  });
+
+  /// The three wire values §12 accepts for [resolution].
+  static const allowedResolutions = {'applied', 'retryable', 'not_applied'};
+
+  final String tool;
+  final String argsHash;
+
+  /// One of [allowedResolutions].
+  final String resolution;
+
+  Map<String, dynamic> toJson() => {
+    'tool': tool,
+    'argsHash': argsHash,
+    'resolution': resolution,
+  };
+}
+
 /// `GET /v1/goals/:id` (`WIRE_SPEC §12`).
 class GoalDetail {
   const GoalDetail({
@@ -101,6 +178,7 @@ class GoalDetail {
     required this.unresolvedMutations,
     required this.steps,
     required this.updatedAt,
+    this.modelPluginId,
   });
 
   factory GoalDetail.fromJson(Object? value) {
@@ -108,6 +186,7 @@ class GoalDetail {
     return GoalDetail(
       goalId: pluginJsonString(json['goalId']),
       status: pluginJsonString(json['status']),
+      modelPluginId: _nullableString(json['modelPluginId']),
       pauseReason: _nullableString(json['pauseReason']),
       pauseQuestion: _nullableString(json['pauseQuestion']),
       resultSummary: _nullableString(json['resultSummary']),
@@ -120,7 +199,10 @@ class GoalDetail {
       canCancel: json['canCancel'] == true,
       canResume: json['canResume'] == true,
       terminal: json['terminal'] == true,
-      unresolvedMutations: _parseList(json['unresolvedMutations'], GoalMutation.fromJson),
+      unresolvedMutations: _parseList(
+        json['unresolvedMutations'],
+        GoalMutation.fromJson,
+      ),
       steps: _parseList(json['steps'], GoalStep.fromJson),
       updatedAt: _stringOr(json['updatedAt'], ''),
     );
@@ -130,6 +212,11 @@ class GoalDetail {
 
   /// One of `queued|running|paused|complete|failed|cancelled`.
   final String status;
+
+  /// The plugin id the goal was admitted against, pinned at admission. Null
+  /// when an older gateway omits it; the resume action then has no model to
+  /// re-credential and refuses with `no_credentials`.
+  final String? modelPluginId;
   final String? pauseReason;
   final String? pauseQuestion;
   final String? resultSummary;
@@ -177,6 +264,7 @@ class GoalSummary {
     required this.terminal,
     required this.createdAt,
     required this.updatedAt,
+    this.modelPluginId,
   });
 
   factory GoalSummary.fromJson(Object? value) {
@@ -184,6 +272,7 @@ class GoalSummary {
     return GoalSummary(
       goalId: pluginJsonString(json['goalId']),
       status: pluginJsonString(json['status']),
+      modelPluginId: _nullableString(json['modelPluginId']),
       instruction: _stringOr(json['instruction'], ''),
       pauseReason: _nullableString(json['pauseReason']),
       pauseQuestion: _nullableString(json['pauseQuestion']),
@@ -203,6 +292,10 @@ class GoalSummary {
 
   /// One of `queued|running|paused|complete|failed|cancelled`.
   final String status;
+
+  /// The pinned model plugin id (see [GoalDetail.modelPluginId]); null when an
+  /// older gateway omits it.
+  final String? modelPluginId;
   final String instruction;
   final String? pauseReason;
   final String? pauseQuestion;

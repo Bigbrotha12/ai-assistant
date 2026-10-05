@@ -811,12 +811,22 @@ export class GoalLedger {
   /**
    * Resumes a `paused` goal (Phase 5.1, plan §Control tools ▸"Resume is
    * atomic"): ONE transaction appends the durable user `goal_message` (the
-   * answer) and CASes `paused -> queued`. The CAS requires `lease_owner IS
-   * NULL` — a paused goal holds no lease, so a live lease column means the row
-   * is NOT actually paused (or a runner is mid-step) and the resume is refused
-   * rather than stealing it. `pause_reason`/`pause_question` are CLEARED: the
-   * question is answered, and leaving them would make the client keep offering
-   * a resolved prompt.
+   * answer, WHEN ONE IS SUPPLIED) and CASes `paused -> queued`. The CAS
+   * requires `lease_owner IS NULL` — a paused goal holds no lease, so a live
+   * lease column means the row is NOT actually paused (or a runner is mid-step)
+   * and the resume is refused rather than stealing it. `pause_reason`/
+   * `pause_question` are CLEARED: the question is answered, and leaving them
+   * would make the client keep offering a resolved prompt.
+   *
+   * `answer` is OPTIONAL: only a `needs_user_input` pause actually asked a
+   * question, but the SAME resume surface rescues `credentials_required` /
+   * `budget_exhausted` / `needs_mutation_resolution` — none of which pose a
+   * question. Requiring a canned line there would force a fabricated `user` row
+   * into the durable log on every credential refresh, poisoning the next step's
+   * input vector. So the append is CONDITIONAL: a non-`undefined` [answer]
+   * appends exactly one `user` row; omitting it appends NOTHING (the caller
+   * decides, per `pause_reason`, whether an answer is mandatory — the route
+   * requires one for `needs_user_input` and treats it as optional otherwise).
    *
    * Compose this with any per-row transition (Phase 6's `resolveMutations`)
    * inside one `transaction(...)`; it opens its OWN transaction on top of that
@@ -833,14 +843,19 @@ export class GoalLedger {
    * and re-registers it BEFORE calling this, so a goal can never become
    * `queued` without a credential handle to spend.
    */
-  resumeGoal(goalId: string, owner: string, answer: string): void {
+  resumeGoal(goalId: string, owner: string, answer?: string): void {
     this.db.transaction(() => {
       this.requireOwnership(this.requireGoal(goalId), owner);
       const now = this.now();
-      this.appendGoalMessage(goalId, owner, {
-        role: "user",
-        content: answer,
-      });
+      // Conditional append: ONLY a supplied answer writes a `user` row. An
+      // omitted answer (a credential/budget/mutation rescue) leaves the durable
+      // log untouched — no fabricated line for a question that was never asked.
+      if (answer !== undefined) {
+        this.appendGoalMessage(goalId, owner, {
+          role: "user",
+          content: answer,
+        });
+      }
       const result = this.db
         .prepare(
           `UPDATE goal

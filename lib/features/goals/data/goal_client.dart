@@ -102,12 +102,121 @@ class GoalClient {
         gatewayKey: gatewayKey,
         cancelToken: token,
       );
-      final nextOffset =
-          int.tryParse(response.headers.value('x-ledger-next-offset') ?? '');
+      final nextOffset = int.tryParse(
+        response.headers.value('x-ledger-next-offset') ?? '',
+      );
       return GoalListPage.fromJson(
         await _http.readJson(response.data),
         nextOffset: nextOffset,
       );
+    });
+  }
+
+  /// `POST /v1/goals/:id/cancel` — cancel a live goal. The body carries nothing
+  /// (`WIRE_SPEC §12`: the id is in the path).
+  ///
+  /// A terminal goal is refused with `409 goal_not_cancellable`; the refusal
+  /// arrives as the typed [PluginClientException] from the shared envelope
+  /// mapping.
+  Future<GoalCancelResult> cancel(
+    String goalId, {
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  }) {
+    if (goalId.trim().isEmpty) {
+      throw const PluginClientException('invalid_request');
+    }
+    return _http.run(cancelToken, (token) async {
+      final response = await _http.send(
+        path: '/goals/${Uri.encodeComponent(goalId)}/cancel',
+        gatewayKey: gatewayKey,
+        cancelToken: token,
+        method: 'POST',
+      );
+      return GoalCancelResult.fromJson(await _http.readJson(response.data));
+    });
+  }
+
+  /// `DELETE /v1/goals/:id` — delete a terminal goal. The server answers `204`
+  /// with an empty body, so this never parses a payload.
+  ///
+  /// A non-terminal goal is refused with `409 goal_not_deletable` (cancel it
+  /// first).
+  Future<void> delete(
+    String goalId, {
+    required String gatewayKey,
+    CancelToken? cancelToken,
+  }) {
+    if (goalId.trim().isEmpty) {
+      throw const PluginClientException('invalid_request');
+    }
+    return _http.run(cancelToken, (token) async {
+      await _http.send(
+        path: '/goals/${Uri.encodeComponent(goalId)}',
+        gatewayKey: gatewayKey,
+        cancelToken: token,
+        method: 'DELETE',
+      );
+    });
+  }
+
+  /// `POST /v1/goals/:id/resume` — re-credential a paused goal, optionally
+  /// carrying the user's answer, a raised token budget, and their resolutions
+  /// for the goal's unresolved mutations (`WIRE_SPEC §12`).
+  ///
+  /// The body carries ONLY the fields the caller supplied: [answer] is omitted
+  /// when null/blank, [resolveMutations] when null/empty, [tokenBudget] when
+  /// null. [credentials] is the goal's OWN pinned model entry — §12's shape is
+  /// `{<modelPluginId>: {…}}`, so the caller supplies exactly one entry and the
+  /// action layer computes it from the goal's `modelPluginId`.
+  ///
+  /// Client-side validation mirrors the server's: a positive [tokenBudget] when
+  /// present, and each resolution's `tool`/`argsHash` non-empty with a
+  /// `resolution` in [GoalMutationResolutionInput.allowedResolutions]. Anything
+  /// else is refused here as `invalid_request` rather than sent.
+  Future<GoalResumed> resume(
+    String goalId, {
+    required String gatewayKey,
+    String? answer,
+    required Map<String, Map<String, String>> credentials,
+    List<GoalMutationResolutionInput>? resolveMutations,
+    int? tokenBudget,
+    CancelToken? cancelToken,
+  }) {
+    if (goalId.trim().isEmpty || credentials.isEmpty) {
+      throw const PluginClientException('invalid_request');
+    }
+    if (tokenBudget != null && tokenBudget <= 0) {
+      throw const PluginClientException('invalid_request');
+    }
+    final resolutions = resolveMutations;
+    if (resolutions != null) {
+      for (final entry in resolutions) {
+        if (entry.tool.trim().isEmpty ||
+            entry.argsHash.trim().isEmpty ||
+            !GoalMutationResolutionInput.allowedResolutions.contains(
+              entry.resolution,
+            )) {
+          throw const PluginClientException('invalid_request');
+        }
+      }
+    }
+    final text = answer?.trim();
+    final body = <String, dynamic>{
+      'credentials': credentials,
+      if (text != null && text.isNotEmpty) 'answer': text,
+      if (resolutions != null && resolutions.isNotEmpty)
+        'resolveMutations': [for (final entry in resolutions) entry.toJson()],
+    };
+    if (tokenBudget != null) body['tokenBudget'] = tokenBudget;
+    return _http.run(cancelToken, (token) async {
+      final response = await _http.send(
+        path: '/goals/${Uri.encodeComponent(goalId)}/resume',
+        gatewayKey: gatewayKey,
+        cancelToken: token,
+        body: body,
+      );
+      return GoalResumed.fromJson(await _http.readJson(response.data));
     });
   }
 }

@@ -727,6 +727,17 @@ export const LEDGER_MIGRATIONS: readonly Migration[] = [
   (db) => {
     db.exec(`ALTER TABLE ledger_step ADD COLUMN body_failed INTEGER NOT NULL DEFAULT 0;`);
   },
+  // v11 — goal_mutation lookup indexes (plan M4/N4): resolveMutations matches
+  // (goal_id, tool, args_hash) — the UNIQUE key's plugin_id makes that a prefix
+  // miss — and listUnresolvedMutations filters (goal_id, state). Pure index
+  // additions, so data-preserving: every existing row keeps its identity and
+  // its UNIQUE (goal_id, plugin_id, tool, args_hash) enforcement.
+  (db) => {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_goal_mutation_goal_tool_hash
+               ON goal_mutation(goal_id, tool, args_hash);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_goal_mutation_goal_state
+               ON goal_mutation(goal_id, state);`);
+  },
 ];
 
 // The migration list is fixed once the module is loaded: a consumer must not

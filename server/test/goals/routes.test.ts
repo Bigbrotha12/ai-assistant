@@ -430,10 +430,9 @@ describe("goal routes — POST /v1/goals admission", () => {
 
     const res = await postGoal(app, { clientGoalId: "one-too-many" });
     assert.equal(res.status, 429);
-    assert.deepEqual(await res.json(), {
-      error: "busy",
-      message: "goal concurrency limit reached",
-    });
+    assert.deepEqual(await res.json(), { error: "busy" });
+    // §5.1 requires `retry-after` on 429 (a hint, not an ETA).
+    assert.equal(res.headers.get("retry-after"), "30");
     // The cap is checked before any credential is minted.
     assert.equal(pins.pinCalls.length, 0);
   });
@@ -525,6 +524,7 @@ describe("goal routes — GET /v1/goals/:id", () => {
       ],
       tokenBudget: 200_000,
       tokensSpent: 41230,
+      modelPluginId: "openrouter",
       effectState: "unknown",
       canCancel: true,
       canResume: false,
@@ -550,6 +550,27 @@ describe("goal routes — GET /v1/goals/:id", () => {
     assert.equal(getRes.status, 200);
     const body = (await getRes.json()) as { todos: unknown[] };
     assert.deepEqual(body.todos, []);
+  });
+
+  test("modelPluginId is the pinned model, and null-safe when absent (resume keys credentials by it)", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const res = await postGoal(app);
+    const { goalId } = (await res.json()) as PostBody;
+
+    const getRes = await app.request(`/v1/goals/${goalId}`, { headers: auth });
+    assert.equal(getRes.status, 200);
+    assert.equal(
+      ((await getRes.json()) as { modelPluginId: string | null }).modelPluginId,
+      "openrouter",
+    );
+
+    // A goal admitted without a pinned model (e.g. a pre-existing row) reads
+    // `null`, never `""` or `undefined`.
+    db.prepare("UPDATE goal SET pinned_model = NULL WHERE id = ?").run(goalId);
+    const nullRes = await app.request(`/v1/goals/${goalId}`, { headers: auth });
+    const nullBody = (await nullRes.json()) as { modelPluginId: string | null };
+    assert.equal(nullBody.modelPluginId, null);
+    assert.equal(goalLedger.getGoal(goalId)!.pinned_model, null);
   });
 
   test("another owner's goal and a missing id are both 404 (no leak)", async (t) => {
@@ -1071,6 +1092,116 @@ describe("goal routes — POST /v1/goals/:id/resume (5.1)", () => {
     assert.deepEqual(await res.json(), { goalId, status: "queued" });
     assert.equal(goalLedger.getGoal(goalId)!.token_budget, 200_000);
   });
+
+  test("a paused credentials_required goal resumes with NO answer -> 200, nothing appended", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const res = await postGoal(app, { clientGoalId: "cred-rescue" });
+    const { goalId } = (await res.json()) as PostBody;
+    const claimed = goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.pauseGoal(goalId, "user-1", {
+      next: "paused",
+      reason: "credentials_required",
+      leaseOwner: "user-1",
+      leaseToken: claimed.lease_token!,
+    });
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+
+    const resume = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(resume.status, 200);
+    assert.deepEqual(await resume.json(), { goalId, status: "queued" });
+
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "queued");
+    assert.equal(row.pause_reason, null, "the pause reason is cleared");
+    assert.equal(
+      goalLedger.listGoalMessages(goalId).length,
+      messagesBefore,
+      "no fabricated answer row for a resize that asked no question",
+    );
+    // A fresh credential handle was still minted and registered.
+    assert.equal(pins.pinCalls.length, 2);
+  });
+
+  test("a paused budget_exhausted goal resumes with tokenBudget and no answer -> 200", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const goalId = await pauseBudgetExhausted(app, goalLedger);
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        tokenBudget: 500_000,
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "queued");
+    assert.equal(row.token_budget, 500_000, "the budget was raised");
+    assert.equal(row.tokens_spent, 200_000, "spend is preserved");
+    assert.equal(
+      goalLedger.listGoalMessages(goalId).length,
+      messagesBefore,
+      "no answer appended on a budget-only resume",
+    );
+  });
+
+  test("a needs_user_input pause without an answer is 400 and stays paused", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+    const mintedBefore = pins.pinCalls.length;
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(
+      goalLedger.getGoal(goalId)!.pause_reason,
+      "needs_user_input",
+      "the unanswered question survives",
+    );
+    assert.equal(goalLedger.listGoalMessages(goalId).length, messagesBefore);
+    assert.equal(pins.pinCalls.length, mintedBefore, "no pin minted on refusal");
+  });
+
+  test("a needs_user_input resume WITH an answer still works", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "high protein, no dessert",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+    const messages = goalLedger.listGoalMessages(goalId);
+    assert.equal(messages.length, messagesBefore + 1);
+    assert.equal(messages.at(-1)!.role, "user");
+    assert.equal(
+      JSON.parse(messages.at(-1)!.content_json),
+      "high protein, no dessert",
+    );
+  });
 });
 
 describe("goal routes — resume with resolveMutations (Phase 6)", () => {
@@ -1496,11 +1627,16 @@ describe("goal routes — GET /v1/goals + DELETE (5.3)", () => {
 
     const res = await app.request("/v1/goals", { headers: auth });
     assert.equal(res.status, 200);
-    const body = (await res.json()) as { goals: { goalId: string; canResume: boolean }[] };
+    const body = (await res.json()) as {
+      goals: { goalId: string; canResume: boolean; modelPluginId: string | null }[];
+    };
     assert.deepEqual(body.goals.map((g) => g.goalId), [second.goalId, first.goalId]);
     assert.equal(res.headers.get("x-ledger-page-limit"), "50");
     assert.equal(res.headers.get("x-ledger-next-offset"), null);
     assert.equal(body.goals[0]!.canResume, false);
+    // §12: list rows expose the goal's pinned model plugin so the client can
+    // key resume credentials without a per-goal GET.
+    assert.equal(body.goals[0]!.modelPluginId, "openrouter");
 
     // Paging: a 1-item page reports a next offset.
     const page = await app.request("/v1/goals?limit=1", { headers: auth });
@@ -1841,10 +1977,8 @@ describe("goal routes — Phase 5 review regressions", () => {
       }),
     });
     assert.equal(res.status, 429);
-    assert.deepEqual(await res.json(), {
-      error: "busy",
-      message: "goal concurrency limit reached",
-    });
+    assert.deepEqual(await res.json(), { error: "busy" });
+    assert.equal(res.headers.get("retry-after"), "30", "§5.1 retry-after hint");
     assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
     assert.equal(
       pins.pinCalls.length,
@@ -1853,11 +1987,12 @@ describe("goal routes — Phase 5 review regressions", () => {
     );
   });
 
-  test("answer takes the same bound as instruction (5.1)", async (t) => {
+  test("answer admits newlines (multi-line prose), refuses other controls and oversize (5.1)", async (t) => {
     const { app, goalLedger, pins } = makeApp(t);
     const goalId = await pauseGoal(app, goalLedger);
     const mintedBefore = pins.pinCalls.length;
 
+    // Oversize is still 413 — the same byte bound as `instruction`.
     const oversized = await app.request(`/v1/goals/${goalId}/resume`, {
       method: "POST",
       headers: auth,
@@ -1869,13 +2004,12 @@ describe("goal routes — Phase 5 review regressions", () => {
     assert.equal(oversized.status, 413);
     assert.deepEqual(await oversized.json(), { error: "request_too_large" });
 
-    // Control characters (newlines included) are refused exactly as the
-    // admission route refuses a multi-line `instruction`.
+    // A DIFFERENT C0 control (BEL) is still refused.
     const controlChar = await app.request(`/v1/goals/${goalId}/resume`, {
       method: "POST",
       headers: auth,
       body: JSON.stringify({
-        answer: "line one\nline two",
+        answer: "line one\u0001line two",
         credentials: { openrouter: { apiKey: "sk-resumed" } },
       }),
     });
@@ -1885,5 +2019,51 @@ describe("goal routes — Phase 5 review regressions", () => {
     assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
     assert.equal(goalLedger.listGoalMessages(goalId).length, 2, "no answer was written");
     assert.equal(pins.pinCalls.length, mintedBefore, "a refused answer never mints a pin");
+
+    // U+000A is legitimate prose: the resume sheet's answer field is multi-line,
+    // so the answer is admitted and appended verbatim.
+    const multiLine = "line one\nline two\nline three";
+    const ok = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: multiLine,
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { goalId, status: "queued" });
+    assert.equal(
+      JSON.parse(goalLedger.listGoalMessages(goalId).at(-1)!.content_json),
+      multiLine,
+      "the multi-line answer is persisted verbatim",
+    );
+  });
+
+  test("S2: a goal with a blank pinned model cannot resume and mints no pin", async (t) => {
+    const { app, db, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseGoal(app, goalLedger);
+    // A raw ledger update can blank the pinned model. On the registry-free path
+    // `structuralModelCredentials(body, "")` would otherwise accept
+    // `credentials: {"": …}` and mint a pin under plugin id `""`.
+    db.prepare("UPDATE goal SET pinned_model = ? WHERE id = ?").run("", goalId);
+    const mintedBefore = pins.pinCalls.length;
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "yes",
+        credentials: { "": { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(
+      pins.pinCalls.length,
+      mintedBefore,
+      "no pin minted for a blank plugin id",
+    );
   });
 });

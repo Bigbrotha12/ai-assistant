@@ -196,7 +196,7 @@ void main() {
     expect(find.byType(GoalTodoScreen), findsNothing);
   });
 
-  testWidgets('the goals chip opens the read-only goals overlay', (
+  testWidgets('the goals chip opens the goals overlay', (
     tester,
   ) async {
     await pumpGoalChat(tester);
