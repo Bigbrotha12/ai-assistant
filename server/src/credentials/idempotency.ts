@@ -49,6 +49,9 @@ export interface RecordToolResultInput {
   toolCallId: string;
   toolName: string;
   result: string;
+  /** MCP domain-failure fact (v10): the tool returned a structured
+   *  `isError: true` result. Persisted so replay re-serves it. */
+  bodyFailed?: boolean;
 }
 
 export interface HasToolResultInput {
@@ -101,6 +104,7 @@ export function recordToolResult(
         // Persisted tool results are state: redact here because custom handlers may bypass ToolExecutor.
         result: redactForOutbound(input.result),
         toolCallId: input.toolCallId,
+        bodyFailed: input.bodyFailed,
       },
       input.fenceToken,
     ).step;

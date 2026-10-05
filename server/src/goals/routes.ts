@@ -15,6 +15,11 @@ import type {
 } from "../credentials/pins.ts";
 import { env } from "../env.ts";
 import {
+  isRecord,
+  publicFieldError,
+  publicTextError,
+} from "../http/public_fields.ts";
+import {
   extractCredentialsFromBody,
   PluginCredentialError,
   validateCredentials,
@@ -33,6 +38,7 @@ import {
 } from "../ledger.ts";
 
 import { GOAL_MAX_CONCURRENT_PER_OWNER } from "./constants.ts";
+import { CONTROL_TOOL_NAMES } from "./control.ts";
 import { GoalError, GoalSetupError } from "./errors.ts";
 import {
   parseAgentSnapshot,
@@ -45,7 +51,11 @@ import {
   GOAL_STATUSES,
   GOAL_TERMINAL_STATUSES,
 } from "./types.ts";
-import type { GoalRow, GoalStatus } from "./types.ts";
+import type {
+  GoalMutationResolution,
+  GoalRow,
+  GoalStatus,
+} from "./types.ts";
 
 /**
  * Phase 3.6 goal REST surface (`POST /v1/goals`, `GET /v1/goals/:id`,
@@ -55,12 +65,14 @@ import type { GoalRow, GoalStatus } from "./types.ts";
  * owner-scoped read (cross-owner id is a `404`, never a leak), and the §5.1
  * flat `{"error":"<code>"}` envelope.
  *
- * Wire shapes are WIRE_SPEC §12. M2's admission guard rejects a non-empty
- * `authorisedTools` (there is no `authorize` interceptor until Phase 6, so a
- * write could not be gated) and terminates any goal whose non-control bound
- * surface is not read-only. Credentials are pinned at admission and registered
- * in the runner's `goalPins` registry — the runner reads ONLY its own handle,
- * never `pins.find(owner, pluginId)` (the Phase 0.3 bug class).
+ * Wire shapes are WIRE_SPEC §12. M4 admission validates and persists
+ * `authorisedTools` — the goal's sentenceable mutating surface, gated at
+ * dispatch by the Phase 6 `authorize` interceptor — and `resume` resolves the
+ * goal's previously-`unresolved` mutations atomically with the answer (§12
+ * `resolveMutations`). A goal whose non-control bound surface is not read-only
+ * (and not authorised) terminates. Credentials are pinned at admission and
+ * registered in the runner's `goalPins` registry — the runner reads ONLY its
+ * own handle, never `pins.find(owner, pluginId)` (the Phase 0.3 bug class).
  *
  * The `registry` dep is optional: when present, `modelPluginId` is resolved
  * exactly as chat does and the model credentials are validated against the
@@ -163,23 +175,42 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     const existing = goalLedger.getGoalByIdempotencyKey(owner, clientGoalId);
     if (existing) return c.json(postShape(existing), 200);
 
-    // 2. Admission guard (3.5 / waves §M2): `authorisedTools` is empty in M2 —
-    //    no `authorize` interceptor exists, so binding a write the pipeline
-    //    cannot gate would be the exact failure the read-only invariant
-    //    prevents. The route refuses loudly rather than admitting it.
-    const authorisedTools = body["authorisedTools"];
-    if (authorisedTools !== undefined) {
-      if (!Array.isArray(authorisedTools)) {
+    // 2. Admission (M4): `authorisedTools` sentences the goal's mutating
+    //    surface — the Phase 6 `authorize` interceptor admits a candidate
+    //    mutating call only when its tool name was authorised here. Absent ->
+    //    `[]` (a read-only-only goal; the v9 column stores the JSON array).
+    //    Every entry must be a non-empty, control-free, <=256-byte tool name;
+    //    the list is de-duplicated (case-sensitive), capped at 32 distinct
+    //    entries, and control-tool names (`update_plan` / `goal_complete` /
+    //    `goal_blocked`) are REFUSED — authorising one would be meaningless and
+    //    would let the model double-call the goal's own CAS transition.
+    const authorisedToolsInput = body["authorisedTools"];
+    let authorisedTools: string[];
+    if (authorisedToolsInput === undefined) {
+      authorisedTools = [];
+    } else {
+      if (!Array.isArray(authorisedToolsInput)) {
         return c.json({ error: "invalid_request" }, 400);
       }
-      if (authorisedTools.length > 0) {
-        return c.json(
-          {
-            error: "invalid_request",
-            message: "authorised tools are not supported until M4",
-          },
-          400,
-        );
+      authorisedTools = [];
+      const seen = new Set<string>();
+      for (const raw of authorisedToolsInput) {
+        if (typeof raw !== "string") {
+          return c.json({ error: "invalid_request" }, 400);
+        }
+        const name = raw.trim();
+        if (publicTextError(name, 256, false) !== null) {
+          return c.json({ error: "invalid_request" }, 400);
+        }
+        if ((CONTROL_TOOL_NAMES as readonly string[]).includes(name)) {
+          return c.json({ error: "invalid_request" }, 400);
+        }
+        if (seen.has(name)) continue;
+        seen.add(name);
+        authorisedTools.push(name);
+      }
+      if (authorisedTools.length > 32) {
+        return c.json({ error: "invalid_request" }, 400);
       }
     }
 
@@ -251,6 +282,7 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
         tokenBudget,
         agentSnapshot,
         pinnedModel: modelPluginId,
+        authorisedTools,
       });
     } catch (error) {
       pins.release(owner, modelPluginId, handle);
@@ -326,7 +358,7 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     }
   });
 
-  // ── Phase 5.1 resume: re-credential + answer, atomically. ──
+  // ── Phase 5.1 resume: re-credential + answer + mutation resolution, atomically. ──
   routes.post("/goals/:id/resume", async (c) => {
     const auth = await verifyKey(c);
     if (!auth.ok) return keyGateResponse(c, auth);
@@ -367,6 +399,86 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     if (answerError !== null) return publicFieldError(c, answerError);
     const answerText = answer as string;
 
+    // Phase 6 (WIRE_SPEC §12): the client resolves the goal's
+    // previously-`unresolved` mutations ATOMICALLY with the resume (plan
+    // §"Resume is atomic"). Absent -> [] (a normal pause resumes with nothing
+    // to resolve). Each entry keys a mutation by `(tool, argsHash)` — the
+    // shape `GET /v1/goals/:id` lists — and states the user's resolution.
+    const resolutionsInput = record["resolveMutations"];
+    let resolutions: {
+      tool: string;
+      argsHash: string;
+      resolution: GoalMutationResolution;
+    }[] = [];
+    if (resolutionsInput !== undefined) {
+      if (!Array.isArray(resolutionsInput) || resolutionsInput.length > 50) {
+        return c.json({ error: "invalid_request" }, 400);
+      }
+      for (const raw of resolutionsInput) {
+        if (!isRecord(raw)) {
+          return c.json({ error: "invalid_request" }, 400);
+        }
+        const tool = raw["tool"];
+        const argsHash = raw["argsHash"];
+        const resolution = raw["resolution"];
+        if (
+          publicTextError(tool, 256, false) !== null ||
+          publicTextError(argsHash, 256, false) !== null ||
+          (resolution !== "applied" &&
+            resolution !== "retryable" &&
+            resolution !== "not_applied")
+        ) {
+          return c.json({ error: "invalid_request" }, 400);
+        }
+        // `publicTextError` refutes every non-string / empty / control /
+        // over-long value above, so the casts are safe here.
+        resolutions.push({
+          tool: tool as string,
+          argsHash: argsHash as string,
+          resolution,
+        });
+      }
+    }
+    // Pre-validate membership BEFORE any transaction: the client can only
+    // resolve what the detail endpoint listed (`listUnresolvedMutations`). A
+    // stale or invented entry is refused here, so a wrong resolution can never
+    // drag the (validated) answer append into the same transaction.
+    //
+    // The entry key is `(tool, args_hash)` — the shape the GET lists — but the
+    // ledger's UNIQUE key is `(goal_id, plugin_id, tool, args_hash)`, so the
+    // SAME key can match MORE THAN ONE unresolved row when two plugins share a
+    // tool name and hash. The client cannot disambiguate (the resolution entry
+    // carries no `plugin_id`), so we build a MULTISET (count per key) over the
+    // listed mutations and refuse 400 `invalid_request` when:
+    //   - any entry's key is absent (0 listed — stale or invented), OR
+    //   - any entry's key counts ABOVE 1 (ambiguous across `plugin_id`s — the
+    //     client cannot know which row to resolve), OR
+    //   - the SAME key appears more than once within `resolutions` (a
+    //     duplicate entry would hit the same row twice).
+    // Each refusal happens BEFORE any transaction: left to the ledger, the
+    // ambiguity / duplicate would throw `GOAL_INVALID_TRANSITION` INSIDE the
+    // resume transaction (rolling the answer append back, surfaced as a 409
+    // `goal_not_resumable` — the goal would become un-resumable). The ledger
+    // still re-checks defensively inside the transaction (TOCTOU).
+    if (resolutions.length > 0) {
+      const resolvable = new Map<string, number>();
+      for (const mutation of goalLedger.listUnresolvedMutations(id)) {
+        const key = `${mutation.tool}\u0000${mutation.args_hash}`;
+        resolvable.set(key, (resolvable.get(key) ?? 0) + 1);
+      }
+      const seenInRequest = new Set<string>();
+      for (const entry of resolutions) {
+        const key = `${entry.tool}\u0000${entry.argsHash}`;
+        if (
+          resolvable.get(key) !== 1 ||
+          seenInRequest.has(key)
+        ) {
+          return c.json({ error: "invalid_request" }, 400);
+        }
+        seenInRequest.add(key);
+      }
+    }
+
     // Admission-cap parity with `POST /goals`: a paused goal holds no slot, so
     // resuming is exactly where an owner could otherwise drift past
     // `GOAL_MAX_CONCURRENT_PER_OWNER` by cycling pause/resume. 429 `busy` is
@@ -403,10 +515,39 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     }
     try {
       // ONE transaction: append the durable answer + CAS `paused -> queued`
-      // requiring `lease_owner IS NULL` (plan §"Resume is atomic"). A lost CAS
-      // (or a goal that moved on) THROWS from inside it, so the answer rolls
-      // back with it — nothing durable changes on a refused resume.
-      goalLedger.transaction(() => goalLedger.resumeGoal(id, owner, answerText));
+      // requiring `lease_owner IS NULL` (plan §"Resume is atomic"), then apply
+      // the user's mutation resolutions — `resumeGoal` and `resolveMutations`
+      // each open their own transaction (nested here as better-sqlite3
+      // SAVEPOINTs under this wrapper), so the answer, the CAS, and the
+      // resolutions commit or roll back TOGETHER. A lost CAS (a goal that
+      // moved on) or a resolution that stopped matching (`GOAL_INVALID_
+      // TRANSITION`) THROWS from inside, so nothing durable changes on a
+      // refused resume.
+      goalLedger.transaction(() => {
+        goalLedger.resumeGoal(id, owner, answerText);
+        // Resolve the user's mutations FIRST, against exactly the rows the
+        // route's pre-check validated (`listUnresolvedMutations` — each key
+        // matched exactly one `unresolved` row). The pre-check counts
+        // `unresolved` rows ONLY, so a `pending` straggler may share
+        // `(tool, args_hash)` with a pre-validated `unresolved` row under a
+        // DIFFERENT `plugin_id` (legal: the ledger's UNIQUE key is
+        // `(goal_id, plugin_id, tool, args_hash)`). Adopting BEFORE resolving
+        // would turn that `pending` into a SECOND `unresolved` row with the same
+        // key, so `resolveMutations` would see an ambiguous pair and throw INSIDE
+        // the transaction — a 409 `goal_not_resumable` and a full rollback on
+        // this request; worse, a retry WITHOUT resolutions would commit the
+        // adoption and strand an ambiguous, unresolvable key pair.
+        if (resolutions.length > 0) goalLedger.resolveMutations(id, resolutions);
+        // N2 self-heal (AFTER resolution, per the above): `pending` rows are
+        // invisible to `resolveMutations` and `listUnresolvedMutations` (both
+        // read `unresolved` only), so a double-failure path (a `markMutation`
+        // settle that missed AND the boot adoption that also missed) would
+        // strand them forever. Adopt them `unresolved` here — an unconditional
+        // UPDATE, a no-op when 0 — so they cannot collide with THIS request's
+        // resolutions, become visible in `listUnresolvedMutations` for the NEXT
+        // GET, and are resolvable on the next resume.
+        goalLedger.adoptPendingMutations(id);
+      });
     } catch (error) {
       // This handle never reached the runner's registry — release it from the
       // STORE (see above), then let the mapper answer.
@@ -722,40 +863,6 @@ function inferenceUnavailable(): Response {
     status: 502,
     headers: { "content-type": "application/json" },
   });
-}
-
-const PUBLIC_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-
-type PublicFieldError = "invalid_request" | "request_too_large";
-
-function publicTextError(
-  value: unknown,
-  maxBytes: number,
-  identifier: boolean,
-): PublicFieldError | null {
-  if (
-    typeof value !== "string" ||
-    value.trim() === "" ||
-    PUBLIC_CONTROL_CHARACTERS.test(value)
-  ) {
-    return "invalid_request";
-  }
-  if (identifier && (value === "." || value === "..")) {
-    return "invalid_request";
-  }
-  return Buffer.byteLength(value, "utf8") > maxBytes
-    ? "request_too_large"
-    : null;
-}
-
-function publicFieldError(c: Context, error: PublicFieldError): Response {
-  return error === "request_too_large"
-    ? c.json({ error }, 413)
-    : c.json({ error }, 400);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Defensive JSON-column read for the `todos` list (never throws). */

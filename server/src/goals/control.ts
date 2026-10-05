@@ -52,6 +52,20 @@ class ControlToolStaleError extends Error {
 }
 
 /**
+ * L12 control-tool gate (N1): true when the goal carries a `pending` or
+ * `unresolved` mutation — an effect whose outcome is UNKNOWN. A control tool
+ * must refuse while this holds rather than CAS the goal terminal: leaving the
+ * goal `running` is what lets the runner's step-end L12 guard pause
+ * `needs_mutation_resolution` on the re-read. Completing (or asking) now would
+ * strand the `unresolved` rows under a terminal goal — only `paused` goals
+ * resume — and would report success for effects that may or may not have
+ * reached the provider. `update_plan` stays ungated: it never leaves
+ * `running`, so the same step-end guard covers it.
+ */
+const hasUnknownOutcome = (goalLedger: GoalLedger, goalId: string): boolean =>
+  goalLedger.effectState(goalId) === "unknown";
+
+/**
  * Builds the two goal-native control tools for ONE running step. The runner
  * appends the result to the SAME `tools` array as the plugin/MCP tools.
  */
@@ -110,6 +124,12 @@ export function buildControlTools(
     },
   });
 
+  // `goal_complete` CASes `running -> complete`. It is REFUSED while the goal's
+  // effect state is `unknown` (N1/L12): a sibling mutation may have reached the
+  // provider without a recorded outcome, and completing would make its
+  // `unresolved` row unreachable (only `paused` goals resume) while reporting
+  // the goal done. The refusal writes nothing; the goal stays `running` and the
+  // runner's step-end guard pauses `needs_mutation_resolution` instead.
   const goalComplete = new DynamicStructuredTool({
     name: "goal_complete",
     description:
@@ -122,6 +142,13 @@ export function buildControlTools(
         .describe("The final result summary delivered to the user."),
     }),
     func: async ({ summary }) => {
+      // Refuse while a mutation's outcome is unknown — never append or CAS.
+      if (hasUnknownOutcome(goalLedger, goalId)) {
+        return JSON.stringify({
+          ok: false,
+          reason: "unknown_mutation_outcome",
+        });
+      }
       try {
         goalLedger.transaction(() => {
           // (1) Persist the result as the final assistant message.
@@ -164,6 +191,13 @@ export function buildControlTools(
   // Pausing clears the lease (the plan's CAS), so the step ends here: the
   // runner's post-invoke re-read sees a goal that is no longer `running` and
   // persists NOTHING from the round, exactly as for `goal_complete`.
+  //
+  // Like `goal_complete`, it is REFUSED while the goal's effect state is
+  // `unknown` (N1/L12): asking the user a question would move the goal
+  // `paused(needs_user_input)` and strand the `unresolved` mutation rows under
+  // a pause reason that offers no way to resolve them. The refusal writes
+  // nothing, so the runner's step-end guard pauses `needs_mutation_resolution`
+  // instead. The question is not put to the user until the effects are known.
   const goalBlocked = new DynamicStructuredTool({
     name: "goal_blocked",
     description:
@@ -180,6 +214,13 @@ export function buildControlTools(
         ),
     }),
     func: async ({ question }) => {
+      // Refuse while a mutation's outcome is unknown — never append or CAS.
+      if (hasUnknownOutcome(goalLedger, goalId)) {
+        return JSON.stringify({
+          ok: false,
+          reason: "unknown_mutation_outcome",
+        });
+      }
       try {
         goalLedger.transaction(() => {
           // (1) The question is durable in the conversation log — this is

@@ -52,6 +52,20 @@ export const GOAL_MUTATION_STATES = [
 ] as const;
 export type GoalMutationState = (typeof GOAL_MUTATION_STATES)[number];
 
+/**
+ * How a user resolves one previously-`unresolved` mutation (Phase 6, plan
+ * F3(b) / §Recovery). Deliberately distinct from [GoalMutationState] — that is
+ * the ledger's own lifecycle state, this is the user's assertion about the
+ * interrupted step's egress:
+ *
+ * - `applied`     — the tool DID run before the crash; the tombstone stands.
+ * - `retryable`   — the tool never started (no egress attempt); the next step
+ *   may retry the identical call.
+ * - `not_applied` — the user asserts no effect escaped (R18); the mutation row
+ *   is deleted so `effectState` can clear.
+ */
+export type GoalMutationResolution = "applied" | "retryable" | "not_applied";
+
 /** Derived from `goal_mutation` rows (`GoalLedger.effectState`). */
 export const GOAL_EFFECT_STATES = [
   "unknown",

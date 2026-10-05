@@ -123,13 +123,12 @@ export type ToolCall = {
    * is still live: `goalId` selects the goal row, `goalLeaseToken` must match
    * the row's `lease_token`, and `stepSeq` selects the `goal_step` row whose
    * per-step terminal flag (set by the control tools) must be unset.
-   * `goalAuthorised`/`goalPluginId` are M4 (`authorize`) fields.
+   * `goalAuthorised` is an M4 (`authorize`) field.
    */
   readonly goalId?: string;
   readonly stepSeq?: number;
   readonly goalLeaseToken?: string;
   readonly goalAuthorised?: boolean;
-  readonly goalPluginId?: string;
 };
 
 /**

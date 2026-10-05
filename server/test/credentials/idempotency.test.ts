@@ -201,6 +201,41 @@ describe("tool-call replay dedupe", () => {
     assert.equal(row.tool_call_id, "call_9", "tool-call-id must be persisted on the step");
     assert.equal(ledger.verifyChain(task.id), true, "chain stays verifiable");
   });
+
+  test("bodyFailed passes through to the stored step and its absence defaults to false", () => {
+    const { ledger, db } = makeLedger();
+    const { task, claimed } = runningTask(ledger);
+    const failed = recordToolResult(ledger, {
+      taskId: task.id,
+      owner: "user-1",
+      fenceToken: claimed.fence_token,
+      toolCallId: "call_failed",
+      toolName: "create_task",
+      result: '{"error":"domain failure"}',
+      bodyFailed: true,
+    });
+    assert.equal(failed.body_failed, true);
+
+    const clean = recordToolResult(ledger, {
+      taskId: task.id,
+      owner: "user-1",
+      fenceToken: claimed.fence_token,
+      toolCallId: "call_clean",
+      toolName: "get_recipe",
+      result: '{"ok":true}',
+    });
+    assert.equal(clean.body_failed, false);
+
+    const rows = db
+      .prepare(
+        "SELECT tool_call_id, body_failed FROM ledger_step WHERE task_id = ? ORDER BY seq",
+      )
+      .all(task.id) as Array<{ tool_call_id: string; body_failed: number }>;
+    assert.deepEqual(rows, [
+      { tool_call_id: "call_failed", body_failed: 1 },
+      { tool_call_id: "call_clean", body_failed: 0 },
+    ]);
+  });
 });
 
 describe("canRetryTool (retry rule)", () => {

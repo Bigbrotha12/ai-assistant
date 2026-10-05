@@ -88,6 +88,48 @@ function insertMutation(
   ).run(`mut-${suffix}`, goalId, `hash-${suffix}`, state, EPOCH);
 }
 
+interface RawMutationRow {
+  id: string;
+  goal_id: string;
+  plugin_id: string;
+  tool: string;
+  args_hash: string;
+  state: string;
+  step_seq: number | null;
+  created_ts: number;
+}
+
+interface RawRefusalRow {
+  id: string;
+  goal_id: string;
+  step_seq: number;
+  tool_call_id: string | null;
+  tool: string;
+  args_json: string | null;
+  reason: string;
+  created_ts: number;
+}
+
+/** Raw `goal_mutation` read — the Phase 6 tests assert row state directly. */
+function readMutations(db: Database.Database, goalId: string): RawMutationRow[] {
+  return db
+    .prepare(
+      `SELECT id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts
+       FROM goal_mutation WHERE goal_id = ? ORDER BY created_ts, id`,
+    )
+    .all(goalId) as RawMutationRow[];
+}
+
+/** Raw `goal_refusal` read — the Phase 6 tests assert redaction/append-only. */
+function readRefusals(db: Database.Database, goalId: string): RawRefusalRow[] {
+  return db
+    .prepare(
+      `SELECT id, goal_id, step_seq, tool_call_id, tool, args_json, reason, created_ts
+       FROM goal_refusal WHERE goal_id = ? ORDER BY created_ts, id`,
+    )
+    .all(goalId) as RawRefusalRow[];
+}
+
 /**
  * Rule 3 of plan §Storage compaction: a `tool` row is only ever deleted with
  * its group head, so every maximal run of consecutive tool rows must still be
@@ -867,5 +909,505 @@ describe("GoalLedger.countActiveGoals", () => {
     assert.equal(ledger.countActiveGoals("o1"), 2);
     assert.equal(ledger.countActiveGoals("o2"), 1);
     assert.equal(ledger.countActiveGoals("nobody"), 0);
+  });
+});
+
+describe("GoalLedger.reserveMutation", () => {
+  test("absent key -> ok and inserts a single pending row (step_seq from the param)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+
+    const result = ledger.reserveMutation(goal.id, key, 7);
+    assert.deepEqual(result, { ok: true });
+
+    const rows = readMutations(db, goal.id);
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+    assert.match(row.id, /^m_/);
+    assert.equal(row.goal_id, goal.id);
+    assert.equal(row.plugin_id, "plugin");
+    assert.equal(row.tool, "create_mealplan");
+    assert.equal(row.args_hash, "hash-abc");
+    assert.equal(row.state, "pending");
+    assert.equal(row.step_seq, 7);
+    assert.equal(row.created_ts, EPOCH);
+  });
+
+  test("step_seq stays NULL when the param is undefined", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    ledger.reserveMutation(
+      goal.id,
+      { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" },
+      undefined,
+    );
+    assert.equal(readMutations(db, goal.id)[0]!.step_seq, null);
+  });
+
+  test("a retryable row is replaced with a fresh pending row (ok)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 1), { ok: true });
+    ledger.markMutation(goal.id, key, "retryable");
+    const oldId = readMutations(db, goal.id)[0]!.id;
+
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 2), { ok: true });
+
+    const rows = readMutations(db, goal.id);
+    assert.equal(rows.length, 1, "the retryable row must be replaced, not added to");
+    assert.notEqual(rows[0]!.id, oldId, "the replacement mints a fresh m_ id");
+    assert.equal(rows[0]!.state, "pending");
+    assert.equal(rows[0]!.step_seq, 2);
+  });
+
+  test("a pending row refuses with duplicate_mutation and is left untouched", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 1), { ok: true });
+
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 2), {
+      ok: false,
+      reason: "duplicate_mutation",
+    });
+    const rows = readMutations(db, goal.id);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.state, "pending");
+    assert.equal(rows[0]!.step_seq, 1, "the refusal must not overwrite the original row");
+  });
+
+  test("an applied row refuses with duplicate_mutation", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 1), { ok: true });
+    ledger.markMutation(goal.id, key, "applied");
+
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 2), {
+      ok: false,
+      reason: "duplicate_mutation",
+    });
+    assert.equal(readMutations(db, goal.id)[0]!.state, "applied");
+  });
+
+  test("an unresolved row refuses with unresolved_mutation until resolved", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 1), { ok: true });
+    ledger.markMutation(goal.id, key, "unresolved");
+
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 2), {
+      ok: false,
+      reason: "unresolved_mutation",
+    });
+    assert.equal(readMutations(db, goal.id)[0]!.state, "unresolved");
+  });
+
+  test("no duplicates accumulate across an ok-replace (F3(b) escape hatch)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+
+    ledger.reserveMutation(goal.id, key, 1); // insert pending
+    ledger.markMutation(goal.id, key, "retryable");
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 2), { ok: true }); // replace
+    assert.deepEqual(ledger.reserveMutation(goal.id, key, 3), {
+      ok: false,
+      reason: "duplicate_mutation",
+    });
+
+    const rows = readMutations(db, goal.id);
+    assert.equal(rows.length, 1, "exactly one row: the replacement pending, never a duplicate");
+    assert.equal(rows[0]!.state, "pending");
+  });
+});
+
+describe("GoalLedger.markMutation", () => {
+  test("updates a reserved row pending -> applied / unresolved / retryable", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "create_mealplan", argsHash: "hash-abc" };
+    ledger.reserveMutation(goal.id, key, 1);
+
+    ledger.markMutation(goal.id, key, "applied");
+    assert.equal(readMutations(db, goal.id)[0]!.state, "applied");
+
+    ledger.markMutation(goal.id, key, "unresolved");
+    assert.equal(readMutations(db, goal.id)[0]!.state, "unresolved");
+
+    ledger.markMutation(goal.id, key, "retryable");
+    assert.equal(readMutations(db, goal.id)[0]!.state, "retryable");
+  });
+
+  test("a 0-row miss does not throw (the row may have raced terminal)", () => {
+    const { ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    assert.doesNotThrow(() =>
+      ledger.markMutation(
+        goal.id,
+        { pluginId: "nobody", tool: "x", argsHash: "y" },
+        "applied",
+      ),
+    );
+  });
+});
+
+describe("GoalLedger.recordGoalRefusal", () => {
+  test("appends a row with REDACTED args (a credential never stored) and the full detail", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const secret = "big-secret-value-1234567890";
+
+    ledger.recordGoalRefusal(goal.id, {
+      stepSeq: 3,
+      toolCallId: "call-42",
+      tool: "create_mealplan",
+      args: { dryRun: false, apiKey: secret },
+      reason: "unauthorized",
+    });
+
+    const rows = readRefusals(db, goal.id);
+    assert.equal(rows.length, 1);
+    const row = rows[0]!;
+    assert.match(row.id, /^r_/);
+    assert.equal(row.goal_id, goal.id);
+    assert.equal(row.step_seq, 3);
+    assert.equal(row.tool_call_id, "call-42");
+    assert.equal(row.tool, "create_mealplan");
+    assert.equal(row.reason, "unauthorized");
+    assert.ok(row.args_json, "args are persisted");
+    assert.ok(
+      !row.args_json.includes(secret),
+      "the stringified args must be redaction-masked before persisting",
+    );
+  });
+
+  test("an identical second insert is ALLOWED (append-only, no dedupe)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const input = {
+      stepSeq: 1,
+      tool: "t",
+      args: { q: "x" },
+      reason: "duplicate_mutation" as const,
+    };
+    ledger.recordGoalRefusal(goal.id, input);
+    ledger.recordGoalRefusal(goal.id, input);
+    assert.equal(readRefusals(db, goal.id).length, 2);
+  });
+
+  test("DELETE is refused by the append-only trigger (goal_refusal is write-once)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    ledger.recordGoalRefusal(goal.id, {
+      stepSeq: 1,
+      tool: "t",
+      args: {},
+      reason: "unresolved_mutation",
+    });
+
+    assert.throws(
+      () => db.prepare("DELETE FROM goal_refusal WHERE goal_id = ?").run(goal.id),
+      /append-only/,
+    );
+  });
+});
+
+describe("GoalLedger.resolveMutations", () => {
+  const keyOf = (suffix: string) => ({
+    pluginId: "plugin",
+    tool: `tool-${suffix}`,
+    argsHash: `hash-${suffix}`,
+  });
+
+  test("applied -> row state applied and effectState completed_steps_only", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = keyOf("a");
+    ledger.reserveMutation(goal.id, key, 1);
+    ledger.markMutation(goal.id, key, "unresolved");
+    assert.equal(ledger.effectState(goal.id), "unknown");
+
+    const state = ledger.resolveMutations(goal.id, [
+      { tool: key.tool, argsHash: key.argsHash, resolution: "applied" },
+    ]);
+    assert.equal(state, "completed_steps_only");
+    assert.equal(ledger.effectState(goal.id), "completed_steps_only");
+    assert.equal(readMutations(db, goal.id)[0]!.state, "applied");
+    assert.equal(
+      ledger.listUnresolvedMutations(goal.id).length,
+      0,
+      "a resolved mutation leaves the unresolved list",
+    );
+  });
+
+  test("retryable -> row state retryable and effectState none_known", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = keyOf("a");
+    ledger.reserveMutation(goal.id, key, 1);
+    ledger.markMutation(goal.id, key, "unresolved");
+
+    const state = ledger.resolveMutations(goal.id, [
+      { tool: key.tool, argsHash: key.argsHash, resolution: "retryable" },
+    ]);
+    assert.equal(state, "none_known");
+    assert.equal(readMutations(db, goal.id)[0]!.state, "retryable");
+  });
+
+  test("not_applied -> row deleted and effectState clears to none_known", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = keyOf("a");
+    ledger.reserveMutation(goal.id, key, 1);
+    ledger.markMutation(goal.id, key, "unresolved");
+
+    const state = ledger.resolveMutations(goal.id, [
+      { tool: key.tool, argsHash: key.argsHash, resolution: "not_applied" },
+    ]);
+    assert.equal(state, "none_known");
+    assert.equal(
+      readMutations(db, goal.id).length,
+      0,
+      "not_applied deletes the row (the user asserts no effect escaped)",
+    );
+  });
+
+  test("referencing a non-unresolved (applied) row throws GOAL_INVALID_TRANSITION", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = keyOf("a");
+    ledger.reserveMutation(goal.id, key, 1);
+    ledger.markMutation(goal.id, key, "applied");
+
+    assert.throws(
+      () =>
+        ledger.resolveMutations(goal.id, [
+          { tool: key.tool, argsHash: key.argsHash, resolution: "applied" },
+        ]),
+      (e: unknown) =>
+        e instanceof GoalError &&
+        e.code === "GOAL_INVALID_TRANSITION" &&
+        /applied, expected unresolved/.test(e.message),
+    );
+    assert.equal(readMutations(db, goal.id)[0]!.state, "applied", "untouched");
+  });
+
+  test("an unknown tool+argsHash throws GOAL_INVALID_TRANSITION", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    assert.throws(
+      () =>
+        ledger.resolveMutations(goal.id, [
+          { tool: "nope", argsHash: "nope", resolution: "applied" },
+        ]),
+      (e: unknown) =>
+        e instanceof GoalError &&
+        e.code === "GOAL_INVALID_TRANSITION" &&
+        /absent, expected unresolved/.test(e.message),
+    );
+    assert.equal(readMutations(db, goal.id).length, 0);
+  });
+
+  test("atomicity: an invalid later entry rolls back valid earlier resolutions", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const a = keyOf("a");
+    const b = keyOf("b");
+    ledger.reserveMutation(goal.id, a, 1);
+    ledger.markMutation(goal.id, a, "unresolved");
+    ledger.reserveMutation(goal.id, b, 1);
+    ledger.markMutation(goal.id, b, "unresolved");
+
+    assert.throws(
+      () =>
+        ledger.resolveMutations(goal.id, [
+          { tool: a.tool, argsHash: a.argsHash, resolution: "applied" },
+          { tool: "missing", argsHash: "missing", resolution: "retryable" },
+        ]),
+      (e: unknown) =>
+        e instanceof GoalError && e.code === "GOAL_INVALID_TRANSITION",
+    );
+
+    const byTool = new Map(readMutations(db, goal.id).map((r) => [r.tool, r.state]));
+    assert.equal(
+      byTool.get("tool-a"),
+      "unresolved",
+      "entry A must roll back together with the failing entry",
+    );
+    assert.equal(byTool.get("tool-b"), "unresolved");
+    assert.equal(ledger.effectState(goal.id), "unknown");
+  });
+
+  test(">1 matching row (same tool+argsHash across plugin_ids) is an ambiguous key", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    // UNIQUE is (goal_id, plugin_id, tool, args_hash), so two plugins can share
+    // tool + args_hash — a resolution key that omits plugin_id is ambiguous.
+    db.prepare(
+      `INSERT INTO goal_mutation
+         (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+       VALUES ('m-1', ?, 'plugin-a', 'shared', 'hash-x', 'unresolved', 1, ?)`,
+    ).run(goal.id, EPOCH);
+    db.prepare(
+      `INSERT INTO goal_mutation
+         (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+       VALUES ('m-2', ?, 'plugin-b', 'shared', 'hash-x', 'unresolved', 1, ?)`,
+    ).run(goal.id, EPOCH);
+
+    assert.throws(
+      () =>
+        ledger.resolveMutations(goal.id, [
+          { tool: "shared", argsHash: "hash-x", resolution: "applied" },
+        ]),
+      (e: unknown) =>
+        e instanceof GoalError &&
+        e.code === "GOAL_INVALID_TRANSITION" &&
+        /ambiguous/.test(e.message),
+    );
+  });
+
+  test("F1: one unresolved + one applied under different plugin_ids resolves the unresolved row", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    // The route pre-check counts only `unresolved` rows (listUnresolvedMutations),
+    // so a key with ONE unresolved + ONE applied row passes it. The ledger must
+    // classify ambiguity over unresolved rows too — otherwise it throws inside
+    // the resume transaction and the goal becomes permanently un-resumable.
+    db.prepare(
+      `INSERT INTO goal_mutation
+         (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+       VALUES ('m-1', ?, 'plugin-a', 'shared', 'hash-x', 'unresolved', 1, ?)`,
+    ).run(goal.id, EPOCH);
+    db.prepare(
+      `INSERT INTO goal_mutation
+         (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+       VALUES ('m-2', ?, 'plugin-b', 'shared', 'hash-x', 'applied', 1, ?)`,
+    ).run(goal.id, EPOCH);
+
+    const state = ledger.resolveMutations(goal.id, [
+      { tool: "shared", argsHash: "hash-x", resolution: "applied" },
+    ]);
+    assert.equal(state, "completed_steps_only");
+    const byId = new Map(readMutations(db, goal.id).map((r) => [r.id, r.state]));
+    assert.equal(byId.get("m-1"), "applied", "the unresolved row takes the resolution");
+    assert.equal(byId.get("m-2"), "applied", "the already-applied row is untouched");
+  });
+});
+
+describe("GoalLedger.adoptPendingMutations", () => {
+  test("adopts pending -> unresolved (returns the count) and leaves applied/retryable untouched", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const tool = (n: string) => ({
+      pluginId: "plugin",
+      tool: n,
+      argsHash: `hash-${n}`,
+    });
+    ledger.reserveMutation(goal.id, tool("pending-a"), 1);
+    ledger.reserveMutation(goal.id, tool("pending-b"), 2);
+    ledger.reserveMutation(goal.id, tool("applied"), 1);
+    ledger.markMutation(goal.id, tool("applied"), "applied");
+    ledger.reserveMutation(goal.id, tool("retryable"), 1);
+    ledger.markMutation(goal.id, tool("retryable"), "retryable");
+
+    const adopted = ledger.adoptPendingMutations(goal.id);
+    assert.equal(adopted, 2, "only the two pending rows are adopted");
+
+    const byTool = new Map(readMutations(db, goal.id).map((r) => [r.tool, r.state]));
+    assert.equal(byTool.get("pending-a"), "unresolved");
+    assert.equal(byTool.get("pending-b"), "unresolved");
+    assert.equal(byTool.get("applied"), "applied", "applied is never touched");
+    assert.equal(byTool.get("retryable"), "retryable", "retryable is never touched");
+    assert.equal(ledger.effectState(goal.id), "unknown");
+  });
+
+  test("an already-unresolved row is not double-adopted; 0 pending returns 0", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const key = { pluginId: "plugin", tool: "already", argsHash: "hash-x" };
+    ledger.reserveMutation(goal.id, key, 1);
+    ledger.markMutation(goal.id, key, "unresolved");
+
+    assert.equal(ledger.adoptPendingMutations(goal.id), 0);
+    assert.equal(readMutations(db, goal.id)[0]!.state, "unresolved");
+    assert.equal(ledger.effectState(goal.id), "unknown");
+  });
+});
+
+describe("GoalLedger.listGoalsWithPendingMutations", () => {
+  test("returns running and paused goals with a pending row, and none for clean goals", () => {
+    const { ledger } = makeGoalLedger();
+    const running = seedGoal(ledger, "owner-1", "key-running");
+    const paused = seedGoal(ledger, "owner-1", "key-paused");
+    const clean = seedGoal(ledger, "owner-1", "key-clean");
+
+    // running: claimed, then a pending mutation.
+    ledger.claimGoal(running.id, "owner-1");
+    ledger.reserveMutation(running.id, { pluginId: "plugin", tool: "t", argsHash: "h1" }, 1);
+
+    // paused: claimed, paused (no question reason), then a pending mutation.
+    const claimed = ledger.claimGoal(paused.id, "owner-1");
+    ledger.transitGoal(paused.id, "owner-1", {
+      next: "paused",
+      reason: "no_progress",
+      leaseOwner: "owner-1",
+      leaseToken: claimed.lease_token!,
+    });
+    ledger.reserveMutation(paused.id, { pluginId: "plugin", tool: "t", argsHash: "h2" }, 1);
+
+    // clean: a queued goal with no mutation rows at all.
+    void clean;
+
+    const ids = ledger.listGoalsWithPendingMutations().map((g) => g.id).sort();
+    assert.deepEqual(ids, [running.id, paused.id].sort());
+  });
+
+  test("a goal with only applied/unresolved rows is not returned", () => {
+    const { ledger } = makeGoalLedger();
+    const applied = seedGoal(ledger, "owner-1", "key-applied");
+    const key = { pluginId: "plugin", tool: "t", argsHash: "h-a" };
+    ledger.reserveMutation(applied.id, key, 1);
+    ledger.markMutation(applied.id, key, "applied");
+
+    assert.deepEqual(ledger.listGoalsWithPendingMutations(), []);
+  });
+});
+
+describe("GoalLedger.retagPausedGoal", () => {
+  test("re-tags a paused goal's reason and clears its question", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    const claimed = ledger.claimGoal(goal.id, "owner-1");
+    ledger.transitGoal(goal.id, "owner-1", {
+      next: "paused",
+      reason: "needs_user_input",
+      question: "which flight?",
+      leaseOwner: "owner-1",
+      leaseToken: claimed.lease_token!,
+    });
+
+    ledger.retagPausedGoal(goal.id, "owner-1", "needs_mutation_resolution");
+
+    const row = readGoal(db, goal.id);
+    assert.equal(row.status, "paused");
+    assert.equal(row.pause_reason, "needs_mutation_resolution");
+    assert.equal(row.pause_question, null);
+    assert.equal(row.updated_ts, EPOCH);
+  });
+
+  test("refuses (0 changes, no throw) when the goal is not paused", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger); // queued
+    assert.doesNotThrow(() =>
+      ledger.retagPausedGoal(goal.id, "owner-1", "needs_mutation_resolution"),
+    );
+    const row = readGoal(db, goal.id);
+    assert.equal(row.status, "queued");
+    assert.equal(row.pause_reason, null);
   });
 });

@@ -202,6 +202,13 @@ export type StepRow = {
   ts: number;
   /** Tool-call id (v4) for replay dedupe; null for non-tool steps. */
   tool_call_id: string | null;
+  /**
+   * MCP domain-failure fact (v10). True when the tool RETURNED a structured
+   * `isError: true` result (pipeline `dispatch.bodyFailed`). Stored WITHOUT
+   * entering the chain digest, so replay can restore it. Read as 0/1 from
+   * SQLite and converted at the reader boundary.
+   */
+  body_failed: boolean;
 };
 
 export type PublicStepRow = StepRow & {
@@ -520,6 +527,10 @@ function canonicalStepContent(step: {
   action: string;
   result: string | null;
 }): string {
+  // Deliberately excludes `tool_call_id` (v4) and `body_failed` (v10): both are
+  // replay-restoration metadata, not step content identity. Replay serves the
+  // SAME content with those flags restored, so including either would change
+  // pre-existing chain digests and break `verifyChain` backward compatibility.
   return `${step.seq}|${step.stage}|${step.action}|${String(step.result ?? "")}`;
 }
 
@@ -704,6 +715,18 @@ export const LEDGER_MIGRATIONS: readonly Migration[] = [
   (db) => {
     migrateGoals(db);
   },
+  // v10 — persist the MCP domain-failure fact on tool steps (plan F3(b)):
+  // replay must re-serve `bodyFailed` so a domain-failed mutation is never
+  // re-served as a clean success.
+  //
+  // Like `tool_call_id` (v4), `body_failed` is intentionally NOT part of the
+  // hash-chain content (`canonicalStepContent`): it is a replay-restoration
+  // flag, not part of a step's identity. Adding it would change digest
+  // computation for pre-existing chains and break `verifyChain` backward
+  // compatibility. Data-preserving (existing rows get 0 = not failed).
+  (db) => {
+    db.exec(`ALTER TABLE ledger_step ADD COLUMN body_failed INTEGER NOT NULL DEFAULT 0;`);
+  },
 ];
 
 // The migration list is fixed once the module is loaded: a consumer must not
@@ -780,6 +803,11 @@ export interface AppendStepInput {
   /** Tool-call id (v4) recorded with the step for replay dedupe; undefined for
    *  non-tool steps. */
   toolCallId?: string;
+  /** MCP domain-failure fact (v10): the tool returned a structured
+   *  `isError: true` result. Persisted so replay re-serves it instead of
+   *  presenting the replayed mutation as a clean success. Excluded from the
+   *  chain digest (see `canonicalStepContent`). */
+  bodyFailed?: boolean;
 }
 
 function redactStepResult(input: AppendStepInput): string | null {
@@ -921,11 +949,16 @@ export class Ledger {
     }
     const row = this.db
       .prepare(
-        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id,
+                body_failed
          FROM ledger_step WHERE task_id = ? AND tool_call_id = ?`,
       )
-      .get(taskId, toolCallId) as StepRow | undefined;
-    return row ?? null;
+      .get(taskId, toolCallId) as
+      | (Omit<StepRow, "body_failed"> & { body_failed: number | boolean })
+      | undefined;
+    if (!row) return null;
+    // Replay reads this flag, so convert the stored 0/1 to a real boolean here.
+    return { ...row, body_failed: row.body_failed === 1 || row.body_failed === true };
   }
 
   /**
@@ -1203,10 +1236,17 @@ export class Ledger {
     }
     return this.db
       .prepare(
-        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id,
+                body_failed
          FROM ledger_step WHERE task_id = ? ORDER BY seq`,
       )
-      .all(taskId) as StepRow[];
+      .all(taskId)
+      .map((row) => {
+        const step = row as Omit<StepRow, "body_failed"> & {
+          body_failed: number | boolean;
+        };
+        return { ...step, body_failed: step.body_failed === 1 || step.body_failed === true };
+      });
   }
 
   listPublicSteps(
@@ -1228,6 +1268,7 @@ export class Ledger {
                 CASE WHEN result IS NULL THEN NULL ELSE substr(result, 1, ?) END AS result,
                 ts,
                 CASE WHEN tool_call_id IS NULL THEN NULL ELSE substr(tool_call_id, 1, ?) END AS tool_call_id,
+                body_failed,
                 CASE WHEN result IS NULL THEN 0 ELSE length(CAST(result AS BLOB)) END AS resultBytes
          FROM ledger_step
          WHERE task_id = ?
@@ -1243,7 +1284,9 @@ export class Ledger {
         PUBLIC_STEP_ID_MAX_BYTES,
         taskId,
         safeLimit,
-      ) as PublicStepRow[];
+      ) as Array<
+        Omit<PublicStepRow, "body_failed"> & { body_failed: number | boolean }
+      >;
     return rows.reverse().map((step) => ({
       ...step,
       id: boundPublicText(step.id, PUBLIC_STEP_ID_MAX_BYTES),
@@ -1255,6 +1298,7 @@ export class Ledger {
         step.tool_call_id === null
           ? null
           : boundPublicText(step.tool_call_id, PUBLIC_STEP_ID_MAX_BYTES),
+      body_failed: step.body_failed === 1 || step.body_failed === true,
     }));
   }
 
@@ -1472,8 +1516,8 @@ export class Ledger {
       this.db
         .prepare(
           `INSERT INTO ledger_step
-             (id, task_id, seq, stage, action, result, ts, tool_call_id)
-           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts, @toolCallId)`,
+             (id, task_id, seq, stage, action, result, ts, tool_call_id, body_failed)
+           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts, @toolCallId, @bodyFailed)`,
         )
         .run({
           id: stepId,
@@ -1484,6 +1528,7 @@ export class Ledger {
           result,
           ts,
           toolCallId: input.toolCallId ?? null,
+          bodyFailed: input.bodyFailed === true ? 1 : 0,
         });
 
       const prevDigest = this.readChain(taskId).at(-1)?.digest ?? genesisDigest(taskId);
@@ -1514,6 +1559,7 @@ export class Ledger {
         result,
         ts,
         tool_call_id: input.toolCallId ?? null,
+        body_failed: input.bodyFailed === true,
       };
     });
     if (!step) throw new LedgerError("APPEND_ONLY_VIOLATION", "step append failed");

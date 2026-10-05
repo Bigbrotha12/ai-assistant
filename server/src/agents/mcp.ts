@@ -1014,6 +1014,14 @@ export type McpBindOptions = {
   goalId?: string;
   stepSeq?: number;
   goalLeaseToken?: string;
+  /**
+   * Goal channel only: the goal's admission-time `authorised_tools` set,
+   * mirroring `BindPluginToolsOptions.authorisedTools`. The binder stamps
+   * `goalAuthorised` on each `ToolCall` from it, which the `authorize`
+   * interceptor reads to refuse an unauthorised MUTATING call before egress
+   * (plan M4/§goalAuthorised). Absent leaves the field unset.
+   */
+  authorisedTools?: ReadonlySet<string>;
   /** Job channel: task-fence re-check, also supplied to the `fence` interceptor. */
   assertActive?: () => void;
   /** Channel-owned tracked execution (job/sync `settle()` draining). */
@@ -2358,6 +2366,9 @@ export async function bindMcpServers(
                       ...(opts?.goalLeaseToken === undefined
                         ? {}
                         : { goalLeaseToken: opts.goalLeaseToken }),
+                      ...(opts?.authorisedTools === undefined
+                        ? {}
+                        : { goalAuthorised: opts?.authorisedTools.has(tool.name) }),
                     }
                   : {}),
               };

@@ -2,12 +2,14 @@ import type { GoalLedger } from "../../goals/ledger.ts";
 import type { Ledger } from "../../ledger.ts";
 import type { BudgetManager } from "../../middleware/budget.ts";
 import type { ToolResultCache } from "../../middleware/cache.ts";
+import { createAuthorizeInterceptor } from "./authorize.ts";
 import { createBudgetInterceptor } from "./budget.ts";
 import { createCacheInterceptor } from "./cache.ts";
 import { createExecutionInterceptor } from "./execution.ts";
 import { createFenceInterceptor } from "./fence.ts";
 import { createGoalFenceInterceptor } from "./goal_fence.ts";
 import { createReplayInterceptor } from "./replay.ts";
+import { createReserveInterceptor } from "./reserve.ts";
 import { createSerializeInterceptor } from "./serialize.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
 
@@ -126,25 +128,33 @@ export function createSyncToolInterceptors(
 }
 
 /**
- * The canonical goal-channel interceptor order, outer→inner (plan M3).
+ * The canonical goal-channel interceptor order, outer→inner (plan M4/6.6):
+ * `fence → serialize → authorize → cache → budget → reserve → execution`.
  *
  * The goal channel is the job order minus `replay` (a step is never re-run —
  * F3a — so there is no per-step ledger to dedupe against; the `goal_mutation`
- * ledger is the sole at-most-once guard and arrives in M4 as `reserve`):
+ * ledger is the sole at-most-once guard and is owned by `reserve`):
  *   - `fence` first preserves the job path's error precedence — a
  *     `GOAL_LEASE_CONFLICT` from the fence must win over a
  *     `tool_args_too_large` from serialization.
+ *   - `authorize` sits directly AFTER `serialize` and BEFORE `cache`: a
+ *     refusal is recorded against args that have already passed the size/depth
+ *     bounds, and an unauthorised call pays no cache admission.
  *   - `budget` OUTSIDE `execution` is what makes quarantine possible (plan D7),
  *     exactly as in the job/sync orders.
- *
- * There is no goal `replay` interceptor and (in M3) no `authorize`/`reserve` —
- * those land in M4, which inserts them into this order.
+ *   - `reserve` is INNERMOST, between `budget` and `execution`: it must observe
+ *     the body's outcome (`executed`/`bodyFailed` are final only after
+ *     `execution`'s bound settles), and `budget`'s own `finally` must still run
+ *     OUTSIDE it so quarantine still fires (D7). No `beforeBody` gather is
+ *     needed — the reservation transaction brackets `next()` directly (R22).
  */
 export const GOAL_TOOL_INTERCEPTOR_ORDER = [
   "fence",
   "serialize",
+  "authorize",
   "cache",
   "budget",
+  "reserve",
   "execution",
 ] as const;
 
@@ -172,12 +182,14 @@ export function createGoalToolInterceptors(
       ...(opts.assertActive === undefined ? {} : { assertActive: opts.assertActive }),
     }),
     createSerializeInterceptor(),
+    createAuthorizeInterceptor({ ledger: opts.ledger, goalId: opts.goalId }),
     createCacheInterceptor(
       opts.cache === undefined ? {} : { cache: opts.cache },
     ),
     createBudgetInterceptor(
       opts.budget === undefined ? {} : { budget: opts.budget },
     ),
+    createReserveInterceptor({ ledger: opts.ledger, goalId: opts.goalId }),
     createExecutionInterceptor(),
   ];
 }

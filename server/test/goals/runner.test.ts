@@ -200,6 +200,8 @@ function admit(
     instruction?: string;
     snapshot?: string;
     registerPin?: boolean;
+    /** M4: the goal's admission-time authorised-tool names. */
+    authorisedTools?: string[];
   },
 ): GoalRow {
   const owner = opts.owner ?? "owner-1";
@@ -211,6 +213,9 @@ function admit(
     tokenBudget: 100_000,
     agentSnapshot: opts.snapshot ?? agentSnapshot(),
     pinnedModel: "openrouter",
+    ...(opts.authorisedTools === undefined
+      ? {}
+      : { authorisedTools: opts.authorisedTools }),
   });
   h.goalLedger.appendGoalMessage(goal.id, owner, {
     role: "user",
@@ -859,6 +864,161 @@ describe("GoalRunner control tools (3.3) and chaining (3.4)", () => {
     assert.equal(h.goalLedger.effectState(goal.id), "unknown");
   });
 
+  test("goal_complete is REFUSED while a mutation outcome is unknown (N1) and the step-end pauses needs_mutation_resolution", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [
+            toolCallMessage(
+              "goal_complete",
+              { summary: "all done" },
+              "call-unknown-complete",
+            ),
+          ],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-unknown-complete" });
+    // A sibling mutating call resolved `unresolved` this round: its outcome is
+    // unknown, so completing would strand the row under a terminal goal.
+    insertMutation(h, goal.id, "unresolved", "cu1");
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    const row = h.goalLedger.getGoal(goal.id)!;
+    // The completion was refused: never `complete`, never a result summary.
+    assert.notEqual(row.status, "complete");
+    assert.equal(row.status, "paused");
+    assert.equal(row.result_summary, null);
+    // The landing pause is the L12 one, not a question.
+    assert.equal(row.pause_reason, "needs_mutation_resolution");
+    assert.equal(row.pause_question, null);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+    assert.equal(h.goalLedger.effectState(goal.id), "unknown");
+    // The refusal is durable: the tool result the model would have seen names
+    // the reason, so a continued round could not mistake it for success.
+    const refusal = h.goalLedger
+      .listGoalMessages(goal.id)
+      .find((message) => message.role === "tool");
+    assert.ok(refusal, "the refused tool result is persisted");
+    assert.match(refusal.content_json, /unknown_mutation_outcome/);
+  });
+
+  test("goal_blocked is REFUSED while a mutation outcome is unknown (N1): the pause is needs_mutation_resolution, not needs_user_input", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [
+            toolCallMessage(
+              "goal_blocked",
+              { question: "which meal?" },
+              "call-unknown-block",
+            ),
+          ],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-unknown-block" });
+    insertMutation(h, goal.id, "unresolved", "cb1");
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    const row = h.goalLedger.getGoal(goal.id)!;
+    assert.equal(row.status, "paused");
+    // The question never landed: the pause is the L12 mutation-resolution one.
+    assert.equal(row.pause_reason, "needs_mutation_resolution");
+    assert.equal(row.pause_question, null);
+    assert.equal(h.goalLedger.effectState(goal.id), "unknown");
+  });
+
+  test("goal_complete is NOT blocked by an `applied` mutation — only `unknown` gates (N1)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [
+            toolCallMessage(
+              "goal_complete",
+              { summary: "applied and done" },
+              "call-applied-complete",
+            ),
+          ],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-applied-complete" });
+    // `applied` -> effectState `completed_steps_only`, a KNOWN outcome: the
+    // completion proceeds exactly as with no mutations.
+    insertMutation(h, goal.id, "applied", "ca1");
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    const row = h.goalLedger.getGoal(goal.id)!;
+    assert.equal(row.status, "complete");
+    assert.equal(row.result_summary, "applied and done");
+    assert.equal(h.goalLedger.effectState(goal.id), "completed_steps_only");
+  });
+
+  test("the refusal writes NOTHING: a direct control call with an unknown outcome leaves the goal running (N1)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("unused")] }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-direct-unknown" });
+    insertMutation(h, goal.id, "unresolved", "du1");
+    const claimed = h.goalLedger.claimGoal(goal.id, "owner-1");
+    const step = h.goalLedger.insertGoalStep(goal.id, "owner-1", {
+      kind: "model",
+    });
+    const controlTools = buildControlTools({
+      goalId: goal.id,
+      owner: "owner-1",
+      leaseOwner: claimed.lease_owner!,
+      leaseToken: claimed.lease_token!,
+      stepSeq: step.seq,
+      goalLedger: h.goalLedger,
+    });
+    const complete = controlTools.find((tool) => tool.name === "goal_complete")!;
+    const blocked = controlTools.find((tool) => tool.name === "goal_blocked")!;
+    const messagesBefore = h.goalLedger.listGoalMessages(goal.id).length;
+
+    const completeResult = await complete.invoke({ summary: "done" });
+    const blockedResult = await blocked.invoke({ question: "which meal?" });
+    assert.match(
+      String(completeResult),
+      /unknown_mutation_outcome/,
+      "goal_complete refuses with the typed reason",
+    );
+    assert.match(
+      String(blockedResult),
+      /unknown_mutation_outcome/,
+      "goal_blocked refuses with the typed reason",
+    );
+
+    // NOTHING was appended and no CAS ran: the goal is still `running` so the
+    // runner's step-end L12 guard — not the control tool — lands the pause.
+    const row = h.goalLedger.getGoal(goal.id)!;
+    assert.equal(row.status, "running");
+    assert.equal(row.result_summary, null);
+    assert.equal(row.pause_reason, null);
+    assert.equal(h.goalLedger.listGoalMessages(goal.id).length, messagesBefore);
+    assert.equal(
+      h.goalLedger.listGoalSteps(goal.id).find((s) => s.seq === step.seq)?.status,
+      "running",
+    );
+  });
+
   test("chain no-op: a control-tool completion is never overwritten", async (t) => {
     const h = makeHarness();
     const mcp = fakeMcp();
@@ -1178,6 +1338,78 @@ describe("GoalRunner read-only invariant (3.5)", () => {
     assert.equal(steps(h, goal.id)[0]?.status, "terminal");
   });
 
+  test("an authorised mutating MCP tool STARTS and executes (M4)", async (t) => {
+    const h = makeHarness();
+    // The server marks the tool non-read-only, so the filter would normally
+    // drop it; the goal's admission-time `authorised_tools` surfaces it and the
+    // post-bind check must let it pass.
+    const mcp = fakeMcp({ tools: [{ name: "write_tool", readOnly: false }] });
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [toolCallMessage("write_tool", { value: "x" }, "call-w")],
+        }),
+    });
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-authorised-mcp",
+      authorisedTools: ["write_tool"],
+      snapshot: agentSnapshot({
+        toolAllowlist: [{ name: "write_tool" }],
+      }),
+    });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    // The declared/bound start checks did not terminate the goal.
+    assert.notEqual(goalStatus(h, goal.id), "failed");
+    assert.equal(failureReason(h, goal.id), null);
+    assert.equal(steps(h, goal.id).length, 1);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+    assert.equal(mcp.calls.length, 1, "the authorised tool was called");
+    assert.equal(mcp.calls[0]?.name, "write_tool");
+  });
+
+  test("an authorised granted plugin tool passes the declared-surface check (M4)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const pluginRegistry = {
+      requirePlugin() {
+        throw new Error("the authorised plugin tool is never invoked by this test");
+      },
+      listInstalledPlugins: () => [
+        {
+          id: "write-plugin",
+          type: "tool",
+          tools: [{ name: "write_tool", readOnly: false, inputSchema: {} }],
+        },
+      ],
+    } as unknown as PluginRegistry;
+    const runner = makeRunner(t, h, {
+      registry: pluginRegistry,
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("working")] }),
+    });
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-authorised-plugin",
+      authorisedTools: ["write_tool"],
+      snapshot: agentSnapshot({
+        toolAllowlist: [{ name: "mcp-tool", readOnly: true }],
+        tools: [{ pluginId: "write-plugin" }],
+      }),
+    });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.notEqual(goalStatus(h, goal.id), "failed");
+    assert.equal(failureReason(h, goal.id), null);
+    assert.equal(steps(h, goal.id).length, 1);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+  });
+
   test("an MCP tool that survives filtering as mutating fails read_only_invariant_violation", async (t) => {
     const h = makeHarness();
     // The allowlist DECLARES read-only, but the server marks the tool
@@ -1230,6 +1462,70 @@ describe("GoalRunner read-only invariant (3.5)", () => {
       "read_only_invariant_violation: create_mealplan",
     );
     assert.equal(mcp.calls.length, 0);
+  });
+
+  test("M3: a bound name safe on one server but destructive on another still fails; authorisation exempts it", async (t) => {
+    const h = makeHarness();
+    // Two servers expose the SAME tool name; the FIRST declares read-only, the
+    // second destructive. The binder's first-occurrence `readOnly` reads `true`
+    // from A, but the AND-merge over every server makes the bound call
+    // `readOnly:false`. The start check must mirror that merge (finding M3).
+    const serverA = fakeMcp({
+      tools: [{ name: "delete_thing", readOnly: true }],
+    });
+    const serverB = fakeMcp({
+      tools: [
+        {
+          name: "delete_thing",
+          annotations: { destructiveHint: true },
+        },
+      ],
+    });
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: async (server) => {
+        const target = server.url.includes("b.example") ? serverB : serverA;
+        return target.factory(server, {} as never);
+      },
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("unused")] }),
+    });
+    const snapshot = agentSnapshot({
+      mcpServers: [
+        { name: "a", url: "https://a.example.com/mcp" },
+        { name: "b", url: "https://b.example.com/mcp" },
+      ],
+      toolAllowlist: [
+        { name: "delete_thing", readOnly: true },
+        { name: "mcp-tool", readOnly: true },
+      ],
+    });
+
+    // Without authorisation: the cross-server divergence must fail the goal.
+    const unauthorised = admit(h, runner, {
+      idempotencyKey: "key-cross-server",
+      snapshot,
+    });
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    assert.equal(goalStatus(h, unauthorised.id), "failed");
+    assert.equal(
+      failureReason(h, unauthorised.id),
+      "read_only_invariant_violation: delete_thing",
+    );
+
+    // With authorisation: the same bound (readOnly:false) tool is surfaced
+    // deliberately and the authorize interceptor governs it at dispatch.
+    const authorised = admit(h, runner, {
+      idempotencyKey: "key-cross-server-auth",
+      snapshot,
+      authorisedTools: ["delete_thing"],
+    });
+    const pin = h.pins.pin("owner-1", "openrouter", { apiKey: "model" });
+    runner.registerGoalPin(authorised.id, "openrouter", pin.handle);
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    assert.notEqual(goalStatus(h, authorised.id), "failed");
+    assert.equal(failureReason(h, authorised.id), null);
   });
 
   test("a mutating granted plugin tool fails at the declared-surface check", async (t) => {
@@ -1533,5 +1829,143 @@ describe("GoalRunner control-tool authority over plugin tools (5.1)", () => {
       1,
       "the control tool wins; the plugin namesake must be dropped before ToolNode",
     );
+  });
+});
+
+describe("GoalRunner recovery adoption (Phase 6)", () => {
+  test("resumeStuckGoals adopts a pending mutation unresolved and pauses the goal needs_mutation_resolution (H1)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("unused")] }),
+    });
+    // "Previous process": a claimed goal mid-step whose `reserve` committed a
+    // `pending` mutation but whose outcome was never recorded (the process
+    // died mid-step) — then nothing else is written.
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-adopt",
+      registerPin: false,
+    });
+    insertMutation(h, goal.id, "pending", "p1");
+    h.goalLedger.claimGoal(goal.id, "owner-1");
+    assert.equal(goalStatus(h, goal.id), "running");
+
+    const result = await runner.resumeStuckGoals();
+    assert.equal(result.processed, 1);
+    assert.equal(result.requeued, 0, "an adopted mutation must NOT requeue");
+
+    // The pending mutation was adopted `unresolved` (never re-executed; only
+    // user-resolved on resume) and the goal PAUSED `needs_mutation_resolution`
+    // — never requeued into a fresh model round with full mutation capability.
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "needs_mutation_resolution");
+    const adopted = h.db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goal.id) as { state: string };
+    assert.equal(adopted.state, "unresolved");
+    // An adopted mutation makes the goal's effects read `unknown` on re-claim —
+    // the L12 guard would also pause it, but recovery already did.
+    assert.equal(h.goalLedger.effectState(goal.id), "unknown");
+  });
+
+  test("resumeStuckGoals requeues a running goal with NO pending rows (H1)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("unused")] }),
+    });
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-recover-clean",
+      registerPin: false,
+    });
+    h.goalLedger.claimGoal(goal.id, "owner-1");
+    h.goalLedger.insertGoalStep(goal.id, "owner-1", { kind: "model" });
+
+    const result = await runner.resumeStuckGoals();
+    assert.equal(result.processed, 1);
+    assert.equal(result.requeued, 1, "a clean running goal requeues as before");
+    assert.equal(goalStatus(h, goal.id), "queued");
+    assert.equal(pauseReason(h, goal.id), null);
+  });
+
+  test("resumeStuckGoals re-tags a paused goal carrying a pending row and clears its question (H1)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("unused")] }),
+    });
+    // A goal paused with a question, then a `pending` mutation appears (a
+    // straggler the earlier adoption missed, or a reserve that raced the
+    // pause). Recovery must re-tag it `needs_mutation_resolution` AND clear
+    // the stale question (that reason forbids one).
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-paused-pending",
+      registerPin: false,
+    });
+    h.goalLedger.claimGoal(goal.id, "owner-1");
+    h.goalLedger.transitGoal(goal.id, "owner-1", {
+      next: "paused",
+      reason: "needs_user_input",
+      question: "which meal?",
+      leaseOwner: "owner-1",
+      leaseToken: h.goalLedger.getGoal(goal.id)!.lease_token!,
+    });
+    insertMutation(h, goal.id, "pending", "p2");
+    assert.equal(goalStatus(h, goal.id), "paused");
+
+    const result = await runner.resumeStuckGoals();
+    assert.equal(result.processed, 0, "no running goals");
+    assert.equal(result.requeued, 0);
+
+    const row = h.goalLedger.getGoal(goal.id)!;
+    assert.equal(row.status, "paused");
+    assert.equal(row.pause_reason, "needs_mutation_resolution");
+    assert.equal(row.pause_question, null, "the stale question is cleared");
+    const adopted = h.db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goal.id) as { state: string };
+    assert.equal(adopted.state, "unresolved");
+  });
+
+  test("F2: a failing pending-mutation scan fails closed — nothing is marked terminal or requeued", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({ responses: [new AIMessage("unused")] }),
+    });
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-pending-scan-fail",
+      registerPin: false,
+    });
+    h.goalLedger.claimGoal(goal.id, "owner-1");
+    const orphan = h.goalLedger.insertGoalStep(goal.id, "owner-1", {
+      kind: "model",
+    });
+    (h.goalLedger as unknown as {
+      listGoalsWithPendingMutations: () => GoalRow[];
+    }).listGoalsWithPendingMutations = () => {
+      throw new Error("pending scan unavailable");
+    };
+
+    const result = await runner.resumeStuckGoals();
+    assert.deepEqual(result, { processed: 0, requeued: 0 });
+    // Fail closed: with the pending set unknown, NOTHING is written. The
+    // interrupted step stays `running` and the goal stays `running`, so the next
+    // boot re-scans rather than requeueing a goal that may hold an in-flight
+    // mutation.
+    assert.equal(
+      h.goalLedger.getStep(goal.id, orphan.seq)?.status,
+      "running",
+      "the interrupted step must not be marked terminal",
+    );
+    assert.equal(goalStatus(h, goal.id), "running", "the goal must not be requeued");
   });
 });

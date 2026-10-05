@@ -190,18 +190,46 @@ export type GoalRunnerDeps = {
 }
 
 /**
- * The M2 effective tool surface for MCP binding: the agent's allowlist
- * narrowed to its read-only entries (waves 3.5: "allowlist ∩ readOnly + the
- * control tools"). Write entries REMAIN in the agent's allowlist but are inert
- * this phase — the model never sees them. An agent with NO allowlist keeps the
+ * Parses the goal's admission-time `authorised_tools` JSON column into a set.
+ * The column is written by `getOrCreateGoal` (an array of tool names) and is
+ * `NULL` for an M2 goal that authorised nothing. A malformed value, a non-array,
+ * or non-string members degrade to the EMPTY set: a parse failure must never
+ * WIDEN the tool surface, so it falls back to the M2 read-only-only invariant.
+ */
+function parseAuthorisedTools(raw: string | null): ReadonlySet<string> {
+  if (raw === null) return new Set();
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(
+      parsed.filter((name): name is string => typeof name === "string"),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * The effective tool surface for goal binding: the agent's allowlist narrowed
+ * to its read-only entries PLUS the goal's admission-time `authorised_tools`
+ * (M4 §goalAuthorised: `allowlist ∩ (readOnly ∪ authorised_tools)`). An
+ * authorised write entry is surfaced even though it is not read-only, because
+ * the `authorize` interceptor is what refuses an unauthorised mutating call at
+ * dispatch time; the surface here only decides what the model may SEE.
+ *
+ * Entries not read-only and not authorised REMAIN in the agent's allowlist but
+ * are inert — the model never sees them. An agent with NO allowlist keeps the
  * binder's documented `allowTools: undefined` semantics (bind every MCP tool);
  * 3.5's per-goal start check is what must reject such a goal.
  */
 export function agentAllowlistFilteredReadOnly(
   allowlist: readonly AgentToolAllowlistEntry[] | undefined,
+  authorised?: ReadonlySet<string>,
 ): AgentToolAllowlistEntry[] | undefined {
   if (allowlist === undefined) return undefined;
-  return allowlist.filter((entry) => entry.readOnly === true);
+  return allowlist.filter(
+    (entry) => entry.readOnly === true || (authorised?.has(entry.name) ?? false),
+  );
 }
 
 type GoalSetupValue = {
@@ -1043,17 +1071,24 @@ export class GoalRunner {
     const goalId = goal.id;
     const leaseToken = goal.lease_token ?? "";
     const agent = parseAgentSnapshot(goal.agent_snapshot);
+    const authorisedTools = parseAuthorisedTools(goal.authorised_tools);
     // 3.5 fail-loud start check (declared surface, BEFORE any model build or
-    // tool bind). The effective MCP surface is `allowlist ∩ readOnly`; the
-    // plugin grants never ride the allowlist, so a granted non-read-only tool
-    // is a violation here. The MCP declaration is re-asserted defensively (the
-    // filter already dropped non-readOnly entries) so a filter regression fails
-    // loudly instead of silently binding a write. A violation TERMINATES the
-    // goal via `GoalSetupError` — the step never binds, never runs.
-    const effectiveAllowlist = agentAllowlistFilteredReadOnly(agent.toolAllowlist);
+    // tool bind). The effective MCP surface is `allowlist ∩ (readOnly ∪
+    // authorised_tools)`; the plugin grants never ride the allowlist, so a
+    // granted non-read-only tool is a violation here UNLESS its name is in the
+    // goal's admission-time `authorised_tools` (M4). The MCP declaration is
+    // re-asserted defensively (the filter already dropped non-readOnly,
+    // non-authorised entries) so a filter regression fails loudly instead of
+    // silently binding a write. A violation TERMINATES the goal via
+    // `GoalSetupError` — the step never binds, never runs.
+    const effectiveAllowlist = agentAllowlistFilteredReadOnly(
+      agent.toolAllowlist,
+      authorisedTools,
+    );
     const declaredViolation = this.findDeclaredReadOnlyViolation(
       agent,
       effectiveAllowlist,
+      authorisedTools,
     );
     if (declaredViolation !== null) {
       console.warn(
@@ -1113,10 +1148,11 @@ export class GoalRunner {
 
     const executor = this.deps.executor ?? this.createDefaultExecutor();
     const assertActive = () => assertNotDeleting(owner);
-    // ONE goal-channel engine per step (`fence → serialize → cache → budget →
-    // execution`, plan M3), shared by the plugin and MCP bindings below. The
-    // fence closes over THIS step's goal row + lease token; `stepSeq`/
-    // `goalLeaseToken` ride every `ToolCall` (set by the binders below).
+    // ONE goal-channel engine per step (`fence → serialize → authorize → cache
+    // → budget → reserve → execution`, plan M4), shared by the plugin and MCP
+    // bindings below. The fence closes over THIS step's goal row + lease token;
+    // `stepSeq`/`goalLeaseToken` ride every `ToolCall` (set by the binders
+    // below).
     const pipeline: ToolPipeline = buildPipelineForChannel("goal", {
       goalLedger: this.deps.goalLedger,
       goalId,
@@ -1137,6 +1173,7 @@ export class GoalRunner {
             goalId,
             stepSeq,
             goalLeaseToken: leaseToken,
+            authorisedTools,
             credentialsResolver: resolver,
             pipeline,
             budget: this.budget,
@@ -1155,7 +1192,8 @@ export class GoalRunner {
           })
         : [];
 
-    // MCP tools with the M2 read-only effective surface (allowlist ∩ readOnly).
+    // MCP tools with the goal's effective surface (allowlist ∩ (readOnly ∪
+    // authorised_tools)).
     let mcpBinding: McpBinding | undefined;
     if (agent.mcpServers.length > 0) {
       mcpBinding = await bindMcpServers(agent.mcpServers, {
@@ -1176,6 +1214,7 @@ export class GoalRunner {
         goalId,
         stepSeq,
         goalLeaseToken: leaseToken,
+        authorisedTools,
         pipeline,
         budget: this.budget,
         ...(this.deps.toolCache === undefined
@@ -1205,7 +1244,9 @@ export class GoalRunner {
     // 3.5 fail-loud start check (bound MCP surface, post-bind because the
     // server's annotations are only known after listing): replicate the
     // binder's D6 classification over the (process-wide, just-populated)
-    // tool-list cache and reject any BOUND MCP tool that is not read-only.
+    // tool-list cache and reject any BOUND MCP tool that is not read-only,
+    // UNLESS its name is in `authorised_tools` (M4 — an authorised mutating
+    // tool is exactly what the `authorize` interceptor governs at dispatch).
     // This is what catches an allowlist-declared read-only entry the server
     // marks non-read-only/destructive (the "survives filtering as mutating"
     // case). The binding is disposed before the throw so nothing leaks and the
@@ -1215,6 +1256,7 @@ export class GoalRunner {
         agent,
         effectiveAllowlist,
         mcpBinding,
+        authorisedTools,
       );
       if (boundViolation !== null) {
         await mcpBinding.dispose().catch(() => {});
@@ -1232,28 +1274,36 @@ export class GoalRunner {
   }
 
   /**
-   * 3.5 declared-surface check: the first non-read-only tool the goal would
-   * bind, or `null` when the declared surface is read-only. Plugin grants are
-   * checked against the installed registry (the allowlist does not govern
-   * plugin tools); the filtered MCP allowlist is re-asserted. An absent
+   * 3.5 declared-surface check: the first non-read-only, non-authorised tool
+   * the goal would bind, or `null` when the declared surface is within the
+   * invariant. Plugin grants are checked against the installed registry (the
+   * allowlist does not govern plugin tools); the filtered MCP allowlist is
+   * re-asserted. A tool is exempt when its name is in the goal's
+   * admission-time `authorised_tools` (M4) — the `authorize` interceptor, not
+   * this start check, is what refuses an unauthorised mutating call. An absent
    * allowlist is deliberately NOT a pre-bind failure — the MCP surface is then
    * unbounded and is verified post-bind by {@link mcpReadOnlyViolation}.
    */
   private findDeclaredReadOnlyViolation(
     agent: GoalAgentSnapshot,
     effectiveAllowlist: AgentToolAllowlistEntry[] | undefined,
+    authorisedTools: ReadonlySet<string>,
   ): string | null {
     const grantedPlugins = new Set((agent.tools ?? []).map((tool) => tool.pluginId));
     if (grantedPlugins.size > 0) {
       for (const plugin of this.deps.registry.listInstalledPlugins()) {
         if (!isToolPlugin(plugin) || !grantedPlugins.has(plugin.id)) continue;
         for (const toolDef of plugin.tools) {
-          if (toolDef.readOnly !== true) return toolDef.name;
+          if (toolDef.readOnly !== true && !authorisedTools.has(toolDef.name)) {
+            return toolDef.name;
+          }
         }
       }
     }
     for (const entry of effectiveAllowlist ?? []) {
-      if (entry.readOnly !== true) return entry.name;
+      if (entry.readOnly !== true && !authorisedTools.has(entry.name)) {
+        return entry.name;
+      }
     }
     return null;
   }
@@ -1278,14 +1328,37 @@ export class GoalRunner {
 
   /**
    * Boot recovery (plan §Recovery — one flow): at boot EVERY persisted step
-   * lease is dead (single replica). For each `running` goal: mark its current
-   * (last non-terminal) step terminal, then CAS `running -> queued`
-   * (lease-agnostic — no adopted mutations yet) so the next claim starts a
-   * FRESH step. The re-claimed goal then pauses `credentials_required` (the
-   * `goalPins` registry is in-memory and empty after a restart) — L1's
-   * restart-resume per D8/Phase 4: pause, not fail, and no spin.
+   * lease is dead (single replica). Four phases, in this order:
    *
-   * Errors are contained PER GOAL: recovery must never abort boot.
+   *   - **B** — snapshot the set of goals carrying a `pending` mutation
+   *     ({@link GoalLedger.listGoalsWithPendingMutations}), FIRST. This phase
+   *     fails CLOSED: if the scan throws, recovery writes NOTHING and returns
+   *     `{ processed: 0, requeued: 0 }` — the next boot re-scans. Marking a
+   *     step terminal or requeueing a goal whose pending set is unknown could
+   *     re-run a mutation that may have reached the provider.
+   *   - **A** — for each `running` goal, mark its current (last non-terminal)
+   *     step terminal.
+   *   - **C** — for each running goal, in scan order: adopt its pending
+   *     mutations `unresolved` ATOMICALLY with the resulting pause (F5) (a
+   *     `pending` row means the reserve committed but the outcome was never
+   *     recorded — the request MAY have reached the provider, so it must not be
+   *     repeated and must not read as a known-clean state). When ANY row was
+   *     adopted the goal MUST NOT be requeued straight into a fresh model round
+   *     with full mutation capability; it is PAUSED
+   *     `needs_mutation_resolution` instead (the pause clears the lease). A
+   *     running goal with nothing to adopt requeues `running -> queued` exactly
+   *     as before.
+   *   - **D** — for each goal from phase B that is now `paused`, adopt any
+   *     stragglers ATOMICALLY with re-tagging it `needs_mutation_resolution`
+   *     (clearing any stale question). Running goals were handled in phase C
+   *     and are skipped here.
+   *
+   * The re-claimed goal then pauses `credentials_required` (the `goalPins`
+   * registry is in-memory and empty after a restart) — L1's restart-resume per
+   * D8/Phase 4: pause, not fail, and no spin.
+   *
+   * Errors are contained PER GOAL: recovery must never abort boot (the sole
+   * exception is the phase-B fail-closed early return above).
    */
   async resumeStuckGoals(): Promise<ResumeStuckGoalsResult> {
     let running: GoalRow[];
@@ -1295,7 +1368,25 @@ export class GoalRunner {
       console.warn("[goals] stuck-goal scan failed:", err);
       return { processed: 0, requeued: 0 };
     }
-    let requeued = 0;
+    // Phase B (F2): the pending-mutation scan runs FIRST, BEFORE any step is
+    // marked terminal. Recovery fails CLOSED: if the scan throws we know nothing
+    // about which goals carry an in-flight `pending` mutation, so we write
+    // NOTHING and return 0/0 — the next boot re-scans. Marking steps terminal or
+    // requeueing a goal whose pending set is unknown could re-run a step whose
+    // mutation actually reached the provider (an at-most-once violation). The
+    // early return is idempotent precisely because no state changed.
+    let pendingIds = new Set<string>();
+    let pendingGoals: GoalRow[] = [];
+    try {
+      pendingGoals = this.deps.goalLedger.listGoalsWithPendingMutations();
+      pendingIds = new Set(pendingGoals.map((goal) => goal.id));
+    } catch (err) {
+      console.warn("[goals] pending-mutation scan failed:", err);
+      return { processed: 0, requeued: 0 };
+    }
+    // Phase A — mark every interrupted running step terminal. Separate from the
+    // adopt/requeue phase so the pending scan above has already decided the
+    // fail-closed question before ANY write happens.
     for (const goal of running) {
       try {
         const steps = this.deps.goalLedger.listGoalSteps(goal.id);
@@ -1304,9 +1395,73 @@ export class GoalRunner {
             this.deps.goalLedger.markStepTerminal(goal.id, goal.owner, step.seq);
           }
         }
-        if (this.deps.goalLedger.requeueGoal(goal.id, goal.owner)) requeued++;
       } catch (err) {
         console.warn(`[goals] recovery failed for goal ${goal.id}:`, err);
+      }
+    }
+    // Phase C — adopt/pause/requeue each running goal.
+    let requeued = 0;
+    for (const goal of running) {
+      try {
+        if (pendingIds.has(goal.id)) {
+          // F5: adopt + pause in ONE ledger transaction (better-sqlite3 nests
+          // the ledger's own transactions as SAVEPOINTs). A crash between adopt
+          // and pause would strand an `unresolved` row with no `pending` marker,
+          // and the next boot would see a "clean" goal and requeue it into a
+          // fresh model round — the exact at-most-once violation adoption exists
+          // to prevent.
+          const adopted = this.deps.goalLedger.transaction(() => {
+            const changed = this.deps.goalLedger.adoptPendingMutations(goal.id);
+            if (changed > 0) {
+              // Plan §Recovery: an interrupted step's adopted mutations mean the
+              // goal must NOT requeue into a fresh model round. The lease-omitted
+              // CAS pauses it `needs_mutation_resolution` (paused CLEARS the
+              // lease) and the adopted rows keep `effectState` `unknown`.
+              this.deps.goalLedger.pauseGoal(goal.id, goal.owner, {
+                next: "paused",
+                reason: "needs_mutation_resolution",
+              });
+            }
+            return changed;
+          });
+          if (
+            adopted === 0 &&
+            this.deps.goalLedger.requeueGoal(goal.id, goal.owner)
+          ) {
+            // Everything was `applied`/`unresolved`/`retryable` already (or
+            // resolved concurrently): safe to requeue as before.
+            requeued++;
+          }
+        } else if (this.deps.goalLedger.requeueGoal(goal.id, goal.owner)) {
+          requeued++;
+        }
+      } catch (err) {
+        console.warn(`[goals] recovery failed for goal ${goal.id}:`, err);
+      }
+    }
+    // Phase D: paused goals carrying stragglers are re-tagged (and any
+    // remaining pending rows adopted). Running goals were handled in phase C.
+    for (const goal of pendingGoals) {
+      if (goal.status !== "paused") continue;
+      try {
+        // F5: adopt + re-tag atomically, same rationale as phase C — a crash
+        // between them would strand an `unresolved` row on an unre-tagged paused
+        // goal the client would never be told to resolve.
+        this.deps.goalLedger.transaction(() => {
+          const adopted = this.deps.goalLedger.adoptPendingMutations(goal.id);
+          if (adopted > 0) {
+            this.deps.goalLedger.retagPausedGoal(
+              goal.id,
+              goal.owner,
+              "needs_mutation_resolution",
+            );
+          }
+        });
+      } catch (err) {
+        console.warn(
+          `[goals] recovery re-tag failed for paused goal ${goal.id}:`,
+          err,
+        );
       }
     }
     return { processed: running.length, requeued };
@@ -1378,50 +1533,64 @@ export class GoalRunner {
 }
 
 /**
- * 3.5 bound-surface check: the first BOUND MCP tool that is not read-only, or
- * `null`. The binder's per-tool D6 classification is not exposed on
- * `McpBinding` (only `tools`), so this re-derives it from the process-wide
- * tool-list cache the just-completed `bindMcpServers` populated — mirroring
- * `mcp.ts`'s `toolSafety` write exactly:
+ * 3.5 bound-surface check: the first BOUND MCP tool that is not read-only and
+ * not in the goal's `authorised_tools` (M4), or `null`.
+ *
+ * The binder's per-tool D6 classification is not exposed on `McpBinding` (only
+ * `tools`), so this re-derives it from the process-wide tool-list cache the
+ * just-completed `bindMcpServers` populated. It mirrors the binder's AND-merge
+ * EXACTLY (`mcp.ts`'s `toolSafety`, finding M5): for EVERY server exposing a
+ * bound name, compute
  *
  *   safe = isMcpToolSafeToRepeat(tool)
  *   if (declaredReadOnly && !explicitlyNotReadOnly && !rawDestructive) safe = true
  *
+ * and AND it across all servers — a name any server declares non-repeatable is
+ * NEVER read-only, even when the first server to bind it hid the second's
+ * `readOnlyHint` from the bound `readOnly` value's first-occurrence read.
+ * Checking only the first server's occurrence would fail OPEN on the exact
+ * cross-server divergence this guards (server A `readOnlyHint:true` binds
+ * first; server B the same name `destructiveHint:true`).
+ *
  * Only ACTUALLY-BOUND names are checked (`binding.tools`; control tools never
- * appear there and are therefore excluded), and the first server to expose a
- * name wins — the binder's plugin-wins/first-MCP tie-break. This is what
- * catches an allowlist-declared read-only entry the server marks non-read-only
- * or destructive, AND an absent allowlist whose full MCP surface binds
- * mutating tools (`isMcpToolSafeToRepeat` is false for every un-annotated MCP
- * tool — Mealie's whole surface).
+ * appear there and are therefore excluded). This catches an allowlist-declared
+ * read-only entry the server marks non-read-only or destructive, AND an absent
+ * allowlist whose full MCP surface binds mutating tools
+ * (`isMcpToolSafeToRepeat` is false for every un-annotated MCP tool — Mealie's
+ * whole surface). An authorised name is exempt: it is surfaced deliberately and
+ * the `authorize` interceptor governs it at dispatch.
  */
 function mcpReadOnlyViolation(
   agent: GoalAgentSnapshot,
   effectiveAllowlist: AgentToolAllowlistEntry[] | undefined,
   binding: McpBinding,
+  authorisedTools: ReadonlySet<string>,
 ): string | null {
   if (binding.tools.length === 0) return null;
   const boundNames = new Set(binding.tools.map((tool) => tool.name));
   const allowByName = new Map<string, AgentToolAllowlistEntry>();
   for (const entry of effectiveAllowlist ?? []) allowByName.set(entry.name, entry);
   const cache = getMcpToolListCache();
-  const checked = new Set<string>();
+  // The binder's AND-merge (finding M5): one entry per bounded name, seeded
+  // `true` and AND-ed down by every server that exposes the name.
+  const safety = new Map<string, boolean>();
   for (const server of agent.mcpServers) {
     const listed = cache.get(mcpToolListCacheKey(server));
     if (listed === undefined) continue;
     for (const tool of listed) {
-      if (!tool.name || !boundNames.has(tool.name) || checked.has(tool.name)) {
-        continue;
-      }
-      checked.add(tool.name);
+      if (!tool.name || !boundNames.has(tool.name)) continue;
       const declaredReadOnly = allowByName.get(tool.name)?.readOnly === true;
       const explicitlyNotReadOnly =
         tool.readOnly === false || tool.annotations?.readOnlyHint === false;
       const rawDestructive = tool.annotations?.destructiveHint === true;
       let safe = isMcpToolSafeToRepeat(tool);
       if (declaredReadOnly && !explicitlyNotReadOnly && !rawDestructive) safe = true;
-      if (!safe) return tool.name;
+      safety.set(tool.name, (safety.get(tool.name) ?? true) && safe);
     }
+  }
+  for (const tool of binding.tools) {
+    if (authorisedTools.has(tool.name)) continue;
+    if (safety.get(tool.name) !== true) return tool.name;
   }
   return null;
 }

@@ -22,9 +22,15 @@ import {
   PUBLIC_TASK_PAGE_MAX_LIMIT,
   PUBLIC_TASK_SPEC_MAX_BYTES,
 } from "./ledger.ts";
-import type { PublicStepRow, PublicTaskRow, TaskRow } from "./ledger.ts";
+import type { PublicStepRow, PublicTaskRow, StepRow, TaskRow } from "./ledger.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import type { VerifyApiKeyFn } from "./plugins/routes.ts";
+import {
+  exceedsByteLimit,
+  isJsonObject,
+  publicFieldError,
+  publicTextError,
+} from "./http/public_fields.ts";
 
 /**
  * The ledger lives in a dedicated SQLite file (`LEDGER_DB_PATH`, default
@@ -332,7 +338,7 @@ export function createLedgerRoutes(
         },
         fenceToken,
       );
-      return c.json(out, 201);
+      return c.json(toPublicAppendedStep(out), 201);
     } catch (e) {
       return ledgerError(c, e);
     }
@@ -447,42 +453,6 @@ function rejectSentinelTaskTransition(
   );
 }
 
-const PUBLIC_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-
-type PublicFieldError = "invalid_request" | "request_too_large";
-
-function exceedsByteLimit(value: string, maxBytes: number): boolean {
-  return Buffer.byteLength(value, "utf8") > maxBytes;
-}
-
-function publicTextError(
-  value: unknown,
-  maxBytes: number,
-  identifier: boolean,
-): PublicFieldError | null {
-  if (
-    typeof value !== "string" ||
-    value.trim() === "" ||
-    PUBLIC_CONTROL_CHARACTERS.test(value)
-  ) {
-    return "invalid_request";
-  }
-  if (identifier && (value === "." || value === "..")) {
-    return "invalid_request";
-  }
-  return exceedsByteLimit(value, maxBytes) ? "request_too_large" : null;
-}
-
-function publicFieldError(c: Context, error: PublicFieldError): Response {
-  return error === "request_too_large"
-    ? c.json({ error }, 413)
-    : c.json({ error }, 400);
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function publicTaskPage(
   c: Context,
 ): { limit: number; offset: number } | null {
@@ -524,9 +494,31 @@ function publicReadLimit(c: Context): number | null {
 
 function toPublicStep(
   step: PublicStepRow,
-): Omit<PublicStepRow, "resultBytes"> {
-  const { resultBytes: _resultBytes, ...publicStep } = step;
+): Omit<PublicStepRow, "resultBytes" | "body_failed"> {
+  const {
+    resultBytes: _resultBytes,
+    // `body_failed` (v10) is replay-restoration metadata, not public surface:
+    // the client never sees it (the pipeline restores it from the internal
+    // readers `getStepByToolCallId`/`listSteps`, which stay unaffected).
+    body_failed: _bodyFailed,
+    ...publicStep
+  } = step;
   return publicStep;
+}
+
+/**
+ * The POST `/tasks/:id/steps` response projection: the endpoint echoes the
+ * appended step alongside its chain `digest`, but the internal `body_failed`
+ * (v10) replay flag must not leak onto the public wire. Mirrors
+ * {@link toPublicStep}'s narrowing; the `step` + `digest` shape is otherwise
+ * unchanged from what the endpoint returned before this projection.
+ */
+function toPublicAppendedStep(out: {
+  step: StepRow;
+  digest: string;
+}): { step: Omit<StepRow, "body_failed">; digest: string } {
+  const { body_failed: _bodyFailed, ...step } = out.step;
+  return { step, digest: out.digest };
 }
 
 /** A `TaskRow` as returned to clients: the internal snapshot `payload` column

@@ -187,7 +187,7 @@ function fakeGoalLedger(): GoalLedger {
   } as unknown as GoalLedger;
 }
 
-describe("goal interceptor order (4.4)", () => {
+describe("goal interceptor order (4.4 / M4/6.6)", () => {
   test("the factory emits exactly the documented canonical order", () => {
     const interceptors = createGoalToolInterceptors({
       ledger: fakeGoalLedger(),
@@ -195,11 +195,25 @@ describe("goal interceptor order (4.4)", () => {
     });
     assert.deepEqual(
       interceptors.map((interceptor) => interceptor.name),
+      // Spelled out, not just compared to the constant: this catches the
+      // constant and the factory drifting together.
+      [
+        "fence",
+        "serialize",
+        "authorize",
+        "cache",
+        "budget",
+        "reserve",
+        "execution",
+      ],
+    );
+    assert.deepEqual(
+      interceptors.map((interceptor) => interceptor.name),
       [...GOAL_TOOL_INTERCEPTOR_ORDER],
     );
   });
 
-  test("load-bearing pairings: fence<serialize, budget<execution, and no replay", () => {
+  test("load-bearing pairings: fence<serialize, serialize<authorize<cache, budget<reserve<execution, and no replay", () => {
     const names = createGoalToolInterceptors({
       ledger: fakeGoalLedger(),
       goalId: "goal-1",
@@ -207,6 +221,22 @@ describe("goal interceptor order (4.4)", () => {
     assert.ok(
       names.indexOf("fence") < names.indexOf("serialize"),
       "a GOAL_LEASE_CONFLICT must win over tool_args_too_large",
+    );
+    assert.ok(
+      names.indexOf("serialize") < names.indexOf("authorize"),
+      "a refusal must be recorded against args that already passed the bounds",
+    );
+    assert.ok(
+      names.indexOf("authorize") < names.indexOf("cache"),
+      "an unauthorised call must not pay cache admission",
+    );
+    assert.ok(
+      names.indexOf("budget") < names.indexOf("reserve"),
+      "reserve must sit inside budget",
+    );
+    assert.ok(
+      names.indexOf("reserve") < names.indexOf("execution"),
+      "reserve must observe the body outcome (inside execution's bound)",
     );
     assert.ok(
       names.indexOf("budget") < names.indexOf("execution"),

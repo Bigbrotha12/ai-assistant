@@ -325,19 +325,82 @@ describe("goal routes — POST /v1/goals admission", () => {
     assert.match(body.message ?? "", /header/i);
   });
 
-  test("a non-empty authorisedTools is refused: M2 cannot gate a write (3.5 admission guard)", async (t) => {
+  test("M4: authorisedTools are validated, trimmed, deduplicated, and persisted (6.1 admission)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+
+    const res = await postGoal(app, {
+      authorisedTools: [
+        " create_mealplan ",
+        "create_mealplan",
+        "upsert_recipe",
+      ],
+    });
+    assert.equal(res.status, 201);
+    const { goalId } = (await res.json()) as PostBody;
+    const goal = goalLedger.getGoal(goalId)!;
+    // De-duplicated (case-sensitive) AFTER trim, persisted as the JSON column —
+    // the exact array the `authorize` interceptor reads at dispatch time.
+    assert.deepEqual(JSON.parse(goal.authorised_tools!), [
+      "create_mealplan",
+      "upsert_recipe",
+    ]);
+  });
+
+  test("M4: omission and an explicit empty list admit with [] authorised_tools", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+
+    const omitted = await postGoal(app, { clientGoalId: "omit-tools" });
+    assert.equal(omitted.status, 201);
+    const omittedGoal = goalLedger.getGoalByIdempotencyKey(
+      "user-1",
+      "omit-tools",
+    )!;
+    assert.deepEqual(JSON.parse(omittedGoal.authorised_tools!), []);
+
+    const empty = await postGoal(app, {
+      clientGoalId: "empty-tools",
+      authorisedTools: [],
+    });
+    assert.equal(empty.status, 201);
+    const emptyGoal = goalLedger.getGoalByIdempotencyKey(
+      "user-1",
+      "empty-tools",
+    )!;
+    assert.deepEqual(JSON.parse(emptyGoal.authorised_tools!), []);
+  });
+
+  test("M4: a malformed authorisedTools is 400 invalid_request and admits nothing", async (t) => {
     const { app, goalLedger, pins } = makeApp(t);
 
-    const res = await postGoal(app, { authorisedTools: ["create_mealplan"] });
-    assert.equal(res.status, 400);
-    assert.deepEqual(await res.json(), {
-      error: "invalid_request",
-      message: "authorised tools are not supported until M4",
-    });
-    assert.equal(
-      goalLedger.getGoalByIdempotencyKey("user-1", "client-goal-1"),
-      undefined,
-    );
+    const cases: Record<string, unknown>[] = [
+      { authorisedTools: "create_mealplan" }, // not an array
+      { authorisedTools: [123] }, // non-string entry
+      { authorisedTools: ["   "] }, // empty after trim
+      { authorisedTools: ["line\nbreak"] }, // control character
+      {
+        authorisedTools: Array.from({ length: 33 }, (_, i) => `tool-${i}`),
+      }, // > 32 distinct entries
+      { authorisedTools: ["goal_complete"] }, // control-tool names are refused
+      { authorisedTools: ["update_plan"] },
+      { authorisedTools: ["goal_blocked"] },
+      { authorisedTools: ["a".repeat(257)] }, // past the 256-byte bound
+    ];
+    for (const [index, overrides] of cases.entries()) {
+      const clientGoalId = `bad-tools-${index}`;
+      const res = await postGoal(app, { clientGoalId, ...overrides });
+      assert.equal(
+        res.status,
+        400,
+        `case ${index}: ${JSON.stringify(overrides)}`,
+      );
+      assert.deepEqual(await res.json(), { error: "invalid_request" });
+      assert.equal(
+        goalLedger.getGoalByIdempotencyKey("user-1", clientGoalId),
+        undefined,
+        `case ${index} must never create a goal`,
+      );
+    }
+    // Every refusal happened before any credential pin was minted.
     assert.equal(pins.pinCalls.length, 0);
   });
 
@@ -669,6 +732,64 @@ async function pauseGoal(
   return goalId;
 }
 
+/**
+ * Raw `goal_mutation` insert (Phase 6 rows normally come from the pipeline's
+ * `reserve` interceptor — M2/M4 tests seed them directly). [pluginId] lets a
+ * test seed two rows that share `(tool, args_hash)` under different plugins —
+ * the UNIQUE key is `(goal_id, plugin_id, tool, args_hash)` — to exercise the
+ * `resolveMutations` ambiguity refusal.
+ */
+function insertMutation(
+  db: Database.Database,
+  goalId: string,
+  tool: string,
+  argsHash: string,
+  state: string,
+  pluginId = "plugin",
+): void {
+  db.prepare(
+    `INSERT INTO goal_mutation
+       (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+  ).run(
+    `mut-${goalId}-${pluginId}-${tool}-${argsHash}`,
+    goalId,
+    pluginId,
+    tool,
+    argsHash,
+    state,
+    EPOCH,
+  );
+}
+
+/**
+ * Admit + pause a goal `paused(needs_mutation_resolution)` carrying one
+ * `unresolved` mutation — the post-crash shape boot recovery leaves behind
+ * (Phase 6, plan §Recovery).
+ */
+async function pauseForMutationResolution(
+  app: Hono,
+  db: Database.Database,
+  goalLedger: GoalLedger,
+  tool: string,
+  argsHash: string,
+): Promise<string> {
+  const res = await postGoal(app, {
+    clientGoalId: `paused-mut-${Math.random()}`,
+  });
+  assert.equal(res.status, 201);
+  const { goalId } = (await res.json()) as PostBody;
+  insertMutation(db, goalId, tool, argsHash, "unresolved");
+  const claimed = goalLedger.claimGoal(goalId, "user-1");
+  goalLedger.pauseGoal(goalId, "user-1", {
+    next: "paused",
+    reason: "needs_mutation_resolution",
+    leaseOwner: "user-1",
+    leaseToken: claimed.lease_token!,
+  });
+  return goalId;
+}
+
 describe("goal routes — POST /v1/goals/:id/resume (5.1)", () => {
   test("resume re-pins, appends the durable answer, and requeues", async (t) => {
     const { app, goalLedger, pins } = makeApp(t);
@@ -778,6 +899,421 @@ describe("goal routes — POST /v1/goals/:id/resume (5.1)", () => {
     });
     assert.equal(crossOwner.status, 404);
     assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+  });
+});
+
+describe("goal routes — resume with resolveMutations (Phase 6)", () => {
+  const MUTATION_TOOL = "create_mealplan";
+  const MUTATION_HASH = "hash-abcdef";
+
+  function resumeBody(overrides: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      answer: "yes, proceed",
+      credentials: { openrouter: { apiKey: "sk-resumed" } },
+      resolveMutations: [
+        { tool: MUTATION_TOOL, argsHash: MUTATION_HASH, resolution: "applied" },
+      ],
+      ...overrides,
+    });
+  }
+
+  test("applied: the mutation resolves atomically with the resume and effectState becomes completed_steps_only", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const goalId = await pauseForMutationResolution(
+      app,
+      db,
+      goalLedger,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+    );
+
+    // Baseline: the unresolved mutation reports `unknown` on the detail read.
+    type Detail = {
+      effectState: string;
+      unresolvedMutations: { tool: string; argsHash: string }[];
+    };
+    const before = (await (
+      await app.request(`/v1/goals/${goalId}`, { headers: auth })
+    ).json()) as Detail;
+    assert.equal(before.effectState, "unknown");
+    assert.deepEqual(before.unresolvedMutations, [
+      { tool: MUTATION_TOOL, argsHash: MUTATION_HASH },
+    ]);
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: resumeBody(),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "queued");
+    assert.equal(row.pause_reason, null);
+    // The answer WAS appended — the resume + resolution committed together.
+    assert.equal(goalLedger.listGoalMessages(goalId).length, 2);
+    // The mutation row is now an `applied` tombstone.
+    const mutation = db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goalId) as { state: string };
+    assert.equal(mutation.state, "applied");
+
+    const after = (await (
+      await app.request(`/v1/goals/${goalId}`, { headers: auth })
+    ).json()) as Detail;
+    assert.equal(after.effectState, "completed_steps_only");
+    assert.deepEqual(after.unresolvedMutations, []);
+  });
+
+  test("not_applied: the row is deleted and effectState clears to none_known", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const goalId = await pauseForMutationResolution(
+      app,
+      db,
+      goalLedger,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+    );
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: resumeBody({
+        resolveMutations: [
+          {
+            tool: MUTATION_TOOL,
+            argsHash: MUTATION_HASH,
+            resolution: "not_applied",
+          },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "queued");
+    const { n } = db
+      .prepare("SELECT COUNT(*) AS n FROM goal_mutation WHERE goal_id = ?")
+      .get(goalId) as { n: number };
+    assert.equal(n, 0, "not_applied deletes the row (R18: no effect escaped)");
+    const after = (await (
+      await app.request(`/v1/goals/${goalId}`, { headers: auth })
+    ).json()) as { effectState: string };
+    assert.equal(after.effectState, "none_known");
+  });
+
+  test("a malformed resolveMutations is a 400 that changes NOTHING (atomic refusal)", async (t) => {
+    const { app, db, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseForMutationResolution(
+      app,
+      db,
+      goalLedger,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+    );
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+    const pinsBefore = pins.pinCalls.length;
+
+    const malformed: Record<string, unknown>[] = [
+      // resolution outside the closed union
+      {
+        resolveMutations: [
+          { tool: MUTATION_TOOL, argsHash: MUTATION_HASH, resolution: "bogus" },
+        ],
+      },
+      // missing tool / missing argsHash
+      { resolveMutations: [{ argsHash: MUTATION_HASH, resolution: "applied" }] },
+      { resolveMutations: [{ tool: MUTATION_TOOL, resolution: "applied" }] },
+      // > 50 entries
+      {
+        resolveMutations: Array.from({ length: 51 }, (_, i) => ({
+          tool: `t-${i}`,
+          argsHash: `h-${i}`,
+          resolution: "applied",
+        })),
+      },
+    ];
+    for (const [index, overrides] of malformed.entries()) {
+      const res = await app.request(`/v1/goals/${goalId}/resume`, {
+        method: "POST",
+        headers: auth,
+        body: resumeBody(overrides),
+      });
+      assert.equal(res.status, 400, `case ${index}`);
+      assert.deepEqual(await res.json(), { error: "invalid_request" });
+    }
+
+    // Atomicity: still paused, no answer appended, no pin minted, and the
+    // mutation row is untouched.
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(goalLedger.listGoalMessages(goalId).length, messagesBefore);
+    assert.equal(pins.pinCalls.length, pinsBefore);
+    const mutation = db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goalId) as { state: string };
+    assert.equal(mutation.state, "unresolved");
+    assert.equal(goalLedger.effectState(goalId), "unknown");
+  });
+
+  test("an entry not in the unresolved list is refused 400 and the goal stays paused", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const goalId = await pauseForMutationResolution(
+      app,
+      db,
+      goalLedger,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+    );
+
+    // A REAL tool with the WRONG argsHash: the (tool, argsHash) pair must
+    // match exactly what the detail endpoint listed.
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: resumeBody({
+        resolveMutations: [
+          { tool: MUTATION_TOOL, argsHash: "hash-wrong", resolution: "applied" },
+        ],
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(goalLedger.listGoalMessages(goalId).length, 1, "no answer was appended");
+    const mutation = db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goalId) as { state: string };
+    assert.equal(mutation.state, "unresolved", "nothing was resolved or deleted");
+  });
+
+  test("a key matching TWO unresolved rows (different plugin_ids) is refused 400 before any transaction", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const res = await postGoal(app, {
+      clientGoalId: `paused-ambig-${Math.random()}`,
+    });
+    assert.equal(res.status, 201);
+    const { goalId } = (await res.json()) as PostBody;
+    // Two plugins share BOTH the tool name AND the args hash — possible
+    // because the ledger's UNIQUE key is `(goal_id, plugin_id, tool,
+    // args_hash)` while the resume entry keys only `(tool, args_hash)` (the
+    // §12 list exposes no plugin_id, so the client cannot disambiguate).
+    insertMutation(
+      db,
+      goalId,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+      "unresolved",
+      "plugin",
+    );
+    insertMutation(
+      db,
+      goalId,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+      "unresolved",
+      "plugin-b",
+    );
+    const claimed = goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.pauseGoal(goalId, "user-1", {
+      next: "paused",
+      reason: "needs_mutation_resolution",
+      leaseOwner: "user-1",
+      leaseToken: claimed.lease_token!,
+    });
+
+    const resume = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: resumeBody(),
+    });
+    assert.equal(resume.status, 400);
+    assert.deepEqual(await resume.json(), { error: "invalid_request" });
+    // The refusal happens at the PRE-CHECK, before the pin or the answer
+    // append: a 400, never a 409 rollback leaving the goal un-resumable.
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(
+      goalLedger.listGoalMessages(goalId).length,
+      1,
+      "no answer was appended",
+    );
+    const rows = db
+      .prepare(
+        "SELECT state FROM goal_mutation WHERE goal_id = ? ORDER BY plugin_id",
+      )
+      .all(goalId) as { state: string }[];
+    assert.deepEqual(
+      rows.map((row) => row.state),
+      ["unresolved", "unresolved"],
+      "neither ambiguous row was resolved",
+    );
+  });
+
+  test("the SAME key twice within resolveMutations is refused 400 and the goal stays paused", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const goalId = await pauseForMutationResolution(
+      app,
+      db,
+      goalLedger,
+      MUTATION_TOOL,
+      MUTATION_HASH,
+    );
+
+    // A duplicate entry would hit the same row twice — the second pass sees it
+    // resolved and throws INSIDE the transaction. The route must refuse it at
+    // the pre-check instead (duplicate keys are a client bug, not a resolution).
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: resumeBody({
+        resolveMutations: [
+          { tool: MUTATION_TOOL, argsHash: MUTATION_HASH, resolution: "applied" },
+          {
+            tool: MUTATION_TOOL,
+            argsHash: MUTATION_HASH,
+            resolution: "not_applied",
+          },
+        ],
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(
+      goalLedger.listGoalMessages(goalId).length,
+      1,
+      "no answer was appended",
+    );
+    const mutation = db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goalId) as { state: string };
+    assert.equal(mutation.state, "unresolved", "the row was not resolved or deleted");
+  });
+
+  test("resolveMutations with nothing unresolved resolves nothing — resume still 200 (empty path)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    // The NORMAL pause (needs_user_input) carries no mutation rows.
+    const goalId = await pauseGoal(app, goalLedger);
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "yes",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+        resolveMutations: [],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "queued");
+    assert.equal(goalLedger.effectState(goalId), "none_known");
+  });
+
+  test("resume adopts a straggler `pending` row so it becomes resolvable (N2)", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    // A paused goal carrying a `pending` mutation that the normal paths missed
+    // (a `markMutation` settle that missed AND the boot adoption that also
+    // missed). `pending` is invisible to `listUnresolvedMutations`, so the
+    // client cannot resolve it yet.
+    const goalId = await pauseGoal(app, goalLedger);
+    insertMutation(db, goalId, MUTATION_TOOL, MUTATION_HASH, "pending");
+    assert.equal(goalLedger.effectState(goalId), "unknown");
+    assert.deepEqual(
+      goalLedger.listUnresolvedMutations(goalId),
+      [],
+      "a pending row is not listed for resolution",
+    );
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "yes",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+        resolveMutations: [],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+    assert.equal(goalLedger.getGoal(goalId)!.status, "queued");
+
+    // The straggler was adopted `unresolved` inside the resume transaction and
+    // is now resolvable via a subsequent GET + resume.
+    const mutation = db
+      .prepare("SELECT state FROM goal_mutation WHERE goal_id = ?")
+      .get(goalId) as { state: string };
+    assert.equal(mutation.state, "unresolved");
+
+    const detail = (await (
+      await app.request(`/v1/goals/${goalId}`, { headers: auth })
+    ).json()) as {
+      effectState: string;
+      unresolvedMutations: { tool: string; argsHash: string }[];
+    };
+    assert.equal(detail.effectState, "unknown");
+    assert.deepEqual(detail.unresolvedMutations, [
+      { tool: MUTATION_TOOL, argsHash: MUTATION_HASH },
+    ]);
+  });
+
+  test("resolving BEFORE adopting a pending straggler never collides with a pre-validated key under another plugin (N2 ordering)", async (t) => {
+    const { app, db, goalLedger } = makeApp(t);
+    const res = await postGoal(app, {
+      clientGoalId: `paused-straggler-${Math.random()}`,
+    });
+    assert.equal(res.status, 201);
+    const { goalId } = (await res.json()) as PostBody;
+    // The route's pre-check lists `unresolved` rows only, so it validates the
+    // 'p1' row below and counts exactly one match for the key. A `pending`
+    // straggler sharing `(tool, args_hash)` under plugin 'p2' is legal (the
+    // UNIQUE key includes `plugin_id`) and invisible to that pre-check.
+    insertMutation(db, goalId, MUTATION_TOOL, MUTATION_HASH, "unresolved", "p1");
+    insertMutation(db, goalId, MUTATION_TOOL, MUTATION_HASH, "pending", "p2");
+    const claimed = goalLedger.claimGoal(goalId, "user-1");
+    goalLedger.pauseGoal(goalId, "user-1", {
+      next: "paused",
+      reason: "needs_mutation_resolution",
+      leaseOwner: "user-1",
+      leaseToken: claimed.lease_token!,
+    });
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+
+    const resume = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: resumeBody(),
+    });
+    // If the straggler were adopted before the resolution it would become a
+    // second key-matching `unresolved` row and `resolveMutations` would throw,
+    // surfacing 409 + rollback (and, without resolutions, stranding the pair).
+    assert.equal(resume.status, 200);
+    assert.deepEqual(await resume.json(), { goalId, status: "queued" });
+
+    // The answer WAS appended — the resume + resolution committed together.
+    assert.equal(goalLedger.listGoalMessages(goalId).length, messagesBefore + 1);
+
+    // 'p1' resolved to its `applied` tombstone; 'p2' adopted from `pending`.
+    const rows = db
+      .prepare(
+        "SELECT plugin_id, state FROM goal_mutation WHERE goal_id = ? ORDER BY plugin_id",
+      )
+      .all(goalId) as { plugin_id: string; state: string }[];
+    assert.deepEqual(rows, [
+      { plugin_id: "p1", state: "applied" },
+      { plugin_id: "p2", state: "unresolved" },
+    ]);
+
+    // The adopted straggler is now visible to the NEXT GET for resolution.
+    const detail = (await (
+      await app.request(`/v1/goals/${goalId}`, { headers: auth })
+    ).json()) as {
+      effectState: string;
+      unresolvedMutations: { tool: string; argsHash: string }[];
+    };
+    assert.equal(detail.effectState, "unknown");
+    assert.deepEqual(detail.unresolvedMutations, [
+      { tool: MUTATION_TOOL, argsHash: MUTATION_HASH },
+    ]);
   });
 });
 

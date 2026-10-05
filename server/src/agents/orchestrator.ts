@@ -71,6 +71,14 @@ export type BindPluginToolsOptions = {
   stepSeq?: number;
   goalLeaseToken?: string;
   /**
+   * Goal channel only: the goal's admission-time `authorised_tools` set. The
+   * binder stamps `goalAuthorised` on each `ToolCall` from it (`has(name)`),
+   * which the `authorize` interceptor reads to refuse an unauthorised MUTATING
+   * call before egress (plan M4/§goalAuthorised). Absent ⇒ the field is left
+   * unset, preserving the non-goal channels' unchanged `ToolCall` shape.
+   */
+  readonly authorisedTools?: ReadonlySet<string>;
+  /**
    * Per-request credential source (plan §5 Phase 3, steps 3.2/3.5). When
    * provided it is the SOLE source of a tool call's credentials + fingerprint,
    * closing over the request's validated maps (constructed in `chat.ts`); the
@@ -204,6 +212,9 @@ export function bindPluginTools(
                 ...(options.goalLeaseToken === undefined
                   ? {}
                   : { goalLeaseToken: options.goalLeaseToken }),
+                ...(options.authorisedTools === undefined
+                  ? {}
+                  : { goalAuthorised: options.authorisedTools.has(ctx.toolDef.name) }),
               }
             : {}),
           ...(ctx.toolCallId === undefined ? {} : { toolCallId: ctx.toolCallId }),

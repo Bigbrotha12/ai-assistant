@@ -11,11 +11,16 @@ import {
   GOAL_MESSAGE_DELETE_TRIGGER_SQL,
   GOAL_REFUSAL_DELETE_TRIGGER_SQL,
 } from "./migrate.ts";
+import { redactForOutbound } from "../redact.ts";
 import { isUniqueConstraintViolation } from "../sqlite_errors.ts";
 import type {
   GoalEffectState,
   GoalMessageRow,
+  GoalMutationResolution,
   GoalMutationRow,
+  GoalMutationState,
+  GoalPauseReason,
+  GoalRefusalReason,
   GoalRow,
   GoalStatus,
   GoalStepKind,
@@ -406,12 +411,16 @@ export class GoalLedger {
       if (!current) {
         throw new GoalError("GOAL_NOT_FOUND", `goal ${goalId} not found`);
       }
-      if (current.status === "running") {
+      if (current.status === "running" && hasLeaseOwner && hasLeaseToken) {
         throw new GoalError(
           "GOAL_LEASE_CONFLICT",
           `goal ${goalId} pause rejected: lease token mismatch for owner ${owner}`,
         );
       }
+      // F6: a LEASE-OMITTED CAS (recovery's adopt-then-pause) that misses can
+      // only mean the row is no longer `running` — the WHERE carried no lease
+      // clause to fail. Report the transition miss, never a lease conflict, so
+      // recovery does not misclassify a self-healed/concurrently-moved goal.
       throw new GoalError(
         "GOAL_INVALID_TRANSITION",
         `goal ${goalId} could not transition running -> ${params.next}` +
@@ -964,6 +973,332 @@ export class GoalLedger {
          ORDER BY created_ts, id`,
       )
       .all(goalId) as GoalMutationRow[];
+  }
+
+  /**
+   * Phase 6 mutation reservation (plan F3(b)) — the reserve step of the
+   * at-most-once guard, run by the goal pipeline's `reserve` interceptor BEFORE
+   * any egress on a mutating call. ONE synchronous better-sqlite3 transaction
+   * (no `await` inside, so it cannot span an `await next()`): Node's single
+   * thread makes the read + conditional write atomic, so two identical sibling
+   * calls in one round cannot both win — the second reads the first's `pending`
+   * row and refuses.
+   *
+   * Row states, read under the transaction:
+   * - absent       -> INSERT `pending` (fresh `m_` id, `created_ts` from the
+   *                   injected clock) -> `{ok: true}`;
+   * - `retryable`  -> DELETE + re-INSERT `pending` (same key, FRESH id) ->
+   *                   `{ok: true}` — the step never ran (no egress attempt),
+   *                   so the identical retry is permitted (F3(b)'s escape
+   *                   hatch; a blanket refusal would make `retryable` a
+   *                   tombstone);
+   * - `unresolved` -> `{ok: false, reason: "unresolved_mutation"}` — only
+   *                   explicit user resolution on resume clears it
+   *                   (`resolveMutations`);
+   * - `pending` | `applied` -> `{ok: false, reason: "duplicate_mutation"}` —
+   *                   an identical call is already in flight or already ran.
+   *
+   * `step_seq` is bound from [stepSeq] as given (nullable), NOT from `key` (the
+   * key carries no seq): the row records which step reserved the key so boot
+   * recovery can adopt exactly that step's pending rows.
+   */
+  reserveMutation(
+    goalId: string,
+    key: { pluginId: string; tool: string; argsHash: string },
+    stepSeq: number | undefined,
+  ):
+    | { ok: true }
+    | { ok: false; reason: "duplicate_mutation" | "unresolved_mutation" } {
+    return this.db.transaction(() => {
+      const existing = this.db
+        .prepare(
+          `SELECT id, state FROM goal_mutation
+           WHERE goal_id = ? AND plugin_id = ? AND tool = ? AND args_hash = ?`,
+        )
+        .get(goalId, key.pluginId, key.tool, key.argsHash) as
+        | { id: string; state: GoalMutationState }
+        | undefined;
+      if (existing === undefined) {
+        this.insertMutationRow(goalId, key, stepSeq, "pending");
+        return { ok: true as const };
+      }
+      if (existing.state === "retryable") {
+        // Retry permitted: replace the row wholesale (fresh `m_` id + clock
+        // stamp) instead of updating, so the retried reservation reads as a new
+        // pending row and the pre-retry row's id/created_ts are gone.
+        this.db.prepare("DELETE FROM goal_mutation WHERE id = ?").run(existing.id);
+        this.insertMutationRow(goalId, key, stepSeq, "pending");
+        return { ok: true as const };
+      }
+      if (existing.state === "unresolved") {
+        return { ok: false as const, reason: "unresolved_mutation" as const };
+      }
+      // `pending` | `applied` — the only remaining CHECK-constraint states.
+      return { ok: false as const, reason: "duplicate_mutation" as const };
+    })();
+  }
+
+  /** Shared INSERT for `reserveMutation`'s two `pending` paths (absent / retryable-replace). */
+  private insertMutationRow(
+    goalId: string,
+    key: { pluginId: string; tool: string; argsHash: string },
+    stepSeq: number | undefined,
+    state: GoalMutationState,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO goal_mutation
+           (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+         VALUES
+           (@id, @goalId, @pluginId, @tool, @argsHash, @state, @stepSeq, @createdTs)`,
+      )
+      .run({
+        id: `m_${randomUUID()}`,
+        goalId,
+        pluginId: key.pluginId,
+        tool: key.tool,
+        argsHash: key.argsHash,
+        state,
+        stepSeq: stepSeq ?? null,
+        createdTs: this.now(),
+      });
+  }
+
+  /**
+   * Records a reserved mutation's outcome (plan F3(b)) — the interceptor's
+   * second synchronous transaction, ran after the tool body settles. UPDATEs by
+   * the UNIQUE `(goal_id, plugin_id, tool, args_hash)` key, so it NEVER inserts:
+   * `reserveMutation` created the row. Classifier -> state:
+   * `executed === false`          -> `retryable` (body never ran; retry
+   *                                   permitted on the next reserve);
+   * executed + clean completion   -> `applied` (tombstone);
+   * executed + threw / bodyFailed -> `unresolved` (may have reached the
+   *                                   provider; user must resolve on resume).
+   *
+   * The UPDATE overwrites the matching row's state UNCONDITIONALLY, and that is
+   * deliberate (the F3 correction), not "idempotent-ish": a sibling's settle
+   * must win over any earlier booking, and a recovery adopt-to-`unresolved`
+   * must be overwritten once the true outcome is recorded. 0 rows matched is
+   * the only "leave existing state alone" case, and only because no row matched
+   * the key at all (a race with a terminal goal or a superseded lease) — it is
+   * deliberately NOT an error.
+   */
+  markMutation(
+    goalId: string,
+    key: { pluginId: string; tool: string; argsHash: string },
+    state: GoalMutationState,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE goal_mutation
+         SET state = ?
+         WHERE goal_id = ? AND plugin_id = ? AND tool = ? AND args_hash = ?`,
+      )
+      .run(state, goalId, key.pluginId, key.tool, key.argsHash);
+  }
+
+  /**
+   * Append-only refusal log (plan §Storage) — ONE INSERT, never UPDATE/DELETE
+   * (the `goal_refusal_append_only_update/delete` triggers abort both, so no
+   * caller can rewrite history). Records a mutation call the pipeline refused
+   * BEFORE egress: an unauthorised tool (the `authorize` interceptor, L6) or a
+   * `duplicate_mutation` / `unresolved_mutation` denial (F3(b)'s reserve).
+   *
+   * `args_json` is the stringified args passed through `redactForOutbound` —
+   * the same discipline every outbound path applies, so a credential-shaped
+   * argument (a bearer token, a quoted `api_key`/`token`/`secret` field) never
+   * lands in the durable log. Append-only also means an identical retry appends
+   * a SECOND row: there is deliberately no dedupe (the ledger's at-most-once
+   * guard lives in `goal_mutation`, not here).
+   */
+  recordGoalRefusal(
+    goalId: string,
+    input: {
+      stepSeq: number;
+      toolCallId?: string;
+      tool: string;
+      args: Record<string, unknown>;
+      reason: GoalRefusalReason;
+    },
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO goal_refusal
+           (id, goal_id, step_seq, tool_call_id, tool, args_json, reason, created_ts)
+         VALUES
+           (@id, @goalId, @stepSeq, @toolCallId, @tool, @argsJson, @reason, @createdTs)`,
+      )
+      .run({
+        id: `r_${randomUUID()}`,
+        goalId,
+        stepSeq: input.stepSeq,
+        toolCallId: input.toolCallId ?? null,
+        tool: input.tool,
+        argsJson: redactForOutbound(JSON.stringify(input.args)),
+        reason: input.reason,
+        createdTs: this.now(),
+      });
+  }
+
+  /**
+   * User resolution of the goal's `unresolved` mutations (plan §Recovery,
+   * WIRE_SPEC §12 `POST /v1/goals/:id/resume`). Runs inside ONE `db.transaction`
+   * so the route composes it with `resumeGoal`'s answer append + CAS (the plan:
+   * "`resolveMutations` commits atomically with the resume"); a failure
+   * mid-list rolls the WHOLE transaction — including every earlier entry — back,
+   * so a resolution is never applied partially.
+   *
+   * Per entry, keyed `(goal_id, tool, args_hash)` against the goal's CURRENT
+   * state (read inside the transaction):
+   * - `resolution: "applied"`     -> row state `applied` (the tombstone stands);
+   * - `resolution: "retryable"`   -> row state `retryable` (the next step may
+   *   retry the identical call);
+   * - `resolution: "not_applied"` -> the USER asserts no effect escaped (R18):
+   *   the row is DELETED, letting `effectState` clear to `none_known`.
+   *
+   * Ambiguity is classified over the `unresolved` rows ONLY, mirroring the
+   * route's pre-check (`listUnresolvedMutations`): the resolution entry omits
+   * `plugin_id`, so two plugins may share `(tool, args_hash)`. Exactly ONE
+   * `unresolved` match is resolved; >1 is an ambiguous key. A MIXED-STATE key
+   * (one `unresolved` + one `applied` under different `plugin_id`s) is NOT
+   * ambiguous — it resolves the `unresolved` row and leaves the others
+   * untouched (the route admitted it, so the ledger must not throw into the
+   * resume transaction and roll it back). With ZERO `unresolved` matches, a key
+   * that matched some row is a stale/already-decided mutation and throws naming
+   * the FIRST matched row's state; a key matching nothing throws naming it
+   * absent — both `GOAL_INVALID_TRANSITION` rather than a silent double-apply.
+   * TOCTOU safety holds because the route's pre-check and this re-check share
+   * the same definition of the resolvable set.
+   *
+   * Returns the goal's post-resolution {@link GoalLedger.effectState}: an
+   * `applied` entry is why a resolved-and-resumed goal is
+   * `completed_steps_only`, and an all-`not_applied` resolution is what lets it
+   * return to `none_known`.
+   */
+  resolveMutations(
+    goalId: string,
+    entries: readonly {
+      tool: string;
+      argsHash: string;
+      resolution: GoalMutationResolution;
+    }[],
+  ): GoalEffectState {
+    return this.db.transaction(() => {
+      for (const entry of entries) {
+        const rows = this.db
+          .prepare(
+            `SELECT id, state FROM goal_mutation
+             WHERE goal_id = ? AND tool = ? AND args_hash = ?`,
+          )
+          .all(goalId, entry.tool, entry.argsHash) as {
+          id: string;
+          state: GoalMutationState;
+        }[];
+        const unresolved = rows.filter((row) => row.state === "unresolved");
+        if (unresolved.length > 1) {
+          throw new GoalError(
+            "GOAL_INVALID_TRANSITION",
+            `goal ${goalId} mutation ${entry.tool}/${entry.argsHash} is ` +
+              `ambiguous (${unresolved.length} matching unresolved rows)`,
+          );
+        }
+        const row = unresolved[0];
+        if (row === undefined) {
+          const matched = rows[0];
+          throw new GoalError(
+            "GOAL_INVALID_TRANSITION",
+            `goal ${goalId} mutation ${entry.tool}/${entry.argsHash} is ` +
+              `${matched === undefined ? "absent" : matched.state}, expected unresolved`,
+          );
+        }
+        if (entry.resolution === "applied") {
+          this.db
+            .prepare("UPDATE goal_mutation SET state = 'applied' WHERE id = ?")
+            .run(row.id);
+        } else if (entry.resolution === "retryable") {
+          this.db
+            .prepare("UPDATE goal_mutation SET state = 'retryable' WHERE id = ?")
+            .run(row.id);
+        } else {
+          // `not_applied` — the user asserts no effect escaped: delete the row.
+          this.db.prepare("DELETE FROM goal_mutation WHERE id = ?").run(row.id);
+        }
+      }
+      return this.effectState(goalId);
+    })();
+  }
+
+  /**
+   * Boot recovery's adoption step (plan §Recovery): every `pending` mutation of
+   * the goal becomes `unresolved`, so it is refused until the user resolves it.
+   * `pending` means the reserve committed but the outcome was never recorded
+   * (the process died mid-step) — the request MAY have reached the provider, so
+   * it must not be repeated AND must not read as a known-clean state; adopting
+   * it to `unresolved` is what routes the goal into `needs_mutation_resolution`
+   * (recovery step 3/4) and makes `effectState` report `unknown`.
+   *
+   * Returns the number of rows adopted (0 when nothing was in flight — recovery
+   * then requeues the goal fresh, plan §Recovery step 4). `applied` /
+   * `retryable` / `unresolved` rows are never touched.
+   */
+  adoptPendingMutations(goalId: string): number {
+    return this.db
+      .prepare(
+        `UPDATE goal_mutation SET state = 'unresolved'
+         WHERE goal_id = ? AND state = 'pending'`,
+      )
+      .run(goalId).changes;
+  }
+
+  /**
+   * Every goal (ANY status) carrying at least one `pending` mutation, one row
+   * per goal — boot recovery's adoption scan (plan §Recovery). `pending` means
+   * the reserve committed but the outcome was never recorded (the process died
+   * mid-step), so an interrupted step's effect state is genuinely unknown.
+   *
+   * The `JOIN ... GROUP BY g.id` collapses one goal to one row however many
+   * pending mutations it holds; there is no ordering guarantee beyond SQLite's
+   * implicit `GROUP BY` sort. Recovery uses the LIST (not just running goals)
+   * because a PAUSED goal can also carry stragglers: it must be re-tagged
+   * `needs_mutation_resolution`, not resumed into a fresh model round.
+   */
+  listGoalsWithPendingMutations(): GoalRow[] {
+    return this.db
+      .prepare(
+        `SELECT g.* FROM goal g
+         JOIN goal_mutation m ON m.goal_id = g.id
+         WHERE m.state = 'pending'
+         GROUP BY g.id`,
+      )
+      .all() as GoalRow[];
+  }
+
+  /**
+   * Re-tags an ALREADY-paused goal's pause reason (plan §Recovery step 4): a
+   * paused goal carrying an adopted (`pending -> unresolved`) mutation is
+   * re-tagged `needs_mutation_resolution` so the client resumes it through the
+   * resolution flow. `pause_question` is CLEARED unconditionally — only
+   * `needs_user_input` may carry a question, and a stale one would be replayed
+   * to the user (mirroring {@link pauseGoal}'s validation).
+   *
+   * `changed === 0` is deliberately NOT an error and does not throw: the goal
+   * may have moved off `paused` (concurrent resume/cancel) since the scan, and
+   * recovery must never abort boot for a row that healed itself. Callers treat
+   * a zero-change result as a no-op. Single statement; `updated_ts` uses
+   * `this.now()`.
+   */
+  retagPausedGoal(
+    goalId: string,
+    owner: string,
+    reason: GoalPauseReason,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE goal
+         SET pause_reason = @reason, pause_question = NULL, updated_ts = @now
+         WHERE id = @id AND owner = @owner AND status = 'paused'`,
+      )
+      .run({ id: goalId, owner, reason, now: this.now() });
   }
 
   // ------------------------------------------- Phase 3.1 runner accessors

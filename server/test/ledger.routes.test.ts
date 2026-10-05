@@ -1071,6 +1071,92 @@ describe("ledger task projection and cancellation route", () => {
     );
   });
 
+  test("body_failed replay metadata never leaks onto the public step wire", async () => {
+    const { app, ledger } = makeApp();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "body-failed", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    // A tool-call step whose tool returned a structured `isError: true` result:
+    // `body_failed` is stored so replay can re-serve the failure fact, but it
+    // is replay-restoration metadata — never public surface.
+    ledger.appendStep(
+      task.id,
+      "user-1",
+      {
+        stage: "tool",
+        action: "tool:send",
+        result: '{"isError":true}',
+        toolCallId: "call-body-failed",
+        bodyFailed: true,
+      },
+      claimed.fence_token,
+    );
+
+    // The INTERNAL reader still sees the replay flag (unchanged surface).
+    const internal = ledger.listSteps(task.id, "user-1");
+    assert.equal(internal[0]?.body_failed, true);
+
+    const response = await app.request(`/ledger/tasks/${task.id}`, { headers: auth });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      steps: Array<Record<string, unknown>>;
+    };
+    assert.equal(body.steps.length, 1);
+    const publicStep = body.steps[0] as Record<string, unknown>;
+    assert.equal(publicStep["tool_call_id"], "call-body-failed");
+    assert.equal(
+      "body_failed" in publicStep,
+      false,
+      "body_failed is replay metadata, not public surface",
+    );
+    // Parity with the other internal-only field stripped from public steps.
+    assert.equal("resultBytes" in publicStep, false);
+  });
+
+  test("F4: the append-step response drops the internal body_failed flag", async () => {
+    const { app, ledger } = makeApp();
+    const task = ledger.createTask({
+      owner: "user-1",
+      intentKey: "append-body-failed",
+      spec: "s",
+    });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    // The route's wire body carries no `bodyFailed`, so force the appended row
+    // to be one: the response projection (not the input) is what must remove
+    // the flag. Mirrors the internal shape `appendStep` returns.
+    const original = ledger.appendStep.bind(ledger);
+    (
+      ledger as unknown as {
+        appendStep: typeof ledger.appendStep;
+      }
+    ).appendStep = (taskId, owner, input, fenceToken) => {
+      const out = original(taskId, owner, input, fenceToken);
+      return { step: { ...out.step, body_failed: true }, digest: out.digest };
+    };
+
+    const response = await app.request(`/ledger/tasks/${task.id}/steps`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        stage: "tool",
+        action: "tool:send",
+        result: '{"isError":true}',
+        fenceToken: claimed.fence_token,
+      }),
+    });
+    assert.equal(response.status, 201);
+    const body = (await response.json()) as {
+      step: Record<string, unknown>;
+      digest: string;
+    };
+    assert.equal(typeof body.digest, "string", "the chain digest is preserved");
+    assert.equal(body.step["action"], "tool:send");
+    assert.equal(
+      "body_failed" in body.step,
+      false,
+      "body_failed is replay metadata, never echoed by the append endpoint",
+    );
+  });
+
   test("a failed task is terminal and is not advertised as retryable", async () => {
     const { app, ledger } = makeApp();
     const task = ledger.createTask({ owner: "user-1", intentKey: "failed", spec: "s" });

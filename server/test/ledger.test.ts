@@ -1423,7 +1423,7 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
-    assert.equal(CURRENT_LEDGER_VERSION, 9);
+    assert.equal(CURRENT_LEDGER_VERSION, 10);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -1449,6 +1449,9 @@ describe("migration", () => {
     db.exec("DROP INDEX idx_tasks_status_updated");
     db.exec("DROP INDEX idx_ledger_task_metadata_window");
     db.exec("ALTER TABLE ledger_task DROP COLUMN job_spec");
+    // v10 added `ledger_step.body_failed`; drop it too so the simulated v6 DB
+    // does not trip "duplicate column name" when the chain re-applies v10.
+    db.exec("ALTER TABLE ledger_step DROP COLUMN body_failed");
     // A genuine v6 DB predates the goal-loop tables; the goal tables (and their
     // append-only triggers, dropped with them) must be removed too so the re-run
     // from v6 is a faithful simulation. Dropping a table drops its triggers.
@@ -1713,5 +1716,58 @@ describe("migration", () => {
       { id: "t1", owner: "o", intent_key: "k1", spec: "s1", status: "queued" },
       { id: "t2", owner: "o", intent_key: "k2", spec: "s2", status: "queued" },
     ]);
+  });
+
+  test("v10 migration adds body_failed to a populated v9 DB, defaulting old rows to 0", () => {
+    // Bring a fresh DB up to v9 through the REAL migration list, seed a step,
+    // then run the real v10 step. Existing steps must survive with
+    // `body_failed = 0` (a pre-v10 step has no domain-failure fact recorded).
+    const db = new Database(":memory:") as DatabaseType;
+    applyMigrations(db, LEDGER_MIGRATIONS.slice(0, 9), 9);
+    assert.equal(db.pragma("user_version", { simple: true }), 9);
+
+    const colsBefore = db
+      .prepare("PRAGMA table_info(ledger_step)")
+      .all()
+      .map((r) => (r as { name: string }).name);
+    assert.ok(
+      !colsBefore.includes("body_failed"),
+      "body_failed must not exist before v10",
+    );
+
+    db.prepare(
+      `INSERT INTO ledger_task
+         (id, owner, intent_key, spec, status, created_ts, updated_ts,
+          last_heartbeat_ts, fence_token)
+       VALUES ('t1', 'o', 'k1', 's1', 'running', 1, 1, 1, '')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO ledger_step (id, task_id, seq, stage, action, result, ts, tool_call_id)
+       VALUES ('s1', 't1', 1, 'tool', 'tool:create_task', '{"applied":true}', 1, 'call_1')`,
+    ).run();
+
+    migrateLedger(db);
+
+    assert.equal(
+      db.pragma("user_version", { simple: true }),
+      CURRENT_LEDGER_VERSION,
+    );
+
+    const colsAfter = db
+      .prepare("PRAGMA table_info(ledger_step)")
+      .all()
+      .map((r) => (r as { name: string }).name);
+    assert.ok(colsAfter.includes("body_failed"), "v10 must add body_failed");
+
+    const oldRow = db
+      .prepare(
+        "SELECT id, tool_call_id, body_failed FROM ledger_step WHERE id = 's1'",
+      )
+      .get() as { id: string; tool_call_id: string; body_failed: number };
+    assert.deepEqual(oldRow, {
+      id: "s1",
+      tool_call_id: "call_1",
+      body_failed: 0,
+    });
   });
 });

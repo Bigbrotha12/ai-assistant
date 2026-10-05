@@ -30,9 +30,9 @@ import type { ToolCall, ToolPipeline } from "./pipeline.ts";
  *   - **job-shaped** (`job`, and MCP bound by `JobRunner`):
  *     `fence → serialize → replay → cache → budget → execution`;
  *   - **goal-shaped** (`goal`, and MCP bound by `GoalRunner`):
- *     `fence → serialize → cache → budget → execution` (no `replay` — a step
- *     is never re-run; the `goal_mutation` ledger is the at-most-once guard and
- *     arrives in M4 as `reserve`).
+ *     `fence → serialize → authorize → cache → budget → reserve → execution`
+ *     (no `replay` — a step is never re-run; `authorize` refuses an unlisted
+ *     mutation and `reserve` is the `goal_mutation` at-most-once guard).
  *
  * The shape is selected by the channel name; `warmup` uses the sync shape. The
  * engine is stateless between dispatches — every per-call value (owner, task
@@ -56,9 +56,12 @@ export type ChannelPipelineDeps = {
   readonly ledger?: Ledger;
   /** Job shape only: the per-job task-fence re-check supplied to `fence`. */
   readonly assertActive?: () => void;
-  /** Goal shape only: the goal ledger the `fence` interceptor reads. */
+  /**
+   * Goal shape only: the goal ledger read/written by the `fence` (lease +
+   * step), `authorize` (refusals) and `reserve` (mutation rows) interceptors.
+   */
   readonly goalLedger?: GoalLedger;
-  /** Goal shape only: the goal id the `fence` interceptor checks. */
+  /** Goal shape only: the goal id those interceptors scope to. */
   readonly goalId?: string;
 };
 
