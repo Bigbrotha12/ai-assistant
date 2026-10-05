@@ -4,11 +4,13 @@ import 'package:ai_assistant/features/auth/data/auth_credentials_store.dart';
 import 'package:ai_assistant/features/goals/ui/goal_todo_screen.dart';
 import 'package:ai_assistant/features/goals/ui/goals_overlay.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_credentials_providers.dart';
+import 'package:ai_assistant/features/settings/data/prefs_providers.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../../fakes.dart';
 import 'goal_client_test.dart' show FakeAdapter, jsonResponse, summaryJson;
 import 'goal_providers_test.dart' show TestAuth, credentials;
 
@@ -51,16 +53,26 @@ void main() {
             )!,
           ),
           authCredentialsProvider.overrideWith(() => TestAuth(credentials)),
+          appPrefsStoreProvider.overrideWithValue(FakePrefsStore()),
         ],
         child: MaterialApp(
           home: Scaffold(
             body: Center(
-              child: Builder(
-                builder: (context) => IconButton(
-                  key: const Key('open-goals'),
-                  icon: const Icon(Icons.settings),
-                  onPressed: () => showGoalsOverlay(context),
-                ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Mirrors production: watching the chip keeps
+                  // `goalListProvider` alive across overlay dismissals, so the
+                  // per-open freshness in `showGoalsOverlay` is exercised.
+                  const GoalsChip(),
+                  Builder(
+                    builder: (context) => IconButton(
+                      key: const Key('open-goals'),
+                      icon: const Icon(Icons.settings),
+                      onPressed: () => showGoalsOverlay(context),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -183,13 +195,45 @@ void main() {
     expect(find.text('newest'), findsOneWidget);
     expect(find.text('Show older goals…'), findsOneWidget);
 
+    // Count from here: the chip keeps the list alive and `showGoalsOverlay`
+    // invalidates it on open, so the total includes those refreshes.
+    final before = listCalls;
     await tester.tap(find.text('Show older goals…'));
     await tester.pumpAndSettle();
 
-    expect(listCalls, 2);
+    expect(listCalls, before + 1);
     expect(find.text('newest'), findsOneWidget);
     expect(find.text('oldest'), findsOneWidget);
     expect(find.text('Show older goals…'), findsNothing);
+  });
+
+  testWidgets('reopening the overlay shows a fresh first page', (tester) async {
+    var instructions = ['first'];
+    adapter = FakeAdapter((options) {
+      if (options.uri.query.isNotEmpty) {
+        return jsonResponse({
+          'goals': [
+            for (var i = 0; i < instructions.length; i++)
+              summaryJson(goalId: 'g_$i', instruction: instructions[i]),
+          ],
+        });
+      }
+      return jsonResponse(_detailFor('g_0'));
+    });
+    await pumpHost(tester);
+    await open(tester);
+    expect(find.text('first'), findsOneWidget);
+
+    // Mutate the server's response while the chip keeps the list alive, then
+    // reopen: the overlay must refetch rather than show the retained snapshot.
+    instructions = ['second'];
+    await tester.tap(find.byKey(const Key('goals-dismiss')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('goals-overlay')), findsNothing);
+
+    await open(tester);
+    expect(find.text('second'), findsOneWidget);
+    expect(find.text('first'), findsNothing);
   });
 
   testWidgets('an empty account shows the empty state', (tester) async {

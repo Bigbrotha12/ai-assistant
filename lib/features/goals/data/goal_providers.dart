@@ -117,8 +117,10 @@ final goalTriggerProvider = Provider<GoalTrigger>(
   (ref) => GoalTrigger(ref),
 );
 
-/// `GET /v1/goals`, kept alive by the goals overlay (autoDispose: a fresh
-/// first page on every open).
+/// `GET /v1/goals`. AutoDispose releases it when nothing observes it, but
+/// [goalAttentionProvider] keeps it alive for the session; `showGoalsOverlay`
+/// therefore invalidates it on every open so the overlay still renders a fresh
+/// first page rather than the retained snapshot.
 final goalListProvider = AsyncNotifierProvider.autoDispose<
   GoalListNotifier,
   GoalListPage

@@ -1,8 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../chat/data/status_tracker.dart';
+import '../../plugins/data/plugin_credentials_providers.dart';
 import '../../plugins/data/plugin_credentials_store.dart';
+import '../../settings/data/prefs_providers.dart';
+import '../data/goal_attention_providers.dart';
 import '../data/goal_dto.dart';
 import '../data/goal_providers.dart';
 import 'goal_status_ui.dart';
@@ -12,13 +17,21 @@ import 'goal_todo_screen.dart';
 /// from BOTH send surfaces (chat composer and voice screen).
 ///
 /// The chip is deliberately self-contained — it owns its own `onPressed` — so
-/// each screen only has to place it.
-class GoalsChip extends StatelessWidget {
+/// each screen only has to place it. Phase 7.3 adds a small attention dot when
+/// a paused/failed goal is newer than the account's last-seen marker; the
+/// tooltip and size are unchanged otherwise.
+class GoalsChip extends ConsumerWidget {
   const GoalsChip({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final scheme = Theme.of(context).colorScheme;
+    final hasAttention = ref.watch(goalAttentionProvider);
+    final icon = Icon(
+      Icons.settings,
+      size: 20,
+      color: scheme.onSurfaceVariant,
+    );
     return IconButton(
       key: const Key('goals-chip'),
       tooltip: 'Goals',
@@ -29,7 +42,25 @@ class GoalsChip extends StatelessWidget {
         shape: const CircleBorder(),
         side: BorderSide(color: scheme.outlineVariant),
       ),
-      icon: Icon(Icons.settings, size: 20, color: scheme.onSurfaceVariant),
+      // The Stack is sized by the 20x20 icon, so the dot never changes the
+      // chip's footprint (only its painting).
+      icon: hasAttention
+          ? Stack(
+              alignment: Alignment.topRight,
+              children: [
+                icon,
+                Container(
+                  key: const Key('goals-attention-dot'),
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    color: scheme.error,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            )
+          : icon,
       onPressed: () => showGoalsOverlay(context),
     );
   }
@@ -38,6 +69,19 @@ class GoalsChip extends StatelessWidget {
 /// Opens the read-only goals overlay. The dialog owns its own dismiss control
 /// (plus the usual barrier tap), and a row opens that goal's todo view.
 Future<void> showGoalsOverlay(BuildContext context) {
+  // [goalAttentionProvider] keeps [goalListProvider] alive for the session, so
+  // its retained page would otherwise be shown on reopen. Invalidate before the
+  // dialog subscribes so every open refetches a fresh first page.
+  //
+  // Accepted flicker: invalidating drops the list to loading, so attention
+  // momentarily returns false; if the refetch somehow retains a stale value it
+  // may flash true again until `markGoalsSeen` lands after the first frame.
+  // That is at most a two-frame flap and it happens behind the dialog barrier,
+  // so the chip is not visible — do not restructure the flow to chase it.
+  ProviderScope.containerOf(
+    context,
+    listen: false,
+  ).invalidate(goalListProvider);
   return showDialog<void>(
     context: context,
     barrierDismissible: true,
@@ -128,14 +172,66 @@ class _GoalsLoadError extends StatelessWidget {
   }
 }
 
-class _GoalsList extends ConsumerWidget {
+class _GoalsList extends ConsumerStatefulWidget {
   const _GoalsList({required this.page, required this.scheme});
 
   final GoalListPage page;
   final ColorScheme scheme;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_GoalsList> createState() => _GoalsListState();
+}
+
+class _GoalsListState extends ConsumerState<_GoalsList> {
+  var _recorded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // The list has rendered once this state is built; defer the marker write
+    // to after the frame so it never blocks the first paint, and record at
+    // most once per overlay.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _markSeen());
+  }
+
+  /// Records the viewed marker for the owning account so the chip's dot clears
+  /// after the user has seen the goals. The marker is clamped to the newest
+  /// `updatedAt` on screen so a server clock ahead of the device cannot leave a
+  /// just-viewed goal looking newer. Fire-and-forget: the write is best-effort
+  /// and guarded, and a scope that cannot resolve simply skips it.
+  void _markSeen() {
+    if (!mounted || _recorded) return;
+    _recorded = true;
+    final String scopeId;
+    try {
+      scopeId = ref.read(pluginAccountScopeProvider).storageId;
+    } on PluginReauthenticationRequired {
+      return;
+    }
+    unawaited(
+      ref.read(appPrefsProvider.notifier).markGoalsSeen(
+        scopeId,
+        maxObservedUpdatedAt: _newestUpdatedAt(widget.page.goals),
+      ),
+    );
+  }
+
+  /// Newest parseable `updatedAt` across [goals], or null when none parse. A
+  /// malformed timestamp is ignored rather than weakening the clamp.
+  static DateTime? _newestUpdatedAt(Iterable<GoalSummary> goals) {
+    DateTime? newest;
+    for (final goal in goals) {
+      final parsed = DateTime.tryParse(goal.updatedAt);
+      if (parsed == null) continue;
+      if (newest == null || parsed.isAfter(newest)) newest = parsed;
+    }
+    return newest;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final page = widget.page;
+    final scheme = widget.scheme;
     if (page.goals.isEmpty) {
       return Center(
         child: Text(

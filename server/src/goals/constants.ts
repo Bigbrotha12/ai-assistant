@@ -60,3 +60,39 @@ export const GOAL_PIN_TTL_MS = 3 * 60 * 60 * 1000;
  */
 export const GOAL_RECLAIM_BACKOFF_MS = 1_000;
 export const GOAL_RECLAIM_BACKOFF_MAX_MS = 30_000;
+
+// ── Phase 7.1: token accounting enforcement + context guard ──
+
+/**
+ * Floor charged to a goal when a CHAINED step attempt produced no durable
+ * state and reached no accounting — i.e. the model invoke threw before the
+ * success-path charged any actual tokens. Without this, a goal that fails
+ * every round before the model call (or before usage is reported) would loop
+ * against its budget for free and never trip `budget_exhausted`. It is a
+ * FLOOR, never a double charge: a round that charged actual tokens (or a
+ * terminal/pause round) records only what it actually spent.
+ *
+ * Tunable via `GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE`; this is the default.
+ */
+export const GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE = 1_000;
+
+/**
+ * Input-vector gate for one goal round (Phase 7.1). After the step input is
+ * rebuilt from the durable message log and BEFORE setup/`graph.invoke`, a
+ * vector estimated over this many tokens pauses the goal `context_overflow`
+ * instead of spending a model call that the provider would reject. Estimated
+ * with the shared chars/4 heuristic (`token_estimate.ts`) — approximate by
+ * design; the client owns exact accounting.
+ *
+ * This is a GOAL-LOG PRE-FLIGHT bound, NOT a mirror of the model's context
+ * window. Chat's `CONTEXT_TOKEN_LIMIT` (default 32_768) caps a chat request's
+ * history; the two are deliberately independent and MUST NOT be tied together:
+ * a goal step is one bounded turn over a durable log that may legitimately be
+ * compacted differently from a chat session. The provider-side
+ * `ContextBudgetError` remains the real backstop at the model's actual context
+ * boundary and is classified `context_overflow` by
+ * `setupFailureOutcomeOf`/the unwind path.
+ *
+ * Tunable via `GOAL_CONTEXT_TOKEN_LIMIT` (env); this is the default.
+ */
+export const GOAL_CONTEXT_TOKEN_LIMIT = 60_000;

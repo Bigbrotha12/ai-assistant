@@ -1,6 +1,10 @@
 import { config } from "dotenv";
 import { z } from "zod";
 import { parseTrustedHostEntries } from "./plugins/ssrf.ts";
+import {
+  GOAL_CONTEXT_TOKEN_LIMIT,
+  GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE,
+} from "./goals/constants.ts";
 
 config({ quiet: true });
 
@@ -52,9 +56,28 @@ export const envSchema = z.object({
   BUDGET_QUEUE_MAX: z.coerce.number().int().positive().default(3),
   BUDGET_MODEL_CALL_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60),
   BUDGET_MODEL_CALL_WINDOW_MS: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60_000),
+  // CHAT request history cap (see `sessions/store.ts` for the byte projection).
+  // This is NOT the goal-log pre-flight bound: goals use a separate,
+  // deliberately independent `GOAL_CONTEXT_TOKEN_LIMIT` (60_000 default) and
+  // the two must not be tied together.
   CONTEXT_TOKEN_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(32_768),
   // Skill injection budget for composeAgentPrompt (chars/4 token heuristic).
   AGENT_SKILL_BUDGET_TOKENS: z.coerce.number().int().positive().max(1_000_000).default(6000),
+  // Phase 7.1 goal token knobs. The defaults live in `goals/constants.ts`
+  // (documented there); both are read at step time so an operator can tune the
+  // floor and the context gate without a code change.
+  GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE: z
+    .coerce.number()
+    .int()
+    .positive()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE),
+  GOAL_CONTEXT_TOKEN_LIMIT: z
+    .coerce.number()
+    .int()
+    .positive()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(GOAL_CONTEXT_TOKEN_LIMIT),
   // Custom-agent spec guard rails (size caps in the request body schema).
   AGENT_SPEC_MAX_SYSTEM_PROMPT: z.coerce.number().int().positive().default(8000),
   AGENT_SPEC_MAX_SKILLS: z.coerce.number().int().positive().default(50),

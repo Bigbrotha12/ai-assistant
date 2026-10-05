@@ -1,4 +1,5 @@
 import { logger } from "../logger.ts";
+import { estimateTokens } from "../token_estimate.ts";
 
 /**
  * Default skill token budget when a caller does not supply one. Production
@@ -6,10 +7,6 @@ import { logger } from "../logger.ts";
  * fallback (matches the env default).
  */
 export const DEFAULT_SKILL_TOKEN_BUDGET = 6000;
-
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
 
 export function composeAgentPrompt(
   systemPrompt: string,

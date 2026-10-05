@@ -55,6 +55,7 @@ Map<String, Object?> summaryJson({
   String instruction = 'do the thing',
   String? pauseQuestion,
   String? failureReason,
+  String updatedAt = '2026-10-04T00:01:00.000Z',
 }) => {
   'goalId': goalId,
   'status': status,
@@ -69,7 +70,7 @@ Map<String, Object?> summaryJson({
   'canResume': status == 'paused',
   'terminal': const ['complete', 'failed', 'cancelled'].contains(status),
   'createdAt': '2026-10-04T00:00:00.000Z',
-  'updatedAt': '2026-10-04T00:01:00.000Z',
+  'updatedAt': updatedAt,
 };
 
 Map<String, Object?> detailJson({

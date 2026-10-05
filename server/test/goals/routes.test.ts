@@ -733,6 +733,32 @@ async function pauseGoal(
 }
 
 /**
+ * Admit + spend-to-budget + pause a goal `paused(budget_exhausted)` with
+ * `tokens_spent` exactly at its 200_000 budget — the shape the parallel
+ * runner step produces when enforcement trips.
+ */
+async function pauseBudgetExhausted(
+  app: Hono,
+  goalLedger: GoalLedger,
+  tokensSpent = 200_000,
+): Promise<string> {
+  const res = await postGoal(app, {
+    clientGoalId: `budget-${Math.random()}`,
+  });
+  assert.equal(res.status, 201);
+  const { goalId } = (await res.json()) as PostBody;
+  goalLedger.addGoalTokens(goalId, "user-1", tokensSpent);
+  const claimed = goalLedger.claimGoal(goalId, "user-1");
+  goalLedger.pauseGoal(goalId, "user-1", {
+    next: "paused",
+    reason: "budget_exhausted",
+    leaseOwner: "user-1",
+    leaseToken: claimed.lease_token!,
+  });
+  return goalId;
+}
+
+/**
  * Raw `goal_mutation` insert (Phase 6 rows normally come from the pipeline's
  * `reserve` interceptor — M2/M4 tests seed them directly). [pluginId] lets a
  * test seed two rows that share `(tool, args_hash)` under different plugins —
@@ -899,6 +925,151 @@ describe("goal routes — POST /v1/goals/:id/resume (5.1)", () => {
     });
     assert.equal(crossOwner.status, 404);
     assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+  });
+
+  test("resume with a higher tokenBudget raises the budget and requeues (Phase 7)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const goalId = await pauseBudgetExhausted(app, goalLedger);
+    assert.equal(goalLedger.getGoal(goalId)!.token_budget, 200_000);
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "keep going with a bigger budget",
+        tokenBudget: 500_000,
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "queued");
+    assert.equal(row.token_budget, 500_000, "the budget was raised");
+    assert.equal(row.tokens_spent, 200_000, "spend is preserved, not reset");
+  });
+
+  test("a tokenBudget <= tokensSpent is 400 invalid_request and stays paused (atomic)", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    const goalId = await pauseBudgetExhausted(app, goalLedger);
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+    const pinsBefore = pins.pinCalls.length;
+
+    // At the spend (200_000) and just below it.
+    for (const bad of [200_000, 199_999]) {
+      const res = await app.request(`/v1/goals/${goalId}/resume`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({
+          answer: "keep going",
+          tokenBudget: bad,
+          credentials: { openrouter: { apiKey: "sk-resumed" } },
+        }),
+      });
+      assert.equal(res.status, 400, `budget ${bad}`);
+      assert.deepEqual(await res.json(), { error: "invalid_request" });
+    }
+
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "paused", "refused before the transaction");
+    assert.equal(row.token_budget, 200_000, "budget unchanged");
+    assert.equal(row.pause_reason, "budget_exhausted");
+    assert.equal(
+      goalLedger.listGoalMessages(goalId).length,
+      messagesBefore,
+      "no answer appended (atomic refusal)",
+    );
+    assert.equal(pins.pinCalls.length, pinsBefore, "no pin minted");
+  });
+
+  test("a tokenBudget <= the current budget is 400 invalid_request even when > tokensSpent (stays paused, no answer)", async (t) => {
+    const { app, goalLedger, pins } = makeApp(t);
+    // Spend 100_000 of the 200_000 budget: a 150_000 raise clears the
+    // tokens_spent gate but would LOWER the per-goal budget, so it must be
+    // refused before any transaction.
+    const goalId = await pauseBudgetExhausted(app, goalLedger, 100_000);
+    const messagesBefore = goalLedger.listGoalMessages(goalId).length;
+    const pinsBefore = pins.pinCalls.length;
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "keep going",
+        tokenBudget: 150_000,
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: "invalid_request" });
+
+    const row = goalLedger.getGoal(goalId)!;
+    assert.equal(row.status, "paused", "refused before the transaction");
+    assert.equal(row.token_budget, 200_000, "budget unchanged");
+    assert.equal(
+      goalLedger.listGoalMessages(goalId).length,
+      messagesBefore,
+      "no answer appended (atomic refusal)",
+    );
+    assert.equal(pins.pinCalls.length, pinsBefore, "no pin minted");
+
+    // Strictly greater than BOTH the current budget and tokensSpent still
+    // raises and persists.
+    const ok = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "keep going with a bigger budget",
+        tokenBudget: 250_000,
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { goalId, status: "queued" });
+
+    const raised = goalLedger.getGoal(goalId)!;
+    assert.equal(raised.status, "queued");
+    assert.equal(raised.token_budget, 250_000, "the budget was raised");
+    assert.equal(raised.tokens_spent, 100_000, "spend preserved, not reset");
+  });
+
+  test("a non-integer / zero / negative tokenBudget is 400 invalid_request", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const goalId = await pauseBudgetExhausted(app, goalLedger);
+
+    for (const bad of [0, -1, 1.5, "500000", null]) {
+      const res = await app.request(`/v1/goals/${goalId}/resume`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({
+          answer: "keep going",
+          tokenBudget: bad,
+          credentials: { openrouter: { apiKey: "sk-resumed" } },
+        }),
+      });
+      assert.equal(res.status, 400, `tokenBudget ${JSON.stringify(bad)}`);
+      assert.deepEqual(await res.json(), { error: "invalid_request" });
+    }
+    assert.equal(goalLedger.getGoal(goalId)!.status, "paused");
+    assert.equal(goalLedger.getGoal(goalId)!.token_budget, 200_000);
+  });
+
+  test("resume without tokenBudget leaves the budget unchanged (regression)", async (t) => {
+    const { app, goalLedger } = makeApp(t);
+    const goalId = await pauseBudgetExhausted(app, goalLedger);
+
+    const res = await app.request(`/v1/goals/${goalId}/resume`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        answer: "keep going at the same budget",
+        credentials: { openrouter: { apiKey: "sk-resumed" } },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { goalId, status: "queued" });
+    assert.equal(goalLedger.getGoal(goalId)!.token_budget, 200_000);
   });
 });
 

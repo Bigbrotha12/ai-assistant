@@ -30,6 +30,7 @@ import {
 } from "../tools/bind.ts";
 import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
 import { buildPipelineForChannel } from "../tools/channel.ts";
+import { withReadOnlyRetry } from "../tools/read_only_retry.ts";
 import { redactForOutbound } from "../redact.ts";
 import {
   emitAuditEvent,
@@ -294,6 +295,9 @@ type McpOperationPermit = {
 const mcpRuntimes = new Map<string, McpRuntime>();
 let mcpConnectionSequence = 0;
 let mcpBindingSequence = 0;
+
+/** A signal that never aborts: defensive fallback for the retry bound. */
+const NEVER_ABORT_SIGNAL = new AbortController().signal;
 
 /**
  * A connected MCP client. The default implementation speaks the SSE transport
@@ -1518,6 +1522,46 @@ type McpOperationOptions<T> = {
   run: () => Promise<T>;
   onFailure: () => void;
   outputBytes?: (value: T) => number;
+  /**
+   * Phase 7.2 (finding H1): when `true`, `run` is a read-only MCP call that may
+   * be retried ONCE on a transient transport failure. The retry lives INSIDE
+   * this operation (below `completeMcpOperation`), so a retried dispatch still
+   * emits exactly ONE `mcp.tool` audit, performs one circuit permit / failure
+   * classification, and calls `onFailure` at most once. A first-attempt
+   * transient failure can no longer open the circuit (`openMcpCircuit` also
+   * closes the server's connections) and reject the retry `MCP_CIRCUIT_OPEN`,
+   * which would mask the original transport error.
+   *
+   * Set only by the goal channel for a tool the binder classified read-only;
+   * absent ⇒ the operation is invoked exactly once.
+   */
+  retryReadOnly?: boolean;
+  /**
+   * Finding C: the ACTUAL read-only classification the binder computed (the
+   * conservative AND-merge `toolSafety.get(tool.name) ?? safe`). The retry is
+   * gated on this value, NOT on `retryReadOnly` alone, so a future caller that
+   * sets `retryReadOnly` on a mutating operation cannot silently retry it.
+   * Defaults to `false`: absent ⇒ no retry even when `retryReadOnly` is true.
+   */
+  readOnly?: boolean;
+  /**
+   * Finding B: teardown invoked once before each retry backoff, after the
+   * decision to retry and before the wait. The MCP goal channel passes
+   * `invalidateCurrent` so the first attempt's transient failure closes/removes
+   * the current lease and the retry reconnects a FRESH client instead of
+   * reusing the dead transport. It is pure teardown: it does not count a
+   * failure or take a circuit permit (those happen once, after the final
+   * attempt).
+   */
+  onRetry?: () => void | Promise<void>;
+  /**
+   * The signal that bounds ONE attempt: the pipeline-composed `bodySignal`
+   * (channel + LangChain run + `execution` timeout), so a caller cancel or a
+   * handler timeout stops the retry instead of starting another attempt. Only
+   * consulted when {@link retryReadOnly} is true; falls back to
+   * {@link attributionSignal} defensively.
+   */
+  retrySignal?: AbortSignal;
 };
 
 async function runMcpOperation<T>(
@@ -1548,7 +1592,28 @@ async function runMcpOperation<T>(
       }
       throw err;
     }
-    const value = await options.run();
+    // Phase 7.2 (finding H1): the read-only retry wraps the raw `run` INSIDE
+    // the operation. It sits BELOW `completeMcpOperation`, so a transient
+    // first-attempt failure cannot open the circuit (which would close the
+    // server's connections and make the retry fail `MCP_CIRCUIT_OPEN`, masking
+    // the original transport error). One `runMcpOperation` invocation therefore
+    // still yields exactly one circuit permit, one failure classification, one
+    // `onFailure`, and one `mcp.tool` audit.
+    const invokeRun = (): Promise<T> => options.run();
+    const value = options.retryReadOnly === true
+      ? await withReadOnlyRetry(invokeRun, {
+          // C: retry only when the binder actually classified the call
+          // read-only; `retryReadOnly` alone is not sufficient.
+          readOnly: options.readOnly === true,
+          signal:
+            options.retrySignal ??
+            options.attributionSignal ??
+            NEVER_ABORT_SIGNAL,
+          // B: between attempts, close/remove the current lease so the retry
+          // reconnects a fresh client rather than reusing a dead transport.
+          ...(options.onRetry === undefined ? {} : { onRetry: options.onRetry }),
+        })
+      : await invokeRun();
     const state = completeMcpOperation(runtime, permit, limits, true, false);
     emitMcpCircuitTransition(
        server,
@@ -2100,6 +2165,11 @@ export async function bindMcpServers(
        lease.record.clientPromise = clientPromise;
        void clientPromise.then(
          () => {
+           // D: a `getClient()` that is retried can legitimately emit TWO
+           // `mcp.connect` records for ONE dispatch — connection attempts are
+           // per-attempt (each connect is a real outbound event). Only
+           // `mcp.tool` is pinned to exactly one record per dispatch (finding
+           // H1); `mcp.connect` deliberately is not.
            emitMcpConnectAudit(lease.record, "ok");
          },
          (error: unknown) => {
@@ -2238,6 +2308,11 @@ export async function bindMcpServers(
               // `buildCall` pre-check (the job/goal channels' fence interceptors
               // own this instead). Runs before `serialize`/`cache` via `dispatch`.
               if (channel !== "job" && channel !== "goal") opts?.assertActive?.();
+              // The conservative AND-merge across duplicate names, read at
+              // invocation time. Computed ONCE and reused for both the `ToolCall`
+              // and the goal-channel retry decision, so the two can never
+              // disagree about whether this call is repeatable.
+              const readOnly = toolSafety.get(tool.name) ?? safe;
               const { bodies, scope: bodyScope } = makeToolBodies({
                 source: "mcp",
                 channelLabel: "mcp",
@@ -2254,6 +2329,26 @@ export async function bindMcpServers(
                     // composed signal still reaches the outbound call below so a
                     // timeout/cancel genuinely aborts it (contract 3, N1).
                     attributionSignal: dispatch.call.signal,
+                    // Phase 7.2 (finding H1): the goal channel retries a
+                    // transient read-only failure INSIDE `runMcpOperation`, so
+                    // one dispatch still yields one `mcp.tool` audit, one
+                    // circuit classification, and one `onFailure`. The retry is
+                    // bounded by the composed `bodySignal`, so a timeout/cancel
+                    // stops it. Every other channel, and every mutating call,
+                    // invokes once.
+                    // Findings B/C: the retry carries the binder's ACTUAL
+                    // read-only classification, and tears down the current
+                    // connection between attempts (`invalidateCurrent`) so the
+                    // retry reconnects a fresh client rather than re-calling a
+                    // dead transport.
+                    ...(channel === "goal" && readOnly
+                      ? {
+                          retryReadOnly: true,
+                          readOnly,
+                          retrySignal: bodySignal,
+                          onRetry: invalidateCurrent,
+                        }
+                      : {}),
                     event: "mcp.tool",
                     tool: tool.name,
                     // Finding m1: this audit describes the TOOL call, not the
@@ -2333,8 +2428,8 @@ export async function bindMcpServers(
                 // same name destructive; `toolSafety` holds the AND of every
                 // occurrence, so a name any server declares non-repeatable is
                 // never treated as read-only (and therefore never cached or
-                // job-replayed).
-                readOnly: toolSafety.get(tool.name) ?? safe,
+                // job-replayed). Reused by the retry decision above.
+                readOnly,
                 ...(opts?.owner === undefined ? {} : { owner: opts.owner }),
                 ...(opts?.requestId === undefined ? {} : { requestId: opts.requestId }),
                 ...(resolvedFingerprint === undefined

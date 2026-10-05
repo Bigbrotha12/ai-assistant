@@ -34,10 +34,13 @@ import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 import { tryReportSentinelShadow } from "../sentinel/shadow.ts";
 import { buildPipelineForChannel } from "../tools/channel.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
+import type { PluginRegistry } from "../plugins/registry.ts";
+import { PluginRegistryError } from "../plugins/registry.ts";
 import { isToolPlugin } from "../plugins/types.ts";
 import type { AgentToolAllowlistEntry } from "../plugins/types.ts";
-import type { PluginRegistry } from "../plugins/registry.ts";
 import { redactForOutbound } from "../redact.ts";
+import { estimateMessagesTokens, estimateTokens } from "../token_estimate.ts";
+import { ModelBuildError } from "../transport/model.ts";
 
 import {
   GOAL_MAX_CONCURRENT_PER_OWNER,
@@ -249,7 +252,7 @@ type GoalSetupValue = {
  * wire string (`"<reason>: <message>"`), which is how M2's `failure_reason`
  * detail reaches the client.
  */
-type GoalStopOutcome =
+export type GoalStopOutcome =
   | { readonly kind: "paused"; readonly reason: GoalPauseReason }
   | { readonly kind: "failed"; readonly reason: string };
 
@@ -520,6 +523,7 @@ export class GoalRunner {
     const signal = controller.signal;
     let step: GoalStepRow | undefined;
     let reachedModelCall = false;
+    let chargedTokens = false;
     let mcpBinding: McpBinding | undefined;
 
     try {
@@ -568,6 +572,69 @@ export class GoalRunner {
         });
         return;
       }
+      // Phase 7.1 (M5): per-goal token-budget ENFORCEMENT, on the claimed row
+      // alongside the other step bounds. `token_budget` is spent: pause
+      // `budget_exhausted` rather than spending another model call. NO question
+      // is persisted — the client derives the raise-budget ask from the wire's
+      // `tokenBudget` / `tokensSpent` (the pause reason is the whole signal).
+      if (goal.tokens_spent >= goal.token_budget) {
+        this.stopGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, {
+          kind: "paused",
+          reason: "budget_exhausted",
+        });
+        return;
+      }
+
+      // ── 1b. Phase 7.1 (finding M1) context guard — HOISTED before setup.
+      //    `messages` (the durable log) and the agent snapshot are already
+      //    available at step start, so the input vector is rebuilt and estimated
+      //    BEFORE any model build, MCP connect, or credential resolution is
+      //    paid. A doomed round therefore costs nothing: the same
+      //    `stopGoalStep(paused, context_overflow)` early return as before,
+      //    with nothing persisted. The rebuilt vector is REUSED for
+      //    `graph.invoke` below, so the log is rebuilt exactly once.
+      //
+      //    M6: the estimate INCLUDES `agent.systemPrompt` (real model input).
+      //    Bound tool SCHEMAS are deliberately EXCLUDED: they are bounded
+      //    separately by the goal's tool allowlist and the MCP tool-list byte
+      //    cap, and the provider-side `ContextBudgetError` remains the backstop
+      //    at the real model-context boundary.
+      let inputMessages: BaseMessage[];
+      let guardSystemPrompt: string | undefined;
+      // E: parse the snapshot ONCE and hand the parsed value to
+      // `setupGoalStep`, so the guard and setup cannot disagree about the agent
+      // (and the snapshot's `${VAR}` header references are not re-resolved).
+      let parsedAgent: GoalAgentSnapshot | undefined;
+      try {
+        parsedAgent = parseAgentSnapshot(goal.agent_snapshot);
+        guardSystemPrompt = parsedAgent.systemPrompt;
+        inputMessages = goalMessagesToBaseMessages(messages);
+      } catch (error) {
+        // An invalid/unresolvable agent snapshot is a SETUP failure: classify it
+        // exactly as the setup path would (a terminal `failed`, or the typed
+        // pause) without building a model or binding anything.
+        this.stopGoalStep(
+          goalId,
+          owner,
+          step.seq,
+          leaseOwner,
+          leaseToken,
+          setupFailureOutcomeOf(error),
+        );
+        return;
+      }
+      const estimatedInputTokens =
+        estimateMessagesTokens(inputMessages) +
+        (guardSystemPrompt === undefined
+          ? 0
+          : estimateTokens(guardSystemPrompt));
+      if (estimatedInputTokens > env.GOAL_CONTEXT_TOKEN_LIMIT) {
+        this.stopGoalStep(goalId, owner, step.seq, leaseOwner, leaseToken, {
+          kind: "paused",
+          reason: "context_overflow",
+        });
+        return;
+      }
 
       const execution = createTrackedExecution(signal);
 
@@ -578,7 +645,7 @@ export class GoalRunner {
       //    `raceWithSignal`) settles that abandoned setup with an `AbortError`;
       //    the underlying DNS query is not cancelled, but nothing awaits it
       //    anymore.
-      const setupPromise = this.setupGoalStep(goal, signal, execution, step.seq)
+      const setupPromise = this.setupGoalStep(goal, signal, execution, step.seq, parsedAgent)
         .then((value) => ({ kind: "ready" as const, value }))
         .catch((error: unknown) => ({ kind: "error" as const, error }));
       const outcome = await waitRace(
@@ -691,8 +758,9 @@ export class GoalRunner {
       });
 
       // ── 4. Run on the rebuilt input vector. M2 rebuilds the FULL log
-      //    (deliberate simplicity vs the message_from_seq..to_seq slice).
-      const inputMessages = goalMessagesToBaseMessages(messages);
+      //    (deliberate simplicity vs the message_from_seq..to_seq slice). The
+      //    vector was already rebuilt for the hoisted Phase 7.1 context guard
+      //    (§1b) and is reused here, so it is built exactly once.
       const result = await graph.invoke({ messages: inputMessages }, { signal });
       await execution.settle();
 
@@ -742,7 +810,14 @@ export class GoalRunner {
           });
         }
         if (tokens > 0) {
+          // Phase 7.1 / M3: mark the actuals as charged IMMEDIATELY after the
+          // FIRST durable write. `updateStepTokens` below is a second write that
+          // can throw; if it does, `unwindStep` must still see the goal total as
+          // charged and skip the failed-attempt floor (otherwise the floor would
+          // be added on top of the actuals). The goal total is authoritative for
+          // the floor decision, so it is the one that flips the flag.
           this.deps.goalLedger.addGoalTokens(goalId, owner, tokens);
+          chargedTokens = true;
           this.deps.goalLedger.updateStepTokens(
             goalId,
             owner,
@@ -801,6 +876,7 @@ export class GoalRunner {
         leaseToken,
         step,
         () => reachedModelCall,
+        () => chargedTokens,
       );
     } finally {
       // AWAIT the binding teardown: `dispose()` claims the step has reached
@@ -859,6 +935,14 @@ export class GoalRunner {
    * output, and anything else CHAINS the goal back to `queued` (M2 self-heal,
    * bounded by the no-progress + step caps) — a step rejected before any
    * model call additionally backs off its re-claim.
+   *
+   * Phase 7.1 (plan M5): a CHAINED failed attempt that produced no state and
+   * charged no actual tokens is charged the [GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE]
+   * floor (goal total + step row) so a step that dies every round before it can
+   * spend tokens still marches the goal toward `budget_exhausted`. A round that
+   * charged actuals (`chargedTokens()`) is never double-charged, and a
+   * terminal/pause round (the early returns, or `pauseForMutationResolution`)
+   * is not a failure and is recorded unaccounted.
    */
   private async unwindStep(
     error: unknown,
@@ -868,6 +952,7 @@ export class GoalRunner {
     leaseToken: string,
     step: GoalStepRow | undefined,
     didReachModelCall: () => boolean,
+    chargedTokens: () => boolean,
   ): Promise<void> {
     // Close the step row in EVERY unwind path, FIRST. A step left `running`
     // when its goal goes terminal — cancel (`GoalTerminalSignal`), account
@@ -903,7 +988,21 @@ export class GoalRunner {
         : false;
       if (!paused) {
         const chained = this.deps.goalLedger.chainGoal(goalId, owner, leaseOwner, leaseToken);
-        if (!chained) this.releaseGoalPin(goalId);
+        if (!chained) {
+          this.releaseGoalPin(goalId);
+        } else if (!chargedTokens()) {
+          // Phase 7.1 floor: the goal is genuinely CONTINUING (the chain
+          // committed) but this attempt produced no state and charged no
+          // actuals. Charge the floor now — the goal total first, then its step
+          // row — before the next claim can start a fresh step. `step` is
+          // undefined only when `insertGoalStep` itself threw; the goal total
+          // is still charged.
+          const floor = env.GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE;
+          this.deps.goalLedger.addGoalTokens(goalId, owner, floor);
+          if (step !== undefined) {
+            this.deps.goalLedger.updateStepTokens(goalId, owner, step.seq, floor);
+          }
+        }
       }
     } catch (err) {
       console.warn(`[goals] failed to requeue goal ${goalId} after step error:`, err);
@@ -1066,11 +1165,15 @@ export class GoalRunner {
     signal: AbortSignal,
     execution: TrackedExecution,
     stepSeq: number,
+    // E: the snapshot parsed by the hoisted context guard, when this is a
+    // normal step. Reused to avoid a second parse; falls back for any caller
+    // that does not supply it.
+    parsedAgent?: GoalAgentSnapshot,
   ): Promise<GoalSetupValue> {
     const owner = goal.owner;
     const goalId = goal.id;
     const leaseToken = goal.lease_token ?? "";
-    const agent = parseAgentSnapshot(goal.agent_snapshot);
+    const agent = parsedAgent ?? parseAgentSnapshot(goal.agent_snapshot);
     const authorisedTools = parseAuthorisedTools(goal.authorised_tools);
     // 3.5 fail-loud start check (declared surface, BEFORE any model build or
     // tool bind). The effective MCP surface is `allowlist ∩ (readOnly ∪
@@ -1655,13 +1758,63 @@ async function waitRace<T>(
 }
 
 /**
- * Phase 5.4 (plan M3): map a setup error to the outcome its reason implies.
- * The reason strings are the plan's own vocabulary, and the classifier is the
- * CLOSED [GOAL_PAUSE_REASONS] union itself (via [stopOutcomeOf]): a bare reason
- * on that list becomes a typed PAUSE, anything else stays a terminal
- * `failed(<reason>: <message>)` with the message preserved for the client.
- * There is no second set to keep in sync — that drift is what silently
- * degraded pauses to `failed(...)` before this became structured.
+ * R7 predicate (Phase 7.1): does this setup error represent a GENUINE
+ * capability gap — something the user/admin can fix by installing or enabling a
+ * plugin — rather than a transient fault? Only these map to
+ * `paused(missing_capability)`; a transient build failure (a timeout, a 5xx, an
+ * unexpected SDK error) must NEVER pause the goal on a false capability claim.
+ *
+ * The allowlist is deliberately small and exact:
+ *  - `GoalSetupError` spelling `plugin_unavailable` (no pinned model plugin, or
+ *    no `buildModel` seam wired);
+ *  - `JobError("plugin_unavailable")` (missing SSRF pins = a configuration gap);
+ *  - `ModelBuildError("plugin_not_found")` — what `buildModel` throws for EVERY
+ *    registry resolution failure (not installed / disabled / pin mismatch),
+ *    folded into this one code in `transport/model.ts`;
+ *  - a raw `PluginRegistryError` with a registry code meaning not installed /
+ *    disabled / removed / pin mismatch, in case one reaches setup unwrapped.
+ *
+ * `missing_credentials` and `plugin_not_model` are NOT here: the former has its
+ * own credentials path, the latter is a misconfiguration that stays terminal.
+ */
+export function isGenuineCapabilityGap(error: unknown): boolean {
+  if (error instanceof GoalSetupError) {
+    return (
+      error.failureReason === "plugin_unavailable" ||
+      error.failureReason.startsWith("plugin_unavailable:")
+    );
+  }
+  if (error instanceof JobError) {
+    return error.code === "plugin_unavailable";
+  }
+  if (error instanceof ModelBuildError) {
+    return error.code === "plugin_not_found";
+  }
+  if (error instanceof PluginRegistryError) {
+    return (
+      error.code === "PLUGIN_NOT_FOUND" ||
+      error.code === "PLUGIN_DISABLED" ||
+      error.code === "PLUGIN_REMOVED" ||
+      error.code === "PIN_MISMATCH"
+    );
+  }
+  return false;
+}
+
+/**
+ * Phase 5.4 (plan M3) + Phase 7.1 (R7): map a setup error to the outcome its
+ * reason implies. The reason strings are the plan's own vocabulary, and the
+ * classifier is the CLOSED [GOAL_PAUSE_REASONS] union itself (via
+ * [stopOutcomeOf]): a bare reason on that list becomes a typed PAUSE, anything
+ * else stays a terminal `failed(<reason>: <message>)` with the message
+ * preserved for the client. There is no second set to keep in sync — that
+ * drift is what silently degraded pauses to `failed(...)` before this became
+ * structured.
+ *
+ * `missing_capability` is gated on [isGenuineCapabilityGap] (R7): only a real
+ * install/enable/pin gap pauses on it. Any other build failure falls through to
+ * its own code or `setup_failed: <message>` so a transient fault is never
+ * mislabeled as a capability gap.
  *
  * This also folds the M3 restart-pause mapping (D8) in: a credentials failure —
  * `CredentialPinError`, a `GoalSetupError` already spelling
@@ -1670,27 +1823,35 @@ async function waitRace<T>(
  * `paused(credentials_required)`, so the goal re-credentials via resume rather
  * than dying or spinning.
  */
-function setupFailureOutcomeOf(error: unknown): GoalStopOutcome {
+export function setupFailureOutcomeOf(error: unknown): GoalStopOutcome {
   const message = redactForOutbound(errorMessageOf(error));
   if (error instanceof CredentialPinError) return stopOutcomeOf(`credentials_required: ${message}`);
-  if (error instanceof GoalSetupError) return stopOutcomeOf(error.failureReason);
-  // A missing model build / plugin is a CAPABILITY gap, not a transient fault:
-  // the goal pauses `missing_capability` and resumes once the plugin is set up,
-  // instead of dying on a configuration the user can fix.
+  if (error instanceof GoalSetupError) {
+    // R7: a `plugin_unavailable` setup error (no pinned model plugin, no
+    // `buildModel` seam) is a genuine capability gap. It must be mapped to the
+    // typed pause explicitly — its failure string is `"plugin_unavailable: ..."`,
+    // and `"plugin_unavailable"` is not itself a `GoalPauseReason`, so a raw
+    // pass-through would terminate the goal instead of pausing it.
+    if (isGenuineCapabilityGap(error)) {
+      return stopOutcomeOf(`missing_capability: ${message}`);
+    }
+    return stopOutcomeOf(error.failureReason);
+  }
   if (error instanceof JobError) {
     if (error.code === "credentials_expired") {
       return stopOutcomeOf(`credentials_required: ${message}`);
     }
-    if (error.code === "plugin_unavailable") return stopOutcomeOf(`missing_capability: ${message}`);
     if (error.code === "budget_exhausted") return stopOutcomeOf(`budget_exhausted: ${message}`);
     if (error.code === "context_length_exceeded") {
       return stopOutcomeOf(`context_overflow: ${message}`);
     }
-    return stopOutcomeOf(`${error.code}: ${message}`);
   }
   if (error instanceof AccountDeletedError) return stopOutcomeOf(`cancelled: ${message}`);
   if (error instanceof BudgetExhaustedError) return stopOutcomeOf(`budget_exhausted: ${message}`);
   if (error instanceof ContextBudgetError) return stopOutcomeOf(`context_overflow: ${message}`);
+  // R7: a genuine capability gap (and ONLY that) pauses missing_capability.
+  if (isGenuineCapabilityGap(error)) return stopOutcomeOf(`missing_capability: ${message}`);
+  if (error instanceof JobError) return stopOutcomeOf(`${error.code}: ${message}`);
   return stopOutcomeOf(`setup_failed: ${message}`);
 }
 

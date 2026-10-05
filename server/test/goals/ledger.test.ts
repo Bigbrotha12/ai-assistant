@@ -527,6 +527,92 @@ describe("GoalLedger.resumeGoal", () => {
   });
 });
 
+describe("GoalLedger.raiseGoalBudget", () => {
+  test("raises the budget and stamps updated_ts (leaves tokens_spent alone)", () => {
+    const { db, ledger, advance } = makeGoalLedger();
+    const goal = seedGoal(ledger); // token_budget 1000, tokens_spent 0
+    ledger.addGoalTokens(goal.id, "owner-1", 400);
+    advance(1_000);
+
+    ledger.raiseGoalBudget(goal.id, "owner-1", 5_000);
+
+    const row = readGoal(db, goal.id);
+    assert.equal(row.token_budget, 5_000);
+    assert.equal(row.tokens_spent, 400, "the raise is not a spend");
+    assert.equal(row.updated_ts, EPOCH + 1_000);
+  });
+
+  test("a budget <= tokens_spent is GOAL_INVALID_TRANSITION (would re-pause)", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    ledger.addGoalTokens(goal.id, "owner-1", 500);
+
+    for (const bad of [500, 499]) {
+      assert.throws(
+        () => ledger.raiseGoalBudget(goal.id, "owner-1", bad),
+        (e: unknown) =>
+          e instanceof GoalError && e.code === "GOAL_INVALID_TRANSITION",
+        `budget ${bad} must be refused`,
+      );
+    }
+    assert.equal(readGoal(db, goal.id).token_budget, 1_000, "unchanged");
+  });
+
+  test("a budget <= the current budget is GOAL_INVALID_TRANSITION even when > tokens_spent", () => {
+    const { db, ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger); // token_budget 1000, tokens_spent 0
+    ledger.addGoalTokens(goal.id, "owner-1", 400);
+
+    // All strictly above tokens_spent (400) yet at or below the current budget
+    // (1000) — a "raise" that would LOWER the budget must be refused.
+    for (const bad of [1_000, 999, 500]) {
+      assert.throws(
+        () => ledger.raiseGoalBudget(goal.id, "owner-1", bad),
+        (e: unknown) =>
+          e instanceof GoalError && e.code === "GOAL_INVALID_TRANSITION",
+        `budget ${bad} must be refused (not above the current budget)`,
+      );
+    }
+    assert.equal(readGoal(db, goal.id).token_budget, 1_000, "unchanged");
+
+    // Strictly greater than BOTH the current budget and tokens_spent raises it.
+    ledger.raiseGoalBudget(goal.id, "owner-1", 1_001);
+    assert.equal(readGoal(db, goal.id).token_budget, 1_001);
+  });
+
+  test("a non-positive or non-integer budget is a RangeError", () => {
+    const { ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    for (const bad of [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      2 ** 53, // not a safe integer
+    ]) {
+      assert.throws(
+        () => ledger.raiseGoalBudget(goal.id, "owner-1", bad),
+        RangeError,
+        `budget ${bad} must be a RangeError`,
+      );
+    }
+  });
+
+  test("requires ownership: intruder is GOAL_FORBIDDEN and a missing id is NOT_FOUND", () => {
+    const { ledger } = makeGoalLedger();
+    const goal = seedGoal(ledger);
+    assert.throws(
+      () => ledger.raiseGoalBudget(goal.id, "intruder", 5_000),
+      (e: unknown) => e instanceof GoalError && e.code === "GOAL_FORBIDDEN",
+    );
+    assert.throws(
+      () => ledger.raiseGoalBudget("g_missing", "owner-1", 5_000),
+      (e: unknown) => e instanceof GoalError && e.code === "GOAL_NOT_FOUND",
+    );
+  });
+});
+
 describe("GoalLedger.renewGoalLease", () => {
   test("extends expiry by one step window without rotating the token", () => {
     const { db, ledger, advance, now } = makeGoalLedger();

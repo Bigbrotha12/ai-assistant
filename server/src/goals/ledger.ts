@@ -869,6 +869,50 @@ export class GoalLedger {
   }
 
   /**
+   * RAISES a paused goal's token budget (the client's "continue with more"
+   * after a `paused(budget_exhausted)`). Validates inside the caller's
+   * transaction: the new budget must be a positive safe integer and strictly
+   * GREATER than BOTH the goal's current `token_budget` (a value at or below
+   * it would LOWER the budget, contradicting this accessor's name and the
+   * WIRE_SPEC) and its `tokens_spent` (a budget the goal already exceeded
+   * would re-pause on the next claim). A malformed value is a `RangeError`
+   * (the caller-value shape guard `addGoalTokens` uses); a value that fails
+   * either strict inequality is `GoalError("GOAL_INVALID_TRANSITION")` naming
+   * both thresholds.
+   *
+   * Deliberately status-agnostic (the route only calls it on a paused goal
+   * inside the resume transaction, matching {@link resumeGoal}'s composition
+   * style) and opens NO transaction of its own — it composes inside the
+   * route's resume transaction. The goal row must exist and be owned
+   * (`requireGoal` + `requireOwnership`, mirroring the other accessors); an
+   * UPDATE that matches 0 rows after those guards is deliberately NOT an
+   * error.
+   */
+  raiseGoalBudget(goalId: string, owner: string, newBudget: number): void {
+    const goal = this.requireGoal(goalId);
+    this.requireOwnership(goal, owner);
+    if (!Number.isSafeInteger(newBudget) || newBudget <= 0) {
+      throw new RangeError(
+        "raiseGoalBudget: newBudget must be a positive safe integer",
+      );
+    }
+    if (newBudget <= goal.token_budget || newBudget <= goal.tokens_spent) {
+      throw new GoalError(
+        "GOAL_INVALID_TRANSITION",
+        `goal ${goalId} new budget ${newBudget} must exceed the current ` +
+          `budget ${goal.token_budget} and tokens_spent ${goal.tokens_spent}`,
+      );
+    }
+    this.db
+      .prepare(
+        `UPDATE goal
+         SET token_budget = @newBudget, updated_ts = @now
+         WHERE id = @id AND owner = @owner`,
+      )
+      .run({ id: goalId, owner, newBudget, now: this.now() });
+  }
+
+  /**
    * Owner-scoped goal listing (Phase 5.3, WIRE_SPEC §12 `GET /v1/goals`) with
    * the `nextOffset` pagination convention of `Ledger.listPublicTasks` (no
    * total: fetch `limit + 1` and report the next offset only when a full page

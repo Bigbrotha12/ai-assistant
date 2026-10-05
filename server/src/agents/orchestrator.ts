@@ -249,6 +249,10 @@ export function bindPluginTools(
             ...(options.track === undefined ? {} : { track: options.track }),
           },
           channelLabel: "sync",
+          // Phase 7.2: the goal channel retries a transient read-only failure
+          // inside the body (one dispatch = one reservation + one execution
+          // bound). Every other channel keeps its single-invocation behavior.
+          ...(options.channel === "goal" ? { readOnlyRetry: true } : {}),
         }),
     },
   });

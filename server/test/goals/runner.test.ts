@@ -16,6 +16,8 @@ import {
 } from "../../src/agents/mcp.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import {
+  GOAL_CONTEXT_TOKEN_LIMIT,
+  GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE,
   GOAL_MAX_CONCURRENT_PER_OWNER,
   GOAL_MAX_STEPS,
   GOAL_MAX_WALL_CLOCK_MS,
@@ -23,19 +25,30 @@ import {
   GOAL_STEP_LEASE_MS,
 } from "../../src/goals/constants.ts";
 import { buildControlTools } from "../../src/goals/control.ts";
+import { GoalSetupError } from "../../src/goals/errors.ts";
 import { GoalLedger } from "../../src/goals/ledger.ts";
 import {
   createGoalRunner,
   agentAllowlistFilteredReadOnly,
+  isGenuineCapabilityGap,
+  setupFailureOutcomeOf,
   GoalTerminalSignal,
 } from "../../src/goals/runner.ts";
-import type { GoalRunner } from "../../src/goals/runner.ts";
-import type { GoalRow, GoalStepRow } from "../../src/goals/types.ts";
+import type { GoalRunner, GoalStopOutcome } from "../../src/goals/runner.ts";
+import {
+  GOAL_PAUSE_REASONS,
+  type GoalRow,
+  type GoalStepRow,
+} from "../../src/goals/types.ts";
 import { JobError } from "../../src/jobs/errors.ts";
 import { BudgetExhaustedError } from "../../src/middleware/budget.ts";
 import { ContextBudgetError } from "../../src/middleware/context.ts";
 import { migrateLedger } from "../../src/ledger.ts";
+import { PluginRegistryError } from "../../src/plugins/registry.ts";
 import type { PluginRegistry } from "../../src/plugins/registry.ts";
+import { estimateMessagesTokens, estimateTokens } from "../../src/token_estimate.ts";
+import { ModelBuildError } from "../../src/transport/model.ts";
+import { env } from "../../src/env.ts";
 
 /**
  * Phase 3.1 goal-runner tests. Fully deterministic: in-memory DB + GoalLedger
@@ -162,6 +175,31 @@ class ScriptedChatModel extends BaseChatModel<BaseChatModelCallOptions> {
   }
 }
 
+/**
+ * Scripted model whose generate ALWAYS rejects — drives `graph.invoke` to throw
+ * AFTER setup + `beforeModelCall` succeeded, the one path that reaches
+ * `unwindStep`'s chain (7.1's failed-attempt floor). `bindTools` must return a
+ * throwing instance (the base `ScriptedChatModel` copy would swallow the
+ * throw).
+ */
+class ThrowingChatModel extends BaseChatModel<BaseChatModelCallOptions> {
+  constructor() {
+    super({});
+  }
+
+  _llmType(): string {
+    return "throwing-goals";
+  }
+
+  bindTools(_tools: StructuredToolInterface[]) {
+    return this.withConfig({ tools: _tools } as BaseChatModelCallOptions);
+  }
+
+  async _generate(_messages: BaseMessage[]): Promise<ChatResult> {
+    throw new Error("transient model invoke failure");
+  }
+}
+
 function toolCallMessage(
   name: string,
   args: Record<string, unknown>,
@@ -265,6 +303,10 @@ type FakeMcpTool = {
 type FakeMcp = {
   factory: McpClientFactory;
   calls: { name: string; args: Record<string, unknown> }[];
+  /** Number of times the client factory ran (a real MCP connect would happen). */
+  connectCalls: number;
+  /** Number of `tools/list` round-trips (a real MCP list would happen). */
+  listCalls: number;
   started: () => boolean;
   settled: () => boolean;
   release: () => void;
@@ -285,24 +327,38 @@ function fakeMcp(
   const calls: FakeMcp["calls"] = [];
   let started = false;
   let settled = false;
+  let connectCalls = 0;
+  let listCalls = 0;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const factory: McpClientFactory = async () => ({
-    listTools: async () => ({ tools: listedTools }),
-    callTool: async (params) => {
-      started = true;
-      calls.push({ name: params.name, args: params.arguments });
-      if (opts.gated === true) await gate;
-      settled = true;
-      return { content: [{ type: "text", text: opts.result ?? "tool-result" }] };
-    },
-    close: async () => {},
-  });
+  const factory: McpClientFactory = async () => {
+    connectCalls += 1;
+    return {
+      listTools: async () => {
+        listCalls += 1;
+        return { tools: listedTools };
+      },
+      callTool: async (params) => {
+        started = true;
+        calls.push({ name: params.name, args: params.arguments });
+        if (opts.gated === true) await gate;
+        settled = true;
+        return { content: [{ type: "text", text: opts.result ?? "tool-result" }] };
+      },
+      close: async () => {},
+    };
+  };
   return {
     factory,
     calls,
+    get connectCalls() {
+      return connectCalls;
+    },
+    get listCalls() {
+      return listCalls;
+    },
     started: () => started,
     settled: () => settled,
     release,
@@ -1967,5 +2023,404 @@ describe("GoalRunner recovery adoption (Phase 6)", () => {
       "the interrupted step must not be marked terminal",
     );
     assert.equal(goalStatus(h, goal.id), "running", "the goal must not be requeued");
+  });
+});
+
+describe("GoalRunner token budget enforcement + context guard (7.1)", () => {
+  test("documented defaults are exported and the env entries are positive", () => {
+    assert.ok(GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE > 0);
+    assert.ok(GOAL_CONTEXT_TOKEN_LIMIT > 0);
+    assert.ok(env.GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE > 0);
+    assert.ok(env.GOAL_CONTEXT_TOKEN_LIMIT > 0);
+  });
+
+  test("budget_exhausted: a claimed goal already at its token budget pauses before setup or any model call", async (t) => {
+    const h = makeHarness();
+    let buildModelCalls = 0;
+    const runner = makeRunner(t, h, {
+      buildModel: () => {
+        buildModelCalls++;
+        return new ScriptedChatModel({ responses: [new AIMessage("should not run")] });
+      },
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-budget" });
+    // Spend the whole admission budget directly (admission sets 100_000).
+    const budget = h.goalLedger.getGoal(goal.id)!.token_budget;
+    h.goalLedger.addGoalTokens(goal.id, "owner-1", budget);
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(buildModelCalls, 0, "no setup / model build once the budget is spent");
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "budget_exhausted");
+    assert.equal(failureReason(h, goal.id), null);
+    assert.equal(
+      h.goalLedger.getGoal(goal.id)?.pause_question,
+      null,
+      "no question is persisted; the client derives the raise-budget ask",
+    );
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+
+    // A paused goal is not re-claimed: no spin, and spend is untouched.
+    const spent = h.goalLedger.getGoal(goal.id)!.tokens_spent;
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+    assert.equal(steps(h, goal.id).length, 1);
+    assert.equal(h.goalLedger.getGoal(goal.id)!.tokens_spent, spent);
+  });
+
+  test("context_overflow: an over-limit rebuilt input pauses BEFORE setup/graph.invoke and persists nothing", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    let generated = false;
+    let buildModelCalls = 0;
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => {
+        buildModelCalls += 1;
+        return new ScriptedChatModel({
+          responses: [new AIMessage("should not run")],
+          onGenerateMessages: () => {
+            generated = true;
+          },
+        });
+      },
+    });
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-71-context",
+      instruction: "x".repeat(400),
+    });
+    const savedLimit = env.GOAL_CONTEXT_TOKEN_LIMIT;
+    // Shrink the gate so the (rebuilt) instruction alone exceeds it. Restored
+    // in `finally` so no later test inherits the override.
+    env.GOAL_CONTEXT_TOKEN_LIMIT = 1;
+    try {
+      h.scheduler.fireAll();
+      await runner.drainInFlight();
+    } finally {
+      env.GOAL_CONTEXT_TOKEN_LIMIT = savedLimit;
+    }
+
+    assert.equal(generated, false, "no model generation was spent");
+    // Finding M1: the guard is hoisted BEFORE setup, so a doomed round pays no
+    // model build and no MCP connect/list.
+    assert.equal(buildModelCalls, 0, "context guard runs before the model build");
+    assert.equal(mcp.connectCalls, 0, "context guard runs before any MCP connect");
+    assert.equal(mcp.listCalls, 0, "context guard runs before any MCP tools/list");
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "context_overflow");
+    assert.equal(failureReason(h, goal.id), null);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+    // The round persisted NOTHING: the log still holds only the instruction.
+    assert.equal(h.goalLedger.listGoalMessages(goal.id).length, 1);
+  });
+
+  test("invalid agent_snapshot: the hoisted context guard classifies it before any setup", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    let buildModelCalls = 0;
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => {
+        buildModelCalls += 1;
+        return new ScriptedChatModel({ responses: [new AIMessage("should not run")] });
+      },
+    });
+    // Bypass admission's own snapshot validation (which the route owns): store a
+    // malformed snapshot on the claimed row so the RUNNER's hoisted guard is the
+    // first parse — proving the guard (not `setupGoalStep`) classifies it and
+    // nothing downstream is paid for.
+    const goal = admit(h, runner, {
+      idempotencyKey: "key-71-bad-snapshot",
+      snapshot: "not valid json",
+    });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(buildModelCalls, 0, "the guard runs before the model build");
+    assert.equal(mcp.connectCalls, 0, "the guard runs before any MCP connect");
+    assert.equal(goalStatus(h, goal.id), "failed");
+    assert.equal(pauseReason(h, goal.id), null);
+    assert.match(
+      failureReason(h, goal.id) ?? "",
+      /^invalid_agent_snapshot:/,
+      "setupFailureOutcomeOf mapped the malformed snapshot to a terminal failure",
+    );
+  });
+
+  test("failed-attempt floor: a chained no-state attempt charges exactly the floor (goal + step)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => new ThrowingChatModel(),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-floor" });
+    const before = h.goalLedger.getGoal(goal.id)!.tokens_spent;
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    // The invoke threw AFTER setup (no accounting block ran), so the step
+    // chained and the floor is the only charge.
+    assert.equal(goalStatus(h, goal.id), "queued");
+    const after = h.goalLedger.getGoal(goal.id)!.tokens_spent;
+    assert.equal(after - before, env.GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+    assert.equal(steps(h, goal.id)[0]?.tokens, env.GOAL_FAILED_ATTEMPT_TOKEN_ESTIMATE);
+  });
+
+  test("a successful round charges only actuals (no floor double-charge)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () =>
+        new ScriptedChatModel({
+          responses: [
+            new AIMessage({
+              content: "progress",
+              usage_metadata: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+            }),
+          ],
+        }),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-actuals" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(h.goalLedger.getGoal(goal.id)!.tokens_spent, 15);
+    assert.equal(steps(h, goal.id)[0]?.tokens, 15);
+  });
+
+  test("a terminal (stopGoalStep) round is not charged the floor", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => {
+        throw new JobError("job_failed", "model build blew up");
+      },
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-stop-fail" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "failed");
+    assert.equal(h.goalLedger.getGoal(goal.id)!.tokens_spent, 0);
+    assert.equal(steps(h, goal.id)[0]?.tokens, 0);
+  });
+
+  test("a pause (unwindStep → pauseForMutationResolution) is not charged the floor", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => new ThrowingChatModel(),
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-pause-floor" });
+    insertMutation(h, goal.id, "unresolved", "f1");
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "needs_mutation_resolution");
+    assert.equal(h.goalLedger.getGoal(goal.id)!.tokens_spent, 0);
+    assert.equal(steps(h, goal.id)[0]?.tokens, 0);
+  });
+});
+
+describe("GoalRunner R7 capability-gap classification (7.1)", () => {
+  test("ModelBuildError(plugin_not_found) from buildModel pauses missing_capability", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => {
+        throw new ModelBuildError(
+          "plugin_not_found",
+          "plugin 'openrouter' is not installed",
+        );
+      },
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-missing-cap" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "paused");
+    assert.equal(pauseReason(h, goal.id), "missing_capability");
+    assert.equal(failureReason(h, goal.id), null);
+    assert.equal(steps(h, goal.id)[0]?.status, "terminal");
+  });
+
+  test("a transient build failure never pauses missing_capability (keeps its code)", async (t) => {
+    const h = makeHarness();
+    const mcp = fakeMcp();
+    const runner = makeRunner(t, h, {
+      mcpClientFactory: mcp.factory,
+      buildModel: () => {
+        throw new JobError("job_failed", "model call timed out");
+      },
+    });
+    const goal = admit(h, runner, { idempotencyKey: "key-71-transient" });
+
+    h.scheduler.fireAll();
+    await runner.drainInFlight();
+
+    assert.equal(goalStatus(h, goal.id), "failed");
+    assert.equal(pauseReason(h, goal.id), null);
+    assert.equal(failureReason(h, goal.id), "job_failed: model call timed out");
+  });
+
+  test("classifier: paused reasons are always typed; missing_capability only from the allowlist", () => {
+    const pauseReasons = new Set<string>(GOAL_PAUSE_REASONS);
+    type Scenario = {
+      label: string;
+      error: unknown;
+      capabilityGap: boolean;
+      kind: "paused" | "failed";
+      reason?: string;
+    };
+    const registryCodeScenarios: Scenario[] = (
+      ["PLUGIN_NOT_FOUND", "PLUGIN_DISABLED", "PLUGIN_REMOVED", "PIN_MISMATCH"] as const
+    ).map((code) => ({
+      label: `PluginRegistryError(${code})`,
+      error: new PluginRegistryError(code, code),
+      capabilityGap: true,
+      kind: "paused",
+      reason: "missing_capability",
+    }));
+    const scenarios: Scenario[] = [
+      // The allowlist: the ONLY inputs that may become missing_capability.
+      {
+        label: "GoalSetupError(plugin_unavailable: no pinned model)",
+        error: new GoalSetupError("plugin_unavailable: goal has no pinned model plugin"),
+        capabilityGap: true,
+        kind: "paused",
+        reason: "missing_capability",
+      },
+      {
+        label: "GoalSetupError(plugin_unavailable: no buildModel seam)",
+        error: new GoalSetupError(
+          "plugin_unavailable: no buildModel seam is wired (the transport supplies it)",
+        ),
+        capabilityGap: true,
+        kind: "paused",
+        reason: "missing_capability",
+      },
+      {
+        label: "JobError(plugin_unavailable)",
+        error: new JobError("plugin_unavailable", "no plugin"),
+        capabilityGap: true,
+        kind: "paused",
+        reason: "missing_capability",
+      },
+      {
+        label: "ModelBuildError(plugin_not_found)",
+        error: new ModelBuildError("plugin_not_found", "not installed"),
+        capabilityGap: true,
+        kind: "paused",
+        reason: "missing_capability",
+      },
+      ...registryCodeScenarios,
+      // Everything else: never missing_capability.
+      {
+        label: "ModelBuildError(plugin_not_model)",
+        error: new ModelBuildError("plugin_not_model", "not a model"),
+        capabilityGap: false,
+        kind: "failed",
+      },
+      {
+        label: "ModelBuildError(missing_credentials)",
+        error: new ModelBuildError("missing_credentials", "no api key"),
+        capabilityGap: false,
+        kind: "failed",
+      },
+      {
+        label: "ModelBuildError(unsupported)",
+        error: new ModelBuildError("unsupported", "no streaming"),
+        capabilityGap: false,
+        kind: "failed",
+      },
+      {
+        label: "JobError(job_failed)",
+        error: new JobError("job_failed", "timed out"),
+        capabilityGap: false,
+        kind: "failed",
+      },
+      {
+        label: "plain Error",
+        error: new Error("kaboom"),
+        capabilityGap: false,
+        kind: "failed",
+      },
+      {
+        label: "ContextBudgetError",
+        error: new ContextBudgetError(4096, 1024),
+        capabilityGap: false,
+        kind: "paused",
+        reason: "context_overflow",
+      },
+      {
+        label: "BudgetExhaustedError",
+        error: new BudgetExhaustedError(60, EPOCH + 60_000, "1000000"),
+        capabilityGap: false,
+        kind: "paused",
+        reason: "budget_exhausted",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      assert.equal(
+        isGenuineCapabilityGap(scenario.error),
+        scenario.capabilityGap,
+        `${scenario.label}: capability-gap predicate`,
+      );
+      const outcome: GoalStopOutcome = setupFailureOutcomeOf(scenario.error);
+      assert.equal(outcome.kind, scenario.kind, `${scenario.label}: outcome kind`);
+      if (outcome.kind === "paused") {
+        assert.ok(
+          pauseReasons.has(outcome.reason),
+          `${scenario.label}: '${outcome.reason}' must be a GOAL_PAUSE_REASON`,
+        );
+        if (scenario.reason !== undefined) {
+          assert.equal(outcome.reason, scenario.reason, `${scenario.label}: reason`);
+        }
+      } else {
+        assert.ok(
+          !outcome.reason.startsWith("missing_capability"),
+          `${scenario.label}: a non-gap must not claim missing_capability`,
+        );
+      }
+    }
+  });
+});
+
+describe("token estimator (7.1)", () => {
+  test("estimateTokens uses the ceil(chars/4) heuristic", () => {
+    assert.equal(estimateTokens(""), 0);
+    assert.equal(estimateTokens("abcd"), 1);
+    assert.equal(estimateTokens("abcde"), 2);
+  });
+
+  test("estimateMessagesTokens sums content and tool-call JSON", () => {
+    assert.equal(estimateMessagesTokens([new AIMessage("abcdefgh")]), 2);
+    const withToolCall = new AIMessage({
+      content: "abcd",
+      tool_calls: [
+        { name: "get", args: { q: "abcdefgh" }, id: "call-1", type: "tool_call" },
+      ],
+    });
+    assert.ok(
+      estimateMessagesTokens([withToolCall]) >
+        estimateMessagesTokens([new AIMessage("abcd")]),
+      "tool-call arguments are counted, not treated as free input",
+    );
   });
 });

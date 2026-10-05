@@ -358,7 +358,8 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
     }
   });
 
-  // ── Phase 5.1 resume: re-credential + answer + mutation resolution, atomically. ──
+  // ── Phase 5.1/7 resume: re-credential + answer + mutation resolution + budget
+  //    raise, atomically. ──
   routes.post("/goals/:id/resume", async (c) => {
     const auth = await verifyKey(c);
     if (!auth.ok) return keyGateResponse(c, auth);
@@ -479,6 +480,29 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
       }
     }
 
+    // Phase 7 (WIRE_SPEC §12): an optional raised per-goal token budget — the
+    // client's "continue with more" after a `paused(budget_exhausted)`. Absent
+    // -> no raise. Present: it must be a positive safe integer AND strictly
+    // exceed BOTH the goal's current `token_budget` (a lower value would
+    // LOWER the budget, contradicting the raise) and its current `tokens_spent`
+    // — a budget the goal already exceeded would re-pause on the next claim, so
+    // it is refused here (before any transaction) as `400 invalid_request`. The
+    // ledger re-checks defensively inside the transaction (TOCTOU).
+    const tokenBudgetInput = record["tokenBudget"];
+    let raisedBudget: number | undefined;
+    if (tokenBudgetInput !== undefined) {
+      if (
+        typeof tokenBudgetInput !== "number" ||
+        !Number.isSafeInteger(tokenBudgetInput) ||
+        tokenBudgetInput <= 0 ||
+        tokenBudgetInput <= goal.token_budget ||
+        tokenBudgetInput <= goal.tokens_spent
+      ) {
+        return c.json({ error: "invalid_request" }, 400);
+      }
+      raisedBudget = tokenBudgetInput;
+    }
+
     // Admission-cap parity with `POST /goals`: a paused goal holds no slot, so
     // resuming is exactly where an owner could otherwise drift past
     // `GOAL_MAX_CONCURRENT_PER_OWNER` by cycling pause/resume. 429 `busy` is
@@ -518,13 +542,30 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
       // requiring `lease_owner IS NULL` (plan §"Resume is atomic"), then apply
       // the user's mutation resolutions — `resumeGoal` and `resolveMutations`
       // each open their own transaction (nested here as better-sqlite3
-      // SAVEPOINTs under this wrapper), so the answer, the CAS, and the
-      // resolutions commit or roll back TOGETHER. A lost CAS (a goal that
-      // moved on) or a resolution that stopped matching (`GOAL_INVALID_
-      // TRANSITION`) THROWS from inside, so nothing durable changes on a
-      // refused resume.
+      // SAVEPOINTs under this wrapper), so the answer, the CAS, the raised
+      // budget (Phase 7), and the resolutions commit or roll back TOGETHER. A
+      // lost CAS (a goal that moved on) or a resolution that stopped matching
+      // (`GOAL_INVALID_TRANSITION`) THROWS from inside, so nothing durable
+      // changes on a refused resume.
       goalLedger.transaction(() => {
         goalLedger.resumeGoal(id, owner, answerText);
+        // Phase 7: raise the per-goal budget (after the CAS so the raise only
+        // rides a successful resume; it needs no status guard because it runs
+        // inside this transaction on the just-requeued row). status-agnostic
+        // on purpose; see GoalLedger.raiseGoalBudget.
+        //
+        // TOCTOU (accepted): the deterministic pre-check above (a raise that
+        // does not strictly exceed the then-current `token_budget`/`tokens_spent`)
+        // returns 400 `invalid_request`. Under a concurrent change between that
+        // read and this transaction, `raiseGoalBudget`'s own re-check can trip
+        // and throw `GOAL_INVALID_TRANSITION`, which this route's `goalError`
+        // maps to 409 `goal_not_resumable` (the whole transaction rolls back).
+        // The two paths therefore disagree on status only inside that race
+        // window; accepted rather than threading a dedicated code through the
+        // ledger for a benign, retryable ambiguity.
+        if (raisedBudget !== undefined) {
+          goalLedger.raiseGoalBudget(id, owner, raisedBudget);
+        }
         // Resolve the user's mutations FIRST, against exactly the rows the
         // route's pre-check validated (`listUnresolvedMutations` — each key
         // matched exactly one `unresolved` row). The pre-check counts

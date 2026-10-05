@@ -677,6 +677,7 @@ it). `unresolvedMutations` is non-empty whenever any `unresolved` mutation exist
 ```jsonc
 { "credentials": { "openrouter": { "apiKey": "…" } },
   "answer": "no shellfish, and skip dessert",
+  "tokenBudget": 400000,                                     // optional raise
   "resolveMutations": [{ "tool": "create_mealplan", "argsHash": "…",
                          "resolution": "not_applied" }] }   // M4+
 // 200
@@ -684,9 +685,14 @@ it). `unresolvedMutations` is non-empty whenever any `unresolved` mutation exist
 ```
 
 `not_applied` is a **user assertion** (no idempotency key is sent to the target, no
-query-before-write), surfaced in the confirmation copy (R18).
+query-before-write), surfaced in the confirmation copy (R18). `tokenBudget` is optional:
+it raises a paused goal's per-goal token budget (the client's "continue with more" after
+`paused(budget_exhausted)`); it must be an integer strictly greater than the goal's
+current budget (and greater than `tokensSpent`), and its absence leaves the budget
+unchanged.
 
-Errors: `404 not_found`, `409 goal_not_resumable`, and `400 invalid_credentials`.
+Errors: `404 not_found`, `409 goal_not_resumable`, `400 invalid_credentials`, and
+`400 invalid_request`.
 
 ### `POST /v1/goals/:id/cancel`
 
