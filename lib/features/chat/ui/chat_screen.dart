@@ -16,6 +16,7 @@ import '../../auth/ui/auth_flow.dart';
 import '../../chat/data/chat_client.dart';
 import '../../goals/data/goal_providers.dart';
 import '../../goals/ui/goal_todo_screen.dart';
+import '../../goals/ui/goals_overlay.dart';
 import '../../settings/ui/settings_screen.dart';
 import '../../plugins/data/ledger_client.dart';
 import '../../plugins/data/plugin_credentials_store.dart';
@@ -698,6 +699,13 @@ class _InputBar extends StatelessWidget {
               attachmentRow!,
               const SizedBox(height: 8),
             ],
+            // Goals entry (3.7): the gear chip sits right-aligned directly
+            // above the text input.
+            const Align(
+              alignment: Alignment.centerRight,
+              child: GoalsChip(),
+            ),
+            const SizedBox(height: 4),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [

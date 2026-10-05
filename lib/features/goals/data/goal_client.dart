@@ -80,4 +80,34 @@ class GoalClient {
       return GoalDetail.fromJson(await _http.readJson(response.data));
     });
   }
+
+  /// `GET /v1/goals?limit=&offset=` — the owner's goals, newest-first, with
+  /// the ledger's `x-ledger-next-offset` header as the "older goals exist"
+  /// signal (WIRE_SPEC §12: pagination rides in headers, never the body).
+  ///
+  /// [goalLimit] is capped by the server at 100 (`PUBLIC_TASK_PAGE_MAX_LIMIT`),
+  /// so a caller asking for more gets 400 `invalid_request`.
+  Future<GoalListPage> list({
+    required String gatewayKey,
+    int goalLimit = 100,
+    int offset = 0,
+    CancelToken? cancelToken,
+  }) {
+    if (goalLimit < 1 || offset < 0) {
+      throw const PluginClientException('invalid_request');
+    }
+    return _http.run(cancelToken, (token) async {
+      final response = await _http.send(
+        path: '/goals?limit=$goalLimit&offset=$offset',
+        gatewayKey: gatewayKey,
+        cancelToken: token,
+      );
+      final nextOffset =
+          int.tryParse(response.headers.value('x-ledger-next-offset') ?? '');
+      return GoalListPage.fromJson(
+        await _http.readJson(response.data),
+        nextOffset: nextOffset,
+      );
+    });
+  }
 }

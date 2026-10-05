@@ -7,6 +7,7 @@ import '../../chat/data/status_tracker.dart';
 import '../../plugins/data/plugin_credentials_store.dart';
 import '../data/goal_dto.dart';
 import '../data/goal_providers.dart';
+import 'goal_status_ui.dart';
 
 /// Phase 3.7's todo view: renders `GET /v1/goals/:id` (WIRE_SPEC §12) and
 /// keeps it live while the goal runs.
@@ -156,9 +157,9 @@ class _GoalDetailView extends StatelessWidget {
       children: [
         Row(
           children: [
-            Icon(_statusIcon(goal.status), size: 18, color: _statusColor(goal, scheme)),
+            Icon(goalStatusIcon(goal.status), size: 18, color: goalStatusColor(goal.status, scheme)),
             const SizedBox(width: 8),
-            Text(_statusLabel(goal.status), style: theme.textTheme.titleSmall),
+            Text(goalStatusLabel(goal.status), style: theme.textTheme.titleSmall),
           ],
         ),
         const SizedBox(height: 12),
@@ -213,32 +214,4 @@ class _GoalDetailView extends StatelessWidget {
       ],
     );
   }
-
-  static String _statusLabel(String status) => switch (status) {
-    'queued' => 'Queued',
-    'running' => 'Running',
-    'paused' => 'Paused',
-    'complete' => 'Complete',
-    'failed' => 'Failed',
-    'cancelled' => 'Cancelled',
-    _ => status,
-  };
-
-  static IconData _statusIcon(String status) => switch (status) {
-    'running' => Icons.timelapse,
-    'paused' => Icons.pause_circle_outline,
-    'complete' => Icons.check_circle,
-    'failed' => Icons.error_outline,
-    'cancelled' => Icons.block,
-    _ => Icons.schedule,
-  };
-
-  static Color _statusColor(GoalDetail goal, ColorScheme scheme) =>
-      switch (goal.status) {
-        'running' => scheme.primary,
-        'paused' => scheme.tertiary,
-        'complete' => scheme.primary,
-        'failed' => scheme.error,
-        _ => scheme.onSurfaceVariant,
-      };
 }

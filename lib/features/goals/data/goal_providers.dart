@@ -117,6 +117,60 @@ final goalTriggerProvider = Provider<GoalTrigger>(
   (ref) => GoalTrigger(ref),
 );
 
+/// `GET /v1/goals`, kept alive by the goals overlay (autoDispose: a fresh
+/// first page on every open).
+final goalListProvider = AsyncNotifierProvider.autoDispose<
+  GoalListNotifier,
+  GoalListPage
+>(GoalListNotifier.new);
+
+/// First page of the owner's goals + append-only paging. Read-only: nothing
+/// here mutates a goal, and a failed `loadMore` keeps the rows already loaded
+/// (the footer simply stays tappable).
+class GoalListNotifier extends AsyncNotifier<GoalListPage> {
+  /// The server's own page cap (`PUBLIC_TASK_PAGE_MAX_LIMIT`).
+  static const pageSize = 100;
+
+  GoalClient? _client;
+  String _gatewayKey = '';
+
+  @override
+  Future<GoalListPage> build() {
+    _client = ref.watch(goalClientProvider);
+    _gatewayKey = ref.watch(
+      authCredentialsProvider.select((auth) => auth.value?.apiKey ?? ''),
+    );
+    if (_gatewayKey.trim().isEmpty) {
+      throw const PluginClientException(ManagedErrorCodes.noCredentials);
+    }
+    return _client!.list(gatewayKey: _gatewayKey, goalLimit: pageSize);
+  }
+
+  /// Appends the next page behind the footer action.
+  Future<void> loadMore() async {
+    final client = _client;
+    final current = state.value;
+    final offset = current?.nextOffset;
+    if (client == null || current == null || offset == null) return;
+    try {
+      final next = await client.list(
+        gatewayKey: _gatewayKey,
+        goalLimit: pageSize,
+        offset: offset,
+      );
+      if (!ref.mounted) return;
+      state = AsyncData(
+        GoalListPage(
+          goals: [...current.goals, ...next.goals],
+          nextOffset: next.nextOffset,
+        ),
+      );
+    } catch (_) {
+      // Keep what is loaded; the footer remains and can be tapped again.
+    }
+  }
+}
+
 /// `GET /v1/goals/:id`, kept live by the todo view's poller.
 final goalDetailProvider = AsyncNotifierProvider.autoDispose
     .family<GoalDetailNotifier, GoalDetail, String>(GoalDetailNotifier.new);

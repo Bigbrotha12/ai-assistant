@@ -12,12 +12,13 @@ import 'package:flutter_test/flutter_test.dart';
 /// error codes arriving through the REAL envelope path (the reachable client
 /// path Phase 3.6's forward-registration was waiting for).
 
-ResponseBody jsonResponse(Object? value, {int status = 200}) =>
+ResponseBody jsonResponse(Object? value, {int status = 200, String? nextOffset}) =>
     ResponseBody.fromString(
       jsonEncode(value),
       status,
       headers: {
         'content-type': ['application/json'],
+        if (nextOffset != null) 'x-ledger-next-offset': [nextOffset],
       },
     );
 
@@ -46,6 +47,29 @@ Map<String, Object?> submittedJson() => {
   'status': 'queued',
   'todos': <Object?>[],
   'createdAt': '2026-10-04T00:00:00.000Z',
+};
+
+Map<String, Object?> summaryJson({
+  String goalId = 'g_1',
+  String status = 'running',
+  String instruction = 'do the thing',
+  String? pauseQuestion,
+  String? failureReason,
+}) => {
+  'goalId': goalId,
+  'status': status,
+  'instruction': instruction,
+  'pauseReason': pauseQuestion == null ? null : 'needs_user_input',
+  'pauseQuestion': pauseQuestion,
+  'resultSummary': null,
+  'failureReason': failureReason,
+  'tokenBudget': 200000,
+  'tokensSpent': 41230,
+  'canCancel': true,
+  'canResume': status == 'paused',
+  'terminal': const ['complete', 'failed', 'cancelled'].contains(status),
+  'createdAt': '2026-10-04T00:00:00.000Z',
+  'updatedAt': '2026-10-04T00:01:00.000Z',
 };
 
 Map<String, Object?> detailJson({
@@ -221,5 +245,70 @@ void main() {
             .having((e) => e.statusCode, 'statusCode', 404),
       ),
     );
+  });
+
+  test('GET /v1/goals pages with the ledger header convention', () async {
+    adapter = FakeAdapter((options) {
+      final offset = int.parse(options.uri.queryParameters['offset'] ?? '0');
+      return jsonResponse(
+        {
+          'goals': offset == 0
+              ? [
+                  summaryJson(goalId: 'g_2', instruction: 'newest first'),
+                  summaryJson(
+                    goalId: 'g_1',
+                    status: 'paused',
+                    instruction: 'answer me',
+                    pauseQuestion: 'which flight?',
+                  ),
+                ]
+              : [summaryJson(goalId: 'g_0', instruction: 'oldest')],
+        },
+        nextOffset: offset == 0 ? '100' : null,
+      );
+    });
+    client = GoalClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gw.test/v1',
+    );
+
+    final page = await client.list(gatewayKey: 'test-key');
+
+    expect(
+      adapter.requests.single.uri.toString(),
+      'https://gw.test/v1/goals?limit=100&offset=0',
+    );
+    expect(page.goals.map((g) => g.goalId), ['g_2', 'g_1']);
+    expect(page.goals.first.instruction, 'newest first');
+    expect(page.goals.last.pauseQuestion, 'which flight?');
+    expect(page.goals.last.canResume, isTrue);
+    expect(page.nextOffset, 100, reason: 'older goals exist beyond this page');
+
+    final last = await client.list(gatewayKey: 'test-key', offset: 100);
+    expect(
+      adapter.requests.last.uri.toString(),
+      'https://gw.test/v1/goals?limit=100&offset=100',
+    );
+    expect(last.goals.single.instruction, 'oldest');
+    expect(last.nextOffset, isNull, reason: 'no header means this is the end');
+  });
+
+  test('a malformed list row is skipped, not fatal', () async {
+    adapter = FakeAdapter(
+      (_) => jsonResponse({
+        'goals': [
+          {'status': 'running'}, // no goalId — dropped
+          summaryJson(goalId: 'g_ok'),
+        ],
+      }),
+    );
+    client = GoalClient(
+      dio: Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://gw.test/v1',
+    );
+
+    final page = await client.list(gatewayKey: 'test-key');
+    expect(page.goals.map((g) => g.goalId), ['g_ok']);
+    expect(page.nextOffset, isNull);
   });
 }

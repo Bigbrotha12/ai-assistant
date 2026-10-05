@@ -158,6 +158,83 @@ List<String> parseGoalTodos(Object? value) {
   return List.unmodifiable(value.whereType<String>());
 }
 
+/// One row of `GET /v1/goals` — the overlay's list item. Same parsing rule as
+/// [GoalDetail]: the identity fields are required, everything derived or
+/// nullable defaults.
+class GoalSummary {
+  const GoalSummary({
+    required this.goalId,
+    required this.status,
+    required this.instruction,
+    required this.pauseReason,
+    required this.pauseQuestion,
+    required this.resultSummary,
+    required this.failureReason,
+    required this.tokenBudget,
+    required this.tokensSpent,
+    required this.canCancel,
+    required this.canResume,
+    required this.terminal,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  factory GoalSummary.fromJson(Object? value) {
+    final json = pluginJsonObject(value);
+    return GoalSummary(
+      goalId: pluginJsonString(json['goalId']),
+      status: pluginJsonString(json['status']),
+      instruction: _stringOr(json['instruction'], ''),
+      pauseReason: _nullableString(json['pauseReason']),
+      pauseQuestion: _nullableString(json['pauseQuestion']),
+      resultSummary: _nullableString(json['resultSummary']),
+      failureReason: _nullableString(json['failureReason']),
+      tokenBudget: _int(json['tokenBudget']),
+      tokensSpent: _int(json['tokensSpent']),
+      canCancel: json['canCancel'] == true,
+      canResume: json['canResume'] == true,
+      terminal: json['terminal'] == true,
+      createdAt: _stringOr(json['createdAt'], ''),
+      updatedAt: _stringOr(json['updatedAt'], ''),
+    );
+  }
+
+  final String goalId;
+
+  /// One of `queued|running|paused|complete|failed|cancelled`.
+  final String status;
+  final String instruction;
+  final String? pauseReason;
+  final String? pauseQuestion;
+  final String? resultSummary;
+  final String? failureReason;
+  final int tokenBudget;
+  final int tokensSpent;
+  final bool canCancel;
+  final bool canResume;
+  final bool terminal;
+  final String createdAt;
+  final String updatedAt;
+}
+
+/// One page of `GET /v1/goals` with the ledger's `nextOffset` convention:
+/// `nextOffset` is non-null only when a full page came back, i.e. older goals
+/// exist beyond this one.
+class GoalListPage {
+  const GoalListPage({required this.goals, required this.nextOffset});
+
+  factory GoalListPage.fromJson(Object? value, {int? nextOffset}) {
+    final json = pluginJsonObject(value);
+    return GoalListPage(
+      goals: _parseList(json['goals'], GoalSummary.fromJson),
+      nextOffset: nextOffset,
+    );
+  }
+
+  final List<GoalSummary> goals;
+  final int? nextOffset;
+}
+
 List<T> _parseList<T>(Object? value, T Function(Object?) parse) {
   if (value is! List) return const [];
   final parsed = <T>[];

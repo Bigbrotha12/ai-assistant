@@ -18,7 +18,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../../fakes.dart';
-import 'goal_client_test.dart' show FakeAdapter, jsonResponse;
+import 'goal_client_test.dart' show FakeAdapter, jsonResponse, summaryJson;
 import 'goal_providers_test.dart'
     show InMemorySecureStorage, TestAuth, credentials;
 
@@ -83,6 +83,18 @@ void main() {
           'status': 'queued',
           'todos': <Object?>[],
           'createdAt': '2026-10-04T00:00:00.000Z',
+        });
+      }
+      // The goals overlay's list call carries a query; the todo view's does not.
+      if (options.uri.query.isNotEmpty) {
+        return jsonResponse({
+          'goals': [
+            summaryJson(
+              goalId: _goalId,
+              status: 'running',
+              instruction: "plan tomorrow's meals",
+            ),
+          ],
         });
       }
       return jsonResponse(_detailJson());
@@ -182,5 +194,29 @@ void main() {
 
     expect(postedBodies, isEmpty, reason: 'no goal is admitted by a chat send');
     expect(find.byType(GoalTodoScreen), findsNothing);
+  });
+
+  testWidgets('the goals chip opens the read-only goals overlay', (
+    tester,
+  ) async {
+    await pumpGoalChat(tester);
+    expect(find.byKey(const Key('goals-chip')), findsOneWidget);
+    expect(find.text('Message…'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('goals-chip')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('goals-overlay')), findsOneWidget);
+    expect(find.text("plan tomorrow's meals"), findsOneWidget);
+    expect(
+      postedBodies,
+      isEmpty,
+      reason: 'browsing the overlay never admits a goal',
+    );
+
+    await tester.tap(find.byKey(const Key('goals-dismiss')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('goals-overlay')), findsNothing);
+    expect(find.byKey(const Key('goals-chip')), findsOneWidget);
   });
 }

@@ -854,4 +854,35 @@ void main() {
       expect(find.text('MCP token (optional)'), findsNothing);
     });
   });
+
+  testWidgets('the goals chip sits right-aligned above the mode toggler', (
+    tester,
+  ) async {
+    final container = buildContainer();
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: VoiceScreen()),
+      ),
+    );
+    await settle(tester);
+
+    final chip = find.byKey(const Key('goals-chip'));
+    expect(chip, findsOneWidget);
+    expect(tester.widget<IconButton>(chip).tooltip, 'Goals');
+
+    // Above the Voice/Text toggler bar, in the right corner (Phase 3.7).
+    final pill = find.byKey(const Key('voice-input-mode-toggle'));
+    expect(pill, findsOneWidget);
+    expect(
+      tester.getTopLeft(chip).dy,
+      lessThan(tester.getTopLeft(pill).dy),
+      reason: 'the chip sits above the toggler',
+    );
+    expect(
+      tester.getTopRight(chip).dx,
+      greaterThan(tester.getCenter(pill).dx),
+      reason: 'the chip is right-aligned',
+    );
+  });
 }
