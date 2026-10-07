@@ -2,8 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path_provider/path_provider.dart';
 
+import '../../../core/app_data_dir.dart';
 import '../../chat/data/message_model.dart';
 
 /// Result of a successful export: the document that was written and the path
@@ -38,13 +38,15 @@ Map<String, Object?> buildAccountExportDocument({
 String encodeAccountExport(Map<String, Object?> document) =>
     const JsonEncoder.withIndent('  ').convert(document);
 
-/// Default writer: timestamped file under `<documents>/exports/`. The app has
-/// no share_plus in its dependency set — `open_file` + `path_provider` are
-/// the share/file-open capabilities that already exist, so the export is
-/// saved and then opened with the platform opener by the caller.
+/// Default writer: timestamped file under `<appDataDir>/exports/` — `data/app`
+/// on a local dev build, the platform documents directory otherwise (see
+/// [AppDataDir]). The app has no share_plus in its dependency set — `open_file`
+/// + `path_provider` are the share/file-open capabilities that already exist,
+/// so the export is saved and then opened with the platform opener by the
+/// caller.
 Future<String> writeAccountExportToDocuments(String encoded) async {
-  final docs = await getApplicationDocumentsDirectory();
-  final dir = Directory('${docs.path}/exports');
+  final base = await AppDataDir.resolve();
+  final dir = Directory('${base.path}/exports');
   await dir.create(recursive: true);
   final stamp = _timestampFor(DateTime.now());
   final file = File('${dir.path}/ai-assistant-export_$stamp.json');

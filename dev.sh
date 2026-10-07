@@ -22,6 +22,11 @@
 # Env (see dev.env.example for persistent configuration):
 #   FLUTTER_DEVICE      Device for flutter run -d (default: linux)
 #   HOST_FQDN           Backend host dart-define (default: Tailscale IP, else localhost)
+#   APP_DATA_DIR        Desktop data root dart-define (default: <repo>/data/app).
+#                       Desktop targets only, so a Linux dev build keeps its
+#                       database, voice models, and caches inside the repo
+#                       instead of ~/Documents. Ignored for phone targets, whose
+#                       sandboxed path_provider directories are correct.
 #   PUBLIC_BACKEND_URL  Public backend URL dart-define; also selects the
 #                       production (https) environment. Default: the cluster
 #                       gateway at https://ai-assistant.fire-chain.com. Set to
@@ -449,6 +454,25 @@ ensure_wireless_target() {
   return 1
 }
 
+# Desktop targets get their app data root pointed at the repo's gitignored
+# `data/app` (see lib/core/app_data_dir.dart), so a local build's SQLite file,
+# downloaded voice models, attachment cache, and exports stay in the tree
+# instead of scattering into the user's ~/Documents. Phone targets keep the
+# platform directories — the define holds a build-host absolute path that does
+# not exist in a phone sandbox, and AppDataDir ignores it off-desktop anyway.
+# `chrome` is excluded: a browser has no filesystem to redirect.
+APP_DATA_DIR="${APP_DATA_DIR:-$ROOT_DIR/data/app}"
+case "$FLUTTER_DEVICE" in
+  linux | macos | windows)
+    mkdir -p "$APP_DATA_DIR"
+    DATA_DIR_ARGS=(--dart-define=APP_DATA_DIR="$APP_DATA_DIR")
+    echo "App data dir: $APP_DATA_DIR"
+    ;;
+  *)
+    DATA_DIR_ARGS=()
+    ;;
+esac
+
 case "$FLUTTER_DEVICE" in
   *.*:[0-9]*)
     if [ -z "$ADB_BIN" ]; then
@@ -470,6 +494,7 @@ esac
   -d "$FLUTTER_DEVICE" \
   --dart-define=HOST_FQDN="$HOST_FQDN" \
   --dart-define=PUBLIC_BACKEND_URL="$PUBLIC_BACKEND_URL" \
+  "${DATA_DIR_ARGS[@]}" \
   "${EXTRA_ARGS[@]}" &
 FLUTTER_PID=$!
 

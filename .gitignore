@@ -50,5 +50,10 @@ app.*.map.json
 # Local docs (generated, not versioned)
 /docs/
 
+# Local runtime data: the desktop dev build's SQLite db, downloaded voice
+# models, attachment cache, and account exports (see lib/core/app_data_dir.dart
+# and APP_DATA_DIR in dev.sh). Everything the app writes lives here.
+/data/
+
 # dev.sh local configuration
 dev.env

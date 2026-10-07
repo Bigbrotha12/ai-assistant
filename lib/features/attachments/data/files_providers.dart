@@ -1,8 +1,8 @@
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path_provider/path_provider.dart';
 
+import '../../../core/app_data_dir.dart';
 import '../../../core/config.dart';
 import '../../../core/http/dio_provider.dart';
 import '../../../app/app_startup.dart';
@@ -34,7 +34,7 @@ final filesServiceProvider = Provider<FilesClient>((ref) {
   );
 });
 
-/// On-disk file cache rooted at `<documents>/files_cache`. The directory is
+/// On-disk file cache rooted at `<appDataDir>/files_cache`. The directory is
 /// resolved lazily on first use because path_provider is async.
 final fileCacheProvider = Provider<FileCache>((ref) {
   final scopeKey = ref.watch(pluginAccessProvider) != PluginAccess.ready
@@ -43,8 +43,8 @@ final fileCacheProvider = Provider<FileCache>((ref) {
   return FileCache.async(
     scopeKey: scopeKey,
     resolveDir: () async {
-      final docs = await getApplicationDocumentsDirectory();
-      return Directory('${docs.path}/files_cache');
+      final base = await AppDataDir.resolve();
+      return Directory('${base.path}/files_cache');
     },
   );
 });

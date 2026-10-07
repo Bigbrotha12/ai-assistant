@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 
+import '../../../core/app_data_dir.dart';
 import './engine_config.dart';
 import './engine_registry.dart';
 import './engines/supertonic_tts_engine.dart';
@@ -443,7 +443,7 @@ class EngineManager extends ChangeNotifier {
 
   Future<String> _resolveModelDir() async {
     if (_resolvedModelDir != null) return _resolvedModelDir!;
-    final base = await getApplicationDocumentsDirectory();
+    final base = await AppDataDir.resolve();
     _resolvedModelDir = '${base.path}/$_modelDir';
     // Ensure the directory exists.
     await Directory(_resolvedModelDir!).create(recursive: true);

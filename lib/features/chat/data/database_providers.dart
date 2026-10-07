@@ -1,6 +1,7 @@
 import 'package:drift_flutter/drift_flutter.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/app_data_dir.dart';
 import '../../attachments/data/file_store.dart';
 import '../../memory/data/memory_store.dart';
 import '../../plugins/data/plugin_catalog_providers.dart';
@@ -9,8 +10,20 @@ import './chat_store.dart';
 import './database.dart';
 
 /// Provides the shared [AppDatabase] instance for the chat feature.
+///
+/// The `ai_assistant.sqlite` file lands in [AppDataDir.resolve] — `data/app`
+/// for a local dev build (see `dev.sh`), the platform documents directory
+/// otherwise — rather than drift's default documents directory, which on Linux
+/// desktop is the user's `~/Documents`.
 final databaseProvider = Provider<AppDatabase>((ref) {
-  final db = AppDatabase(driftDatabase(name: 'ai_assistant'));
+  final db = AppDatabase(
+    driftDatabase(
+      name: 'ai_assistant',
+      native: DriftNativeOptions(
+        databaseDirectory: () async => AppDataDir.resolve(),
+      ),
+    ),
+  );
   ref.onDispose(db.close);
   return db;
 });

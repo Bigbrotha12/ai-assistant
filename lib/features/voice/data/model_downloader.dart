@@ -3,8 +3,8 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 
+import '../../../core/app_data_dir.dart';
 import './engine_config.dart';
 
 typedef FreeStorageBytesReader = Future<int?> Function();
@@ -136,7 +136,7 @@ class ModelDownloader {
   final Future<Directory> _modelDirectory;
 
   static Future<Directory> _loadModelDirectory() async {
-    final base = await getApplicationDocumentsDirectory();
+    final base = await AppDataDir.resolve();
     return Directory('${base.path}/${EngineConfig.modelStorageDir}');
   }
 
