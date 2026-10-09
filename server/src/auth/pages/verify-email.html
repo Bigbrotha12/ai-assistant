@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Verify email — AI Assistant</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0 24px;
+        background: #f4f4f5;
+        color: #18181b;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid #e4e4e7;
+        border-radius: 12px;
+        padding: 32px;
+        width: 100%;
+        max-width: 380px;
+        box-shadow: 0 1px 3px rgb(0 0 0 / 0.06);
+      }
+      h1 { font-size: 20px; margin: 0 0 8px; }
+      p { color: #52525b; font-size: 14px; margin: 0 0 20px; }
+      .msg { margin-top: 16px; font-size: 14px; border-radius: 8px; padding: 10px 12px; display: none; }
+      .msg.pending { display: block; background: #f4f4f5; color: #52525b; }
+      .msg.ok { display: block; background: #dcfce7; color: #166534; }
+      .msg.err { display: block; background: #fee2e2; color: #991b1b; }
+      .hint { margin-top: 12px; font-size: 12px; color: #71717a; }
+    </style>
+  </head>
+  <body>
+    <div id="card" class="card">
+      <h1>Verify your email</h1>
+      <p>Confirming your AI Assistant email address…</p>
+      <div id="msg" class="msg pending">Verifying…</div>
+      <p class="hint">You can close this page once verification succeeds, then open the app.</p>
+    </div>
+    <script>
+      const token = atob(/*__TOKEN__*/);
+      const msg = document.getElementById("msg");
+      function show(outcome, text) {
+        msg.className = "msg " + outcome;
+        while (msg.firstChild) msg.removeChild(msg.firstChild);
+        const p = document.createElement("p");
+        p.style.margin = "0";
+        p.textContent = text;
+        msg.appendChild(p);
+      }
+      (async () => {
+        if (!token) {
+          return show("err", "This verification link is missing its token. Request a new email from the app.");
+        }
+        try {
+          const res = await fetch("/api/auth/verify-email?token=" + encodeURIComponent(token), {
+            method: "GET",
+          });
+          if (!res.ok) {
+            return show("err", "Verification failed — the link may be invalid or expired. Request a new email from the app.");
+          }
+          show("ok", "Email verified — you can now open the AI Assistant app and sign in.");
+        } catch {
+          show("err", "Network error. Please try again.");
+        }
+      })();
+    </script>
+  </body>
+</html>

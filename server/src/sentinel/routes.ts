@@ -1,9 +1,9 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { accountDeletedResponse, requireApiKey, requireOwner } from "../request_auth.ts";
-import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
-import { isDeleting } from "../account_deletion.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
+import { isDeleting } from "../auth/account_deletion.ts";
 import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
 import type { PerOwnerRateLimiter, RateLimitResult } from "../middleware/rate_limit.ts";
 import { isRecord } from "../util.ts";

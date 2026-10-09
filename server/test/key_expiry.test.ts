@@ -12,13 +12,13 @@ import { getMigrations } from "better-auth/db/migration";
 import {
   API_KEY_DEFAULT_EXPIRES_IN_SECONDS,
   API_KEY_PLUGIN_OPTIONS,
-} from "../src/auth.ts";
+} from "../src/auth/index.ts";
 import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 const BASE = "http://localhost:17600";
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 
-// Mirrors src/auth.ts over a throwaway SQLite DB, but plugs in the SAME
+// Mirrors src/auth/index.ts over a throwaway SQLite DB, but plugs in the SAME
 // exported API_KEY_PLUGIN_OPTIONS object the gateway uses — so the key minted
 // below goes through the production expiry configuration, not a copied literal.
 async function buildTestAuth() {

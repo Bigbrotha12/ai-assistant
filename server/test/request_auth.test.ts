@@ -3,7 +3,7 @@ import { registerHooks } from "node:module";
 import { test, describe } from "node:test";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { clearDeleting, markDeleting } from "../src/account_deletion.ts";
+import { clearDeleting, markDeleting } from "../src/auth/account_deletion.ts";
 
 /**
  * C2 backstop coverage for the tri-state `requireApiKey` + `keyGateResponse`
@@ -11,7 +11,7 @@ import { clearDeleting, markDeleting } from "../src/account_deletion.ts";
  * the same distinct 403 `email_not_verified` so the probe can tell "verify
  * your email" from "re-auth".
  *
- * `src/auth.ts` (better-auth + its DB) is swapped for a deterministic fake
+ * `src/auth/index.ts` (better-auth + its DB) is swapped for a deterministic fake
  * via `registerHooks` — the same mechanism production.integration.test.ts
  * uses — so the REAL `requireApiKey`/`keyGateResponse`/route logic runs
  * against scripted keys/users without touching the gateway's SQLite file.
@@ -57,7 +57,7 @@ const globals = globalThis as typeof globalThis & { __apiKeyAuthState?: FakeStat
 globals.__apiKeyAuthState = state;
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (specifier === "./auth.ts" && context.parentURL?.includes("/src/request_auth.ts")) {
+    if (specifier === "./index.ts" && context.parentURL?.includes("/src/auth/request_auth.ts")) {
       return {
         url: `data:text/javascript,${encodeURIComponent(fakeAuthModule)}`,
         shortCircuit: true,
@@ -66,7 +66,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { createAuthCheckRoutes, requireApiKey } = await import("../src/request_auth.ts");
+const { createAuthCheckRoutes, requireApiKey } = await import("../src/auth/request_auth.ts");
 hooks.deregister();
 
 /** Minimal Context carrying only the Authorization header (all requireApiKey reads). */

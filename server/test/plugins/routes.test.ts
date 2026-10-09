@@ -10,7 +10,7 @@ import { PluginStore } from "../../src/plugins/store.ts";
 import { computeManifestDigest } from "../../src/plugins/digest.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { createPluginRoutes } from "../../src/plugins/routes.ts";
-import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
+import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 import type { AgentPluginDefinition, ModelPluginDefinition, ToolPluginDefinition } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import { logger } from "../../src/logger.ts";

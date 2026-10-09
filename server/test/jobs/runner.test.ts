@@ -37,7 +37,7 @@ import type { CredentialPinHandle } from "../../src/credentials/pins.ts";
 import { AsyncMutex } from "../../src/jobs/mutex.ts";
 import { Ledger, migrateLedger } from "../../src/ledger.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
-import { clearDeleting, markDeleting } from "../../src/account_deletion.ts";
+import { clearDeleting, markDeleting } from "../../src/auth/account_deletion.ts";
 import { CredentialPinError } from "../../src/credentials/pins.ts";
 
 function isNotFound(e: unknown): boolean {

@@ -6,11 +6,13 @@ import type { Database as DatabaseType } from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { sendEmailVerificationMail, sendPasswordResetMail } from "./email.ts";
-import { env } from "./env.ts";
+import { env } from "../env.ts";
 import {
+  VERIFY_EMAIL_PATH,
   createSendVerificationEmailCallback,
   getSendVerificationRateLimitGate,
 } from "./verify_email.ts";
+import { RESET_PASSWORD_PATH } from "./reset_password.ts";
 import {
   clearDeleting,
   completeDeletion,
@@ -23,10 +25,14 @@ mkdirSync(dirname(env.DB_PATH), { recursive: true });
 
 const isProduction = env.NODE_ENV === "production";
 
-// Shared handle on the better-auth SQLite database. Exported (C2) so the
-// later tri-state `requireApiKey` can look up the owning user: an API key's
-// `referenceId` is the user id, and the gate needs that user's
-// `emailVerified` flag. The gate itself lives in a later step.
+/** Absolute link for an emailed auth action, pointing at our own page. */
+function authUrl(path: string, token: string): string {
+  return `${env.BETTER_AUTH_URL}${path}?token=${token}`;
+}
+
+// Shared handle on the better-auth SQLite database. Exported so request_auth's
+// `requireApiKey` can look up the API key's owning user (`referenceId` is the
+// user id) and read `emailVerified` for the verification gate.
 export const authDb = new Database(env.DB_PATH);
 
 export interface AuthUserRow {
@@ -57,16 +63,14 @@ export function getUserById(id: string): AuthUserRow | null {
 }
 
 /**
- * M12: default API-key lifetime at CREATE time — 90 days, in SECONDS.
+ * Default API-key lifetime at CREATE time — 90 days, in SECONDS.
  *
  * CRITICAL UNIT: better-auth's api-key plugin treats
  * `keyExpiration.defaultExpiresIn` as SECONDS — the create path computes
- * `expiresAt = getDate(span, "sec") = Date.now() + span * 1000`. The previous
- * literal `60 * 60 * 24 * 365 * 1000` was therefore evaluated as ~31.5
- * BILLION seconds (~1000 years), not the 1 year its `*1000` suggested (that
- * multiplier belongs to milliseconds, which this option does not use).
- * Applies only at create: keys minted before this change keep their original
- * `expiresAt` until rotated (client-side M12 rotation sweep).
+ * `expiresAt = getDate(span, "sec") = Date.now() + span * 1000`. A `* 1000`
+ * multiplier here would mean milliseconds and overshoot the intended lifetime
+ * by ~1000x. Applies only at create: existing keys keep their `expiresAt`
+ * until rotated.
  */
 export const API_KEY_DEFAULT_EXPIRES_IN_SECONDS = 90 * 24 * 60 * 60;
 
@@ -143,7 +147,7 @@ export type AccountDeletionHooks = {
 
 /**
  * Cascade cleanup for better-auth's built-in, session-guarded
- * `POST /api/auth/delete-user` (M12). The built-in delete removes the `user`
+ * `POST /api/auth/delete-user`. The built-in delete removes the `user`
  * and `session` rows but MISSES apikey rows, the encrypted notify blob and
  * ledger tasks — these hooks sweep them, each strictly self-scoped to
  * `user.id` (never another owner's rows).
@@ -192,9 +196,9 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
     minPasswordLength: 8,
-    // C2: a fresh signup gets `token: null` and NO session row, and sign-in
-    // of an unverified account is rejected with better-auth's built-in
-    // 403 EMAIL_NOT_VERIFIED until the emailed token flips `emailVerified`.
+    // A fresh signup gets `token: null` and NO session row, and sign-in of an
+    // unverified account is rejected with better-auth's built-in 403
+    // EMAIL_NOT_VERIFIED until the emailed token flips `emailVerified`.
     // (`autoSignIn` and `requireEmailVerification` live here — better-auth
     // reads both from `emailAndPassword`, not from `emailVerification`.)
     autoSignIn: false,
@@ -206,11 +210,11 @@ export const auth = betterAuth({
     sendResetPassword: async ({ user, token }) => {
       await sendPasswordResetMail({
         to: user.email,
-        url: `${env.BETTER_AUTH_URL}/reset-password?token=${token}`,
+        url: authUrl(RESET_PASSWORD_PATH, token),
       });
     },
   },
-  // C2: top-level better-auth option (NOT a plugin). `sendOnSignIn` makes the
+  // Top-level better-auth option (NOT a plugin). `sendOnSignIn` makes the
   // sign-in 403 path also re-send the mail; `autoSignInAfterVerification`
   // signs the user in when they hit the verify page. Token lifetime stays
   // better-auth's default 1h (`expiresIn` deliberately unset).
@@ -227,13 +231,13 @@ export const auth = betterAuth({
       async ({ user, token }) => {
         await sendEmailVerificationMail({
           to: user.email,
-          url: `${env.BETTER_AUTH_URL}/verify-email?token=${token}`,
+          url: authUrl(VERIFY_EMAIL_PATH, token),
         });
       },
       { gate: getSendVerificationRateLimitGate() },
     ),
   },
-  // M12 — full account deletion via better-auth's built-in, session-guarded
+  // Full account deletion via better-auth's built-in, session-guarded
   // `POST /api/auth/delete-user` (password-confirmed body; sensitiveSession-
   // Middleware requires a session, the password OR a fresh session gates the
   // destructive step). No custom endpoint. Without
@@ -249,22 +253,21 @@ export const auth = betterAuth({
         purgeLedgerOwner: async (owner) => {
           // Lazy dynamic import: a static `import { ledger } from
           // "./ledger.routes.ts"` would open LEDGER_DB_PATH and start the
-          // retention sweep for EVERY importer of auth.ts (request_auth.ts,
+          // retention sweep for EVERY importer of auth/index.ts (request_auth.ts,
           // tests) and form the cycle auth -> ledger.routes -> request_auth ->
           // auth. index.ts loads ledger.routes at boot in production; tests
           // inject their own purge through createAccountDeletionHooks.
-          const { ledger } = await import("./ledger.routes.ts");
+          const { ledger } = await import("../ledger.routes.ts");
           return ledger.purgeOwnerData(owner);
         },
         getNotifyStore: () => accountDeletionNotifyStore,
       }),
     },
   },
-  // H2 server half: sliding 30-day session. better-auth session time values
-  // are in SECONDS — 30d = 30*24*60*60. The sliding refresh (once per day,
-  // better-auth's default cadence) extends `expiresAt` in the DB WITHOUT
-  // rotating the token, so a persisted session token stays valid while the
-  // user is active.
+  // Sliding 30-day session: better-auth session time values are in SECONDS —
+  // 30d = 30*24*60*60. The sliding refresh (once per day, better-auth's
+  // default cadence) extends `expiresAt` in the DB WITHOUT rotating the token,
+  // so a persisted session token stays valid while the user is active.
   session: {
     expiresIn: 30 * 24 * 60 * 60,
     updateAge: 24 * 60 * 60,
@@ -282,7 +285,7 @@ export const auth = betterAuth({
     onError: handleAccountDeletionAPIError,
   },
   plugins: [
-    // M12: 90-day default expiry (SECONDS — see
+    // 90-day default expiry (SECONDS — see
     // API_KEY_DEFAULT_EXPIRES_IN_SECONDS); shared options object exported for
     // tests so key-minting assertions run through the production config.
     apiKey(API_KEY_PLUGIN_OPTIONS),

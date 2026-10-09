@@ -6,9 +6,9 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
-import { accountDeletedResponse, requireApiKey, requireOwner } from "./request_auth.ts";
-import type { OwnerVariables, VerifyApiKeyFn } from "./request_auth.ts";
-import { AccountDeletedError, isDeleting } from "./account_deletion.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "./auth/request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "./auth/request_auth.ts";
+import { AccountDeletedError, isDeleting } from "./auth/account_deletion.ts";
 import {
   Ledger,
   LedgerError,

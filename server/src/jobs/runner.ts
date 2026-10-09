@@ -21,7 +21,7 @@ import {
 } from "../sentinel/shadow.ts";
 import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 import { redactForOutbound, redactMessages } from "../redact.ts";
-import { AccountDeletedError, isDeleting } from "../account_deletion.ts";
+import { AccountDeletedError, isDeleting } from "../auth/account_deletion.ts";
 import { env } from "../env.ts";
 import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";

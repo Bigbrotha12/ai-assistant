@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { Hono } from "hono";
 import { describe, test } from "node:test";
-import { clearDeleting, markDeleting } from "../../src/account_deletion.ts";
+import { clearDeleting, markDeleting } from "../../src/auth/account_deletion.ts";
 import { Ledger, migrateLedger } from "../../src/ledger.ts";
 import { createSentinelRoutes } from "../../src/sentinel/routes.ts";
 import type { SentinelVerifyKey } from "../../src/sentinel/routes.ts";

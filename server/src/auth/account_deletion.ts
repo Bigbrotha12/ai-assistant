@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { AsyncMutex } from "./jobs/mutex.ts";
+import { AsyncMutex } from "../jobs/mutex.ts";
 
 /**
  * Process-local deletion coordination. Tombstones, owner barriers, and pending
@@ -22,10 +22,8 @@ type AccountDeletionRequestState = {
 
 const accountDeletionRequests = new AsyncLocalStorage<AccountDeletionRequestState>();
 
-export const ACCOUNT_DELETED_ERROR = "account_deleted" as const;
-
 export class AccountDeletedError extends Error {
-  readonly code = ACCOUNT_DELETED_ERROR;
+  readonly code = "account_deleted" as const;
 
   constructor(owner: string) {
     super(`account deleted: ${owner}`);

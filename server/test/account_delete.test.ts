@@ -16,14 +16,14 @@ import {
   API_KEY_PLUGIN_OPTIONS,
   createAccountDeletionHooks,
   type AccountDeletionRuntime,
-} from "../src/auth.ts";
+} from "../src/auth/index.ts";
 import {
   clearDeleting,
   handleAccountDeletionAPIError,
   isDeleting,
   markDeleting,
   runWithAccountDeletionRequest,
-} from "../src/account_deletion.ts";
+} from "../src/auth/account_deletion.ts";
 import { CredentialPinStore } from "../src/credentials/pins.ts";
 import { createToolResultCache } from "../src/middleware/cache.ts";
 import { createSessionStore } from "../src/sessions/store.ts";
@@ -112,7 +112,7 @@ function seedOwnerTasks(
 }
 
 /**
- * Throwaway better-auth instance mirroring src/auth.ts over a temp SQLite DB,
+ * Throwaway better-auth instance mirroring src/auth/index.ts over a temp SQLite DB,
  * with the production apiKey options and `createAccountDeletionHooks` wired to
  * an in-memory Ledger + a temp-path NotifyStore — so a real
  * `POST /api/auth/delete-user` exercises the actual cascade.

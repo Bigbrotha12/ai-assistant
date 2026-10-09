@@ -12,13 +12,13 @@ export type HealthChecks = {
   ledgerDb: HealthCheck;
 };
 
-// Default probes lazily import the live handles (same pattern as auth.ts's
+// Default probes lazily import the live handles (same pattern as auth/index.ts's
 // deletion hook): a static import would open BOTH databases for every importer
 // of health.ts — including tests that only inject fake checks, and the
 // production integration test's module-mock surface (its mocks apply only to
 // index.ts's direct imports).
 async function probeAuthDb(): Promise<void> {
-  const { authDb } = await import("./auth.ts");
+  const { authDb } = await import("./auth/index.ts");
   authDb.prepare("SELECT 1").get();
 }
 

@@ -7,14 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { assertNoUrlLeak } from "../helpers/leak.ts";
-import { createAuthCheckRoutes } from "../../src/request_auth.ts";
+import { createAuthCheckRoutes } from "../../src/auth/request_auth.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import {
   createAgentsRoutes,
 } from "../../src/transport/agents.ts";
 import type { AgentsListResponse } from "../../src/transport/agents.ts";
-import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
+import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 import type {
   AgentPluginDefinition,
   ToolPluginDefinition,

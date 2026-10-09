@@ -9,7 +9,7 @@ import ts from "typescript";
  * Regression guard for raw server-side egress (plan §5, task 2.7).
  *
  * The egress seam's exit criterion is "exactly one module performs server-side
- * egress" (SCOPED to HTTP(S) — SMTP via `email.ts` is a recorded carve-out, see
+ * egress" (SCOPED to HTTP(S) — SMTP via `auth/email.ts` is a recorded carve-out, see
  * the plan). This test enforces the direction of that criterion for the ambient
  * global `fetch`: no module under `server/src` may reach it outside the facade.
  *
@@ -31,14 +31,10 @@ import ts from "typescript";
  *  - member calls (`client.fetch(...)`, `stream.fetch(...)`);
  *  - property names/type members (`{ fetch: mcpFetch }`, `fetch(url): ...`)
  *    and type-only references (`typeof fetch`);
- *  - a raw `fetch(` that appears inside a `<script>` template region. With an
- *    AST this needs no allowlist at all: template-literal TEXT is not parsed as
- *    code, so the browser-side `fetch(` in the two server-rendered HTML pages
- *    is invisible to the detector. A genuine server-side `fetch(` added to those
- *    files — including inside a `${...}` substitution, which really does run at
- *    render time — IS parsed and caught. (The old regex guard scanned template
- *    text and therefore needed a whole-file allowlist; the AST removes both the
- *    false positive and the evasion hole a file-wide exemption would leave.)
+ *  - browser-side `fetch(` calls. The two server-rendered pages live as
+ *    `.html` assets (`src/auth/pages/`), which this guard does not scan (it
+ *    only walks `.ts` files), and an AST never parses template-literal text
+ *    anyway. A genuine server-side `fetch(` in a `.ts` module IS caught.
  */
 
 const SRC_DIR = fileURLToPath(new URL("../../src", import.meta.url));

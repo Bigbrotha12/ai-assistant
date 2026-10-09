@@ -14,8 +14,8 @@ import type { StreamEvent } from "./openai.ts";
 
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
-import { accountDeletedResponse, requireApiKey, requireOwner } from "../request_auth.ts";
-import { AccountDeletedError, assertNotDeleting, isDeleting } from "../account_deletion.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
+import { AccountDeletedError, assertNotDeleting, isDeleting } from "../auth/account_deletion.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
@@ -49,7 +49,7 @@ import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { Catalogs, ResolvedAgentDef } from "../catalog/index.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { RateLimiterFn } from "../plugins/routes.ts";
-import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 import type { WarmupManager } from "../middleware/warmup.ts";
@@ -313,7 +313,7 @@ export type ChatRoutesOptions = {
    * model + tool credentials here; the runner reads them by (owner, pluginId).
    */
   pins?: CredentialPinStore;
-  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from auth/request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
   /**
    * Per-owner rate limiter (Phase 4, Wave A). Returns a structured

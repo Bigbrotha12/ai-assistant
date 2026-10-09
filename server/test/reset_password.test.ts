@@ -8,11 +8,11 @@ import { betterAuth } from "better-auth";
 import { apiKey } from "@better-auth/api-key";
 import { bearer } from "better-auth/plugins";
 import Database from "better-sqlite3";
-import { createResetPasswordRoutes } from "../src/reset_password.ts";
+import { createResetPasswordRoutes } from "../src/auth/reset_password.ts";
 import { getMigrations } from "better-auth/db/migration";
 import { testPasswordHasher } from "./better_auth_test_password.ts";
 
-// Mirrors src/auth.ts wiring (same config surface) but with a throwaway
+// Mirrors src/auth/index.ts wiring (same config surface) but with a throwaway
 // SQLite DB and a captured reset URL, so the forgot-password loop can be
 // exercised without touching the gateway's real DB or SMTP.
 async function buildTestAuth(captured: { url: string; token: string; to: string }) {
@@ -29,7 +29,7 @@ async function buildTestAuth(captured: { url: string; token: string; to: string 
       minPasswordLength: 8,
       autoSignIn: true,
       sendResetPassword: async ({ user, token }: { user: { email: string }; token: string }) => {
-        // Mirrors src/auth.ts: route the email to our reset page
+        // Mirrors src/auth/index.ts: route the email to our reset page
         // (GET /reset-password?token=…), not better-auth's default callback.
         captured.to = user.email;
         captured.url = `http://localhost:17600/reset-password?token=${token}`;

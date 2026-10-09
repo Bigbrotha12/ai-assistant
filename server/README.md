@@ -31,7 +31,7 @@ To run the server standalone:
 cd server
 cp .env.example .env            # then edit the values (see env table below)
 npm install
-npm run migrate                 # creates the SQLite schema (better-auth CLI discovers src/auth.ts)
+npm run migrate                 # creates the SQLite schema (better-auth CLI discovers src/auth/index.ts)
 npm run dev                     # starts on PORT (default 17600)
 ```
 
@@ -392,7 +392,7 @@ and rollout strategy.
   Clients recover from a missing managed session with `409 session_missing` and a
   same-`session_id` re-establish, but that is recovery, not shared-session
   coordination.
-- **Postgres**: swap the SQLite adapter in `src/auth.ts` for a `pg` Pool
+- **Postgres**: swap the SQLite adapter in `src/auth/index.ts` for a `pg` Pool
   (`import { Pool } from "pg"; database: new Pool({ connectionString: … })`).
   Run `npx auth generate` against a Postgres config, or
   `npx auth migrate` with `DATABASE_URL`/`PG*` env set —
@@ -405,7 +405,7 @@ and rollout strategy.
   It is enabled even in development (`enabled: true`) and uses in-memory storage by
   default. Behind a proxy, better-auth falls back to a single shared per-path bucket
   unless it can resolve a client IP — set `advanced.ipAddress.ipAddressHeaders` /
-  `advanced.ipAddress.trustedProxies` in `src/auth.ts`. For multi-instance
+  `advanced.ipAddress.trustedProxies` in `src/auth/index.ts`. For multi-instance
   deployments use `storage: "database"` or `"secondary-storage"` (Redis) instead of
   the default `"memory"`.
 - **Inference rate limiting**: `/v1/chat/completions` uses an in-memory

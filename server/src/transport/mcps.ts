@@ -1,6 +1,6 @@
 import { Hono } from "hono";
-import { requireApiKey, requireOwner } from "../request_auth.ts";
-import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
+import { requireApiKey, requireOwner } from "../auth/request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import type { Catalogs } from "../catalog/index.ts";
 
 export type McpRoutesOptions = {

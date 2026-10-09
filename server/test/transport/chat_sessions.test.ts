@@ -28,7 +28,7 @@ import type {
 } from "../../src/plugins/types.ts";
 import { createChatRoutes } from "../../src/transport/chat.ts";
 import type { Catalogs, ResolvedAgentDef } from "../../src/catalog/index.ts";
-import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
+import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 import type { BuildModelInput } from "../../src/transport/model.ts";
 import { ModelBuildError } from "../../src/transport/model.ts";
 import { createBudgetManager } from "../../src/middleware/budget.ts";

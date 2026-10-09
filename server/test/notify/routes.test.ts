@@ -9,10 +9,10 @@ import {
   clearDeleting,
   markDeleting,
   withOwnerBarrier,
-} from "../../src/account_deletion.ts";
+} from "../../src/auth/account_deletion.ts";
 import { NotifyStore } from "../../src/notify/store.ts";
 import { createNotifyRoutes } from "../../src/notify/routes.ts";
-import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
+import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 
 const TEST_KEY = "test-key-0123456789abcdef";
 

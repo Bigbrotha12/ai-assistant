@@ -13,7 +13,7 @@ import {
   createAuthCheckRoutes,
   type OwnerVariables,
   type VerifyApiKeyFn,
-} from "../src/request_auth.ts";
+} from "../src/auth/request_auth.ts";
 import { createSentinelRoutes } from "../src/sentinel/routes.ts";
 import { createSessionRoutes } from "../src/sessions/routes.ts";
 import { createSessionStore } from "../src/sessions/store.ts";

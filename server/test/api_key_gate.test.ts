@@ -14,12 +14,12 @@ import {
   clearDeleting,
   isDeleting,
   markDeleting,
-} from "../src/account_deletion.ts";
+} from "../src/auth/account_deletion.ts";
 import {
   API_KEY_PLUGIN_OPTIONS,
   createAccountDeletionHooks,
-} from "../src/auth.ts";
-import { createApiKeyEmailVerificationGate } from "../src/verify_email.ts";
+} from "../src/auth/index.ts";
+import { createApiKeyEmailVerificationGate } from "../src/auth/verify_email.ts";
 import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 const BASE = "http://localhost:17600";

@@ -1,13 +1,8 @@
 import nodemailer from "nodemailer";
-import { env } from "./env.ts";
-import { logger } from "./logger.ts";
+import { env } from "../env.ts";
+import { logger } from "../logger.ts";
 
-export interface PasswordResetMail {
-  to: string;
-  url: string;
-}
-
-export interface EmailVerificationMail {
+export interface MailLink {
   to: string;
   url: string;
 }
@@ -61,7 +56,7 @@ export function smtpUnconfigured(
  * usable without a mail server. Outside development, the same condition logs
  * only a redacted host/path so reset tokens never reach production logs.
  */
-export async function sendPasswordResetMail({ to, url }: PasswordResetMail): Promise<void> {
+export async function sendPasswordResetMail({ to, url }: MailLink): Promise<void> {
   if (smtpUnconfigured("password reset", to, url)) return;
   await sendMail({
     to,
@@ -74,13 +69,13 @@ export async function sendPasswordResetMail({ to, url }: PasswordResetMail): Pro
 }
 
 /**
- * Sends the better-auth email-verification mail (C2) via the same SMTP
+ * Sends the better-auth email-verification mail via the same SMTP
  * transport as the reset mail — used by the `sendVerificationEmail` callback
- * in auth.ts. In development, with SMTP unset the verification link is logged
+ * in auth/index.ts. In development, with SMTP unset the verification link is logged
  * instead of sent (valid for one hour, better-auth's default token lifetime).
  * Other environments log only a redacted host/path.
  */
-export async function sendEmailVerificationMail({ to, url }: EmailVerificationMail): Promise<void> {
+export async function sendEmailVerificationMail({ to, url }: MailLink): Promise<void> {
   if (smtpUnconfigured("email verification", to, url)) return;
   await sendMail({
     to,

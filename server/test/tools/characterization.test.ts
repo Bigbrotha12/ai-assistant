@@ -50,7 +50,7 @@ import {
   assertNotDeleting,
   clearDeleting,
   markDeleting,
-} from "../../src/account_deletion.ts";
+} from "../../src/auth/account_deletion.ts";
 import {
   recordToolResult,
 } from "../../src/credentials/idempotency.ts";

@@ -8,7 +8,7 @@ import { join } from "node:path";
  * Several modules open and migrate a SQLite file at import time:
  *  - `ledger.routes.ts` opens + migrates `LEDGER_DB_PATH` (`PRAGMA
  *    user_version`-gated schema migrations).
- *  - `auth.ts` opens `DB_PATH` (better-auth's schema).
+ *  - `auth/index.ts` opens `DB_PATH` (better-auth's schema).
  *
  * `node --test` runs every test file in its own parallel child process, so a
  * shared path makes those processes race the same migration — e.g. one throws

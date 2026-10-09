@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
-import { auth, getUserById } from "./auth.ts";
+import { auth, getUserById } from "./index.ts";
 import { isDeleting } from "./account_deletion.ts";
 
 export function accountDeletedResponse(c: Context): Response {

@@ -15,11 +15,11 @@ import {
   createSendVerificationRateLimitGate,
   createVerifyEmailRoutes,
   type SendVerificationRateLimitGate,
-} from "../src/verify_email.ts";
-import { smtpUnconfigured } from "../src/email.ts";
+} from "../src/auth/verify_email.ts";
+import { smtpUnconfigured } from "../src/auth/email.ts";
 import { testPasswordHasher } from "./better_auth_test_password.ts";
 
-// Mirrors src/auth.ts C2 wiring (emailVerification + autoSignIn:false +
+// Mirrors src/auth/index.ts C2 wiring (emailVerification + autoSignIn:false +
 // requireEmailVerification + sliding session) but with a throwaway SQLite DB
 // and a captured verification URL, so signup/sign-in/resend can be exercised
 // without touching the gateway's real DB or SMTP.
@@ -56,7 +56,7 @@ async function buildTestAuth(
       sendOnSignUp: true,
       sendOnSignIn: true,
       autoSignInAfterVerification: true,
-      // Mirrors src/auth.ts: route the link to OUR /verify-email page rather
+      // Mirrors src/auth/index.ts: route the link to OUR /verify-email page rather
       // than better-auth's /api/auth JSON response.
       sendVerificationEmail: createSendVerificationEmailCallback(
         async ({ user, token }) => {
@@ -159,7 +159,7 @@ test("signup with autoSignIn:false returns token:null, creates NO session row, a
   assert.equal(Boolean(user.emailVerified), false);
 
   // sendOnSignUp fired: one captured send, addressed to the user and pointing
-  // at OUR /verify-email page (mirroring the auth.ts callback).
+  // at OUR /verify-email page (mirroring the auth/index.ts callback).
   assert.equal(captures.length, 1);
   assert.equal(captures[0]!.to, "fresh@example.com");
   assert.match(captures[0]!.url, /^http:\/\/localhost:17600\/verify-email\?token=./);

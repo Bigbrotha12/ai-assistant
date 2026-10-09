@@ -1,13 +1,13 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { randomBytes } from "node:crypto";
-import { requireApiKey, requireOwner } from "../request_auth.ts";
-import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
+import { requireApiKey, requireOwner } from "../auth/request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import {
   AccountDeletedError,
   assertNotDeleting,
   withOwnerBarrier,
-} from "../account_deletion.ts";
+} from "../auth/account_deletion.ts";
 import type { NotifyStore } from "./store.ts";
 
 /**
@@ -38,7 +38,7 @@ import type { NotifyStore } from "./store.ts";
 
 export type NotifyRoutesOptions = {
   store: NotifyStore;
-  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from auth/request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 

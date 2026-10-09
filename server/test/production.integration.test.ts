@@ -125,9 +125,9 @@ test("production boot shares phase 4 services and uses scoped model credentials"
         return { close: () => { cleanup.push("server"); } };
       },
     },
-    "./auth.ts": { auth: { handler: () => new Response() } },
+    "./auth/index.ts": { auth: { handler: () => new Response() } },
     "./env.ts": { env: environment },
-    "./request_auth.ts": {
+    "./auth/request_auth.ts": {
       createAuthCheckRoutes: () => new Hono(),
       requireApiKey: async () => ({ ok: true as const, owner: "test-user" }),
     },

@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { accountDeletedResponse, requireApiKey, requireOwner } from "../request_auth.ts";
-import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
-import { isDeleting } from "../account_deletion.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
+import { isDeleting } from "../auth/account_deletion.ts";
 import { createTokenBucketLimiter } from "../rate_limit.ts";
 import { PluginRegistryError } from "./registry.ts";
 import type { PluginRegistry } from "./registry.ts";
@@ -83,7 +83,7 @@ export type PluginRoutesOptions = {
   registry: PluginRegistry;
   /** Backing store; install/uninstall operate on it. Must be loaded first. */
   store: PluginStore;
-  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from auth/request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
   /** Test seam; defaults to a real token bucket (30 req/min, burst 10). */
   limiter?: RateLimiterFn;

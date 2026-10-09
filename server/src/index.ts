@@ -1,12 +1,12 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { existsSync, unlinkSync } from "node:fs";
-import * as authModule from "./auth.ts";
-import { runWithAccountDeletionRequest } from "./account_deletion.ts";
+import * as authModule from "./auth/index.ts";
+import { runWithAccountDeletionRequest } from "./auth/account_deletion.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
 import { createHealthRoutes } from "./health.ts";
-import { createAuthCheckRoutes, requireApiKey } from "./request_auth.ts";
+import { createAuthCheckRoutes, requireApiKey } from "./auth/request_auth.ts";
 import { createSentinelRoutes } from "./sentinel/routes.ts";
 import { createSentinelService } from "./sentinel/service.ts";
 import { policyForMode } from "./sentinel/policy.ts";
@@ -18,13 +18,13 @@ import { createNotifyRoutes } from "./notify/routes.ts";
 import { NotifyStore } from "./notify/store.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
-import { createResetPasswordRoutes } from "./reset_password.ts";
+import { createResetPasswordRoutes } from "./auth/reset_password.ts";
 import {
   createApiKeyEmailVerificationGate,
   createVerifyEmailRoutes,
   createSendVerificationRateLimit,
   getSendVerificationRateLimitGate,
-} from "./verify_email.ts";
+} from "./auth/verify_email.ts";
 import { createModelsRoutes } from "./transport/models.ts";
 import { createAgentsRoutes } from "./transport/agents.ts";
 import { createSkillsRoutes } from "./transport/skills.ts";

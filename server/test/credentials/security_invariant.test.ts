@@ -12,7 +12,7 @@ import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { createPluginRoutes } from "../../src/plugins/routes.ts";
-import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
+import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 import { createModelsRoutes } from "../../src/transport/models.ts";
 import { createAgentsRoutes } from "../../src/transport/agents.ts";
 import { createSkillsRoutes } from "../../src/transport/skills.ts";

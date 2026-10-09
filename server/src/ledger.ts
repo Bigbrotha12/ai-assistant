@@ -1649,7 +1649,7 @@ export class Ledger {
   /**
    * M12 account-deletion purge: removes EVERY row owned by [owner] — tasks,
    * steps and chain — and returns what happened so the caller (the better-auth
-   * `deleteUser` cascade in auth.ts) can observe the cleanup.
+   * `deleteUser` cascade in auth/index.ts) can observe the cleanup.
    *
    * Before any delete, every NON-terminal task of the owner is transitioned to
    * `cancelled` through the legal state machine (`queued`/`running` go
