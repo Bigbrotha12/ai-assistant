@@ -1,6 +1,6 @@
 import { Hono } from "hono";
-import { keyGateResponse, requireApiKey } from "../request_auth.ts";
-import type { VerifyApiKeyFn } from "../plugins/routes.ts";
+import { requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import type { Catalogs } from "../catalog/index.ts";
 
@@ -62,16 +62,14 @@ export type AgentsRoutesOptions = {
   verifyKey?: VerifyApiKeyFn;
 };
 
-export function createAgentsRoutes(opts: AgentsRoutesOptions): Hono {
+export function createAgentsRoutes(opts: AgentsRoutesOptions): Hono<OwnerVariables> {
   const { catalogs } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
 
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
+  routes.use("/agents/*", requireOwner(verifyKey));
 
-  routes.get("/agents", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-
+  routes.get("/agents", (c) => {
     try {
       return c.json(agentListFromCatalogs(catalogs));
     } catch (err) {

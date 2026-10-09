@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Context } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { auth, getUserById } from "./auth.ts";
 import { isDeleting } from "./account_deletion.ts";
 
@@ -23,7 +23,20 @@ export type KeyAuth =
   | { ok: false; reason: "bad_key" | "email_not_verified" | "account_deleted" };
 
 /** The failure arm of `KeyAuth`, already narrowed by an `if (!result.ok)` guard. */
-type KeyAuthFailure = Extract<KeyAuth, { ok: false }>;
+export type KeyAuthFailure = Extract<KeyAuth, { ok: false }>;
+
+/** Verifier seam: routes accept one so tests can inject a deterministic stub. */
+export type VerifyApiKeyFn = (c: Context) => Promise<KeyAuth>;
+
+/** Hono environment for routers that read the authenticated owner from context. */
+export type OwnerVariables = { Variables: { owner: string } };
+
+/** Hook run after the gate builds its denial response, e.g. to emit an audit event. */
+export type OnDenied = (
+  c: Context,
+  auth: KeyAuthFailure,
+  response: Response,
+) => void | Promise<void>;
 
 /** Single gate every `verifyKey` call site maps a failed verification through. */
 export function keyGateResponse(c: Context, result: KeyAuthFailure): Response {
@@ -66,17 +79,36 @@ export async function requireApiKey(c: Context): Promise<KeyAuth> {
   return { ok: false, reason: "bad_key" };
 }
 
-export function createAuthCheckRoutes(): Hono {
-  const routes = new Hono();
+/**
+ * Hono middleware that gates an entire router. It verifies the request, stores
+ * the authenticated owner on the context, and calls `next()`; on failure it
+ * returns the mapped 401/403 (running `onDenied` first). Register it with
+ * `routes.use(...)` before any route so every route is protected by
+ * construction rather than by remembering an inline check in each handler.
+ */
+export function requireOwner(
+  verifyKey: VerifyApiKeyFn = requireApiKey,
+  onDenied?: OnDenied,
+): MiddlewareHandler<OwnerVariables> {
+  return async (c, next) => {
+    const auth = await verifyKey(c);
+    if (!auth.ok) {
+      const response = keyGateResponse(c, auth);
+      await onDenied?.(c, auth, response);
+      return response;
+    }
+    c.set("owner", auth.owner);
+    await next();
+  };
+}
 
-  // The probe uses this route to tell "verify your email" (403
-  // email_not_verified) from "re-auth" (401), so it must return the same
-  // distinct 403 as every other gated route.
-  routes.get("/auth/check", async (c) => {
-    const keyAuth = await requireApiKey(c);
-    if (!keyAuth.ok) return keyGateResponse(c, keyAuth);
-    return c.json({ status: "ok" });
-  });
+export function createAuthCheckRoutes(): Hono<OwnerVariables> {
+  const routes = new Hono<OwnerVariables>();
+  routes.use("/auth/*", requireOwner());
+
+  // The probe relies on this route returning the same distinct 403/401 as every
+  // other gated route, so it can tell "verify your email" from "re-auth".
+  routes.get("/auth/check", (c) => c.json({ status: "ok" }));
 
   return routes;
 }

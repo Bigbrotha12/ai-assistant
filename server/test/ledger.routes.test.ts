@@ -20,7 +20,7 @@ import { createLedgerRoutes } from "../src/ledger.routes.ts";
 import { SentinelReportStore } from "../src/sentinel/reports.ts";
 import { SentinelShadowReporter } from "../src/sentinel/shadow.ts";
 import type { JobRunner, TaskCancelReport } from "../src/jobs/runner.ts";
-import type { VerifyApiKeyFn } from "../src/plugins/routes.ts";
+import type { VerifyApiKeyFn } from "../src/request_auth.ts";
 import { clearDeleting, markDeleting } from "../src/account_deletion.ts";
 
 /**

@@ -1,8 +1,8 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../request_auth.ts";
-import type { KeyAuth } from "../request_auth.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import { isDeleting } from "../account_deletion.ts";
 import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
 import type { PerOwnerRateLimiter, RateLimitResult } from "../middleware/rate_limit.ts";
@@ -24,7 +24,7 @@ import type { Ledger } from "../ledger.ts";
 
 export const DEFAULT_SENTINEL_MAX_BODY_BYTES = 65_536;
 
-export type SentinelVerifyKey = (c: Context) => Promise<KeyAuth>;
+export type SentinelVerifyKey = VerifyApiKeyFn;
 export type SentinelRateLimiter =
   | PerOwnerRateLimiter
   | ((owner: string) => boolean);
@@ -135,7 +135,7 @@ function bodyByteLength(c: Context, value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
 }
 
-export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono {
+export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono<OwnerVariables> {
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_SENTINEL_MAX_BODY_BYTES;
   const verifyKey = opts.verifyKey ?? requireApiKey;
   const service =
@@ -148,19 +148,19 @@ export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono {
   const limiter =
     opts.rateLimiter ??
     createPerOwnerRateLimiter({ ratePerMinute: 60, burst: 20 });
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
 
   routes.use(
+    "/sentinel/*",
     bodyLimit({
       maxSize: maxBodyBytes,
       onError: (c) => c.json({ error: "request_too_large" }, 413),
     }),
   );
+  routes.use("/sentinel/*", requireOwner(verifyKey));
 
-  routes.get("/sentinel/reports", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+  routes.get("/sentinel/reports", (c) => {
+    const owner = c.get("owner");
     if (isDeleting(owner)) return accountDeletedResponse(c);
     c.header("cache-control", "no-store");
     const parsed = parseSentinelReportQuery(c.req.query());
@@ -168,10 +168,8 @@ export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono {
     return c.json(reportStore.list(owner, parsed.value));
   });
 
-  routes.get("/sentinel/reports/:reportId", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+  routes.get("/sentinel/reports/:reportId", (c) => {
+    const owner = c.get("owner");
     if (isDeleting(owner)) return accountDeletedResponse(c);
     c.header("cache-control", "no-store");
     const report = reportStore.get(owner, c.req.param("reportId"));
@@ -180,9 +178,7 @@ export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono {
   });
 
   routes.post("/sentinel/check", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     if (isDeleting(owner)) return accountDeletedResponse(c);
     const rate = checkRateLimiter(limiter, owner);
     if (!rate.allowed) {

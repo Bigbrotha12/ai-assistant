@@ -1,20 +1,15 @@
 import { Hono } from "hono";
-import { keyGateResponse, requireApiKey } from "../request_auth.ts";
-import type { VerifyApiKeyFn } from "../plugins/routes.ts";
+import { requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isModelPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import { isRecord } from "../util.ts";
 
 /**
- * OpenAI-compatible `GET /v1/models` transport (Phase 3, Wave B).
- *
- * Replaces the Phase 1 proxy (formerly in `inference.ts`, now `request_auth.ts`)
- * that forwarded `/v1/models` to
- * `INFERENCE_URL`. The models list is now compiled from the installed MODEL
- * plugins in the registry, so the client sees exactly what this gateway can
- * actually route to (incl. `visionCapable`) instead of whatever upstream
- * advertises.
+ * OpenAI-compatible `GET /v1/models` transport: compiles the model list from
+ * the installed MODEL plugins in the registry, so the client sees exactly what
+ * this gateway can route to (incl. `visionCapable`).
  *
  * SECURITY CONTRACT (plan §3.3, guardrail): a plugin's `inference.endpoint`
  * and `baseUrls` may point at admin-trusted internal hosts (`vikunja.local`,
@@ -23,13 +18,9 @@ import { isRecord } from "../util.ts";
  * `url` and any credential material are dropped by construction (the test
  * suite scans the serialized body recursively for `https://` and those keys).
  *
- * ROUTING / MOUNT ORDER: the old `GET /models` proxy was REMOVED from
- * the auth-check routes (this transport is the single `/v1/models` owner), so the
- * mount order in `index.ts` introduces no duplicate-path shadowing.
- *
- * ERROR SHAPES (kept consistent with the proxy it replaces):
+ * ERROR SHAPES:
  *   - no/invalid key        -> 401 {"error":"unauthorized"}
- *   - unverified owner      -> 403 {"error":"email_not_verified"} (C2 backstop)
+ *   - unverified owner      -> 403 {"error":"email_not_verified"}
  *   - registry unavailable  -> 502 {"error":"inference_unavailable"}
  *   - empty registry        -> 200 {"object":"list","data":[]}  (not an error)
  */
@@ -111,16 +102,14 @@ export type ModelsRoutesOptions = {
   verifyKey?: VerifyApiKeyFn;
 };
 
-export function createModelsRoutes(opts: ModelsRoutesOptions): Hono {
+export function createModelsRoutes(opts: ModelsRoutesOptions): Hono<OwnerVariables> {
   const { registry } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
 
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
+  routes.use("/models/*", requireOwner(verifyKey));
 
   routes.get("/models", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-
     let modelPlugins: ModelPluginDefinition[];
     try {
       modelPlugins = registry.listInstalledPlugins().filter(isModelPlugin);

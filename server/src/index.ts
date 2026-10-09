@@ -163,25 +163,23 @@ pluginRegistry.watch({
 });
 app.route("/v1", createPluginRoutes({ registry: pluginRegistry, store: pluginStore }));
 
-// Phase 3, Wave B: `GET /v1/models` now serves the installed MODEL plugins
-// (incl. `visionCapable`) from the registry instead of proxying INFERENCE_URL.
-// The old proxy handler was removed from the auth-check routes (above), so this is
-// the single `/v1/models` owner — no duplicate-path shadowing regardless of
-// mount order. Never leaks plugin endpoints/baseUrls (see transport/models.ts).
+// `GET /v1/models` serves the installed MODEL plugins (incl. `visionCapable`)
+// from the registry; the single `/v1/models` owner. Never leaks plugin
+// endpoints/baseUrls (see transport/models.ts).
 app.route("/v1", createModelsRoutes({ registry: pluginRegistry }));
 
-// Wave 1: `GET /v1/agents` lists installed agent plugins. Same security
-// contract as /v1/models — never leaks systemPrompt/skills content/endpoints.
+// `GET /v1/agents` lists installed agent plugins. Same security contract as
+// /v1/models — never leaks systemPrompt/skills content/endpoints.
 app.route("/v1", createAgentsRoutes({ registry: pluginRegistry, catalogs }));
 
-// Wave 2: `GET /v1/skills` and `GET /v1/mcps` list catalog entries with
-// content redacted — never leaks skill content or MCP urls/headers.
+// `GET /v1/skills` and `GET /v1/mcps` list catalog entries with content
+// redacted — never leaks skill content or MCP urls/headers.
 app.route("/v1", createSkillsRoutes({ catalogs, verifyKey: requireApiKey }));
 app.route("/v1", createMcpRoutes({ catalogs, verifyKey: requireApiKey }));
 
-// Phase 4, Wave B: ONE in-memory tool-result cache shared by the sync
-// transport and every background job so the same read-only tool call is never
-// executed twice across either path.
+// ONE in-memory tool-result cache shared by the sync transport and every
+// background job so the same read-only tool call is never executed twice
+// across either path.
 const toolCache = createToolResultCache();
 const chatBudget = createBudgetManager({
   maxConcurrentPerUser: env.BUDGET_MAX_CONCURRENT,
@@ -221,7 +219,7 @@ const warmups = createWarmupManager({
 });
 let jobRunner: JobRunner | undefined;
 let jobPins: CredentialPinStore | undefined;
-// Phase 3.5 (credential seam): the composition root owns the SHARED credential
+// The composition root owns the SHARED credential
 // dependency — the in-memory pin store — but NOT the two providers. Both are
 // inherently per-invocation and are constructed by their consumers:
 //   - `RequestBodyCredentialResolver` per REQUEST in `transport/chat.ts`
@@ -261,7 +259,7 @@ try {
       // carve-out), scoped to notify egress only.
       trustedHosts: env.NOTIFY_TRUSTED_HOSTS,
     }),
-    // Phase 4, Wave B: the shared in-memory tool-result cache so a repeated
+    // The shared in-memory tool-result cache so a repeated
     // read-only tool call is never executed twice across sync and async.
     toolCache,
     budget: chatBudget,
@@ -316,7 +314,7 @@ try {
 
 app.route("/ledger", createLedgerRoutes(ledger, { jobRunner }));
 
-// Phase 3, Wave C1/C2: `POST /v1/chat/completions` is the LangChain transport
+// `POST /v1/chat/completions` is the LangChain transport
 // (`src/transport/chat.ts`) — model built from the MODEL plugin + per-request
 // credentials, agent graph streamed via the SSE adapter (sync), or admitted as
 // an idempotent background job (async, `background: true`). The sync path is
@@ -324,7 +322,7 @@ app.route("/ledger", createLedgerRoutes(ledger, { jobRunner }));
 // runner persists as the ledger payload (no checkpoint store involved). If
 // runner wiring failed, async delegation returns 503 background_unavailable.
 //
-// Phase 4, Wave A middleware (per-owner gates): the rate limiter reuses the
+// Per-owner gates: the rate limiter reuses the
 // existing INFERENCE_RATE_LIMIT / INFERENCE_RATE_BURST knobs as PER-OWNER
 // values (the bucket key is the authenticated user id, not the API key), and
 // the budget caps concurrent in-flight chat operations per owner.

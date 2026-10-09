@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { keyGateResponse, requireApiKey } from "../request_auth.ts";
-import type { KeyAuth } from "../request_auth.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
+import { isDeleting } from "../account_deletion.ts";
 import { createTokenBucketLimiter } from "../rate_limit.ts";
 import { PluginRegistryError } from "./registry.ts";
 import type { PluginRegistry } from "./registry.ts";
@@ -15,18 +16,16 @@ import {
 } from "../audit/telemetry.ts";
 
 /**
- * Plugin HTTP surface (Phase 1, Step 6), mounted under `/v1` by the app.
+ * Plugin HTTP surface, mounted under `/v1` by the app.
  *
  * Route-factory DI mirrors `createLedgerRoutes(l)`: `createPluginRoutes(...)`
  * takes the dependencies explicitly so tests pass a real `PluginStore`/
  * `PluginRegistry` over temp fixtures (no network, no DB) instead of booting
- * the server. The `verifyKey` seam swaps the real `requireApiKey` (which
- * verifies against better-auth's DB and applies the C2 email-verification
- * backstop) for a deterministic stub in tests that returns a `KeyAuth` —
- * `{ ok: false, reason: "bad_key" }` exercises the 401 path and
- * `{ ok: false, reason: "email_not_verified" }` the 403 path without ever
- * touching auth. The `limiter` seam swaps the default token bucket for a
- * deterministic stub in tests.
+ * the server. The `verifyKey` seam swaps the real `requireApiKey` for a
+ * deterministic stub in tests that returns a `KeyAuth` — `{ ok: false, reason:
+ * "bad_key" }` exercises the 401 path and `{ ok: false, reason:
+ * "email_not_verified" }` the 403 path without ever touching auth. The
+ * `limiter` seam swaps the default token bucket for a deterministic stub.
  *
  * AUTHORIZATION MODEL (single-owner homelab): this gateway is a personal
  * homelab appliance. Every ApiKey issued by better-auth belongs to the owner;
@@ -77,11 +76,6 @@ import {
  *   installed ids and cannot signal "already there" on its own.
  */
 
-/** Shape of `requireApiKey`: tri-state key verification — owner (`ok:true`),
- *  `bad_key`, or `email_not_verified` (C2 backstop); gate via
- *  `keyGateResponse`. */
-export type VerifyApiKeyFn = (c: Context) => Promise<KeyAuth>;
-
 /** Per-owner token-bucket gate for the plugin-management endpoints. */
 export type RateLimiterFn = (key: string) => boolean;
 
@@ -101,6 +95,23 @@ function managementRequestId(c: Context): string {
   const header = c.req.header("x-request-id")?.trim();
   if (header && /^[A-Za-z0-9_.:-]{1,64}$/.test(header)) return header;
   return `plugin_${randomUUID()}`;
+}
+
+/** Names the audit target for a denied plugin-management request, else null. */
+function managementTarget(
+  c: Context,
+): { operation: string; pluginId?: string } | null {
+  if (c.req.method !== "POST") return null;
+  const segments = c.req.path.split("/").filter(Boolean);
+  const pluginsIndex = segments.indexOf("plugins");
+  if (pluginsIndex === -1) return null;
+  const rest = segments.slice(pluginsIndex + 1);
+  if (rest.length === 1 && rest[0] === "reload") return { operation: "reload" };
+  const operation = rest[1];
+  if (rest.length === 2 && (operation === "install" || operation === "uninstall")) {
+    return { operation, pluginId: rest[0] };
+  }
+  return null;
 }
 
 function managementErrorCode(error: unknown): string | undefined {
@@ -136,25 +147,37 @@ function emitManagementAudit(input: {
   }
 }
 
-export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
+export function createPluginRoutes(opts: PluginRoutesOptions): Hono<OwnerVariables> {
   const { registry, store } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
   const limiter = opts.limiter ?? managementLimiter;
 
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
+  routes.use(
+    "/plugins/*",
+    requireOwner(verifyKey, (c, auth, response) => {
+      const target = managementTarget(c);
+      if (target === null) return;
+      emitManagementAudit({
+        requestId: managementRequestId(c),
+        operation: target.operation,
+        ...(target.pluginId === undefined ? {} : { pluginId: target.pluginId }),
+        startedAt: Date.now(),
+        outcome: "error",
+        status: response.status,
+        errorCode: auth.reason.toUpperCase(),
+      });
+    }),
+  );
 
   // Public marketplace list. Auth-gated: the CLI/UI client needs a valid key
   // to see the catalog. Never leaks baseUrl url values (registry redacts).
-  routes.get("/plugins", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
+  routes.get("/plugins", (c) => {
     return c.json({ plugins: registry.listAvailablePlugins() });
   });
 
   // Full detail incl. baseUrl urls + inference.endpoint for the config form.
-  routes.get("/plugins/:id", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
+  routes.get("/plugins/:id", (c) => {
     const detail = registry.getPluginDetails(c.req.param("id"));
     if (!detail) return c.json({ error: "plugin_not_found" }, 404);
     return c.json(detail);
@@ -163,23 +186,12 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
   routes.post("/plugins/reload", async (c) => {
     const requestId = managementRequestId(c);
     const startedAt = Date.now();
-    const auth = await verifyKey(c);
-    if (!auth.ok) {
-      const response = keyGateResponse(c, auth);
-      emitManagementAudit({
-        requestId,
-        operation: "reload",
-        startedAt,
-        outcome: "error",
-        status: response.status,
-        errorCode: auth.reason.toUpperCase(),
-      });
-      return response;
-    }
-    if (!limiter(auth.owner)) {
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    if (!limiter(owner)) {
       const response = c.json({ error: "rate_limited" }, 429);
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "reload",
         startedAt,
@@ -193,7 +205,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
       await registry.hotReload();
       const response = c.json({ status: "ok" });
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "reload",
         startedAt,
@@ -204,7 +216,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
     } catch (e) {
       const response = pluginError(c, e);
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "reload",
         startedAt,
@@ -222,24 +234,12 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
     const id = c.req.param("id");
     const requestId = managementRequestId(c);
     const startedAt = Date.now();
-    const auth = await verifyKey(c);
-    if (!auth.ok) {
-      const response = keyGateResponse(c, auth);
-      emitManagementAudit({
-        requestId,
-        operation: "install",
-        pluginId: id,
-        startedAt,
-        outcome: "error",
-        status: response.status,
-        errorCode: auth.reason.toUpperCase(),
-      });
-      return response;
-    }
-    if (!limiter(auth.owner)) {
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    if (!limiter(owner)) {
       const response = c.json({ error: "rate_limited" }, 429);
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "install",
         pluginId: id,
@@ -254,7 +254,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
       if (store.getPlugin(id) && !store.needsManifestReapproval(id)) {
         const response = c.json({ error: "plugin_already_installed" }, 409);
         emitManagementAudit({
-          owner: auth.owner,
+          owner,
           requestId,
           operation: "install",
           pluginId: id,
@@ -267,7 +267,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
       await store.install(id);
       const response = c.json({ status: "ok" });
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "install",
         pluginId: id,
@@ -279,7 +279,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
     } catch (e) {
       const response = pluginError(c, e);
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "install",
         pluginId: id,
@@ -296,24 +296,12 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
     const id = c.req.param("id");
     const requestId = managementRequestId(c);
     const startedAt = Date.now();
-    const auth = await verifyKey(c);
-    if (!auth.ok) {
-      const response = keyGateResponse(c, auth);
-      emitManagementAudit({
-        requestId,
-        operation: "uninstall",
-        pluginId: id,
-        startedAt,
-        outcome: "error",
-        status: response.status,
-        errorCode: auth.reason.toUpperCase(),
-      });
-      return response;
-    }
-    if (!limiter(auth.owner)) {
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
+    if (!limiter(owner)) {
       const response = c.json({ error: "rate_limited" }, 429);
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "uninstall",
         pluginId: id,
@@ -328,7 +316,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
       await store.uninstall(id);
       const response = c.json({ status: "ok" });
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "uninstall",
         pluginId: id,
@@ -340,7 +328,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono {
     } catch (e) {
       const response = pluginError(c, e);
       emitManagementAudit({
-        owner: auth.owner,
+        owner,
         requestId,
         operation: "uninstall",
         pluginId: id,

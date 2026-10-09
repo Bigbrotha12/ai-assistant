@@ -14,7 +14,7 @@ import type { StreamEvent } from "./openai.ts";
 
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
-import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../request_auth.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "../request_auth.ts";
 import { AccountDeletedError, assertNotDeleting, isDeleting } from "../account_deletion.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
@@ -48,7 +48,8 @@ import { composeAgentPrompt } from "../agents/skills.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { Catalogs, ResolvedAgentDef } from "../catalog/index.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
-import type { RateLimiterFn, VerifyApiKeyFn } from "../plugins/routes.ts";
+import type { RateLimiterFn } from "../plugins/routes.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 import type { WarmupManager } from "../middleware/warmup.ts";
@@ -517,12 +518,11 @@ function reportShadowInput(
 /** The compiled agent graph the sync path streams (createAgentGraph's type). */
 type AgentGraph = ReturnType<typeof createAgentGraph>;
 
-export function createChatRoutes(opts: ChatRoutesOptions): Hono {
+export function createChatRoutes(opts: ChatRoutesOptions): Hono<OwnerVariables> {
   const verifyKey = opts.verifyKey ?? requireApiKey;
-  // Phase 4 Wave A: the per-owner rate limiter replaces the old boolean gate.
-  // The legacy `limiter` seam is preserved for existing tests; an explicit
-  // `rateLimiter` wins, otherwise `limiter` is adapted into the per-owner
-  // path, otherwise a default per-owner bucket (60/min, burst 20) is built.
+  // Rate limiting is per-owner: an explicit `rateLimiter` wins, otherwise the
+  // legacy boolean `limiter` seam is adapted, otherwise a default per-owner
+  // bucket (60/min, burst 20) is built.
   let rateLimiter: PerOwnerRateLimiter;
   if (opts.rateLimiter) {
     rateLimiter = opts.rateLimiter;
@@ -538,7 +538,7 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
   }
   const budget = opts.budget ?? createBudgetManager();
 
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
 
   // Bounds the request body BEFORE it is buffered by `c.req.json()`. An
   // oversized POST (no Content-Length, chunked) would otherwise stall the
@@ -546,16 +546,16 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono {
   // Raised to the ESTABLISH cap (§5/R6): vision establishes carry full history
   // + base64 images; non-establish requests are re-bounded post-read below.
   routes.use(
+    "/chat/*",
     bodyLimit({
       maxSize: env.MAX_ESTABLISH_BODY_BYTES,
       onError: (c) => c.json({ error: "request_too_large" }, 413),
     }),
   );
+  routes.use("/chat/*", requireOwner(verifyKey));
 
   routes.post("/chat/completions", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     if (isDeleting(owner)) return accountDeletedResponse(c);
     const rate = rateLimiter.check(owner);
     if (!rate.allowed) {

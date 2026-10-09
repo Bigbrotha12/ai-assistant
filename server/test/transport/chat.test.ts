@@ -43,7 +43,7 @@ import {
   ModelBuildError,
 } from "../../src/transport/model.ts";
 import type { BuildModelInput } from "../../src/transport/model.ts";
-import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
+import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
 import { Ledger, migrateLedger } from "../../src/ledger.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import type {

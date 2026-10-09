@@ -1,22 +1,20 @@
 import { Hono } from "hono";
-import { keyGateResponse, requireApiKey } from "../request_auth.ts";
+import { requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import type { Catalogs } from "../catalog/index.ts";
-import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 
 export type McpRoutesOptions = {
   catalogs: Catalogs;
   verifyKey?: VerifyApiKeyFn;
 };
 
-export function createMcpRoutes(opts: McpRoutesOptions): Hono {
+export function createMcpRoutes(opts: McpRoutesOptions): Hono<OwnerVariables> {
   const { catalogs } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
+  routes.use("/mcps/*", requireOwner(verifyKey));
 
-  routes.get("/mcps", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-
+  routes.get("/mcps", (c) => {
     const data = catalogs.mcps.map(s => ({
       name: s.name,
     })).sort((a, b) => a.name.localeCompare(b.name));

@@ -15,7 +15,7 @@ import {
   modelListFromPlugins,
 } from "../../src/transport/models.ts";
 import type { ModelsListResponse } from "../../src/transport/models.ts";
-import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
+import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
 import type {
   ModelPluginDefinition,
   ToolPluginDefinition,

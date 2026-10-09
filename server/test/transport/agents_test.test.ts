@@ -14,7 +14,7 @@ import {
   createAgentsRoutes,
 } from "../../src/transport/agents.ts";
 import type { AgentsListResponse } from "../../src/transport/agents.ts";
-import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
+import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
 import type {
   AgentPluginDefinition,
   ToolPluginDefinition,

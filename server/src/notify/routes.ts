@@ -1,19 +1,14 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { randomBytes } from "node:crypto";
-import { keyGateResponse, requireApiKey } from "../request_auth.ts";
+import { requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import {
   AccountDeletedError,
   assertNotDeleting,
   withOwnerBarrier,
 } from "../account_deletion.ts";
-import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { NotifyStore } from "./store.ts";
-
-/** Shape of `requireApiKey`: tri-state `KeyAuth` (owner / bad_key /
- *  email_not_verified). Re-exported from `plugins/routes.ts` (single
- *  definition; the plugin surface owns it). */
-export type { VerifyApiKeyFn };
 
 /**
  * ntfy push-notification provisioning surface (plan §Notifications), mounted
@@ -22,12 +17,12 @@ export type { VerifyApiKeyFn };
  *
  * SECURITY MODEL: the topic + access token are a secret, stored encrypted
  * server-side and never logged. Provisioning is authenticated via the same
- * `verifyKey` seam the checkpoint/plugin routes use (owner = the API key's
- * `referenceId`, gated through `keyGateResponse` — 401 bad key, 403
- * email_not_verified). The token is returned EXACTLY once, at first provision;
- * a later `provision` (or a read-only GET) only reports the topic. `rotate`
- * mints a new token for the SAME topic. `revoke` deletes the owner's stored
- * credentials so the next `provision` starts a brand-new topic+token.
+ * `verifyKey` seam the plugin routes use (owner = the API key's `referenceId`;
+ * failures map to 401 bad key / 403 email_not_verified). The token is returned
+ * EXACTLY once, at first provision; a later `provision` (or a read-only GET)
+ * only reports the topic. `rotate` mints a new token for the SAME topic.
+ * `revoke` deletes the owner's stored credentials so the next `provision`
+ * starts a brand-new topic+token.
  *
  * ENDPOINTS:
  *   POST /api/notify/provision — first call mints topic+token (the only time
@@ -37,9 +32,8 @@ export type { VerifyApiKeyFn };
  *   POST /api/notify/revoke     — deletes the owner's credentials.
  *
  * Route-factory DI mirrors `createPluginRoutes(...)`: the store is injected
- * and the `verifyKey` seam swaps the real `requireApiKey` (which verifies
- * against better-auth's DB + the C2 email backstop) for a deterministic
- * `KeyAuth` stub in tests.
+ * and the `verifyKey` seam swaps the real verifier for a deterministic stub
+ * in tests.
  */
 
 export type NotifyRoutesOptions = {
@@ -68,18 +62,19 @@ async function runNotifyMutation<T>(
   }
 }
 
-export function createNotifyRoutes(opts: NotifyRoutesOptions): Hono {
+export function createNotifyRoutes(opts: NotifyRoutesOptions): Hono<OwnerVariables> {
   const { store } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
 
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
+  // notify is the only router under its `/api/notify` mount, so a `*` gate
+  // cannot leak onto a sibling router's paths.
+  routes.use("*", requireOwner(verifyKey));
 
   // First provision reveals the token exactly once; repeat calls (and the
   // read-only GET below) never reveal it again.
   routes.post("/provision", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     c.header("cache-control", "no-store");
     return runNotifyMutation(c, owner, async (beforeWrite) => {
       const existing = await store.get(owner);
@@ -100,9 +95,7 @@ export function createNotifyRoutes(opts: NotifyRoutesOptions): Hono {
 
   // Read-only recovery: reveals only the topic, and only when already set.
   routes.get("/provision", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     c.header("cache-control", "no-store");
     try {
       const existing = await store.get(owner);
@@ -120,9 +113,7 @@ export function createNotifyRoutes(opts: NotifyRoutesOptions): Hono {
   // Rotation: a NEW token for the SAME topic (subscribers keep their topic,
   // old token dies, new token ships).
   routes.post("/rotate", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     c.header("cache-control", "no-store");
     return runNotifyMutation(c, owner, async (beforeWrite) => {
       const existing = await store.get(owner);
@@ -137,9 +128,7 @@ export function createNotifyRoutes(opts: NotifyRoutesOptions): Hono {
   // Revocation: drop the stored credentials entirely; the next provision mints
   // a brand-new topic + token.
   routes.post("/revoke", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     c.header("cache-control", "no-store");
     return runNotifyMutation(c, owner, async (beforeWrite) => {
       beforeWrite();

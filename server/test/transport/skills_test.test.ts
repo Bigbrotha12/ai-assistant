@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Hono } from "hono";
 import { createSkillsRoutes } from "../../src/transport/skills.ts";
 import type { Catalogs } from "../../src/catalog/index.ts";
-import type { VerifyApiKeyFn } from "../../src/plugins/routes.ts";
+import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
 
 function testApp(catalogs: Catalogs, verifyKey?: VerifyApiKeyFn) {
   const app = new Hono();

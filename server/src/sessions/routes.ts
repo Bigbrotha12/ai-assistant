@@ -1,18 +1,17 @@
 import { Hono } from "hono";
 import { AIMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
-import { keyGateResponse, requireApiKey } from "../request_auth.ts";
-import type { VerifyApiKeyFn } from "../plugins/routes.ts";
+import { requireApiKey, requireOwner } from "../request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../request_auth.ts";
 import type { SessionStore } from "./store.ts";
 
 /**
  * In-memory session read-back + delete surface (plan §5), mounted under `/v1`.
  *
- * Replaces `GET/DELETE /v1/threads/:threadId` as the conversation surface: the
- * client reads back the session's accumulated `messages` under the same
- * `session_id` it sent (the `reconcileFromServer`/`_reconcileAlreadyCompleted`
- * fetch) and deletes a conversation with `DELETE /v1/sessions/:id`. The store
- * is RAM-only and evictable; a live session the caller owns returns its
- * messages, everything else is an IDOR-safe miss (see below).
+ * The client reads a session's accumulated `messages` under the `session_id`
+ * it sent (the `reconcileFromServer`/`_reconcileAlreadyCompleted` fetch) and
+ * deletes a conversation with `DELETE /v1/sessions/:id`. The store is RAM-only
+ * and evictable; a live session the caller owns returns its messages,
+ * everything else is an IDOR-safe miss (see below).
  *
  * AUTHORIZATION MODEL (single-owner homelab): every endpoint is gated only by
  * "is a valid API key"; the caller's `referenceId` is the owner and is passed
@@ -33,8 +32,8 @@ import type { SessionStore } from "./store.ts";
  * session, or an absent session, is a 404 — never a successful delete.
  */
 
-/** Wire shape of a session message, mirroring the old checkpoint read-back so
- *  the client's existing message parser keeps working. */
+/** Wire shape of a session message, matching what the client's message parser
+ *  consumes. */
 export type SessionHistoryMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content: BaseMessage["content"];
@@ -43,8 +42,7 @@ export type SessionHistoryMessage = {
 };
 
 /** BaseMessage -> `{ role, content, tool_calls?, tool_call_id? }` (the shape
- *  the old checkpoint read-back produced, kept so the client's existing
- *  message parser keeps working). */
+ *  the client's message parser consumes). */
 export function serializeSessionMessages(messages: readonly BaseMessage[]): SessionHistoryMessage[] {
   return messages.map((message) => {
     const type = message.getType();
@@ -71,16 +69,15 @@ export type SessionRoutesOptions = {
   verifyKey?: VerifyApiKeyFn;
 };
 
-export function createSessionRoutes(opts: SessionRoutesOptions): Hono {
+export function createSessionRoutes(opts: SessionRoutesOptions): Hono<OwnerVariables> {
   const { store } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
 
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
+  routes.use("/sessions/*", requireOwner(verifyKey));
 
-  routes.get("/sessions/:id", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+  routes.get("/sessions/:id", (c) => {
+    const owner = c.get("owner");
     const sessionId = c.req.param("id");
     const record = store.get(owner, sessionId);
     c.header("cache-control", "no-store");
@@ -101,13 +98,10 @@ export function createSessionRoutes(opts: SessionRoutesOptions): Hono {
     );
   });
 
-  // Conversation delete (§5): owner-scoped, replaces `DELETE /v1/threads/:id`.
-  // Another owner's session, or an absent one, is a 404 — never a successful
-  // delete and never a leak.
-  routes.delete("/sessions/:id", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+  // Conversation delete (§5): owner-scoped. Another owner's session, or an
+  // absent one, is a 404 — never a successful delete and never a leak.
+  routes.delete("/sessions/:id", (c) => {
+    const owner = c.get("owner");
     const sessionId = c.req.param("id");
     c.header("cache-control", "no-store");
     const ownerOf = store.lookupOwner(sessionId);

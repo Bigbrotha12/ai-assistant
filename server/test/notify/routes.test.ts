@@ -12,7 +12,7 @@ import {
 } from "../../src/account_deletion.ts";
 import { NotifyStore } from "../../src/notify/store.ts";
 import { createNotifyRoutes } from "../../src/notify/routes.ts";
-import type { VerifyApiKeyFn } from "../../src/notify/routes.ts";
+import type { VerifyApiKeyFn } from "../../src/request_auth.ts";
 
 const TEST_KEY = "test-key-0123456789abcdef";
 

@@ -6,7 +6,8 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
-import { accountDeletedResponse, keyGateResponse, requireApiKey } from "./request_auth.ts";
+import { accountDeletedResponse, requireApiKey, requireOwner } from "./request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "./request_auth.ts";
 import { AccountDeletedError, isDeleting } from "./account_deletion.ts";
 import {
   Ledger,
@@ -23,7 +24,6 @@ import {
 } from "./ledger.ts";
 import type { PublicStepRow, PublicTaskRow, TaskRow } from "./ledger.ts";
 import type { JobRunner } from "./jobs/runner.ts";
-import type { VerifyApiKeyFn } from "./plugins/routes.ts";
 
 /**
  * The ledger lives in a dedicated SQLite file (`LEDGER_DB_PATH`, default
@@ -56,7 +56,7 @@ if (orphanedCount > 0) {
     `ledger: reconciled ${orphanedCount} orphaned running task(s) as stuck`,
   );
 }
-// D6: periodic retention sweep purges terminal tasks (and their steps/chain)
+// Periodic retention sweep purges terminal tasks (and their steps/chain)
 // once they have sat past LEDGER_RETENTION_MS. Tick errors are logged, never
 // crash the timer; the timer is unref'd inside the Ledger so it cannot keep
 // the process alive.
@@ -67,22 +67,21 @@ ledger.startRetentionSweep(env.LEDGER_SWEEP_INTERVAL_MS, {
 export function createLedgerRoutes(
   l: Ledger,
   opts: { verifyKey?: VerifyApiKeyFn; jobRunner?: JobRunner } = {},
-): Hono {
+): Hono<OwnerVariables> {
   const verifyKey = opts.verifyKey ?? requireApiKey;
-  const routes = new Hono();
+  const routes = new Hono<OwnerVariables>();
 
   routes.use(
-    "*",
+    "/tasks/*",
     bodyLimit({
       maxSize: env.MAX_REQUEST_BODY_BYTES,
       onError: (c) => c.json({ error: "request_too_large" }, 413),
     }),
   );
+  routes.use("/tasks/*", requireOwner(verifyKey));
 
   routes.post("/tasks", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    const owner = auth.owner;
+    const owner = c.get("owner");
     const body = (await c.req.json().catch(() => null)) as {
       intentKey?: unknown;
       spec?: unknown;
@@ -145,12 +144,11 @@ export function createLedgerRoutes(
   });
 
   routes.get("/tasks", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const page = publicTaskPage(c);
     if (page === null) return c.json({ error: "invalid_request" }, 400);
-    const result = l.listPublicTasks(auth.owner, page.limit, page.offset);
+    const result = l.listPublicTasks(owner, page.limit, page.offset);
     c.header("x-ledger-page-limit", String(page.limit));
     c.header("x-ledger-page-offset", String(page.offset));
     if (result.nextOffset !== null) {
@@ -159,14 +157,13 @@ export function createLedgerRoutes(
     return c.json(result.tasks.map(toPublicTask));
   });
 
-  // Status-by-idempotency-key: the client's poll-after-drop endpoint (plan
-  // line 228). Owner-scoped via getTaskByIntentKey — a cross-owner lookup is a
-  // miss → 404 (IDOR), never a leak. Registered before `/tasks/:id`; Hono's
-  // router disambiguates by segment count regardless.
+  // Status-by-idempotency-key: the client's poll-after-drop endpoint.
+  // Owner-scoped via getTaskByIntentKey — a cross-owner lookup is a miss →
+  // 404 (IDOR), never a leak. Registered before `/tasks/:id`; Hono's router
+  // disambiguates by segment count regardless.
   routes.get("/tasks/by-key/:intentKey", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const intentKey = c.req.param("intentKey");
     const intentKeyError = publicTextError(
       intentKey,
@@ -176,26 +173,24 @@ export function createLedgerRoutes(
     if (intentKeyError !== null) return publicFieldError(c, intentKeyError);
     const limit = publicReadLimit(c);
     if (limit === null) return c.json({ error: "invalid_request" }, 400);
-    const task = l.getTaskByIntentKey(auth.owner, intentKey);
+    const task = l.getTaskByIntentKey(owner, intentKey);
     if (!task) return c.json({ error: "not_found" }, 404);
-    const steps = l.listPublicSteps(task.id, auth.owner, limit);
-    const stats = l.getPublicStepStats(task.id, auth.owner);
+    const steps = l.listPublicSteps(task.id, owner, limit);
+    const stats = l.getPublicStepStats(task.id, owner);
     return c.json({
       ...toPublicTask(task),
       projection: projectPublicTaskProgress(
         task,
         steps,
-        opts.jobRunner?.getTaskExecution(task.id, auth.owner),
+        opts.jobRunner?.getTaskExecution(task.id, owner),
         stats ?? undefined,
       ),
     });
   });
 
   routes.get("/tasks/:id", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
-    const owner = auth.owner;
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
@@ -221,30 +216,28 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/cancel", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
     if (!opts.jobRunner) {
       return c.json({ error: "background_unavailable" }, 503);
     }
-    const report = opts.jobRunner.cancelTask(id, auth.owner);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const report = opts.jobRunner.cancelTask(id, owner);
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     if (report === null) return c.json({ error: "not_found" }, 404);
     return c.json(report, report.stage === "cancelling" ? 202 : 200);
   });
 
   routes.post("/tasks/:id/claim", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
     try {
-      return c.json(toPublicTask(l.claimTask(id, auth.owner)));
+      return c.json(toPublicTask(l.claimTask(id, owner)));
     } catch (e) {
       if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
       return ledgerError(c, e);
@@ -252,10 +245,8 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/steps", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
-    const owner = auth.owner;
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
@@ -304,7 +295,7 @@ export function createLedgerRoutes(
     if (!task) return c.json({ error: "not_found" }, 404);
     const fenceToken =
       typeof body.fenceToken === "string" ? body.fenceToken : undefined;
-    // M8: a RUNNING task is fence-protected — a caller appending steps without
+    // A RUNNING task is fence-protected — a caller appending steps without
     // the claim/resume fence token is (or may be) a superseded worker and must
     // not write. Queued/terminal transitions never carry a fence, so the gate
     // is conditional on `running`.
@@ -332,10 +323,8 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/heartbeat", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
-    const owner = auth.owner;
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
@@ -366,17 +355,16 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/resume", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
-    const ownerTask = l.getTask(id, auth.owner);
+    const ownerTask = l.getTask(id, owner);
     const sentinelError = rejectSentinelTaskTransition(c, ownerTask);
     if (sentinelError !== null) return sentinelError;
     try {
-      return c.json(toPublicTask(l.resumeTask(id, auth.owner)));
+      return c.json(toPublicTask(l.resumeTask(id, owner)));
     } catch (e) {
       if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
       return ledgerError(c, e);
@@ -384,10 +372,8 @@ export function createLedgerRoutes(
   });
 
   routes.post("/tasks/:id/complete", async (c) => {
-    const auth = await verifyKey(c);
-    if (!auth.ok) return keyGateResponse(c, auth);
-    if (isDeleting(auth.owner)) return accountDeletedResponse(c);
-    const owner = auth.owner;
+    const owner = c.get("owner");
+    if (isDeleting(owner)) return accountDeletedResponse(c);
     const id = c.req.param("id");
     const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
     if (idError !== null) return publicFieldError(c, idError);
@@ -526,7 +512,7 @@ function toPublicStep(
  *  (ledger v5) is stripped. Job-status delivery must never echo the client's
  *  own message snapshot — the client already owns it; the ledger holds it
  *  transiently ONLY for the runner's crash-resume, purged with the task by the
- *  retention sweep (plan §10). */
+ *  retention sweep. */
 function toPublicTask(
   task: TaskRow | PublicTaskRow,
 ): Omit<TaskRow, "payload" | "job_spec"> {
@@ -548,5 +534,3 @@ function ledgerError(c: Context, e: unknown): Response {
   console.error("ledger: unexpected error", e);
   return c.json({ error: "internal" }, 500);
 }
-
-export const ledgerRoutes = createLedgerRoutes(ledger);
