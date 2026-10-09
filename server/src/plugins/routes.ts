@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { keyGateResponse, requireApiKey } from "../api_key.ts";
-import type { KeyAuth } from "../api_key.ts";
+import { keyGateResponse, requireApiKey } from "../request_auth.ts";
+import type { KeyAuth } from "../request_auth.ts";
 import { createTokenBucketLimiter } from "../rate_limit.ts";
 import { PluginRegistryError } from "./registry.ts";
 import type { PluginRegistry } from "./registry.ts";
@@ -89,7 +89,7 @@ export type PluginRoutesOptions = {
   registry: PluginRegistry;
   /** Backing store; install/uninstall operate on it. Must be loaded first. */
   store: PluginStore;
-  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
   /** Test seam; defaults to a real token bucket (30 req/min, burst 10). */
   limiter?: RateLimiterFn;

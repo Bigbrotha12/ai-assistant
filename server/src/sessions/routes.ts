@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { AIMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
-import { keyGateResponse, requireApiKey } from "../api_key.ts";
+import { keyGateResponse, requireApiKey } from "../request_auth.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { SessionStore } from "./store.ts";
 
@@ -67,7 +67,7 @@ export function serializeSessionMessages(messages: readonly BaseMessage[]): Sess
 
 export type SessionRoutesOptions = {
   store: SessionStore;
-  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 

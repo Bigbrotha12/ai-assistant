@@ -57,7 +57,7 @@ const globals = globalThis as typeof globalThis & { __apiKeyAuthState?: FakeStat
 globals.__apiKeyAuthState = state;
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (specifier === "./auth.ts" && context.parentURL?.includes("/src/api_key.ts")) {
+    if (specifier === "./auth.ts" && context.parentURL?.includes("/src/request_auth.ts")) {
       return {
         url: `data:text/javascript,${encodeURIComponent(fakeAuthModule)}`,
         shortCircuit: true,
@@ -66,7 +66,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { inferenceRoutes, requireApiKey } = await import("../src/api_key.ts");
+const { createAuthCheckRoutes, requireApiKey } = await import("../src/request_auth.ts");
 hooks.deregister();
 
 /** Minimal Context carrying only the Authorization header (all requireApiKey reads). */
@@ -112,7 +112,7 @@ test("a tombstoned owner fails the API-key gate with account_deleted", async () 
       reason: "account_deleted",
     });
     const app = new Hono();
-    app.route("/v1", inferenceRoutes);
+    app.route("/v1", createAuthCheckRoutes());
     const res = await app.request("/v1/auth/check", {
       headers: { authorization: "Bearer sk-deleted" },
     });
@@ -125,7 +125,7 @@ test("a tombstoned owner fails the API-key gate with account_deleted", async () 
 
 describe("GET /v1/auth/check — C2 backstop gate", () => {
   const app = new Hono();
-  app.route("/v1", inferenceRoutes);
+  app.route("/v1", createAuthCheckRoutes());
 
   test("verified owner → 200 { status: ok }", async () => {
     const res = await app.request("/v1/auth/check", {

@@ -249,8 +249,8 @@ export const auth = betterAuth({
         purgeLedgerOwner: async (owner) => {
           // Lazy dynamic import: a static `import { ledger } from
           // "./ledger.routes.ts"` would open LEDGER_DB_PATH and start the
-          // retention sweep for EVERY importer of auth.ts (api_key.ts,
-          // tests) and form the cycle auth -> ledger.routes -> api_key ->
+          // retention sweep for EVERY importer of auth.ts (request_auth.ts,
+          // tests) and form the cycle auth -> ledger.routes -> request_auth ->
           // auth. index.ts loads ledger.routes at boot in production; tests
           // inject their own purge through createAccountDeletionHooks.
           const { ledger } = await import("./ledger.routes.ts");

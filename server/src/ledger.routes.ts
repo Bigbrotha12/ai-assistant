@@ -6,7 +6,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { getOrCreateTask } from "./credentials/idempotency.ts";
 import { env } from "./env.ts";
-import { accountDeletedResponse, keyGateResponse, requireApiKey } from "./api_key.ts";
+import { accountDeletedResponse, keyGateResponse, requireApiKey } from "./request_auth.ts";
 import { AccountDeletedError, isDeleting } from "./account_deletion.ts";
 import {
   Ledger,

@@ -26,7 +26,7 @@ import { isRecord } from "../util.ts";
  *
  * `extractCredentialsFromBody` resolves the per-plugin object; the
  * `Authorization: Bearer` header (used for model-plugin keys) is parsed by the
- * transport's `requireApiKey`/`extractBearerToken` in `api_key.ts`.
+ * transport's `requireApiKey` in `request_auth.ts`.
  *
  * Non-leak guardrails:
  *  - No credential value is ever logged, echoed, or included in error messages

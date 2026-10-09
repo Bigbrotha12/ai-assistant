@@ -14,7 +14,7 @@ import type { StreamEvent } from "./openai.ts";
 
 import { env } from "../env.ts";
 import { logger } from "../logger.ts";
-import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_key.ts";
+import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../request_auth.ts";
 import { AccountDeletedError, assertNotDeleting, isDeleting } from "../account_deletion.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
@@ -312,7 +312,7 @@ export type ChatRoutesOptions = {
    * model + tool credentials here; the runner reads them by (owner, pluginId).
    */
   pins?: CredentialPinStore;
-  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
   /**
    * Per-owner rate limiter (Phase 4, Wave A). Returns a structured

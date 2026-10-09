@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { keyGateResponse, requireApiKey } from "../api_key.ts";
+import { keyGateResponse, requireApiKey } from "../request_auth.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import type { Catalogs } from "../catalog/index.ts";

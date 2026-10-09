@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { keyGateResponse, requireApiKey } from "../api_key.ts";
+import { keyGateResponse, requireApiKey } from "../request_auth.ts";
 import type { VerifyApiKeyFn } from "../plugins/routes.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isModelPlugin } from "../plugins/types.ts";
@@ -9,7 +9,7 @@ import { isRecord } from "../util.ts";
 /**
  * OpenAI-compatible `GET /v1/models` transport (Phase 3, Wave B).
  *
- * Replaces the Phase 1 proxy (formerly in `inference.ts`, now `api_key.ts`)
+ * Replaces the Phase 1 proxy (formerly in `inference.ts`, now `request_auth.ts`)
  * that forwarded `/v1/models` to
  * `INFERENCE_URL`. The models list is now compiled from the installed MODEL
  * plugins in the registry, so the client sees exactly what this gateway can
@@ -24,7 +24,7 @@ import { isRecord } from "../util.ts";
  * suite scans the serialized body recursively for `https://` and those keys).
  *
  * ROUTING / MOUNT ORDER: the old `GET /models` proxy was REMOVED from
- * `inferenceRoutes` (this transport is the single `/v1/models` owner), so the
+ * the auth-check routes (this transport is the single `/v1/models` owner), so the
  * mount order in `index.ts` introduces no duplicate-path shadowing.
  *
  * ERROR SHAPES (kept consistent with the proxy it replaces):
@@ -107,7 +107,7 @@ export function sanitizeParameters(
 
 export type ModelsRoutesOptions = {
   registry: PluginRegistry;
-  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 

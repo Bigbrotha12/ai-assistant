@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { randomBytes } from "node:crypto";
-import { keyGateResponse, requireApiKey } from "../api_key.ts";
+import { keyGateResponse, requireApiKey } from "../request_auth.ts";
 import {
   AccountDeletedError,
   assertNotDeleting,
@@ -44,7 +44,7 @@ export type { VerifyApiKeyFn };
 
 export type NotifyRoutesOptions = {
   store: NotifyStore;
-  /** Test seam; defaults to the real `requireApiKey` from api_key.ts. */
+  /** Test seam; defaults to the real `requireApiKey` from request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
 };
 

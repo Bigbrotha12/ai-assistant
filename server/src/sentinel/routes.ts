@@ -1,8 +1,8 @@
 import { bodyLimit } from "hono/body-limit";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../api_key.ts";
-import type { KeyAuth } from "../api_key.ts";
+import { accountDeletedResponse, keyGateResponse, requireApiKey } from "../request_auth.ts";
+import type { KeyAuth } from "../request_auth.ts";
 import { isDeleting } from "../account_deletion.ts";
 import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
 import type { PerOwnerRateLimiter, RateLimitResult } from "../middleware/rate_limit.ts";

@@ -6,7 +6,7 @@ import { runWithAccountDeletionRequest } from "./account_deletion.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
 import { env } from "./env.ts";
 import { createHealthRoutes } from "./health.ts";
-import { inferenceRoutes, requireApiKey } from "./api_key.ts";
+import { createAuthCheckRoutes, requireApiKey } from "./request_auth.ts";
 import { createSentinelRoutes } from "./sentinel/routes.ts";
 import { createSentinelService } from "./sentinel/service.ts";
 import { policyForMode } from "./sentinel/policy.ts";
@@ -89,7 +89,7 @@ app.use("/api/auth/delete-user", (c, next) => {
   return runWithAccountDeletionRequest(() => next());
 });
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
-app.route("/v1", inferenceRoutes);
+app.route("/v1", createAuthCheckRoutes());
 const sentinelService = createSentinelService({
   ledger,
   policy: policyForMode(env.SENTINEL_POLICY_MODE ?? "advisory"),
@@ -165,7 +165,7 @@ app.route("/v1", createPluginRoutes({ registry: pluginRegistry, store: pluginSto
 
 // Phase 3, Wave B: `GET /v1/models` now serves the installed MODEL plugins
 // (incl. `visionCapable`) from the registry instead of proxying INFERENCE_URL.
-// The old proxy handler was removed from inferenceRoutes (above), so this is
+// The old proxy handler was removed from the auth-check routes (above), so this is
 // the single `/v1/models` owner — no duplicate-path shadowing regardless of
 // mount order. Never leaks plugin endpoints/baseUrls (see transport/models.ts).
 app.route("/v1", createModelsRoutes({ registry: pluginRegistry }));

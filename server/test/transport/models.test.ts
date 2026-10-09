@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { assertNoUrlLeak } from "../helpers/leak.ts";
-import { inferenceRoutes } from "../../src/api_key.ts";
+import { createAuthCheckRoutes } from "../../src/request_auth.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import {
@@ -304,8 +304,8 @@ describe("GET /v1/models (HTTP)", () => {
 });
 
 describe("GET /v1/models — mount order / single owner", () => {
-  test("inferenceRoutes no longer registers GET /models (proxy removed)", async () => {
-    const res = await inferenceRoutes.request("/models");
+  test("the auth-check routes no longer register GET /models (proxy removed)", async () => {
+    const res = await createAuthCheckRoutes().request("/models");
     assert.equal(res.status, 404, "the inference proxy must not own /models");
   });
 
@@ -313,7 +313,7 @@ describe("GET /v1/models — mount order / single owner", () => {
     const dir = await makeTempDir(t);
     const { registry } = await makeEnv(dir);
     const app = new Hono();
-    app.route("/v1", inferenceRoutes);
+    app.route("/v1", createAuthCheckRoutes());
     app.route(
       "/v1",
       createModelsRoutes({ registry, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),

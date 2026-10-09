@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { assertNoUrlLeak } from "../helpers/leak.ts";
-import { inferenceRoutes } from "../../src/api_key.ts";
+import { createAuthCheckRoutes } from "../../src/request_auth.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import {
@@ -289,8 +289,8 @@ describe("GET /v1/agents (HTTP)", () => {
 });
 
 describe("GET /v1/agents — mount order", () => {
-  test("inferenceRoutes does not register GET /agents", async () => {
-    const res = await inferenceRoutes.request("/agents");
+  test("the auth-check routes do not register GET /agents", async () => {
+    const res = await createAuthCheckRoutes().request("/agents");
     assert.equal(res.status, 404);
   });
 
@@ -298,7 +298,7 @@ describe("GET /v1/agents — mount order", () => {
     const dir = await makeTempDir(t);
     const { registry } = await makeEnv(dir);
     const app = new Hono();
-    app.route("/v1", inferenceRoutes);
+    app.route("/v1", createAuthCheckRoutes());
     app.route(
       "/v1",
       createAgentsRoutes({
