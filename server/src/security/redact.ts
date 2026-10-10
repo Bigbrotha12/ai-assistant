@@ -2,7 +2,7 @@ import {
   mapStoredMessagesToChatMessages,
   type BaseMessage,
 } from "@langchain/core/messages";
-import { CREDENTIAL_REDACTION } from "./plugins/credential.ts";
+import { CREDENTIAL_REDACTION } from "../plugins/credential.ts";
 
 /**
  * Credential redaction (stateless-gateway, step 8). The SQLCipher checkpoint

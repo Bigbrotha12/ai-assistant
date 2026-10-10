@@ -4,7 +4,7 @@ import { createToolPipeline } from "../../../src/tools/pipeline.ts";
 import { createReplayInterceptor } from "../../../src/tools/interceptors/replay.ts";
 import { createCacheInterceptor } from "../../../src/tools/interceptors/cache.ts";
 import type { ToolCallResult } from "../../../src/tools/pipeline.ts";
-import type { Ledger, StepRow } from "../../../src/ledger.ts";
+import type { Ledger, StepRow } from "../../../src/ledger/index.ts";
 import { recordToolResult } from "../../../src/credentials/idempotency.ts";
 import { createToolResultCache } from "../../../src/middleware/cache.ts";
 import { JobError } from "../../../src/jobs/runner.ts";

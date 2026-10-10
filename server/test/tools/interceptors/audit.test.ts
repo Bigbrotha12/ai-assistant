@@ -2,7 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createPluginAuditSink } from "../../../src/tools/audit.ts";
 import type { ToolCallResult, ToolDispatch } from "../../../src/tools/pipeline.ts";
-import { logger } from "../../../src/logger.ts";
+import { logger } from "../../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,
   flushAuditTelemetry,

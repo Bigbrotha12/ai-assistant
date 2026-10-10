@@ -20,9 +20,9 @@ import {
   tryReportSentinelShadow,
 } from "../sentinel/shadow.ts";
 import type { SentinelShadowSink } from "../sentinel/shadow.ts";
-import { redactForOutbound, redactMessages } from "../redact.ts";
+import { redactForOutbound, redactMessages } from "../security/redact.ts";
 import { AccountDeletedError, isDeleting } from "../auth/account_deletion.ts";
-import { env } from "../env.ts";
+import { env } from "../config/env.ts";
 import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
@@ -36,7 +36,7 @@ import { buildPipelineForChannel } from "../tools/channel.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 import { JobError } from "./errors.ts";
 import type { JobErrorCode } from "./errors.ts";
-import { LedgerError, projectTaskProgress } from "../ledger.ts";
+import { LedgerError, projectTaskProgress } from "../ledger/index.ts";
 import type {
   Ledger,
   TaskEffectState,
@@ -44,7 +44,7 @@ import type {
   TaskProgress,
   TaskRow,
   TaskStatus,
-} from "../ledger.ts";
+} from "../ledger/index.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isMcpHeaderReference, isToolPlugin } from "../plugins/types.ts";
 import { resolveEnvReference } from "../credentials/env_reference.ts";
@@ -65,7 +65,7 @@ import {
   serializeBoundedToolArguments,
   readBoundedResponseText,
   ToolResourceError,
-} from "../tool_bounds.ts";
+} from "../tools/bounds.ts";
 
 /**
  * Async job runner (stateless-gateway, step 8 — Phase C part 2 rewrite).
@@ -108,7 +108,7 @@ import {
  *      On error: fail the task with a redacted error step. Pins are released
  *      and swept, and the heartbeat is stopped in the finally.
  *
- * RESTART-LOSS (`resumeStuckJobs`): `ledger.reconcileOrphans()` (ledger.routes.ts)
+ * RESTART-LOSS (`resumeStuckJobs`): `ledger.reconcileOrphans()` (ledger/routes.ts)
  * runs at boot and marks orphaned `running` tasks `stuck`. The pin store is
  * in-memory, so after a restart the pins are GONE. This best-effort startup
  * pass tries to re-establish them via the optional `credentialSource` seam;

@@ -1,4 +1,4 @@
-import { serializeBoundedToolArguments } from "../../tool_bounds.ts";
+import { serializeBoundedToolArguments } from "../bounds.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
 
 /**

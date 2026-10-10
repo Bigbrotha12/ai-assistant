@@ -4,15 +4,15 @@ import { existsSync, unlinkSync } from "node:fs";
 import * as authModule from "./auth/index.ts";
 import { runWithAccountDeletionRequest } from "./auth/account_deletion.ts";
 import { CredentialPinStore } from "./credentials/pins.ts";
-import { env } from "./env.ts";
-import { createHealthRoutes } from "./health.ts";
+import { env } from "./config/env.ts";
+import { createHealthRoutes } from "./observability/health.ts";
 import { createAuthCheckRoutes, requireApiKey } from "./auth/request_auth.ts";
 import { createSentinelRoutes } from "./sentinel/routes.ts";
 import { createSentinelService } from "./sentinel/service.ts";
 import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
-import { createLedgerRoutes, ledger } from "./ledger.routes.ts";
+import { createLedgerRoutes, ledger } from "./ledger/routes.ts";
 import { createNtfyNotificationHook, notifyEgressConfigWarning } from "./notify/hook.ts";
 import { createNotifyRoutes } from "./notify/routes.ts";
 import { NotifyStore } from "./notify/store.ts";
@@ -299,7 +299,7 @@ try {
       });
     },
   });
-  // Restart-loss startup pass: `ledger.reconcileOrphans()` (ledger.routes.ts)
+  // Restart-loss startup pass: `ledger.reconcileOrphans()` (ledger/routes.ts)
   // already marked orphans `stuck`; resumeStuckJobs re-runs them from their
   // stored snapshot payload when pins can be re-established, else fails them
   // cleanly (no vault yet → credentials_expired).

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Database as DatabaseType } from "better-sqlite3";
-import { redactForOutbound } from "./redact.ts";
+import { redactForOutbound } from "../security/redact.ts";
 
 export const TASK_STATUSES = [
   "queued",
@@ -14,7 +14,7 @@ export const TASK_STATUSES = [
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /**
- * Terminal statuses (D6): tasks in one of these are eligible for the retention
+ * Terminal statuses: tasks in one of these are eligible for the retention
  * purge once they have sat past the retention window. `queued`/`running`/
  * `stuck` are NON-terminal and must NEVER be purged.
  */
@@ -26,7 +26,7 @@ export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = [
 ];
 
 /**
- * Cap for the job label (D4): `spec` is a short, non-sensitive label (notify
+ * Cap for the job label: `spec` is a short, non-sensitive label (notify
  * title / future job list), never user content. Enforced at the ledger write
  * boundary so every caller (sync async-admission, the JobRunner, the routes)
  * is capped in one place.
@@ -48,18 +48,16 @@ export const TASK_STEP_METADATA_MAX_RESULT_CHARS = 65_536;
 export const DEFAULT_TERMINAL_RETENTION_MS = 86_400_000;
 
 /**
- * Threshold ordering is FIXED and stated here: stuck-timeout must be strictly
- * shorter than lease-expiry so the watchdog never marks a task `stuck` and
- * then deadlocks waiting for the lease to lapse before it can relaunch the
- * worker. Final tuning of these values is Phase 4 (M5); these are
- * conservative dev defaults.
+ * Threshold ordering is FIXED: stuck-timeout must be strictly shorter than
+ * lease-expiry so the watchdog never marks a task `stuck` and then deadlocks
+ * waiting for the lease to lapse before it can relaunch the worker.
  */
 export const DEFAULT_STUCK_TIMEOUT_MS = 10_000;
 export const DEFAULT_LEASE_EXPIRY_MS = 60_000;
 
 export const LEDGER_GENESIS_PREFIX = "ledger-genesis:";
 
-/** Result of {@link Ledger.purgeOwnerData} (M12 account deletion). */
+/** Result of {@link Ledger.purgeOwnerData} (account deletion). */
 export type OwnerPurgeResult = {
   /** Non-terminal tasks transitioned to `cancelled` before the delete, with
    *  the status each held when the purge started. */
@@ -72,7 +70,7 @@ export type LedgerConfig = {
   stuckTimeoutMs?: number;
   leaseExpiryMs?: number;
   /** How long a terminal task (and its steps/chain) is retained before the
-   *  periodic sweep purges it (D6). Defaults to 24 h. */
+   *  periodic sweep purges it. Defaults to 24 h. */
   terminalRetentionMs?: number;
   /** Gateway clock; defaults to Date.now. Injectable for tests. */
   now?: () => number;
@@ -99,16 +97,15 @@ export type TaskRow = {
   /** Monotonic fence token: rotated by every `claimTask`/`resumeTask` and
    *  required (when supplied) by `heartbeat`/`appendStep`, so a superseded
    *  worker's writes/heartbeats are rejected with `FENCE_CONFLICT`. The empty
-   *  string means "no fence held" (pre-v3 rows, or a call with no token). */
+   *  string means "no fence held" (a call with no token). */
   fence_token: string;
   /**
-   * JSON-encoded snapshot messages (v5) the job runs on. Written by the
-   * JobRunner at admission and read by `resumeStuckJobs` to re-run a stuck
-   * task from the STORED snapshot (the checkpointer is gone). Transient user
-   * content (plan §10): it is purged WITH the task by the step-7 retention
-   * sweep — never exposed on the ledger routes (job-status delivery must not
-   * echo the client's own snapshot). Null for tasks admitted before v5 or
-   * through routes that never store a payload.
+   * JSON-encoded snapshot messages the job runs on. Written by the JobRunner
+   * at admission and read by `resumeStuckJobs` to re-run a stuck task from the
+   * STORED snapshot. Transient user content: it is purged WITH the task by the
+   * retention sweep — never exposed on the ledger routes (job-status delivery
+   * must not echo the client's own snapshot). Null for tasks admitted through
+   * routes that never store a payload.
    */
   payload?: string | null;
   job_spec?: string | null;
@@ -509,8 +506,8 @@ type Migration = (db: DatabaseType) => void;
 
 const LEDGER_MIGRATIONS: readonly Migration[] = [
   // v1 — initial ledger schema.
-  // intentKey is stored raw. Canonical form semantics + unique constraint are
-  // finalized in Phase 6 (M12); do NOT add a unique constraint here yet.
+  // intentKey is stored raw; the unique (owner, intent_key) constraint is added
+  // by a later migration, so do NOT add one here.
   (db) => {
     db.exec(`
       CREATE TABLE ledger_task (
@@ -570,9 +567,10 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
   },
   // v2 — heartbeat-based stuck detection.
   // Adds `last_heartbeat_ts`, which `claimTask`/`resumeTask`/`heartbeat` stamp
-  // (the gateway clock) and `markStuckIfHeartbeatStale` keys off of. This
-  // decouples stuck detection from `updated_ts` (which `appendStep` also bumps,
-  // so step-append-only workers were never marked stuck). Data-preserving.
+  // (the gateway clock) and `markStuckIfHeartbeatStale` keys off of. Stuck
+  // detection keys off this rather than `updated_ts`, which `appendStep` also
+  // bumps and would therefore mask a dead worker that only appends steps.
+  // Data-preserving.
   (db) => {
     db.exec(`
       ALTER TABLE ledger_task
@@ -583,36 +581,32 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
   // Adds `fence_token`, rotated by every `claimTask`/`resumeTask`. Workers hold
   // the token granted at claim/resume and present it on `heartbeat`/
   // `appendStep`; a superseded worker (whose task was resumed under a new
-  // fence) is rejected with `FENCE_CONFLICT`, so it can no longer extend a
-  // lease or append steps — killing duplicate-execution races between
-  // overlapping workers. Data-preserving (existing rows default to `''` = no
-  // fence held; calls that pass no token skip the check, so old callers keep
-  // working).
+  // fence) is rejected with `FENCE_CONFLICT`, killing duplicate-execution races
+  // between overlapping workers. Data-preserving (existing rows default to `''`
+  // = no fence held; calls that pass no token skip the check).
   (db) => {
     db.exec(`
       ALTER TABLE ledger_task
         ADD COLUMN fence_token TEXT NOT NULL DEFAULT '';
     `);
   },
-  // v4 — idempotency (Phase 2 Wave B).
+  // v4 — idempotency.
   //
   // (a) Unique (owner, intent_key): a client's idempotency key (messageId)
   // maps to EXACTLY ONE task, forever, under one owner. This is the
-  // owner-scoped uniqueness that makes get-or-create-by-key race-safe. The v1
-  // comment deferred this constraint to Phase 6 (M12); Wave B's idempotency
-  // needs it now, so it lands here — and the get-or-create catches the
-  // SQLITE_CONSTRAINT violation and re-reads the existing row instead of
-  // erroring (no raw-INSERT 500 on a repeat). An UNCONDITIONAL index (no
-  // partial WHERE) is deliberate: a terminal task's intentKey is never
-  // re-sent as a new message (the client generates messageId once per send),
-  // so a partial index would only introduce "which row wins" ambiguity when a
-  // terminal and a fresh task share a key.
+  // owner-scoped uniqueness that makes get-or-create-by-key race-safe; the
+  // get-or-create catches the SQLITE_CONSTRAINT violation and re-reads the
+  // existing row instead of erroring (no raw-INSERT 500 on a repeat). An
+  // UNCONDITIONAL index (no partial WHERE) is deliberate: a terminal task's
+  // intentKey is never re-sent as a new message (the client generates messageId
+  // once per send), so a partial index would only introduce "which row wins"
+  // ambiguity when a terminal and a fresh task share a key.
   //
-  // M4: a pre-v4 DB written through the raw-insert path can already hold
-  // duplicate (owner, intent_key) rows; creating the UNIQUE index over them
-  // would abort the whole migration at import. So BEFORE the index, delete the
-  // older duplicates, keeping the NEWEST row per group (newest by updated_ts,
-  // id as the deterministic tie-breaker) — the same "newest wins" rule the
+  // A database written through the raw-insert path can already hold duplicate
+  // (owner, intent_key) rows; creating the UNIQUE index over them would abort
+  // the whole migration at import. So BEFORE the index, delete the older
+  // duplicates, keeping the NEWEST row per group (newest by updated_ts, id as
+  // the deterministic tie-breaker) — the same "newest wins" rule the
   // get-or-create re-read applies. (Orphaned steps/chain rows of the deleted
   // duplicates remain — they are never surfaced because reads are keyed by
   // task_id, and ledger_step's append-only trigger forbids cleanup.)
@@ -624,9 +618,9 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
   // tool_call_id) makes `hasToolResult` an indexed point lookup, not a scan,
   // and makes a duplicate record a SQLITE_CONSTRAINT that `recordToolResult`
   // catches (idempotent record). The column is intentionally NOT part of the
-  // hash-chain content (`canonicalStepContent`): adding it would change digest
-  // computation for pre-existing chains and break `verifyChain` backward
-  // compatibility. Data-preserving (existing steps get NULL tool_call_id).
+  // hash-chain content (`canonicalStepContent`): adding it would change the
+  // digest computation and invalidate existing chains. Data-preserving
+  // (existing steps get NULL tool_call_id).
   (db) => {
     db.exec(`
       DELETE FROM ledger_task AS older
@@ -647,14 +641,13 @@ const LEDGER_MIGRATIONS: readonly Migration[] = [
         WHERE tool_call_id IS NOT NULL;
     `);
   },
-  // v5 — job snapshot payload (stateless-gateway §7, targeted runner rewrite).
+  // v5 — job snapshot payload.
   // `ledger_task.payload` stores the JSON-encoded snapshot messages a job runs
-  // on. The JobRunner writes it at admission (it is the ONLY durable place a
-  // snapshot can live once the checkpointer is gone) and `resumeStuckJobs`
-  // reads it to re-run a stuck task from the stored snapshot. It is transient
-  // user content (plan §10): purged WITH the task by the step-7 retention
-  // sweep (no separate purge), and never exposed on the ledger routes.
-  // Data-preserving (existing rows get NULL payload).
+  // on. The JobRunner writes it at admission and `resumeStuckJobs` reads it to
+  // re-run a stuck task from the stored snapshot. It is transient user content:
+  // purged WITH the task by the retention sweep (no separate purge), and never
+  // exposed on the ledger routes. Data-preserving (existing rows get NULL
+  // payload).
   (db) => {
     db.exec(`
       ALTER TABLE ledger_task ADD COLUMN payload TEXT;
@@ -796,8 +789,8 @@ export class Ledger {
     const id = randomUUID();
     const ts = this.now();
     const worker = input.worker ?? null;
-    // D4: cap the job label at the write boundary so no caller can persist
-    // user content as the ledger's `spec`.
+    // Cap the job label at the write boundary so no caller can persist user
+    // content as the ledger's `spec`.
     const spec =
       input.spec.length > SPEC_MAX_LENGTH
         ? input.spec.slice(0, SPEC_MAX_LENGTH)
@@ -1336,8 +1329,8 @@ export class Ledger {
    * task's current token. A superseded worker holds a stale token — granted by
    * an earlier `claimTask`/`resumeTask` that has since rotated it — so its
    * heartbeats and step appends are refused. When [fenceToken] is undefined the
-   * check is skipped (backwards compatibility for pre-v3 callers/tests); the
-   * routes always pass it through from claim/resume.
+   * check is skipped (callers that pass no token, such as tests); the routes
+   * always pass it through from claim/resume.
    */
   private requireFence(task: TaskRow, fenceToken: string | undefined): void {
     if (fenceToken !== undefined && task.fence_token !== fenceToken) {
@@ -1517,7 +1510,7 @@ export class Ledger {
    *
    * This keys off `last_heartbeat_ts` (NOT `updated_ts`): `appendStep` also
    * bumps `updated_ts`, so a worker that appends steps but never heartbeats
-   * must still be marked stuck per the heartbeat-based spec (§3.3).
+   * must still be marked stuck.
    */
   markStuckIfHeartbeatStale(taskId: string): TaskRow | null {
     const task = this.getTask(taskId);
@@ -1599,11 +1592,11 @@ export class Ledger {
   }
 
   /**
-   * D6 retention purge: deletes every terminal task (`succeeded`/`failed`/
+   * Retention purge: deletes every terminal task (`succeeded`/`failed`/
    * `cancelled`/`awaiting_review`) whose last transition (`updated_ts`) is
    * older than `terminalRetentionMs` before [now], along with its
    * `ledger_step` and `ledger_chain` rows. NEVER touches `queued`/`running`/
-   * `stuck` tasks, however old. The chain (D5) survives everywhere except on
+   * `stuck` tasks, however old. The chain survives everywhere except on
    * tasks that are themselves purged.
    *
    * The append-only delete triggers would abort the delete, so they are
@@ -1647,7 +1640,7 @@ export class Ledger {
   }
 
   /**
-   * M12 account-deletion purge: removes EVERY row owned by [owner] — tasks,
+   * Account-deletion purge: removes EVERY row owned by [owner] — tasks,
    * steps and chain — and returns what happened so the caller (the better-auth
    * `deleteUser` cascade in auth/index.ts) can observe the cleanup.
    *
@@ -1720,7 +1713,7 @@ export class Ledger {
   }
 
   /**
-   * Starts the D6 periodic retention sweep: every [intervalMs] it calls
+   * Starts the periodic retention sweep: every [intervalMs] it calls
    * `purgeTerminalTasks()`. Mirrors the JobRunner `sweepPins` timer pattern:
    * tick errors are forwarded to [onError] and never escape the timer, and the
    * timer is `unref()`ed (when the underlying handle supports it) so it can
@@ -1769,7 +1762,7 @@ export class Ledger {
    * Resumes a task on behalf of the task owner. Non-owners are rejected.
    * Clears the broken lease, grants it to the resumer and ROTATES the fence
    * token (a resumed task gets a NEW token), so any superseded worker holding
-   * the old token is rejected on its next heartbeat/append.
+   * a previously issued token is rejected on its next heartbeat/append.
    */
   resumeTask(taskId: string, owner: string): TaskRow {
     const task = this.getTask(taskId);

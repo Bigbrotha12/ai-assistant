@@ -29,7 +29,7 @@ test("production context config validates limits and warmups default off", () =>
       "WARMUP_TIMEOUT_MS", "BUDGET_MODEL_CALL_LIMIT", "BUDGET_MODEL_CALL_WINDOW_MS",
     ]) delete environment[key];
     return spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
-      const { env } = await import('./src/env.ts');
+      const { env } = await import('./src/config/env.ts');
       process.stdout.write(JSON.stringify({
         limit: env.CONTEXT_TOKEN_LIMIT, warmups: env.WARMUP_ENABLED,
         calls: env.BUDGET_MODEL_CALL_LIMIT, window: env.BUDGET_MODEL_CALL_WINDOW_MS,
@@ -126,12 +126,12 @@ test("production boot shares phase 4 services and uses scoped model credentials"
       },
     },
     "./auth/index.ts": { auth: { handler: () => new Response() } },
-    "./env.ts": { env: environment },
+    "./config/env.ts": { env: environment },
     "./auth/request_auth.ts": {
       createAuthCheckRoutes: () => new Hono(),
       requireApiKey: async () => ({ ok: true as const, owner: "test-user" }),
     },
-    "./ledger.routes.ts": {
+    "./ledger/routes.ts": {
       ledger: { close() {} },
       createLedgerRoutes: () => new Hono(),
     },

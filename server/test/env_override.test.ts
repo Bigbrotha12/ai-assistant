@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
-import { envSchema } from "../src/env.ts";
+import { envSchema } from "../src/config/env.ts";
 
 const REQUIRED = {
   BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
@@ -164,7 +164,7 @@ describe("MCP_TRUSTED_HOSTS fail-fast (fresh process)", () => {
     const environment = { ...process.env };
     for (const key of ["MCP_TRUSTED_HOSTS", "PLUGINS_TRUSTED_HOSTS"]) delete environment[key];
     return spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
-      await import('./src/env.ts');
+      await import('./src/config/env.ts');
       process.stdout.write('ok');
     `], {
       cwd: new URL("../", import.meta.url),
@@ -204,7 +204,7 @@ describe("NOTIFY_TRUSTED_HOSTS fail-fast (fresh process)", () => {
       delete environment[key];
     }
     return spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
-      await import('./src/env.ts');
+      await import('./src/config/env.ts');
       process.stdout.write('ok');
     `], {
       cwd: new URL("../", import.meta.url),

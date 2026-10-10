@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { logger } from "../logger.ts";
-import { redactForOutbound } from "../redact.ts";
+import { logger } from "../observability/logger.ts";
+import { redactForOutbound } from "../security/redact.ts";
 
 export const AUDIT_TELEMETRY_ENABLED_ENV = "AUDIT_TELEMETRY_ENABLED";
 export const AUDIT_TELEMETRY_LEVEL_ENV = "AUDIT_TELEMETRY_LEVEL";

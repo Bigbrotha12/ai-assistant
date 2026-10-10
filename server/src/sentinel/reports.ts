@@ -3,7 +3,7 @@ import type {
   TaskStepMetadataAggregate,
   TaskStepMetadataFilter,
   TaskStepMetadataQuery,
-} from "../ledger.ts";
+} from "../ledger/index.ts";
 import {
   SENTINEL_CATEGORIES,
   SENTINEL_SEVERITIES,

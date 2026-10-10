@@ -10,7 +10,7 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { Annotation, END, Overwrite, START, StateGraph } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { SUPERVISOR_PROMPT, SYSTEM_PROMPT } from "./prompts.ts";
-import { boundToolResultContent } from "../tool_bounds.ts";
+import { boundToolResultContent } from "../tools/bounds.ts";
 
 export const MAX_TOOL_ROUNDS = 5;
 

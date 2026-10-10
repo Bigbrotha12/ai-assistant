@@ -5,7 +5,7 @@ import type {
   ToolCall,
   ToolInterceptor,
 } from "../../src/tools/pipeline.ts";
-import { Ledger, migrateLedger } from "../../src/ledger.ts";
+import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
 
 /** A complete `ToolCall` with plugin/sync defaults; override per test. */
 export function makeCall(overrides: Partial<ToolCall> = {}): ToolCall {

@@ -28,8 +28,8 @@ import {
   mcpServerBookkeepingKey,
   mcpServerRuntimeKey,
 } from "../../src/agents/mcp.ts";
-import { logger } from "../../src/logger.ts";
-import { ToolResourceError } from "../../src/tool_bounds.ts";
+import { logger } from "../../src/observability/logger.ts";
+import { ToolResourceError } from "../../src/tools/bounds.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import {
   configureAuditTelemetry,

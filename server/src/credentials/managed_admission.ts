@@ -1,4 +1,4 @@
-import { TERMINAL_TASK_STATUSES, type TaskRow } from "../ledger.ts";
+import { TERMINAL_TASK_STATUSES, type TaskRow } from "../ledger/index.ts";
 
 export type ManagedAdmission =
   | { kind: "admitted"; task: TaskRow }
@@ -15,7 +15,7 @@ export function inspectManagedTurn(task: TaskRow, clientThreadId?: string): Mana
   return undefined;
 }
 
-/** Single source of truth: `server/src/ledger.ts` TERMINAL_TASK_STATUSES. */
+/** Single source of truth: `server/src/ledger/index.ts` TERMINAL_TASK_STATUSES. */
 export function isTerminalStatus(status: TaskRow["status"]): boolean {
   return TERMINAL_TASK_STATUSES.includes(status);
 }

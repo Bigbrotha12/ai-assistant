@@ -6,7 +6,7 @@ import type { Database as DatabaseType } from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { sendEmailVerificationMail, sendPasswordResetMail } from "./email.ts";
-import { env } from "../env.ts";
+import { env } from "../config/env.ts";
 import {
   VERIFY_EMAIL_PATH,
   createSendVerificationEmailCallback,
@@ -252,12 +252,12 @@ export const auth = betterAuth({
         getRuntime: () => accountDeletionRuntime,
         purgeLedgerOwner: async (owner) => {
           // Lazy dynamic import: a static `import { ledger } from
-          // "./ledger.routes.ts"` would open LEDGER_DB_PATH and start the
+          // "../ledger/routes.ts"` would open LEDGER_DB_PATH and start the
           // retention sweep for EVERY importer of auth/index.ts (request_auth.ts,
           // tests) and form the cycle auth -> ledger.routes -> request_auth ->
           // auth. index.ts loads ledger.routes at boot in production; tests
           // inject their own purge through createAccountDeletionHooks.
-          const { ledger } = await import("../ledger.routes.ts");
+          const { ledger } = await import("../ledger/routes.ts");
           return ledger.purgeOwnerData(owner);
         },
         getNotifyStore: () => accountDeletionNotifyStore,

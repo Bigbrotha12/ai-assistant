@@ -44,7 +44,7 @@ import {
 } from "../../src/transport/model.ts";
 import type { BuildModelInput } from "../../src/transport/model.ts";
 import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
-import { Ledger, migrateLedger } from "../../src/ledger.ts";
+import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import type {
   JobDescriptor,
@@ -59,7 +59,7 @@ import type { BudgetManager } from "../../src/middleware/budget.ts";
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import type { ToolResultCache } from "../../src/middleware/cache.ts";
 import { clearDeleting, markDeleting } from "../../src/auth/account_deletion.ts";
-import { redactForOutbound } from "../../src/redact.ts";
+import { redactForOutbound } from "../../src/security/redact.ts";
 import { createWarmupManager } from "../../src/middleware/warmup.ts";
 import type { SentinelShadowSink } from "../../src/sentinel/shadow.ts";
 import type { WarmupManager } from "../../src/middleware/warmup.ts";

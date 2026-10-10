@@ -12,15 +12,15 @@ import {
 import type { BaseMessage } from "@langchain/core/messages";
 import type { StreamEvent } from "./openai.ts";
 
-import { env } from "../env.ts";
-import { logger } from "../logger.ts";
+import { env } from "../config/env.ts";
+import { logger } from "../observability/logger.ts";
 import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
 import { AccountDeletedError, assertNotDeleting, isDeleting } from "../auth/account_deletion.ts";
 import { bindPluginTools } from "../agents/orchestrator.ts";
 import { bindMcpServers, type McpClientFactory, type McpServerConfig } from "../agents/mcp.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
 import { createTrackedExecution, trackModelExecution } from "../agents/execution.ts";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 import { createAgentGraph } from "../agents/graph.ts";
 import { ToolExecutor } from "../jobs/runner.ts";
 import type {
@@ -33,7 +33,7 @@ import { inspectManagedTurn } from "../credentials/managed_admission.ts";
 import type { ManagedAdmission } from "../credentials/managed_admission.ts";
 import { RequestBodyCredentialResolver } from "../credentials/request_body.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
-import { redactBaseMessage } from "../redact.ts";
+import { redactBaseMessage } from "../security/redact.ts";
 import {
   extractCredentialsFromBody,
   PluginCredentialError,
@@ -59,8 +59,8 @@ import type {
   PerOwnerRateLimiter,
   RateLimitResult,
 } from "../middleware/rate_limit.ts";
-import type { Ledger, TaskRow } from "../ledger.ts";
-import { SPEC_MAX_LENGTH } from "../ledger.ts";
+import type { Ledger, TaskRow } from "../ledger/index.ts";
+import { SPEC_MAX_LENGTH } from "../ledger/index.ts";
 import { toOpenAiSse } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";

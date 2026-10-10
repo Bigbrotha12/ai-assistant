@@ -2,7 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createToolPipeline } from "../../../src/tools/pipeline.ts";
 import { createExecutionInterceptor } from "../../../src/tools/interceptors/execution.ts";
-import { TOOL_RESULT_TRUNCATION_MARKER, ToolResourceError } from "../../../src/tool_bounds.ts";
+import { TOOL_RESULT_TRUNCATION_MARKER, ToolResourceError } from "../../../src/tools/bounds.ts";
 import { makeBodies, makeCall } from "../support.ts";
 
 function executionPipeline() {

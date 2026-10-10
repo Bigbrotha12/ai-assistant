@@ -4,7 +4,7 @@ import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import { isModelPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 
 /**
  * OpenAI-compatible `GET /v1/models` transport: compiles the model list from

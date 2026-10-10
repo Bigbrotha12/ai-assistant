@@ -33,7 +33,7 @@ import {
 } from "./ssrf.ts";
 import { resolvePins } from "../egress/client.ts";
 import type { LookupFn, Mode } from "./ssrf.ts";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 import { AsyncMutex } from "../jobs/mutex.ts";
 
 /**

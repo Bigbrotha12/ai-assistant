@@ -1,6 +1,6 @@
 import nodemailer from "nodemailer";
-import { env } from "../env.ts";
-import { logger } from "../logger.ts";
+import { env } from "../config/env.ts";
+import { logger } from "../observability/logger.ts";
 
 export interface MailLink {
   to: string;

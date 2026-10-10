@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { Hono } from "hono";
 
 const require = createRequire(import.meta.url);
-const { version } = require("../package.json") as { version: string };
+const { version } = require("../../package.json") as { version: string };
 
 /** A single reachability probe. Throws (sync or async) to signal failure. */
 export type HealthCheck = () => void | Promise<void>;
@@ -19,7 +19,7 @@ export type HealthProbes = {
 // production integration test's module-mock surface (its mocks apply only to
 // index.ts's direct imports).
 async function probeAuthDb(): Promise<void> {
-  const { authDb } = await import("./auth/index.ts");
+  const { authDb } = await import("../auth/index.ts");
   authDb.prepare("SELECT 1").get();
 }
 
@@ -27,7 +27,7 @@ async function probeLedgerDb(): Promise<void> {
   // `Ledger.getTask` is a primary-key SELECT on the SHARED ledger handle —
   // reachability without opening a second connection (ledger.db's raw handle
   // is not exported; the exported `ledger` instance is the existing seam).
-  const { ledger } = await import("./ledger.routes.ts");
+  const { ledger } = await import("../ledger/routes.ts");
   ledger.getTask("health-probe");
 }
 

@@ -37,7 +37,7 @@ import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import { createSessionStore } from "../../src/sessions/store.ts";
 import type { SessionStore } from "../../src/sessions/store.ts";
 import { createSessionRoutes } from "../../src/sessions/routes.ts";
-import type { Ledger } from "../../src/ledger.ts";
+import type { Ledger } from "../../src/ledger/index.ts";
 import type { SentinelShadowSink } from "../../src/sentinel/shadow.ts";
 
 /**

@@ -7,7 +7,7 @@ import { BudgetExhaustedError, type BudgetManager } from "./budget.ts";
 import {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   serializeBoundedToolArguments,
-} from "../tool_bounds.ts";
+} from "../tools/bounds.ts";
 import type { ToolCacheKey, ToolResultCache } from "./cache.ts";
 import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
 import { makePluginBodies } from "../tools/bind.ts";

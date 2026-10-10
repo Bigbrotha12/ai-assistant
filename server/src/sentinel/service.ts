@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Ledger } from "../ledger.ts";
+import type { Ledger } from "../ledger/index.ts";
 import { DEFAULT_RULE_SET, evaluateL1 } from "./l1.ts";
 import { decideSentinel, DEFAULT_SENTINEL_POLICY } from "./policy.ts";
 import { SentinelShadowReporter } from "./shadow.ts";

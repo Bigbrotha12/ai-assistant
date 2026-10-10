@@ -1,9 +1,10 @@
-import { createTokenBucketLimiter } from "../rate_limit.ts";
+import { createTokenBucketLimiter } from "./token_bucket.ts";
 
 /**
  * Per-OWNER rate limiting (Phase 4, Wave A middleware).
  *
- * The gateway's existing `createTokenBucketLimiter` (`src/rate_limit.ts`) is
+ * The gateway's existing `createTokenBucketLimiter`
+ * (`src/middleware/token_bucket.ts`) is
  * an in-memory, continuously-refilled token bucket keyed by API key. That
  * algorithm — the single source of truth for admission — is wrapped, NOT
  * re-implemented: this factory keeps the exact bucket the rest of the gateway

@@ -13,7 +13,7 @@ import { createPluginRoutes } from "../../src/plugins/routes.ts";
 import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 import type { AgentPluginDefinition, ModelPluginDefinition, ToolPluginDefinition } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
-import { logger } from "../../src/logger.ts";
+import { logger } from "../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,
   flushAuditTelemetry,

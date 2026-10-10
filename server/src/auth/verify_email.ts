@@ -3,7 +3,7 @@ import type { MiddlewareHandler } from "hono";
 import {
   createSendVerificationRateLimiter,
   type SendVerificationRateLimiterOptions,
-} from "../rate_limit.ts";
+} from "./verify_rate_limit.ts";
 import { isDeleting, withOwnerBarrier } from "./account_deletion.ts";
 import { injectToken, loadPageTemplate, scriptStringLiteral } from "./page_template.ts";
 

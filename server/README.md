@@ -41,7 +41,7 @@ sign-up/sign-in, API-key mint) fails until the tables exist.
 
 `npm run migrate` first runs the better-auth CLI (`auth`, the v1.7 CLI package — the old
 `@better-auth/cli` is deprecated and only supports better-auth ≤ 1.6), then chained
-`npm run migrate:ledger` (a small `tsx src/migrate-ledger.ts` script) which migrates the
+`npm run migrate:ledger` (a small `tsx src/ledger/migrate.ts` script) which migrates the
 ledger DB to the current schema via `PRAGMA user_version`. So one command covers both
 databases. Equivalent manual invocation: `npx auth migrate`. It creates `DB_PATH` (default
 `./data/gateway.db`) with the `user`, `session`, `account`, `verification`, and

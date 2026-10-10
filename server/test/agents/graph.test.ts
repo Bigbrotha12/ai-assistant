@@ -28,7 +28,7 @@ import {
   type PrepareMessages,
 } from "../../src/agents/graph.ts";
 import { jsonSchemaToZod } from "../../src/agents/orchestrator.ts";
-import { TOOL_RESULT_TRUNCATION_MARKER } from "../../src/tool_bounds.ts";
+import { TOOL_RESULT_TRUNCATION_MARKER } from "../../src/tools/bounds.ts";
 
 /**
  * Scripted fake chat model: returns a preset sequence of AIMessages (some with

@@ -13,7 +13,7 @@ import { credentialFingerprint } from "../../../src/plugins/credential.ts";
 import {
   DEFAULT_TOOL_ARGS_MAX_BYTES,
   ToolResourceError,
-} from "../../../src/tool_bounds.ts";
+} from "../../../src/tools/bounds.ts";
 import type { ToolPluginDefinition } from "../../../src/plugins/types.ts";
 import { makeLedger } from "../support.ts";
 

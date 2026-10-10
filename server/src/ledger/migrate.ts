@@ -1,8 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
-import { env } from "./env.ts";
-import { CURRENT_LEDGER_VERSION, migrateLedger } from "./ledger.ts";
+import { env } from "../config/env.ts";
+import { CURRENT_LEDGER_VERSION, migrateLedger } from "./index.ts";
 
 mkdirSync(dirname(env.LEDGER_DB_PATH), { recursive: true });
 const db = new Database(env.LEDGER_DB_PATH);

@@ -38,7 +38,7 @@ import type {
 } from "../../src/tools/pipeline.ts";
 import { buildPipelineForChannel } from "../../src/tools/channel.ts";
 import { JobError } from "../../src/jobs/errors.ts";
-import { logger } from "../../src/logger.ts";
+import { logger } from "../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,
   flushAuditTelemetry,

@@ -3,7 +3,7 @@ import {
   pluginDefinitionSchema,
 } from "../types.ts";
 import type { ModelPluginDefinition } from "../types.ts";
-import { env } from "../../env.ts";
+import { env } from "../../config/env.ts";
 
 /**
  * Builtin model plugins.

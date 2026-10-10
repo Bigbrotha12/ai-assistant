@@ -94,8 +94,8 @@
  * whole session — the client cannot control reply size.
  */
 import { AsyncMutex } from "../jobs/mutex.ts";
-import { isRecord } from "../util.ts";
-import { redactBaseMessage, redactMessages } from "../redact.ts";
+import { isRecord } from "../shared/util.ts";
+import { redactBaseMessage, redactMessages } from "../security/redact.ts";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 
 export type SessionKey = { owner: string; sessionId: string };

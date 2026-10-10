@@ -1,4 +1,4 @@
-import type { Ledger } from "../../ledger.ts";
+import type { Ledger } from "../../ledger/index.ts";
 import type { BudgetManager } from "../../middleware/budget.ts";
 import type { ToolResultCache } from "../../middleware/cache.ts";
 import { createBudgetInterceptor } from "./budget.ts";

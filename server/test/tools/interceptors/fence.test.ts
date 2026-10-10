@@ -4,9 +4,9 @@ import { createToolPipeline } from "../../../src/tools/pipeline.ts";
 import { createFenceInterceptor } from "../../../src/tools/interceptors/fence.ts";
 import { createSerializeInterceptor } from "../../../src/tools/interceptors/serialize.ts";
 import type { ToolInterceptor } from "../../../src/tools/pipeline.ts";
-import type { Ledger } from "../../../src/ledger.ts";
+import type { Ledger } from "../../../src/ledger/index.ts";
 import { JobError } from "../../../src/jobs/runner.ts";
-import { DEFAULT_TOOL_ARGS_MAX_BYTES } from "../../../src/tool_bounds.ts";
+import { DEFAULT_TOOL_ARGS_MAX_BYTES } from "../../../src/tools/bounds.ts";
 import { makeBodies, makeCall } from "../support.ts";
 
 type FakeTask = { status: string; fence_token: string };

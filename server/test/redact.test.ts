@@ -7,7 +7,7 @@ import {
   redactForOutbound,
   redactMessageContent,
   redactMessages,
-} from "../src/redact.ts";
+} from "../src/security/redact.ts";
 
 const RANDOM_PART = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
 const PRODUCTION_KEY = `sk${RANDOM_PART}`;

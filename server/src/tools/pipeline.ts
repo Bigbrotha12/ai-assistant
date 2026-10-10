@@ -1,5 +1,5 @@
-import { logger } from "../logger.ts";
-import { boundToolResult } from "../tool_bounds.ts";
+import { logger } from "../observability/logger.ts";
+import { boundToolResult } from "./bounds.ts";
 
 /**
  * ToolExecutionPipeline — the single around-middleware engine every tool call

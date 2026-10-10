@@ -1,8 +1,8 @@
 import {
   boundToolResult,
   invokeBoundedToolHandler,
-} from "../../tool_bounds.ts";
-import { logger } from "../../logger.ts";
+} from "../bounds.ts";
+import { logger } from "../../observability/logger.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
 
 /**

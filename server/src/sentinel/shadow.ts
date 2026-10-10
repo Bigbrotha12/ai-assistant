@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Ledger, TaskRow } from "../ledger.ts";
+import type { Ledger, TaskRow } from "../ledger/index.ts";
 import { DEFAULT_RULE_SET, evaluateL1 } from "./l1.ts";
 import { decideSentinel, policyForMode } from "./policy.ts";
 import {

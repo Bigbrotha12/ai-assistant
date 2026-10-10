@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { BudgetExhaustedError, createBudgetManager } from "../../src/middleware/budget.ts";
-import { logger } from "../../src/logger.ts";
+import { logger } from "../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,
   flushAuditTelemetry,

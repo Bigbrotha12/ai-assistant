@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
-import { envSchema } from "../src/env.ts";
+import { envSchema } from "../src/config/env.ts";
 import { bindMcpServers } from "../src/agents/mcp.ts";
 
 const REQUIRED = {
@@ -47,7 +47,7 @@ describe("logger threshold filtering (fresh process)", () => {
     const result = spawnSync(
       process.execPath,
       ["--import", "tsx", "--input-type=module", "--eval", `
-        const { logger } = await import('./src/logger.ts');
+        const { logger } = await import('./src/observability/logger.ts');
         logger.error('ERR');
         logger.warn('WARN');
         logger.info('INFO');

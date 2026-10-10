@@ -1,4 +1,4 @@
-import { env } from "../env.ts";
+import { env } from "../config/env.ts";
 import { builtinPlugins } from "./builtin/openrouter.ts";
 import { availableToolManifests } from "./manifests/index.ts";
 import { PluginRegistry } from "./registry.ts";

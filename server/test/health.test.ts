@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { test } from "node:test";
 import { Hono } from "hono";
-import { createHealthRoutes } from "../src/health.ts";
+import { createHealthRoutes } from "../src/observability/health.ts";
 
 const require = createRequire(import.meta.url);
 const pkgVersion = (require("../package.json") as { version: string }).version;

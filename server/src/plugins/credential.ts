@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CredentialSpec } from "./types.ts";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 
 /**
  * Per-request credential extraction & validation (Phase 1, Step 5).

@@ -6,7 +6,7 @@ import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import { isDeleting } from "../auth/account_deletion.ts";
 import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
 import type { PerOwnerRateLimiter, RateLimitResult } from "../middleware/rate_limit.ts";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 import { SentinelService, SentinelTaskNotFoundError } from "./service.ts";
 import { policyForMode } from "./policy.ts";
 import {
@@ -20,7 +20,7 @@ import type {
   SentinelPolicyMode,
 } from "./types.ts";
 import { SENTINEL_CATEGORIES, SENTINEL_DIRECTIONS } from "./types.ts";
-import type { Ledger } from "../ledger.ts";
+import type { Ledger } from "../ledger/index.ts";
 
 export const DEFAULT_SENTINEL_MAX_BODY_BYTES = 65_536;
 

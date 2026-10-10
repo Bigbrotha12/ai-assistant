@@ -35,7 +35,7 @@ import {
 import type { JobRunner } from "../../src/jobs/runner.ts";
 import type { CredentialPinHandle } from "../../src/credentials/pins.ts";
 import { AsyncMutex } from "../../src/jobs/mutex.ts";
-import { Ledger, migrateLedger } from "../../src/ledger.ts";
+import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
 import { CredentialPinStore } from "../../src/credentials/pins.ts";
 import { clearDeleting, markDeleting } from "../../src/auth/account_deletion.ts";
 import { CredentialPinError } from "../../src/credentials/pins.ts";
@@ -44,7 +44,7 @@ function isNotFound(e: unknown): boolean {
   return e instanceof CredentialPinError && e.code === "pin_not_found";
 }
 import { recordToolResult } from "../../src/credentials/idempotency.ts";
-import { redactForOutbound } from "../../src/redact.ts";
+import { redactForOutbound } from "../../src/security/redact.ts";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
@@ -60,7 +60,7 @@ import { credentialFingerprint } from "../../src/plugins/credential.ts";
 import {
   TOOL_RESULT_TRUNCATION_MARKER,
   ToolResourceError,
-} from "../../src/tool_bounds.ts";
+} from "../../src/tools/bounds.ts";
 import {
   readSentinelShadowReport,
   SentinelShadowReporter,

@@ -1,4 +1,4 @@
-import { logger } from "../logger.ts";
+import { logger } from "../observability/logger.ts";
 
 /**
  * Default skill token budget when a caller does not supply one. Production

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 import {
   SENTINEL_CATEGORIES,
   SENTINEL_SCHEMA_VERSION,

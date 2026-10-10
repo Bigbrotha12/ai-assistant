@@ -4,7 +4,7 @@ import type { Context } from "hono";
 import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
 import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import { isDeleting } from "../auth/account_deletion.ts";
-import { createTokenBucketLimiter } from "../rate_limit.ts";
+import { createTokenBucketLimiter } from "../middleware/token_bucket.ts";
 import { PluginRegistryError } from "./registry.ts";
 import type { PluginRegistry } from "./registry.ts";
 import { PluginStoreError } from "./store.ts";
@@ -56,7 +56,7 @@ import {
  *
  * RATE LIMITING: the three MANAGEMENT endpoints (`reload`, `install`,
  * `uninstall`) are token-bucket limited per-owner via `createTokenBucketLimiter`
- * (`src/rate_limit.ts`), matching the inference limiter's `{"error":
+ * (`src/middleware/token_bucket.ts`), matching the inference limiter's `{"error":
  * "rate_limited"}` 429 shape. The GET list/detail endpoints are left unlimited
  * (read-only, cheap, and the leaks they could amplify are already redacted).
  *

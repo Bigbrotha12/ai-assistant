@@ -9,7 +9,7 @@ import type { ToolResultCache } from "../../../src/middleware/cache.ts";
 import {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   TOOL_RESULT_TRUNCATION_MARKER,
-} from "../../../src/tool_bounds.ts";
+} from "../../../src/tools/bounds.ts";
 import { makeBodies, makeCall } from "../support.ts";
 
 function makeCache(t: TestContext): ToolResultCache {

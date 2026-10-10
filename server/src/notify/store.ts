@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname } from "node:path";
-import { isRecord } from "../util.ts";
+import { isRecord } from "../shared/util.ts";
 import { AsyncMutex } from "../jobs/mutex.ts";
 
 /**

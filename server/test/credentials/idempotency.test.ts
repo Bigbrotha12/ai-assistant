@@ -1,14 +1,14 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { Ledger, migrateLedger } from "../../src/ledger.ts";
+import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
 import {
   canRetryTool,
   getOrCreateTask,
   hasToolResult,
   recordToolResult,
 } from "../../src/credentials/idempotency.ts";
-import type { Ledger as LedgerType } from "../../src/ledger.ts";
+import type { Ledger as LedgerType } from "../../src/ledger/index.ts";
 
 function makeLedger(): { db: Database.Database; ledger: Ledger } {
   const db = new Database(":memory:");

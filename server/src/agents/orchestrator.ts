@@ -4,7 +4,7 @@ import { jsonSchemaToZod } from "../tools/schema.ts";
 import {
   DEFAULT_TOOL_HANDLER_TIMEOUT_MS,
   DEFAULT_TOOL_RESULT_MAX_CHARS,
-} from "../tool_bounds.ts";
+} from "../tools/bounds.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { CredentialResolver } from "../credentials/resolver.ts";
 import { RequestBodyCredentialResolver } from "../credentials/request_body.ts";

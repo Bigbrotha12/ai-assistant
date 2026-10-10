@@ -1,6 +1,6 @@
 import { config } from "dotenv";
 import { z } from "zod";
-import { parseTrustedHostEntries } from "./plugins/ssrf.ts";
+import { parseTrustedHostEntries } from "../plugins/ssrf.ts";
 
 config({ quiet: true });
 

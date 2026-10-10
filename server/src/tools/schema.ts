@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { logger } from "../logger.ts";
+import { logger } from "../observability/logger.ts";
 import type { JsonSchema } from "../plugins/types.ts";
 
 /**

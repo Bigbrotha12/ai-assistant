@@ -1,4 +1,4 @@
-import { redactForOutbound } from "./redact.ts";
+import { redactForOutbound } from "../security/redact.ts";
 
 export const DEFAULT_TOOL_RESPONSE_MAX_BYTES = 1_048_576;
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 65_536;

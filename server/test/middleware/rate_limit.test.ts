@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createPerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
-import { createSendVerificationRateLimiter } from "../../src/rate_limit.ts";
+import { createSendVerificationRateLimiter } from "../../src/auth/verify_rate_limit.ts";
 
 describe("createPerOwnerRateLimiter", () => {
   it("allows up to the burst, then denies, with a retry-after derived from the refill rate", () => {

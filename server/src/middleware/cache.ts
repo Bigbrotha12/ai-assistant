@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { McpTool } from "../agents/mcp.ts";
-import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../tool_bounds.ts";
+import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../tools/bounds.ts";
 
 /**
  * In-memory tool-result cache (Phase 4, Wave B).

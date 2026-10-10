@@ -20,8 +20,8 @@ import {
 import { createToolResultCache } from "../../src/middleware/cache.ts";
 import { JobError } from "../../src/jobs/errors.ts";
 import Database from "better-sqlite3";
-import { Ledger, migrateLedger } from "../../src/ledger.ts";
-import { logger } from "../../src/logger.ts";
+import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
+import { logger } from "../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,
   flushAuditTelemetry,

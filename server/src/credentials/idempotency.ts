@@ -1,5 +1,5 @@
-import type { Ledger, StepRow, TaskRow } from "../ledger.ts";
-import { redactForOutbound } from "../redact.ts";
+import type { Ledger, StepRow, TaskRow } from "../ledger/index.ts";
+import { redactForOutbound } from "../security/redact.ts";
 
 /**
  * Idempotency — Phase 2, Wave B (rebuild, correct).

@@ -1,7 +1,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { ChatOpenAIFields } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { env } from "../env.ts";
+import { env } from "../config/env.ts";
 import { PluginRegistryError } from "../plugins/registry.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
 import type { PluginStore } from "../plugins/store.ts";

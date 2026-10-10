@@ -3,15 +3,15 @@ import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { z } from "zod";
-import { env } from "../env.ts";
-import { logger } from "../logger.ts";
+import { env } from "../config/env.ts";
+import { logger } from "../observability/logger.ts";
 import {
   createMcpToolListCache,
   type McpToolListCache,
 } from "../middleware/cache.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
-import type { Ledger } from "../ledger.ts";
+import type { Ledger } from "../ledger/index.ts";
 import { SsrfValidationError, validateMcpHeaderName } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";
 import { egressTrustOptions } from "../plugins/ssrf.ts";
@@ -21,7 +21,7 @@ import {
   boundToolResult,
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   TOOL_RESULT_TRUNCATION_MARKER,
-} from "../tool_bounds.ts";
+} from "../tools/bounds.ts";
 import {
   channelScopeHooks,
   createAnonymousSequence,
@@ -30,7 +30,7 @@ import {
 } from "../tools/bind.ts";
 import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
 import { buildPipelineForChannel } from "../tools/channel.ts";
-import { redactForOutbound } from "../redact.ts";
+import { redactForOutbound } from "../security/redact.ts";
 import {
   emitAuditEvent,
   type AuditEventInput,
@@ -1293,7 +1293,7 @@ function isAbortFailure(err: unknown, signal?: AbortSignal): boolean {
 /**
  * True when `signal` was aborted by the pipeline's `execution` bound rather than
  * by the caller: `invokeBoundedToolHandler` aborts its controller with the
- * `tool_timeout` `ToolResourceError` as the reason (`tool_bounds.ts:146`). The
+ * `tool_timeout` `ToolResourceError` as the reason (`tools/bounds.ts:146`). The
  * MCP body inspects the reason to attribute the resulting `AbortError` as an MCP
  * timeout (finding M1) instead of a cancellation.
  */

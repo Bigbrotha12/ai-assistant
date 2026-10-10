@@ -12,7 +12,7 @@ import { createExecutionInterceptor } from "../../src/tools/interceptors/executi
 import { createBudgetInterceptor } from "../../src/tools/interceptors/budget.ts";
 import { makePluginBodies } from "../../src/tools/bind.ts";
 import { createBudgetManager } from "../../src/middleware/budget.ts";
-import { ToolResourceError } from "../../src/tool_bounds.ts";
+import { ToolResourceError } from "../../src/tools/bounds.ts";
 import { makeBodies, makeCall, tracingInterceptor } from "./support.ts";
 
 function captureResults(): {

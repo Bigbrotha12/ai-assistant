@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
-import { env } from "../env.ts";
+import { env } from "../config/env.ts";
 import { pluginIdSchema } from "../plugins/types.ts";
 import {
   SsrfValidationError,

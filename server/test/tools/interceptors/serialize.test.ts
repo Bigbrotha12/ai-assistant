@@ -6,7 +6,7 @@ import {
   DEFAULT_TOOL_ARGS_MAX_BYTES,
   serializeBoundedToolArguments,
   ToolResourceError,
-} from "../../../src/tool_bounds.ts";
+} from "../../../src/tools/bounds.ts";
 import { makeBodies, makeCall } from "../support.ts";
 
 function serializePipeline(): ReturnType<typeof createToolPipeline> {

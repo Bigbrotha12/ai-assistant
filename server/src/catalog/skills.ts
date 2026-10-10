@@ -1,6 +1,6 @@
 import { glob, readFile, realpath } from "node:fs/promises";
 import { join, parse } from "node:path";
-import { logger } from "../logger.ts";
+import { logger } from "../observability/logger.ts";
 import { pluginIdSchema } from "../plugins/types.ts";
 
 export type SkillEntry = {

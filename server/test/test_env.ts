@@ -6,7 +6,7 @@ import { join } from "node:path";
  * Test-only, per-process database isolation.
  *
  * Several modules open and migrate a SQLite file at import time:
- *  - `ledger.routes.ts` opens + migrates `LEDGER_DB_PATH` (`PRAGMA
+ *  - `ledger/routes.ts` opens + migrates `LEDGER_DB_PATH` (`PRAGMA
  *    user_version`-gated schema migrations).
  *  - `auth/index.ts` opens `DB_PATH` (better-auth's schema).
  *

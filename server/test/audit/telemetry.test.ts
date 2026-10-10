@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { logger } from "../../src/logger.ts";
+import { logger } from "../../src/observability/logger.ts";
 import { bindPluginTools } from "../../src/agents/orchestrator.ts";
 import type { ToolPluginDefinition } from "../../src/plugins/types.ts";
 import {

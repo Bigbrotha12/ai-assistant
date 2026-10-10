@@ -12,7 +12,7 @@ import type {
   BudgetManager,
   ToolCallBudgetOptions,
 } from "../../../src/middleware/budget.ts";
-import { ToolResourceError } from "../../../src/tool_bounds.ts";
+import { ToolResourceError } from "../../../src/tools/bounds.ts";
 import type { ToolCallScope, ToolInterceptor } from "../../../src/tools/pipeline.ts";
 import { createTrackedExecution } from "../../../src/agents/execution.ts";
 import { makeBodies, makeCall } from "../support.ts";

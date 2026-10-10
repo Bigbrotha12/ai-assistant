@@ -1,5 +1,5 @@
 import { JobError } from "../../jobs/errors.ts";
-import type { Ledger } from "../../ledger.ts";
+import type { Ledger } from "../../ledger/index.ts";
 import type { ToolDispatch, ToolInterceptor } from "../pipeline.ts";
 
 /**

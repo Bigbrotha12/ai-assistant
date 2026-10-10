@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { redactForOutbound } from "../redact.ts";
+import { redactForOutbound } from "../security/redact.ts";
 import { BudgetExhaustedError } from "../middleware/budget.ts";
 import { ContextBudgetError } from "../middleware/context.ts";
 

@@ -14,9 +14,9 @@ import {
   PUBLIC_STEP_LIMIT,
   PUBLIC_TASK_PAGE_MAX_LIMIT,
   SPEC_MAX_LENGTH,
-} from "../src/ledger.ts";
+} from "../src/ledger/index.ts";
 import type { Database as DatabaseType } from "better-sqlite3";
-import type { TaskRow } from "../src/ledger.ts";
+import type { TaskRow } from "../src/ledger/index.ts";
 
 function makeLedger(
   opts: {

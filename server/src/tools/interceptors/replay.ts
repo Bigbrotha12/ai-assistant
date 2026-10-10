@@ -4,8 +4,8 @@ import {
   hasToolResult,
   recordToolResult,
 } from "../../credentials/idempotency.ts";
-import { boundToolResult } from "../../tool_bounds.ts";
-import type { Ledger } from "../../ledger.ts";
+import { boundToolResult } from "../bounds.ts";
+import type { Ledger } from "../../ledger/index.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
 
 /**

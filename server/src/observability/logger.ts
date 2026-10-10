@@ -1,4 +1,4 @@
-import { env } from "./env.ts";
+import { env } from "../config/env.ts";
 
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 } as const;
 type Level = keyof typeof LEVELS;
