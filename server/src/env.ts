@@ -41,13 +41,13 @@ export const envSchema = z.object({
   DB_PATH: z.string().default("./data/gateway.db"),
   CONFIG_DIR: z.string().default("/config"),
   // Sustained / burst ceiling for `POST /v1/chat/completions`, applied
-  // PER-OWNER (the authenticated user id, not the API key) since Phase 4
-  // Wave A — a user with many keys cannot rotate keys to bypass the limit.
+  // PER-OWNER (the authenticated user id, not the API key): a user with many
+  // keys cannot rotate keys to bypass the limit.
   INFERENCE_RATE_LIMIT: z.coerce.number().int().positive().default(60),
   INFERENCE_RATE_BURST: z.coerce.number().int().positive().default(20),
-  // Per-user concurrency budget (Phase 4, Wave A): max in-flight chat
-  // operations (sync streams + background jobs) and how many background
-  // admissions may queue per owner before rejection.
+  // Per-user concurrency budget: max in-flight chat operations (sync streams +
+  // background jobs) and how many background admissions may queue per owner
+  // before rejection.
   BUDGET_MAX_CONCURRENT: z.coerce.number().int().positive().default(2),
   BUDGET_QUEUE_MAX: z.coerce.number().int().positive().default(3),
   BUDGET_MODEL_CALL_LIMIT: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(60),
@@ -80,8 +80,8 @@ export const envSchema = z.object({
   // event loop or inflate memory for all users. Large enough for inline
   // base64 vision images.
   MAX_REQUEST_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(10_000_000),
-  // Max accepted request body for a SESSION ESTABLISH (§5/R6): full history +
-  // base64 images ride the establish body, so it gets a higher ceiling than the
+  // Max accepted request body for a SESSION ESTABLISH: full history + base64
+  // images ride the establish body, so it gets a higher ceiling than the
   // delta/stateless paths. The route-level `bodyLimit` is raised to this value;
   // non-establish requests are still bounded by MAX_REQUEST_BODY_BYTES,
   // enforced post-read with the same 413 `request_too_large` shape (the
@@ -94,7 +94,7 @@ export const envSchema = z.object({
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),
-  // D6: how long a terminal task (and its steps/chain) is retained before the
+  // How long a terminal task (and its steps/chain) is retained before the
   // periodic sweep purges it, and how often that sweep runs.
   LEDGER_RETENTION_MS: z.coerce.number().int().positive().default(86_400_000),
   LEDGER_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),

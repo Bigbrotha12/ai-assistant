@@ -7,7 +7,8 @@ const { version } = require("../package.json") as { version: string };
 /** A single reachability probe. Throws (sync or async) to signal failure. */
 export type HealthCheck = () => void | Promise<void>;
 
-export type HealthChecks = {
+/** The named probes rendered into `/health`'s `checks` map. */
+export type HealthProbes = {
   authDb: HealthCheck;
   ledgerDb: HealthCheck;
 };
@@ -31,7 +32,7 @@ async function probeLedgerDb(): Promise<void> {
 }
 
 /**
- * M5 watchdog — `GET /health`, UNAUTHENTICATED (k8s probes cannot auth).
+ * `GET /health` — UNAUTHENTICATED (k8s probes cannot auth).
  *
  * Response contract (probe surface; keep stable):
  * {
@@ -45,15 +46,15 @@ async function probeLedgerDb(): Promise<void> {
  * }
  * HTTP 200 when status is "ok"; 503 when "degraded" — k8s liveness/readiness
  * treat any non-2xx as failure. A thrown check becomes `"error"` in `checks`,
- * never a 500. Dropped per scope: SLA, incident alerts, runbooks, clock-skew.
+ * never a 500.
  *
  * `overrides` replaces individual checks (test injection seam); omitted checks
  * default to the live probes above.
  */
 export function createHealthRoutes(
-  overrides: Partial<HealthChecks> = {},
+  overrides: Partial<HealthProbes> = {},
 ): Hono {
-  const active: HealthChecks = {
+  const active: HealthProbes = {
     authDb: overrides.authDb ?? probeAuthDb,
     ledgerDb: overrides.ledgerDb ?? probeLedgerDb,
   };

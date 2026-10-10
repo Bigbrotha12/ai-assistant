@@ -73,7 +73,7 @@ app.use(async (c, next) => {
 });
 
 app.get("/api/auth/ok", (c) => c.json({ status: "ok" }));
-// C2 resend gate: per-address ≥60s limiter for `POST
+// Resend gate: per-address ≥60s limiter for `POST
 // /api/auth/send-verification-email` (better-auth's global rate limit is not
 // per-address). MUST be registered before the catch-all below so it wraps the
 // better-auth handler — Hono runs matched handlers in registration order and
@@ -115,21 +115,20 @@ app.route(
 // (the app has no deep-link handling). Mounted OUTSIDE the /api/auth namespace
 // so the page is only ever served by this Hono app.
 app.route("/", createResetPasswordRoutes());
-// Email-verification completion page (C2) — same pattern: the emailed link
+// Email-verification completion page — same pattern: the emailed link
 // targets `GET /verify-email?token=…`; the page fetches better-auth's
 // `GET /api/auth/verify-email` wire route from JS.
 app.route("/", createVerifyEmailRoutes());
 
-// D8 (stateless-gateway): the SQLCipher checkpoint store is gone — no
-// checkpoint DB is ever opened. Remove any checkpoints.db left behind by
-// older deployments so abandoned conversation data does not linger at rest
+// No checkpoint DB is ever opened. Remove any checkpoints.db left behind by
+// earlier deployments so abandoned conversation data does not linger at rest
 // (goal: no long-term user content on disk). Best-effort, never fatal.
 for (const base of ["./data/checkpoints.db"]) {
   for (const path of [base, `${base}-wal`, `${base}-shm`]) {
     try {
       if (existsSync(path)) {
         unlinkSync(path);
-        console.warn(`Gateway: removed legacy checkpoint file ${path} (D8 stateless cutover)`);
+        console.warn(`Gateway: removed legacy checkpoint file ${path}`);
       }
     } catch (err) {
       console.warn(`Gateway: could not remove legacy checkpoint file ${path}: ${(err as Error).message}`);
@@ -137,7 +136,7 @@ for (const base of ["./data/checkpoints.db"]) {
   }
 }
 
-// ntfy push-notification provisioning (plan §Notifications): the topic +
+// ntfy push-notification provisioning: the topic +
 // access token are encrypted at rest with the NOTIFY_STORE_KEY secret; the
 // NOTIFY_BASE_URL env var (empty = disabled) gates the push hook. The store
 // lazy-loads, so a corrupt notify file degrades provision 500s rather than
@@ -187,7 +186,7 @@ const chatBudget = createBudgetManager({
   maxModelCallsPerWindow: env.BUDGET_MODEL_CALL_LIMIT,
   modelCallWindowMs: env.BUDGET_MODEL_CALL_WINDOW_MS,
 });
-// Step 1.13: tool-pipeline construction is a composition-root concern. ONE
+// Tool-pipeline construction is a composition-root concern. ONE
 // sync-shaped engine (`serialize → cache → budget → execution`) is shared by
 // the sync transport's plugin and MCP bindings AND by warmup; it is stateless
 // between dispatches (per-call data rides `ToolCall`/`ToolCallScope`). The
@@ -228,7 +227,7 @@ let jobPins: CredentialPinStore | undefined;
 //     (it closes over the admitted pin handles + running-fence guard).
 // Neither can be a root singleton: a shared one would either hold one
 // request's credentials for another's turn or lose the per-job handle/fence.
-// M1: tie NOTIFY_BASE_URL's host to NOTIFY_TRUSTED_HOSTS at boot. A private-
+// Tie NOTIFY_BASE_URL's host to NOTIFY_TRUSTED_HOSTS at boot. A private-
 // address (or production http:) ntfy that is not trusted would otherwise be
 // refused by SSRF validation and its pushes SILENTLY dropped — best-effort by
 // design, so warn loudly rather than exit.
@@ -245,7 +244,7 @@ try {
     registry: pluginRegistry,
     pins: jobPins,
     getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
-    // H1: the executor's call-time validatedFetch re-resolution must apply
+    // The executor's call-time validatedFetch re-resolution must apply
     // the SAME trusted-hosts policy the pins were computed under, or an
     // admin-trusted internal plugin backend (`*.local`, RFC1918) would be
     // rejected as DNS_REBINDING on every tool call.
@@ -263,7 +262,7 @@ try {
     // read-only tool call is never executed twice across sync and async.
     toolCache,
     budget: chatBudget,
-    // Step 1.13: the job-channel engine is built here (from the same shared
+    // The job-channel engine is built here (from the same shared
     // deps) but instantiated per job by the runner, because `fence` closes over
     // the per-job `assertActive`. The channel→interceptor mapping still lives
     // in `buildPipelineForChannel`.
@@ -274,7 +273,7 @@ try {
         cache: toolCache,
         assertActive,
       }),
-    // M1: periodic credential-pin GC. In-memory pins are released by the
+    // Periodic credential-pin GC. In-memory pins are released by the
     // runner's finally / the transport's non-claimed-path releases, but a
     // crash between admission and claim could still leak one; a periodic
     // sweep bounds that window instead of relying on the release paths alone.
@@ -330,8 +329,8 @@ const chatRateLimiter = createPerOwnerRateLimiter({
   ratePerMinute: env.INFERENCE_RATE_LIMIT,
   burst: env.INFERENCE_RATE_BURST,
 });
-// Stateless-gateway session cache (plan §4): the in-memory, evictable mirror
-// of a client-owned conversation, keyed (owner, session_id). Always created —
+// In-memory, evictable session cache: a mirror of a client-owned conversation,
+// keyed (owner, session_id). Always created —
 // RAM-only, no boot dependencies. Served read-back via `createSessionRoutes`
 // (GET/DELETE /v1/sessions/:id) and written by the sync transport's
 // managed-session path.
@@ -355,7 +354,7 @@ app.route(
     jobRunner,
     pins: jobPins,
     toolCache,
-    // Step 1.13: the ONE sync-shaped engine, shared with warmup above.
+    // The ONE sync-shaped engine, shared with warmup above.
     toolPipeline: syncToolPipeline,
     trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
     rateLimiter: chatRateLimiter,
@@ -365,7 +364,7 @@ app.route(
 );
 
 
-// M5 watchdog: unauthenticated probe for k8s liveness/readiness (200 when
+// Unauthenticated probe for k8s liveness/readiness (200 when
 // both DB checks pass, 503 `degraded` otherwise). The probes themselves are
 // OUT-OF-REPO — the copy-paste k3s patch ships at deploy/k8s/health-probes.yaml
 // and is applied by ops, not this repo's CI.
@@ -395,7 +394,8 @@ app.onError((err, c) => {
 });
 
 const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
-  console.log(`ai-assistant gateway listening on http://localhost:${info.port}`);
+  const host = info.family === "IPv6" ? `[${info.address}]` : info.address;
+  console.log(`ai-assistant gateway listening on ${host}:${info.port}`);
 });
 const SENTINEL_SHADOW_FLUSH_TIMEOUT_MS = 2_000;
 const cleanup = (name: string, dispose: () => void) => {
