@@ -42,38 +42,36 @@ import type { JsonSchema } from "../plugins/types.ts";
 import { jsonSchemaToZod } from "../tools/schema.ts";
 
 /**
- * MCP tools on the shared tool pipeline (step 1.11).
+ * MCP tools on the shared tool pipeline.
  *
  * MCP connection/circuit/list-cache lifecycle stays here; only per-call policy
  * moves onto `tools/pipeline.ts`. `bindMcpServers` dispatches every MCP tool
  * call through the SAME engine the plugin channels use, with
- * `pluginId: "mcp:<serverName>"` and `source: "mcp"`. Consequences recorded in
- * the plan (`docs/plugin-seam-architecture-plan.md` §5 D1/D2, §13):
+ * `pluginId: "mcp:<serverName>"` and `source: "mcp"`. Consequences:
  *
- *   - **D1 — MCP is budgeted.** Because MCP calls now carry `requestId` and
- *     `tool`, `withToolCallBudget` applies its FULL policy in addition to MCP's
- *     own per-server/per-owner caps. Concretely, an MCP server's tools are
- *     capped per owner at `DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_TURN`
- *     (8 calls to the SAME tool in one turn) and
- *     `DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_WINDOW` (20 calls to ANY tool
- *     of that one server per owner per `DEFAULT_TOOL_CALL_RATE_WINDOW_MS`
+ *   - **MCP is budgeted.** Because MCP calls carry `requestId` and `tool`,
+ *     `withToolCallBudget` applies its FULL policy in addition to MCP's own
+ *     per-server/per-owner caps. Concretely, an MCP server's tools are capped
+ *     per owner at `DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_TURN` (8 calls
+ *     to the SAME tool in one turn) and
+ *     `DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_WINDOW` (20 calls to ANY
+ *     tool of that one server per owner per `DEFAULT_TOOL_CALL_RATE_WINDOW_MS`
  *     (60 s)), in addition to the per-owner/per-plugin concurrency caps. The
- *     effective concurrency is `min(mcp cap, budget cap)`. This is a deliberate
- *     side effect of a uniform budget policy, accepted as ample for a chat agent
- *     and pinned by `test/agents/mcp_pipeline.test.ts`.
- *   - **D2 — MCP results are cacheable.** Read-only calls are keyed including a
+ *     effective concurrency is `min(mcp cap, budget cap)`. This is a
+ *     deliberate side effect of a uniform budget policy, accepted as ample for
+ *     a chat agent and pinned by `test/agents/mcp_pipeline.test.ts`.
+ *   - **MCP results are cacheable.** Read-only calls are keyed including a
  *     fingerprint of the RESOLVED request headers, so rotating `${MCP_TOKEN}`
  *     cannot serve a stale entry.
- *   - **D5 — MCP audit stays inside `runMcpOperation`.** The pipeline's
- *     `onResult` sink is plugin-source only; MCP audit carries fields
- *     (`circuitState`, `policyCode`, `ownerBound`, `cacheHit`) the sink cannot.
+ *   - **MCP audit stays inside `runMcpOperation`.** The pipeline's `onResult`
+ *     sink is plugin-source only; MCP audit carries fields (`circuitState`,
+ *     `policyCode`, `ownerBound`, `cacheHit`) the sink cannot.
  *
- * Accepted minor divergence (no D-number, 1.11): a read-only RESULT-CACHE HIT
- * short-circuits in the pipeline's `cache` interceptor before the body, so
- * `runMcpOperation` never runs and the hit emits NO `mcp.tool` audit record.
- * D5 keeps audit inside the body, so closing this would require a second audit
- * path; the hit is not silent end to end (`cache.size`/diagnostics), but it is
- * not audited. See the plan's 1.11 "Accepted minor divergences".
+ * Accepted minor divergence: a read-only RESULT-CACHE HIT short-circuits in
+ * the pipeline's `cache` interceptor before the body, so `runMcpOperation`
+ * never runs and the hit emits NO `mcp.tool` audit record. Audit lives inside
+ * the body, so closing this would require a second audit path; the hit is not
+ * silent end to end (`cache.size`/diagnostics), but it is not audited.
  */
 
 export type McpServerConfig = {
@@ -975,19 +973,19 @@ export type McpBindOptions = {
   limits?: Partial<McpLimits>;
   bounds?: Partial<McpBoundaryLimits>;
   /**
-   * Step 1.13: the composition-root-supplied engine for this binding's channel
+   * The composition-root-supplied engine for this binding's channel
    * (the same one the channel's plugin tools use). When absent, the binder
    * falls back to {@link buildPipelineForChannel} with the policy deps below
    * (the unit-test path), so the channel→interceptor mapping still lives in one
-   * place. MCP audit stays inside `runMcpOperation` (D5); the shared engine's
+   * place. MCP audit stays inside `runMcpOperation`; the shared engine's
    * `onResult` sink is plugin-source-only, so an MCP dispatch is a no-op there.
    */
   pipeline?: ToolPipeline;
   /**
-   * Step 1.11: policy deps for the pipeline every MCP tool call dispatches
+   * Policy deps for the pipeline every MCP tool call dispatches
    * through. Interceptors close over the SAME budget/cache/ledger objects the
-   * channel's plugin tools use, so MCP gains budget (D1) and read-only result
-   * caching (D2). When omitted, MCP still dispatches through the engine, just
+   * channel's plugin tools use, so MCP gains budget and read-only result
+   * caching. When omitted, MCP still dispatches through the engine, just
    * with an empty policy (the transport guard inside the body still applies).
    */
   budget?: BudgetManager;
@@ -1295,7 +1293,7 @@ function isAbortFailure(err: unknown, signal?: AbortSignal): boolean {
  * by the caller: `invokeBoundedToolHandler` aborts its controller with the
  * `tool_timeout` `ToolResourceError` as the reason (`tools/bounds.ts:146`). The
  * MCP body inspects the reason to attribute the resulting `AbortError` as an MCP
- * timeout (finding M1) instead of a cancellation.
+ * timeout instead of a cancellation.
  */
 function isToolTimeoutAbort(signal: AbortSignal): boolean {
   const reason: unknown = signal.reason;
@@ -1454,8 +1452,8 @@ type McpOperationOptions<T> = {
   ownerKey?: string;
   requestId?: string;
   /**
-   * The signal used to ATTRIBUTE a failure, not to cancel the outbound call
-   * (finding M1). It is the CHANNEL signal (`call.signal`), captured before any
+   * The signal used to ATTRIBUTE a failure, not to cancel the outbound call.
+   * It is the CHANNEL signal (`call.signal`), captured before any
    * timeout controller exists — never the pipeline-composed `bodySignal`, which
    * the `execution` interceptor aborts on a handler timeout. Passing the
    * composed signal here would make `isAbortFailure` classify every genuine
@@ -1567,10 +1565,10 @@ async function runMcpOperation<T>(
   }
 }
 
-// `jsonSchemaToZod` lives in the neutral `tools/schema.ts` (finding m2) so
-// `tools/bind.ts` no longer has to import from this module, which imports
-// `tools/bind.ts` back. Imported for local use above and re-exported here so
-// existing importers (`test/agents/mcp.test.ts`) keep working unchanged.
+// `jsonSchemaToZod` lives in the neutral `tools/schema.ts` so `tools/bind.ts`
+// does not import this module (which imports `tools/bind.ts` back). Imported
+// for local use above and re-exported here so callers keep importing from one
+// spot.
 export { jsonSchemaToZod } from "../tools/schema.ts";
 
 function resolveMcpRequestHeaders(
@@ -1810,7 +1808,7 @@ export function resetMcpToolListCache(): void {
 }
 
 /**
- * The D2 result-cache credential component: a one-way fingerprint of the
+ * The result-cache credential component: a one-way fingerprint of the
  * RESOLVED request headers for a server. Unlike `mcpToolListCacheKey` (which
  * fingerprints the literal `${REF}` strings so the tool-list entry stays stable
  * across rotations), this resolves `${MCP_TOKEN}` first, so rotating the env var
@@ -1844,14 +1842,14 @@ export async function bindMcpServers(
   const session = resolveMcpSessionConfig(opts, limits);
   const bindingPins = new Map<string, Promise<readonly string[]>>();
 
-  // Step 1.11/1.13: MCP calls dispatch through the SAME shared engine as plugin
-  // tools. The engine is injected by the caller (one per channel shape, built
-  // by the composition root); the fallback goes through the same
+  // MCP calls dispatch through the SAME shared engine as plugin tools. The
+  // engine is injected by the caller (one per channel shape, built by the
+  // composition root); the fallback goes through the same
   // `buildPipelineForChannel` helper, so the channel→interceptor mapping lives
-  // in exactly one place. Budget (D1) and read-only result caching (D2) apply
-  // to MCP without a second policy path. MCP audit stays in `runMcpOperation`
-  // (D5): the engine's `onResult` sink is plugin-source-only, so an MCP
-  // dispatch reaching it is a no-op.
+  // in exactly one place. Budget and read-only result caching apply to MCP
+  // without a second policy path. MCP audit stays in `runMcpOperation`: the
+  // engine's `onResult` sink is plugin-source-only, so an MCP dispatch reaching
+  // it is a no-op.
   const channel = opts?.channel ?? "sync-stateless";
   const scopeHooks = channelScopeHooks({
     track: opts?.track,
@@ -1935,7 +1933,7 @@ export async function bindMcpServers(
       let pending = bindingPins.get(runtimeKey);
       if (pending === undefined) {
         pending = Promise.resolve().then(async () => {
-          // M1: one trust-construction path. `resolvePins` performs the same
+          // One trust-construction path. `resolvePins` performs the same
           // static validation + DNS pinning `openPinned` uses, with the MCP
           // `http:` carve-out paired via `egressTrustOptions` instead of being
           // re-inlined here.
@@ -2151,7 +2149,7 @@ export async function bindMcpServers(
                     owner: opts?.owner,
                     ownerKey: scope,
                     requestId: opts?.requestId,
-                    // Finding M1: attribute the failure with the CHANNEL signal
+                    // Attribute the failure with the CHANNEL signal
                     // (`call.signal`), NOT the pipeline-composed `bodySignal`,
                     // which the `execution` interceptor aborts on timeout. The
                     // composed signal still reaches the outbound call below so a
@@ -2187,7 +2185,7 @@ export async function bindMcpServers(
                         // `AbortError` from `runMcpClientOperation`. Attribute it
                         // as MCP's own timeout so `classifyMcpFailure` (reading
                         // the non-aborted channel signal) counts it toward the
-                        // circuit instead of recording a cancellation (M1).
+                        // circuit instead of recording a cancellation.
                         if (
                           error instanceof Error &&
                           error.name === "AbortError" &&
@@ -2216,13 +2214,13 @@ export async function bindMcpServers(
                 pluginId: `mcp:${server.name}`,
                 // The tool-list cache identity: URL + (unresolved) header
                 // fingerprint. The result-cache key's credential component is the
-                // RESOLVED-header fingerprint below (D2), so a rotated
+                // RESOLVED-header fingerprint below, so a rotated
                 // `${MCP_TOKEN}` cannot serve a stale entry even though this
                 // component stays stable.
                 pluginVersion: cacheKey,
                 tool: tool.name,
                 args: ctx.args,
-                // Finding M5: conservative AND-merge across ALL servers, read at
+                // Conservative AND-merge across ALL servers, read at
                 // invocation time. `safe` is the FIRST occurrence's value, but a
                 // later server (whose duplicate tool is skipped) may declare the
                 // same name destructive; `toolSafety` holds the AND of every

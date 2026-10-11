@@ -27,10 +27,6 @@ export const AgentStateAnnotation = Annotation.Root({
     reducer: (left, right) => left + right,
     default: () => 0,
   }),
-  compacted: Annotation<boolean>({
-    reducer: (left, right) => left || right,
-    default: () => false,
-  }),
 });
 
 export type AgentState = typeof AgentStateAnnotation.State;

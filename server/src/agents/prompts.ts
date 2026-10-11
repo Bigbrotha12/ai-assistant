@@ -1,5 +1,5 @@
 /**
- * System prompts for the LangChain agent core (Phase 2, Wave A1).
+ * System prompts for the LangChain agent core.
  *
  * `SYSTEM_PROMPT` is the assistant's base persona; `SUPERVISOR_PROMPT` frames
  * the orchestrator's tool-vs-answer decision. Both are intentionally

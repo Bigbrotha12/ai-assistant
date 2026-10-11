@@ -7,6 +7,7 @@ import {
   createSyncToolInterceptors,
 } from "../../../src/tools/interceptors/order.ts";
 import { bindPluginTools } from "../../../src/agents/orchestrator.ts";
+import { RequestBodyCredentialResolver } from "../../../src/credentials/request_body.ts";
 import { createToolResultCache } from "../../../src/middleware/cache.ts";
 import { createBudgetManager } from "../../../src/middleware/budget.ts";
 import { credentialFingerprint } from "../../../src/plugins/credential.ts";
@@ -100,7 +101,7 @@ describe("sync binding dispatches in the factory order (m2)", () => {
         owner: "user-1",
         channel: "sync-stateless",
         cache,
-        credentialsByPlugin: { vikunja: { apiKey: "tok-123" } },
+        credentialsResolver: new RequestBodyCredentialResolver({ toolCredentialsByPlugin: { vikunja: { apiKey: "tok-123" } } }),
       },
     );
     const oversized: Record<string, unknown> = {
@@ -153,7 +154,7 @@ describe("sync binding dispatches in the factory order (m2)", () => {
         channel: "sync-stateless",
         cache,
         budget,
-        credentialsByPlugin: { vikunja: { apiKey: "tok-123" } },
+        credentialsResolver: new RequestBodyCredentialResolver({ toolCredentialsByPlugin: { vikunja: { apiKey: "tok-123" } } }),
       },
     );
     cache.set(

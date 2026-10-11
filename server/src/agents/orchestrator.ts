@@ -7,7 +7,6 @@ import {
 } from "../tools/bounds.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { CredentialResolver } from "../credentials/resolver.ts";
-import { RequestBodyCredentialResolver } from "../credentials/request_body.ts";
 import type { BudgetManager } from "../middleware/budget.ts";
 import type { ToolResultCache } from "../middleware/cache.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
@@ -16,14 +15,13 @@ import { buildPipelineForChannel } from "../tools/channel.ts";
 
 // Single source of truth for JSON-Schema -> zod translation lives in the neutral
 // `tools/schema.ts` (it also infers `type` for schema-less MCP tools), so neither
-// this module nor `tools/bind.ts` forms an import cycle with `agents/mcp.ts`
-// (finding m2). Re-export it here so the runner and tests keep importing from one
-// spot.
+// this module nor `tools/bind.ts` forms an import cycle with `agents/mcp.ts`.
+// Re-export it here so the runner and tests keep importing from one spot.
 export { jsonSchemaToZod };
 
 /**
- * Wiring layer (Phase 2 plan: `orchestrator.ts`): assembles a ready-to-run
- * supervisor agent from the plugin registry + an already-configured model.
+ * Wiring layer: assembles a ready-to-run supervisor agent from the plugin
+ * registry + an already-configured model.
  *
  * Tool plugins from the registry are translated into LangChain
  * `DynamicStructuredTool` instances whose `func` delegates to an injected
@@ -63,26 +61,17 @@ export type BindPluginToolsOptions = {
    */
   channel: "sync-stateless" | "sync-managed";
   /**
-   * Per-request credential source (plan §5 Phase 3, steps 3.2/3.5). When
-   * provided it is the SOLE source of a tool call's credentials + fingerprint,
-   * closing over the request's validated maps (constructed in `chat.ts`); the
-   * binder no longer looks up `credentialsByPlugin` inline.
+   * Per-request credential source — the SOLE source of a tool call's
+   * credentials + fingerprint, closing over the request's validated maps
+   * (constructed in `chat.ts`). Omitted = tool calls carry no credentials.
    */
   credentialsResolver?: CredentialResolver;
-  /**
-   * Per-plugin credentials collected from the request body. Retained for the
-   * unit-test call shape (and as the request-body resolver's own input when no
-   * explicit resolver is injected); production wiring passes
-   * `credentialsResolver` instead.
-   */
-  credentialsByPlugin?: Record<string, Record<string, string>>;
   /**
    * Composition-root-supplied engine for this channel. When present it is used
    * verbatim; otherwise the binder falls back to
    * {@link buildPipelineForChannel} with the `budget`/`cache` deps below (the
    * unit-test path). The root injects one shared sync-shaped engine so the
-   * construction and the channel→interceptor mapping live in one place
-   * (plan task 1.13).
+   * construction and the channel→interceptor mapping live in one place.
    */
   pipeline?: ToolPipeline;
   budget?: BudgetManager;
@@ -112,15 +101,14 @@ export type BindPluginToolsOptions = {
  * The whole sync-channel policy lives in the shared `ToolPipeline`, and the
  * loop/filter/dedupe/dispatch skeleton lives in `bindTools`; this function only
  * supplies the sync-specific hooks. The interceptor set
- * (`serialize → cache → budget → execution`, built by `createSyncToolInterceptors`)
- * reproduces the previous inline body:
+ * (`serialize → cache → budget → execution`) is that channel's policy:
  *   - `serialize` bounds and measures the args;
  *   - `cache` serves/stores read-only results;
  *   - `budget` gates per owner+plugin and quarantines an unsettled raw body —
- *     now INSIDE the sync channel too (plan D7);
+ *     now INSIDE the sync channel too;
  *   - `execution` bounds the handler with the effective timeout, propagates the
  *     abort signal, and tracks the call with the channel's `StreamExecution`;
- *   - `onResult` emits the `plugin.tool` audit the per-call `finally` used to.
+ *   - `onResult` emits the `plugin.tool` audit for the call.
  */
 export function bindPluginTools(
   registry: PluginRegistry,
@@ -133,22 +121,15 @@ export function bindPluginTools(
   // The engine is injected by the composition root; the fallback preserves the
   // unit-test call shape (no explicit pipeline). Either way the channel→
   // interceptor mapping lives in `buildPipelineForChannel` and every per-call
-  // value rides `ToolCall`/`ToolCallScope` (plan §4.1/§4.2).
+  // value rides `ToolCall`/`ToolCallScope`.
   const pipeline = options.pipeline ??
     buildPipelineForChannel(options.channel, {
       ...(options.budget === undefined ? {} : { budget: options.budget }),
       ...(options.cache === undefined ? {} : { cache: options.cache }),
     });
-  // Step 3.2/3.5: one credential source for the binding. Production injects
-  // the per-request `RequestBodyCredentialResolver` (chat.ts); the fallback
-  // preserves the unit-test shape by wrapping `credentialsByPlugin` in the
-  // same provider, so `buildCall` never performs an inline map lookup.
-  const credentialsResolver = options.credentialsResolver ??
-    (options.credentialsByPlugin === undefined
-      ? undefined
-      : new RequestBodyCredentialResolver({
-          toolCredentialsByPlugin: options.credentialsByPlugin,
-        }));
+  // One credential source for the binding — the per-request resolver the
+  // transport injects, so `buildCall` never performs an inline map lookup.
+  const credentialsResolver = options.credentialsResolver;
   return bindTools({
     registry,
     pipeline,
@@ -161,9 +142,9 @@ export function bindPluginTools(
         // must not be served to a deleting owner (mirrors the old
         // `withToolResultCache` pre-check).
         options.assertActive?.();
-        // Sync fingerprints the raw per-plugin request credentials (plan §10.1);
-        // this derivation is deliberately NOT unified with warmup/job and lives
-        // in the provider now. Missing -> undefined credentials, with the empty
+        // Sync fingerprints the raw per-plugin request credentials; this
+        // derivation is deliberately NOT unified with warmup/job and lives in
+        // the provider now. Missing -> undefined credentials, with the empty
         // fingerprint the inline `credentialFingerprint(credentials ?? {})` used.
         const resolvedCredentials = credentialsResolver?.resolve({
           ...(options.owner === undefined ? {} : { owner: options.owner }),
@@ -196,7 +177,7 @@ export function bindPluginTools(
       // `plugin` body, the `rawSettled`/`onBodySkipped` pair, and the fail-loud
       // `mcp` stub. Sync's post-execution tombstone re-check runs inside the
       // invoke closure: a throw after the handler resolved still rejects the
-      // body after `rawSettled` has settled, so budget releases (D9) while no
+      // body after `rawSettled` has settled, so budget releases while no
       // cache entry is written. `call.credentials` is reused so the credential
       // reference the `ToolCall` carries is the one executed.
       buildExecution: (ctx, call) =>
@@ -210,7 +191,7 @@ export function bindPluginTools(
               bodySignal,
             );
             // Post-execution tombstone re-check: do not cache a result produced
-            // after the owner began deleting (mirrors the old post-direct check).
+            // after the owner began deleting.
             options.assertActive?.();
             return result;
           },

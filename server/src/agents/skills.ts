@@ -31,6 +31,9 @@ export function composeAgentPrompt(
     const skillEstimate = estimateTokens(skillText);
 
     if (running + skillEstimate > effectiveBudget) {
+      // Always include at least one skill: if the first skill alone is over
+      // budget, dropping everything would leave an empty Skills section. The
+      // prompt may therefore exceed the budget by the first skill's size.
       if (included.length === 0) {
         included.push(skill);
       }

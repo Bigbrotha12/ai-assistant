@@ -450,12 +450,12 @@ describe("agent graph Phase 4 state and dispatch", () => {
     }).builder.compile({ checkpointer: new MemorySaver() });
     const config = { configurable: { thread_id: "overwrite" } };
     await graph.invoke({ messages: [new HumanMessage("old")], toolResults: ["diagnostic"] }, config);
-    await graph.updateState(config, { messages: new Overwrite([new HumanMessage("kept")]), compacted: true }, "orchestrator");
+    await graph.updateState(config, { messages: new Overwrite([new HumanMessage("kept")]), toolRounds: 7 }, "orchestrator");
     const state = await graph.getState(config);
     assert.equal(state.values.messages.length, 1);
     assert.equal(state.values.messages[0].content, "kept");
     assert.deepEqual(state.values.toolResults, ["diagnostic"]);
-    assert.equal(state.values.compacted, true);
+    assert.equal(state.values.toolRounds, 7);
     assert.deepEqual(state.next, []);
   });
 });

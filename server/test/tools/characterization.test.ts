@@ -21,6 +21,7 @@ import type { ChatResult } from "@langchain/core/outputs";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { PluginStore } from "../../src/plugins/store.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
+import { RequestBodyCredentialResolver } from "../../src/credentials/request_body.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { LookupAddress } from "node:dns";
 import type {
@@ -280,7 +281,6 @@ type SyncAppOptions = {
   toolTimeoutMs?: number;
   warmups?: ReturnType<typeof createWarmupManager>;
   buildModel?: typeof buildModel;
-  credentialsByPlugin?: Record<string, Record<string, string>>;
 };
 
 async function makeSyncApp(
@@ -805,7 +805,7 @@ describe("characterization — cache", () => {
         owner,
         channel: "sync-stateless",
         cache: hitCache,
-        credentialsByPlugin: { vikunja: { apiKey: "tok-123" } },
+        credentialsResolver: new RequestBodyCredentialResolver({ toolCredentialsByPlugin: { vikunja: { apiKey: "tok-123" } } }),
         assertActive: () => assertNotDeleting(owner),
       },
     );
@@ -840,7 +840,7 @@ describe("characterization — cache", () => {
         owner,
         channel: "sync-stateless",
         cache: freshCache,
-        credentialsByPlugin: { vikunja: { apiKey: "tok-123" } },
+        credentialsResolver: new RequestBodyCredentialResolver({ toolCredentialsByPlugin: { vikunja: { apiKey: "tok-123" } } }),
         assertActive: () => assertNotDeleting(owner),
       },
     );
