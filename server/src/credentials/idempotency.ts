@@ -2,7 +2,7 @@ import type { Ledger, StepRow, TaskRow } from "../ledger/index.ts";
 import { redactForOutbound } from "../security/redact.ts";
 
 /**
- * Idempotency — Phase 2, Wave B (rebuild, correct).
+ * Idempotency for the async job path.
  *
  * Two guarantees for the async job path:
  *
@@ -10,14 +10,14 @@ import { redactForOutbound } from "../security/redact.ts";
  *    `messageId` once per send and reuses it across retries. The server maps
  *    (owner, messageId) to exactly ONE task: `getOrCreateTask` returns the
  *    existing task when one exists and otherwise creates it. It is NOT a raw
- *    INSERT — the ledger's v4 unique index on (owner, intent_key) means a
+ *    INSERT — the ledger's unique index on (owner, intent_key) means a
  *    concurrent writer can win the race, so the create is wrapped and a
- *    SQLITE_CONSTRAINT violation re-reads the existing row instead of 500ing
- *    (the old raw `createTask` 500ed on a repeat).
+ *    SQLITE_CONSTRAINT violation re-reads the existing row instead of a 500 on
+ *    a repeat.
  *
- * 2. TOOL-CALL REPLAY DEDUPE. A checkpoint-resumed worker must NEVER re-execute
+ * 2. TOOL-CALL REPLAY DEDUPE. A resumed worker must NEVER re-execute
  *    a tool whose result was already persisted. `recordToolResult` appends a
- *    step whose row carries the tool-call-id (ledger v4 `tool_call_id`), and
+ *    step whose row carries the tool-call-id (`tool_call_id`), and
  *    `hasToolResult` does an indexed point lookup for it. The partial unique
  *    index on (task_id, tool_call_id) also makes `recordToolResult` idempotent:
  *    a duplicate record is caught and returns the existing step.
@@ -32,7 +32,7 @@ export interface GetOrCreateTaskInput {
   intentKey: string;
   spec: string;
   worker?: string;
-  /** JSON-encoded snapshot messages (ledger v5) — forwarded to `createTask`
+  /** JSON-encoded snapshot messages — forwarded to `createTask`
    *  so the runner persists the job's snapshot at admission. Absent on route
    *  admissions (the routes never store a snapshot). */
   payload?: string | null;
@@ -141,7 +141,7 @@ export function hasToolResult(
 /**
  * Retry rule: only read-only (safe-to-repeat) tools may be re-run after a
  * partial success. Mutating tools are un-dedupable — re-running them could
- * apply a side effect twice — so a checkpoint resume must never retry them.
+ * apply a side effect twice — so a resume must never retry them.
  */
 export function canRetryTool(tool: { readOnly: boolean }): boolean {
   return tool.readOnly;

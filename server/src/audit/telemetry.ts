@@ -229,7 +229,7 @@ async function drainAuditQueue(): Promise<void> {
     while (auditQueue.length > 0) {
       const record = auditQueue.shift()!;
       try {
-        await logger[record.level](record.line);
+        logger[record.level](record.line);
       } catch {
         reportFailure();
       }

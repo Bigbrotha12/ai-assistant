@@ -7,9 +7,7 @@ import type {
 } from "./resolver.ts";
 
 /**
- * Credential pin-store provider (plan §5 Phase 3, step 3.3).
- *
- * Wraps the job runner's inline `getCredentials` closure verbatim:
+ * Credential pin-store provider, the job channel's resolver.
  *
  *   - the job's running-fence guard (`assertActive`) runs before every read;
  *   - a plugin with no admitted handle fails `JobError("credentials_expired")`
@@ -21,15 +19,14 @@ import type {
  *
  * Owner and handles are per-JOB context, captured at construction; the
  * selector never carries them. `kind` is accepted for the shared contract but
- * does not change the lookup: the admitted handle map is the authority, exactly
- * as the closed-over `descriptor.pinHandles?.[pluginId]` was (the model plugin
- * rides the same map).
+ * does not change the lookup: the admitted handle map is the authority (the
+ * model plugin rides the same map).
  *
  * The fingerprint is the pin's precomputed `CredentialPin.fingerprint` — the
- * job channel's own derivation, preferred as-is over re-deriving (plan §10.1).
- * That is why this provider needs the richer `ResolvedCredential` result and
- * could not return a bare credential map without changing the cache key's
- * fingerprint source.
+ * job channel's own derivation, preferred as-is over re-deriving. That is why
+ * this provider needs the richer `ResolvedCredential` result and could not
+ * return a bare credential map without changing the cache key's fingerprint
+ * source.
  *
  * Security: returns the pin's already-held credential object (a frozen copy
  * held by the in-memory store); never copies, persists, or logs it.

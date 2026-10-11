@@ -91,7 +91,7 @@ export async function loadMcpCatalog(
     seen.add(entry.name);
 
     const trustedHosts = options.trustedHosts ?? env.MCP_TRUSTED_HOSTS;
-    // M1: the MCP http: carve-out is paired via `egressTrustOptions` and the
+    // The MCP http: carve-out is paired via `egressTrustOptions` and the
     // validation/pinning is the same facade path `openPinned` uses.
     entry.pinnedIps = await resolvePins(entry.url, {
       ...egressTrustOptions(trustedHosts),

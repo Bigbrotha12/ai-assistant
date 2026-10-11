@@ -1,12 +1,11 @@
 /**
- * Credential resolver seam — Service Definition (plan §5 Phase 3, step 3.1).
+ * Credential resolver seam.
  *
- * The plan's seam test is "a capability is a seam only if all three roles
- * exist": this module is the Contract, the providers are the Service, and
- * `transport/chat.ts` / `jobs/runner.ts` are the Consumers (steps 3.2, 3.3,
- * 3.5).
+ * A capability becomes a seam when all three roles exist: this module is the
+ * Contract, the providers are the Service, and `transport/chat.ts` /
+ * `jobs/runner.ts` are the Consumers.
  *
- * ── Interface-gap settlement (step 3a) ──────────────────────────────────────
+ * ── Interface-gap settlement ────────────────────────────────────────────────
  * `CredentialRequest` is `{owner?, pluginId, kind, channel}` and is kept as the
  * per-call SELECTOR. The two providers it was designed for need per-request /
  * per-job context that a selector must not carry:
@@ -21,7 +20,7 @@
  * `bindMcpServers` already do. `resolve({pluginId, kind, channel})` is
  * therefore the whole call surface.
  *
- * Two deviations from the frozen plan signature are deliberate and recorded:
+ * Two deliberate design choices:
  *
  *  1. `resolve` is SYNCHRONOUS. All three providers are in-memory lookups
  *     (request-body maps, the pin store, `process.env`), and both consumers are
@@ -32,13 +31,12 @@
  *     own cache-key fingerprint derivation. The plain
  *     `Record<string, unknown> | undefined` could not express the pin store's
  *     precomputed `CredentialPin.fingerprint`, which the job channel must
- *     prefer over re-deriving it (plan §10.1). Returning it from the provider
- *     is what keeps each channel's derivation intact once the inline sourcing
- *     is gone.
+ *     prefer over re-deriving it. Returning it from the provider keeps each
+ *     channel's derivation intact.
  *
- * Security invariant (plan §5 Phase 3): credentials resolved through this seam
- * are never persisted, logged, or returned by a list/detail endpoint. The only
- * derived representation that may leave the seam is `credentialFingerprint`
+ * Security invariant: credentials resolved through this seam are never
+ * persisted, logged, or returned by a list/detail endpoint. The only derived
+ * representation that may leave the seam is `credentialFingerprint`
  * (`plugins/credential.ts`); `plugins/store.ts`'s `assertNoCredentialValues` /
  * `assertCredentialsSpecOnly` continue to gate persistence. A provider returns
  * a reference to an already-held credential object and performs no caching,

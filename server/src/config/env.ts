@@ -7,10 +7,10 @@ config({ quiet: true });
 /**
  * Development-only encryption key for the notify store (ntfy credentials at
  * rest). Encrypted records must survive gateway restarts in dev too, so this
- * default is a STABLE literal (never randomly re-derived — a fresh random key
- * per boot would make every previously-written store unreadable). It is a loud
- * anti-pattern named as such; production is fail-fast instead (see the
- * superRefine below).
+ * default is a STABLE literal — never randomly re-derived, or a fresh key per
+ * boot would make previously-written stores unreadable. It is deliberately a
+ * loud dev-only value; production is fail-fast instead (see the superRefine
+ * below).
  */
 const NOTIFY_STORE_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
 

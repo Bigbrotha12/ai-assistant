@@ -1,7 +1,7 @@
 import { MCP_HEADER_REFERENCE_PATTERN } from "../plugins/types.ts";
 
 /**
- * Shared core of the `${VAR}` MCP-header resolvers (plan §5 Phase 3, step 3.4).
+ * Shared core of the `${VAR}` MCP-header resolvers.
  *
  * It owns exactly one thing: turn a `${VAR}` reference into `process.env[VAR]`,
  * rejecting an undefined variable and rejecting CRLF / control characters in
@@ -25,11 +25,11 @@ import { MCP_HEADER_REFERENCE_PATTERN } from "../plugins/types.ts";
  */
 
 /**
- * `\r`, `\n`, and every C0 control (`\u0000`–`\u001f`). All three historical
- * call sites used exactly this class, so it is simultaneously the strictest and
- * the only check applied to a resolved header value in the codebase.
- * (`plugins/credential.ts` additionally rejects `\u007f` for API-key payloads,
- * but widening this class would be a behaviour change for these callers.)
+ * `\r`, `\n`, and every C0 control (`\u0000`–`\u001f`). All three call sites use
+ * exactly this class, so it is simultaneously the strictest and the only check
+ * applied to a resolved header value in the codebase. (`plugins/credential.ts`
+ * additionally rejects `\u007f` for API-key payloads, but widening this class
+ * would change these callers' behavior.)
  */
 const CONTROL_CHARACTER_PATTERN = /[\r\n\u0000-\u001f]/;
 
