@@ -67,7 +67,7 @@ export function createExecutionInterceptor(): ToolInterceptor {
         // `signal.throwIfAborted()`, or an invalid limit). Release the channel's
         // raw deferred NOW, before the error unwinds out through `budget`, so a
         // body-skipped dispatch releases instead of transiently quarantining
-        // (finding m3). The dispatch-level backstop is idempotent.
+        // . The dispatch-level backstop is idempotent.
         if (!dispatch.executed) {
           try {
             scope.onBodySkipped?.();

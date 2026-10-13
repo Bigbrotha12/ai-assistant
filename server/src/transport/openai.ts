@@ -10,7 +10,7 @@ function exhaustionCode(error: unknown): string | undefined {
 }
 
 /**
- * OpenAI-compatible SSE adapter (Phase 3, Wave A).
+ * OpenAI-compatible SSE adapter.
  *
  * Translates a LangGraph `streamEvents(..., { version: "v2" })` async iterable
  * into OpenAI chat-completions SSE frames, byte-exactly per `WIRE_SPEC.md`

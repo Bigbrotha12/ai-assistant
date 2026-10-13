@@ -5,7 +5,7 @@ import type { ToolCallResult, ToolDispatch } from "./pipeline.ts";
  * `plugin`-source `onResult` sink — replaces the two duplicated `finally` audit
  * blocks (`agents/orchestrator.ts:125-140`, `jobs/runner.ts:1002-1015`).
  *
- * Scope (plan §1.8 / D5 / D6):
+ * Scope :
  *   - only `source === "plugin"` — MCP audit stays inside `runMcpOperation`
  *     (`mcp.ts`), which carries fields the pipeline cannot (`circuitState`,
  *     `policyCode`, `ownerBound`, `cacheHit`) and a distinct event name. Routing

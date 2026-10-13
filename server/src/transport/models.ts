@@ -11,7 +11,7 @@ import { isRecord } from "../shared/util.ts";
  * the installed MODEL plugins in the registry, so the client sees exactly what
  * this gateway can route to (incl. `visionCapable`).
  *
- * SECURITY CONTRACT (plan §3.3, guardrail): a plugin's `inference.endpoint`
+ * SECURITY CONTRACT: a plugin's `inference.endpoint`
  * and `baseUrls` may point at admin-trusted internal hosts (`vikunja.local`,
  * RFC1918 IPs) and must NEVER leave the gateway. `modelListFromPlugins`
  * therefore copies only id + capability metadata — `endpoint`, `baseUrls`,
@@ -71,7 +71,7 @@ export function modelListFromPlugins(
 }
 
 /**
- * L3: a plugin's `inference.parameters` are echoed onto the wire verbatim —
+ * A plugin's `inference.parameters` are echoed onto the wire verbatim —
  * a URL-shaped parameter value (or a key named `url`/`endpoint`/`host`) could
  * leak an admin-trusted internal endpoint, so they are stripped before the
  * models response is serialized. String values that begin with `http` are

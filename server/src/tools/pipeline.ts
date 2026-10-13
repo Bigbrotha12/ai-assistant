@@ -4,8 +4,7 @@ import { boundToolResult } from "./bounds.ts";
 /**
  * ToolExecutionPipeline — the single around-middleware engine every tool call
  * traverses, regardless of source (plugin/MCP) or channel (`sync-stateless`,
- * `sync-managed`, `job`, `warmup`). See `docs/plugin-seam-architecture-plan.md`
- * §4.1 (interface) and §4.2 (per-interceptor bodies).
+ * `sync-managed`, `job`, `warmup`).
  *
  * The four channels differ ONLY by which interceptors are registered and which
  * bodies are supplied — never by divergent execution code. Interceptors are
@@ -60,7 +59,7 @@ import { boundToolResult } from "./bounds.ts";
  *    `finally` is an idempotent backstop. Firing EARLY (before the error
  *    unwinds through `budget`) is what prevents a transient spurious
  *    quarantine: budget's own `finally` would otherwise still see an unsettled
- *    raw body (finding m3). It lets the channel settle its raw-body deferred so
+ *    raw body . It lets the channel settle its raw-body deferred so
  *    budget releases instead of quarantining and the job's `settle()` is not
  *    held open for the quarantine deadline. A channel whose `onBodySkipped`
  *    resolves an already-resolved deferred is unaffected by the extra call.
@@ -257,7 +256,7 @@ export type ToolPipeline = {
     bodies: ToolBodies;
     scope?: ToolCallScope;
   }): Promise<string>;
-  /** Per §3.2: unregisters nothing today, but keeps the seam honest. */
+  /** Per : unregisters nothing today, but keeps the seam honest. */
   dispose(): void;
 };
 
@@ -354,7 +353,7 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
             // The body will not run: release the channel's raw deferred NOW,
             // before the error unwinds out through `budget`, so a body-skipped
             // dispatch does not transiently quarantine the plugin while its
-            // `finally` still sees an unsettled raw body (finding m3).
+            // `finally` still sees an unsettled raw body .
             notifyBodySkipped();
             throw error;
           }
@@ -390,7 +389,7 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
         // `onResult`: a throwing hook must not break the dispatch. This is the
         // idempotent backstop; the terminal and `execution` fire it earlier (as
         // soon as the engine knows the body will not run) so `budget` releases
-        // rather than transiently quarantining (finding m3).
+        // rather than transiently quarantining .
         if (!state.executed) notifyBodySkipped();
         // Contract 6: apply the DEFAULT-cap bound post-onion so executed calls,
         // cache hits and replay hits all match production (`runner.ts:949,968,980`).
@@ -440,7 +439,7 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
 
     dispose(): void {
       // Registrations are constructor-supplied and unwound by the composition
-      // root today; nothing is registered at runtime yet (§3.2).
+      // root today; nothing is registered at runtime yet ().
     },
   };
 }

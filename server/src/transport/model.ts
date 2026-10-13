@@ -16,7 +16,7 @@ import type { EgressPolicy, LookupFn, Mode } from "../plugins/ssrf.ts";
 import { createPinnedEgressClient } from "../egress/client.ts";
 
 /**
- * Model construction (Phase 3, Wave C1).
+ * Model construction.
  *
  * Turns a model-plugin id + per-request credentials into a ready-to-stream
  * `ChatOpenAI` (the OpenAI-compatible client used by every model plugin — the
@@ -56,10 +56,9 @@ import { createPinnedEgressClient } from "../egress/client.ts";
  * unusable without one, and silently borrowing the host env would leak it onto
  * the wire.
  *
- * `pluginStore` is accepted now to keep the seam stable: Wave C2's background
- * delegation reuses this builder per job and hands the store's `getPinnedIps`
- * to the tool executor; `buildModel` itself reads the plugin definition via the
- * registry.
+ * `pluginStore` is accepted so background jobs reuse this builder per job and
+ * hand the store's `getPinnedIps` to the tool executor; `buildModel` itself
+ * reads the plugin definition via the registry.
  */
 
 export type ModelBuildErrorCode =
@@ -161,8 +160,8 @@ function modelEgressPolicy(
 }
 
 /**
- * Build the chat model for one request. `pluginStore` is accepted for the
- * stable seam (Wave C2's background jobs); `buildModel` resolves the plugin
+ * Build the chat model for one request. `pluginStore` is accepted so
+ * background jobs reuse this builder; `buildModel` resolves the plugin
  * definition through the registry and routes all outbound traffic through the
  * egress client (`policyFetch` under the hood).
  */
@@ -197,8 +196,8 @@ export function buildModel(input: BuildModelInput): BaseChatModel {
 
   // The client may select a base-URL instance from the plugin's allowlisted
   // `baseUrls` via the non-secret `baseUrlEntry` routing credential (the
-  // per-plugin `{ apiKey, baseUrlEntry }` contract, docs/archive/backend-langchain-plan.md
-  // §329-335). Resolve the id against the plugin's OWN allowlist; an
+  // per-plugin `{ apiKey, baseUrlEntry }` contract). Resolve the id against
+  // the plugin's OWN allowlist; an
   // unknown/blank id — e.g. a stale client selection after the admin rotated
   // the plugin — FALLS BACK to `plugin.inference.endpoint` rather than
   // failing. A client can never supply an arbitrary URL: only ids present in

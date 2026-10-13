@@ -11,16 +11,12 @@ import type { ToolCall, ToolPipeline } from "./pipeline.ts";
 
 /**
  * `channel.ts` — the ONE place the "which interceptors for which channel"
- * decision lives (plan §5, task 1.13).
+ * decision lives.
  *
- * Before this module the channel→engine mapping was re-implemented at every
- * construction site: `bindPluginTools` (`agents/orchestrator.ts`) and the
- * warmup manager both hand-built the sync set, `bindJobTools`
- * (`jobs/runner.ts`) hand-built the job set, and `bindMcpServers`
- * (`agents/mcp.ts`) hand-rolled its own `channel === "job" ? job : sync`
- * selection. Every binder now takes a `ToolPipeline` dependency and falls back
- * to {@link buildPipelineForChannel}, so the mapping (and the audit sink) exists
- * exactly once.
+ * Every binder takes a `ToolPipeline` dependency and falls back to
+ * {@link buildPipelineForChannel}, so the channel→engine mapping (and the audit
+ * sink) exists exactly once instead of being re-implemented at each
+ * construction site.
  *
  * The channels share two *shapes*, not one engine:
  *   - **sync-shaped** (`sync-stateless`, `sync-managed`, `warmup`, and MCP
@@ -31,11 +27,11 @@ import type { ToolCall, ToolPipeline } from "./pipeline.ts";
  * The shape is selected by the channel name; `warmup` uses the sync shape. The
  * engine is stateless between dispatches — every per-call value (owner, task
  * fence, credentials, timeout, bodies, scope) rides `ToolCall`/`ToolCallScope`
- * (plan §4.1/§4.2), so a single engine can be shared by every dispatch of its
+ * , so a single engine can be shared by every dispatch of its
  * shape.
  *
  * The `onResult` sink is always attached: `createPluginAuditSink` is
- * plugin-source-only and skips `channel === "warmup"` (plan D5/D6). MCP
+ * plugin-source-only and skips `channel === "warmup"` (plan ). MCP
  * dispatches reaching it are no-ops (audit stays inside `runMcpOperation`);
  * warmup dispatches are no-ops (warmup emits no `plugin.tool` audit). Sharing
  * one source/channel-filtered sink is what lets a single engine per shape serve

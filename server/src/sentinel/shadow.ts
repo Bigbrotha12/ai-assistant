@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Ledger, TaskRow } from "../ledger/index.ts";
 import { DEFAULT_RULE_SET, evaluateL1 } from "./l1.ts";
 import { decideSentinel, policyForMode } from "./policy.ts";
+import { isRecord } from "../shared/util.ts";
 import {
   SENTINEL_CATEGORIES,
   SENTINEL_SEVERITIES,
@@ -118,10 +119,6 @@ const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const SEVERITY_ORDER = new Map<SentinelSeverity, number>(
   SENTINEL_SEVERITIES.map((severity, index) => [severity, index]),
 );
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");

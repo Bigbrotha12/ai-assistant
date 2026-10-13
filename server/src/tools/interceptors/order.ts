@@ -19,12 +19,12 @@ import type { ToolInterceptor } from "../pipeline.ts";
  *     (the `executed && !fromCache` guard).
  *   - `budget` OUTSIDE `execution` is what makes quarantine possible: budget's
  *     `finally` runs when the bounded race settles, so it can observe an
- *     unsettled raw body (`runner.ts:908`, plan D7).
+ *     unsettled raw body (`runner.ts:908`, ).
  *
  * The composition root builds the job channel's interceptor array through
  * `createJobToolInterceptors` (via `buildPipelineForChannel`, `tools/channel.ts`)
  * so the order lives in one place; `bindJobTools` (`jobs/runner.ts`) receives
- * the resulting engine (task 1.13) rather than re-deriving the set.
+ * the resulting engine  rather than re-deriving the set.
  */
 export const JOB_TOOL_INTERCEPTOR_ORDER = [
   "fence",
@@ -81,14 +81,14 @@ export function createJobToolInterceptors(
  *   - `serialize` first preserves the sync path's "args are bounded before any
  *     policy runs" behaviour (`orchestrator.ts` used to serialize at the top of
  *     `bindPluginTool.func`);
- *   - `budget` OUTSIDE `execution` is what makes quarantine possible (plan D7):
+ *   - `budget` OUTSIDE `execution` is what makes quarantine possible :
  *     the sync channel previously abandoned the inner promise from an outer
  *     bound, so `withToolCallBudget`'s `finally` never ran and no quarantine was
  *     ever registered. Unifying budget around execution fixes that.
  *
  * `buildPipelineForChannel` (`tools/channel.ts`) builds the sync-shaped engine
  * through this factory, so the order lives in one place; `bindPluginTools`,
- * `bindMcpServers` and the warmup manager receive that engine (task 1.13)
+ * `bindMcpServers` and the warmup manager receive that engine 
  * rather than re-deriving the set.
  */
 export const SYNC_TOOL_INTERCEPTOR_ORDER = [

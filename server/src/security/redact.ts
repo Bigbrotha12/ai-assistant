@@ -3,20 +3,20 @@ import {
   type BaseMessage,
 } from "@langchain/core/messages";
 import { CREDENTIAL_REDACTION } from "../plugins/credential.ts";
+import { isRecord } from "../shared/util.ts";
 
 /**
- * Credential redaction (stateless-gateway, step 8). The SQLCipher checkpoint
- * store this module once wrapped is gone (plan §9) — no checkpoint DB is ever
- * opened — but `redactForOutbound` survives because every outbound path
- * (the ToolExecutor, the tool-result cache, the transports) still masks
- * credential-shaped material in tool results before they reach graph state or
- * the ledger.
+ * Credential redaction: masks credential-shaped material in a string before it
+ * is persisted into graph state, the ledger, or the session store. Every
+ * outbound path (the ToolExecutor, the tool-result cache, the transports)
+ * funnels content through it.
  *
  * Masks `Authorization: <value>` headers (Bearer AND Basic/generic, value to
- * end-of-line), bare `Bearer <token>` occurrences, configured `sk`-prefixed API keys,
- * `Api-Key`/`X-Api-Key` headers, and quoted JSON `api_key`/`token`/`secret`/
- * `authorization` fields with `CREDENTIAL_REDACTION` (`***`), reusing the
- * marker from `plugins/credential.ts`. Never logs anything itself.
+ * end-of-line), bare `Bearer <token>` occurrences, configured `sk`-prefixed
+ * API keys, `Api-Key`/`X-Api-Key` headers, and quoted JSON
+ * `api_key`/`token`/`secret`/`authorization` fields with
+ * `CREDENTIAL_REDACTION` (`***`), reusing the marker from
+ * `plugins/credential.ts`. Never logs anything itself.
  */
 
 const AUTHORIZATION_BEARER = /Authorization\s*:\s*Bearer\s+\S+/gi;
@@ -43,16 +43,9 @@ const JSON_CREDENTIAL_FIELD =
   /("|')((?:x-)?api[-_]?key|token|secret|authorization)(?:"|')\s*:\s*("|')([^"'\n]*)\3/gi;
 
 /**
- * Masks credential-shaped material in a string before it is persisted into
- * checkpoint rows (tool results routinely echo API keys/bearer tokens back
- * into message content). Masks `Authorization: <value>` headers (Bearer AND
- * Basic/generic, value to end-of-line), bare `Bearer <token>` occurrences,
- * configured `sk`-prefixed API keys, `Api-Key`/`X-Api-Key` headers, and quoted JSON
- * `api_key`/`token`/`secret`/`authorization` fields with `CREDENTIAL_REDACTION`
- * (`***`), reusing the marker from `plugins/credential.ts`. The transport
- * (Wave C1 / Phase 3) applies this to message/tool-result content before the
- * graph writes it; the store keeps it here so the redaction discipline lives
- * next to the data it protects. Never logs anything itself.
+ * The string redactor behind every structural redactor below: tool results
+ * routinely echo API keys/bearer tokens back into message content, so every
+ * string that will be persisted passes through here. Never logs anything itself.
  */
 export function redactForOutbound(content: string): string {
   return content
@@ -101,10 +94,6 @@ const METADATA_STRUCTURAL_FIELDS = new Set([
   "timestamp",
   "status",
 ]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isToolCallContentBlock(value: Record<string, unknown>): boolean {
   return typeof value.type === "string" && value.type.includes("tool_call");

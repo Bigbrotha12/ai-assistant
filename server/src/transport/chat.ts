@@ -74,14 +74,13 @@ import {
 import type { SentinelShadowSink } from "../sentinel/shadow.ts";
 
 /**
- * Server-side caps on the CUSTOM agent spec (`body.agent` as an object) —
- * open-gaps P0 "residue" (Agent editor C.4b, server half): systemPrompt
- * ≤8000, skills ≤50, mcpServers ≤20, tools ≤100 (env-overridable),
- * inference.maxTokens ≤200000, inference.temperature clamped to [0,2]
- * (clamp — never rejected). A TEMPLATE agent (string id resolved from the
- * server catalog) is NOT subject to these field caps. Over-cap specs fail
- * the schema parse below → 400 `invalid_request` with the block's existing
- * `invalid agent spec: …` message.
+ * Server-side caps on the CUSTOM agent spec (`body.agent` as an object):
+ * systemPrompt ≤8000, skills ≤50, mcpServers ≤20, tools ≤100
+ * (env-overridable), inference.maxTokens ≤200000, inference.temperature
+ * clamped to [0,2] (clamp — never rejected). A TEMPLATE agent (string id
+ * resolved from the server catalog) is NOT subject to these field caps.
+ * Over-cap specs fail the schema parse below → 400 `invalid_request` with the
+ * block's existing `invalid agent spec: …` message.
  */
 const agentSpecCaps = {
   systemPrompt: env.AGENT_SPEC_MAX_SYSTEM_PROMPT,
@@ -102,7 +101,7 @@ const customAgentSpecSchema = z.object({
   }).strict()).max(agentSpecCaps.tools).optional(),
   modelRef: pluginIdSchema.optional(),
   inference: z.object({
-    // Clamp to [0,2] rather than reject ("temperature clamp 0–2", P0).
+    // Clamp to [0,2] rather than reject ("temperature clamp 0–2").
     temperature: z.number().transform((t) => Math.min(2, Math.max(0, t))).optional(),
     maxTokens: z.number().int().positive().max(200000).optional(),
     visionCapable: z.boolean().default(false),
@@ -110,14 +109,14 @@ const customAgentSpecSchema = z.object({
 }).strict();
 
 /**
- * OpenAI-compatible `POST /v1/chat/completions` transport (Phase 3, Waves C1/C2).
+ * OpenAI-compatible `POST /v1/chat/completions` transport.
  *
  * The handler builds a LangChain agent from the installed MODEL plugin +
  * per-request credentials and either:
  *
  *   - SYNCHRONOUS (default): runs the supervisor graph and streams the result
  *     through the SSE adapter (`transport/openai.ts`) as `text/event-stream`.
- *   - ASYNCHRONOUS (`body.background === true`, Wave C2): admits an idempotent
+ *   - ASYNCHRONOUS (`body.background === true`): admits an idempotent
  *     background task, pins the request's credentials, starts a detached
  *     `JobRunner`, and immediately returns `202 Accepted`. The client polls
  *     `GET /ledger/tasks/by-key/:messageId` for status and terminal output.
@@ -149,19 +148,19 @@ const customAgentSpecSchema = z.object({
  * let the gateway's own key leak to the provider and would make per-plugin key
  * rotation impossible. Missing/invalid -> 400 invalid_credentials.
  *
- * CONVERSATION IDENTITY (plan §5): `thread_id` is replaced by `session_id` on
+ * CONVERSATION IDENTITY: `thread_id` is replaced by `session_id` on
  * the sync path. A managed request MUST carry `session_id` (see MANAGED SESSION
  * PATH); a non-managed sync request is STATELESS — the client's `messages` are
  * streamed verbatim and no checkpoint is written. `thread_id` survives ONLY as
  * a worker label on the BACKGROUND path (see ASYNC DELEGATION).
  *
- * SYNC VS ASYNC DECISION RULE (Wave C2):
+ * SYNC VS ASYNC DECISION RULE:
  *   - `body.background === true` -> ASYNC delegation (below).
  *   - `body.background` absent or `false` -> the synchronous SSE stream.
  *   - any other value -> 400 invalid_request (`background must be a boolean`),
  *     so a malformed flag can never silently run synchronously.
  *
- * ASYNC DELEGATION (Wave C2 / stateless-gateway step 8): a background request:
+ * ASYNC DELEGATION: a background request:
  *   1. resolves the model plugin + validates credentials (shared with sync);
  *   2. requires `jobRunner` + `ledger` + `pins` -> 503
  *      `{ error: "background_unavailable" }` when the async path is not wired;
@@ -181,7 +180,7 @@ const customAgentSpecSchema = z.object({
  *      Post-admission failures settle in the ledger and are observed by polling.
  *
  * IDEMPOTENCY: the client generates `body.messageId` ONCE per send and reuses
- * it across retries. The ledger's v4 unique (owner, intent_key) index maps
+ * it across retries. The ledger's unique (owner, intent_key) index maps
  * (owner, messageId) to exactly ONE task forever, so a retried send never
  * creates a duplicate job. The status-by-key endpoint
  * (`GET /ledger/tasks/by-key/:messageId`) is the client's poll-after-drop
@@ -195,7 +194,7 @@ const customAgentSpecSchema = z.object({
  * ERROR MAPPING (pre-stream; flat `{"error": <code>}` for consistency with the
  * sibling plugin/checkpoint surfaces — see `WIRE_SPEC.md` §5.1):
  *   401 unauthorized              no/invalid gateway key (auth_error)
- *   403 email_not_verified        valid key, owner's email unconfirmed (C2)
+ *   403 email_not_verified        valid key, owner's email unconfirmed
  *   429 rate_limited              per-owner rate limiter rejected (rate_limited)
  *   429 busy                      per-user budget pool full — sync path
  *                                 (concurrent-capacity, retryable)
@@ -209,7 +208,7 @@ const customAgentSpecSchema = z.object({
  *   400 invalid_credentials       missing/invalid model-plugin credentials
  *                                 (auth_error, user-fixable)
  *   409 conversation_in_flight    a managed-session turn with this messageId is
- *                                 already running (session dedupe; §4)
+ *                                 already running (session dedupe)
  *   409 session_missing           managed-session session_id is gone — client
  *                                 re-establishes under the SAME session_id;
  *                                 reason is the store's "evicted"|"restart"
@@ -224,7 +223,7 @@ const customAgentSpecSchema = z.object({
  * Mid-stream failures never change the HTTP status: the SSE adapter emits one
  * error envelope then [DONE] (§5.2).
  *
- * MANAGED SESSION PATH (stateless gateway, plan §4/§5): the synchronous managed
+ * MANAGED SESSION PATH (stateless gateway): the synchronous managed
  * path is SESSION-ONLY. A managed request (`conversation_mode: "managed"`) MUST
  * carry a non-empty `session_id` (400 invalid_request otherwise) and a
  * `messageId`; it dispatches to `handleManagedSessionStream`, where the
@@ -233,34 +232,34 @@ const customAgentSpecSchema = z.object({
  * is the store's per-session `outcomes` map.
  *
  *   - ESTABLISH (a full-history body, i.e. more than one message — first turn,
- *     reseed, or the §6 compaction re-base): the request's messages are the
+ *     reseed, or the compaction re-base): the request's messages are the
  *     full history. We seed the history WITHOUT the trailing user turn, then
  *     `store.appendDelta(messageId, lastUserMessage)` so the exactly-once
  *     `outcomes[messageId]` anchor is recorded from the very first turn (a
  *     retried/concurrent establish is deduped, and a failed establish rolls
  *     the user turn back). Graph input = the session's accumulated messages;
  *     `x-conversation-state: seeded`. A compaction re-base is an establish even
- *     against a LIVE session — the server REPLACES `messages` (§6), exactly
- *     what a client-trimmed re-base means (F2).
+ *     against a LIVE session — the server REPLACES `messages`, exactly
+ *     what a client-trimmed re-base means.
  *   - SINGLE-MESSAGE ESTABLISH (session MISSING + one message, reason
  *     `"restart"`/fresh): the FIRST TURN of a brand-new managed conversation is
- *     a single-message full history, so it establishes (F1) — seeded the same
+ *     a single-message full history, so it establishes — seeded the same
  *     way (empty seed + `appendDelta` anchor), `x-conversation-state: seeded`.
  *   - DELTA (session live + a single-message body): the request must end with a
  *     single new user message (400 otherwise). `store.appendDelta(...)` appends
- *     it; graph input = the session's accumulated messages (full context,
- *     R12); `x-conversation-state: resumed`.
+ *     it; graph input = the session's accumulated messages (full context);
+ *     `x-conversation-state: resumed`.
  *   - MISSING-SESSION DELTA (session missing + a single-message body whose
  *     store reason is `"evicted"`): a delta-shaped request the store cannot
- *     apply -> 409 `session_missing` with the `"evicted"` reason (the §4
+ *     apply -> 409 `session_missing` with the `"evicted"` reason (the
  *     eviction signal; the client re-establishes under the SAME session_id
  *     with a full-history establish). A fresh/`"restart"` single-message body
  *     is NOT this case — it establishes (above).
  *   - appendDelta results -> HTTP: resumed/established -> stream (a retry of a
- *     `failed` messageId also returns `resumed` — a clean re-run per plan §4
- *     step 6 — so it streams normally as a resumed turn); already_completed
+ *     `failed` messageId also returns `resumed` — a clean re-run — so it
+ *     streams normally as a resumed turn); already_completed
  *     -> 200 `{ status, sessionId, messageId }` (no
- *     taskId/terminalStatus/threadId per §5; `x-conversation-state: resumed`);
+ *     taskId/terminalStatus/threadId; `x-conversation-state: resumed`);
  *     in_progress -> 409
  *     `conversation_in_flight`; session_missing -> 409 `session_missing` with
  *     the store's reason.
@@ -275,17 +274,17 @@ const customAgentSpecSchema = z.object({
  *     a budget-busy rejection, or a buildStreamResponse construction error —
  *     ALSO rolls the turn back with `markFailed` (exactly once per failed turn)
  *     before its response is returned/rethrown; a half-appended delta is never
- *     left `in_progress` (plan §4 step 6). Both the reply
+ *     left `in_progress`. Both the reply
  *     append and the marks carry the generation captured at append time, so a
- *     mid-turn eviction + re-seed can never stamp the new incarnation (F4);
+ *     mid-turn eviction + re-seed can never stamp the new incarnation;
  *     the reply append is `evictOnOverflow: false`, so an over-cap reply is
- *     dropped rather than evicting the session (F5). An evicted-mid-turn mark
+ *     dropped rather than evicting the session. An evicted-mid-turn mark
  *     is logged and ignored (client re-establishes).
  *   - Headers: every session-path response sets `x-session-id`; the stream
  *     sets `x-conversation-state: seeded|resumed`. `recreated` is never
  *     emitted on this path.
  *
- * ESTABLISH BODY CAP (§5/R6): vision establishes carry full history + base64
+ * ESTABLISH BODY CAP: vision establishes carry full history + base64
  * images, so the route-level `bodyLimit` is raised to `MAX_ESTABLISH_BODY_BYTES`
  * (25 MiB default). The establish/delta distinction is only visible from the
  * parsed body (content-length is the only pre-read signal), so non-establish
@@ -296,7 +295,7 @@ const customAgentSpecSchema = z.object({
  * `request_too_large` shape the bodyLimit middleware emits. An establish is
  * signalled by `conversation_mode: "managed"` + `session_id` + more than one
  * message (full history) OR a single-message body against a missing, non-
- * evicted session (the F1 first turn); a re-sent establish body therefore
+ * evicted session (the first turn); a re-sent establish body therefore
  * keeps the higher cap even when the session already exists (the
  * already_completed retry).
  */
@@ -306,7 +305,7 @@ export type ChatRoutesOptions = {
   pluginStore: PluginStore;
   /** Optional — required for async delegation (`getOrCreateTask`). */
   ledger?: Ledger;
-  /** Optional — the background job runner (Wave C2 async delegation). */
+  /** Optional — the background job runner. */
   jobRunner?: JobRunner;
   /**
    * Credential pin store SHARED with the job runner. Async admission pins the
@@ -316,7 +315,7 @@ export type ChatRoutesOptions = {
   /** Test seam; defaults to the real `requireApiKey` from auth/request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
   /**
-   * Per-owner rate limiter (Phase 4, Wave A). Returns a structured
+   * Per-owner rate limiter. Returns a structured
    * `{ allowed, retryAfterSeconds }`; a rejection -> `429 { error:
    * "rate_limited" }` + `Retry-After`. Defaults to a per-owner token bucket
    * (60/min, burst 20; `index.ts` wires the INFERENCE_RATE_LIMIT/BURST env).
@@ -331,7 +330,7 @@ export type ChatRoutesOptions = {
    */
   limiter?: RateLimiterFn;
   /**
-   * Per-user concurrency budget (Phase 4, Wave A): caps in-flight sync streams
+   * Per-user concurrency budget: caps in-flight sync streams
    * + background jobs per owner through one shared pool. Pool full (sync) ->
    * `429 { error: "busy" }` + `Retry-After`; queue full (async) -> `503
    * { error: "busy" }` + `Retry-After`. Defaults to `createBudgetManager()`
@@ -353,14 +352,14 @@ export type ChatRoutesOptions = {
    * Test seam for the sync path's tool handler. Defaults to the real
    * `ToolExecutor` (validatedFetch + pinned IPs + trusted hosts). When
    * supplied, the transport still injects each call's per-plugin credentials
-   * (H2) so a fake can assert them.
+   *  so a fake can assert them.
    */
   toolHandler?: JobToolHandler;
   toolTimeoutMs?: number;
   mcpClientFactory?: McpClientFactory;
   warmups?: WarmupManager;
   /**
-   * Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the sync tool
+   * Shared in-memory tool-result cache. Wraps the sync tool
    * handler so a repeated READ-ONLY tool call — same (owner, pluginId,
    * pluginVersion, credentialFingerprint, tool, argsHash) — is served without
    * re-executing the backend. Mutating tools are never cached. The cache
@@ -372,10 +371,10 @@ export type ChatRoutesOptions = {
   toolCache?: ToolResultCache;
   /** Admin-trusted hosts for every outbound `validatedFetch` (model + tools). */
   trustedHosts?: readonly string[];
-  /** Agent template catalog (plumbing for Step 6 agent override resolution). */
+  /** Agent template catalog (plumbing for agent override resolution). */
   catalogs?: Catalogs;
   /**
-   * In-memory session store (plan §4, step 1). Required for the managed-session
+   * In-memory session store. Required for the managed-session
    * path (`conversation_mode: "managed"` + `session_id`); a managed-session
    * request with no store is a 503 managed_unavailable (never a silent
    * stateless run). Constructed in index.ts and shared with createSessionRoutes.
@@ -403,10 +402,10 @@ export type JobModelRequestConfig = {
 };
 
 /**
- * Establish-vs-delta body signal (§5/R6, F1/F2): a request is an establish when
+ * Establish-vs-delta body signal: a request is an establish when
  * it is managed, carries `session_id`, and EITHER has more than one message
  * (full history — a first turn, a reseed, or a compaction re-base, which is an
- * establish regardless of session liveness per F2/§6) OR is a SINGLE-message
+ * establish regardless of session liveness)) OR is a SINGLE-message
  * body against a missing, non-tombstoned session (a brand-new conversation's
  * first turn per F1). The single-message case needs the store to distinguish a
  * fresh session (reason `"restart"`) from a tombstoned/`"evicted"` one (409 —
@@ -543,7 +542,7 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono<OwnerVariables> 
   // Bounds the request body BEFORE it is buffered by `c.req.json()`. An
   // oversized POST (no Content-Length, chunked) would otherwise stall the
   // event loop and inflate memory for every user. 413 request_too_large.
-  // Raised to the ESTABLISH cap (§5/R6): vision establishes carry full history
+  // Raised to the ESTABLISH cap: vision establishes carry full history
   // + base64 images; non-establish requests are re-bounded post-read below.
   routes.use(
     "/chat/*",
@@ -567,7 +566,7 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono<OwnerVariables> 
     const body = await c.req.json().catch(() => null);
     if (!isRecord(body)) return c.json({ error: "invalid_request" }, 400);
 
-    // §5/R6 establish body cap: the route bodyLimit above admits up to the
+    // Establish body cap: the route bodyLimit above admits up to the
     // establish cap for EVERY request, so non-establish requests (no
     // session_id, or a single-message session delta) are re-bounded here,
     // post-read, with the same 413 `request_too_large` shape. Content-Length is
@@ -578,7 +577,7 @@ export function createChatRoutes(opts: ChatRoutesOptions): Hono<OwnerVariables> 
       return c.json({ error: "request_too_large" }, 413);
     }
 
-    // Wave C2 sync-vs-async decision (see the module doc): only an explicit
+    // Sync-vs-async decision (see the module doc): only an explicit
     // boolean `true` selects the async path; `false`/absent is the C1 stream,
     // and any other value is rejected rather than silently running sync.
     const requestId = chatRequestId(c, body);
@@ -608,14 +607,14 @@ type ResolvedChat = {
   requestModel: string | undefined;
   plugin: ModelPluginDefinition;
   credentials: Record<string, string>;
-  /** Per-tool-plugin validated credentials from `body.credentials` (H2). */
+  /** Per-tool-plugin validated credentials from `body.credentials`. */
   toolCredentialsByPlugin: Record<string, Record<string, string>>;
   rawMessages: unknown[];
   requestParameters: Record<string, unknown>;
   /** Background-path worker label only (`body.thread_id`, else `messageId`). */
   clientThreadId: string | undefined;
   /**
-   * Client-generated session id (plan §5) for the managed-session path. Present
+   * Client-generated session id  for the managed-session path. Present
    * exactly when the managed request carried a valid, non-empty `session_id`
    * (REQUIRED for managed turns). Absent for every other request.
    */
@@ -699,7 +698,7 @@ export function resolveChatRequest(
   if (!resolvedCredentials.ok) return resolvedCredentials;
   let credentials = resolvedCredentials.credentials;
 
-  // H2: extract + validate every TOOL plugin credential the request carries.
+  // Extract + validate every TOOL plugin credential the request carries.
   // Missing credentials for a tool plugin do NOT fail the request — the model
   // may never call that tool — so only what is supplied is validated, and only
   // what passes is forwarded to the sync ToolExecutor. An explicitly supplied
@@ -717,7 +716,7 @@ export function resolveChatRequest(
 
   const rawMessages = Array.isArray(body["messages"]) ? body["messages"] : [];
 
-  // Managed mode is an explicit, opt-in contract (§5): it REQUIRES a messageId
+  // Managed mode is an explicit, opt-in contract: it REQUIRES a messageId
   // (the idempotency key) and a non-empty `session_id` — the session path is
   // the ONLY sync conversation mode (the legacy `thread_id`/checkpoint path is
   // gone). A managed request is never stateless: a missing session store is a
@@ -748,7 +747,7 @@ export function resolveChatRequest(
       };
     }
     managedMessageId = rawMessageId;
-    // `session_id` is the managed path's conversation identity (§5) and is
+    // `session_id` is the managed path's conversation identity and is
     // REQUIRED: a managed request without it is a 400, never a checkpoint/thread
     // fallback.
     const rawSessionId = typeof body["session_id"] === "string" ? body["session_id"].trim() : "";
@@ -1058,7 +1057,7 @@ async function handleSyncStream(
   reportShadowInput(opts.shadowReporter, owner, resolved.value.rawMessages, requestId);
   const { managed } = resolved.value;
 
-  // Managed-session path (plan §5): a managed request carries a validated
+  // Managed-session path: a managed request carries a validated
   // non-empty `session_id` (required in resolveChatRequest) and dispatches to
   // the session store — the ledger, checkpointer, thread locks, and context
   // manager are NOT touched. A managed request with no store is a 503 (never a
@@ -1083,7 +1082,7 @@ async function handleSyncStream(
     requestParameters,
   } = resolved.value;
 
-  // Step 3.2/3.5: ONE per-request credential source for both halves of the
+  // ONE per-request credential source for both halves of the
   // request body — the selected model plugin's validated credentials and the
   // validated TOOL map. Constructed here because it is inherently per-request
   // (it closes over this request's maps); `index.ts` owns only the shared pin
@@ -1128,9 +1127,9 @@ async function handleSyncStream(
       trustedHosts: opts.trustedHosts,
       timeoutMs: effectiveToolTimeoutMs,
     });
-  // H2: the binding threads each tool call's per-plugin credentials (mirrors the
+  // The binding threads each tool call's per-plugin credentials (mirrors the
   // async path's `bindJobTools` threading) so a tool backend that requires auth
-  // receives the client's key on the SYNC path too. Step 3.2/3.5: that sourcing
+  // receives the client's key on the SYNC path too. This sourcing
   // is now the per-request resolver, not an inline map lookup.
   const execution = createStreamExecution(c.req.raw.signal);
   trackModelExecution(model, execution);
@@ -1163,8 +1162,8 @@ async function handleSyncStream(
         trustedHosts: env.MCP_TRUSTED_HOSTS,
         clientFactory: opts.mcpClientFactory,
         resolvePins: (server) => resolveMcpPins(opts.pluginStore, server),
-        // Step 1.11: MCP dispatches through the same engine as the plugin tools
-        // above, gaining budget (D1) and read-only result caching (D2). The
+        // MCP dispatches through the same engine as the plugin tools
+        // above, gaining budget and read-only result caching. The
         // plugin tools are already bound, so their names seed the tie-break.
         channel: "sync-stateless",
         budget,
@@ -1224,7 +1223,7 @@ async function handleSyncStream(
     });
     const modelId = requestModel ?? plugin.inference.defaultModel;
 
-    // Phase 4 Wave A: reserve the per-user slot at stream admission — after
+    // Reserve the per-user slot at stream admission — after
     // every pre-stream validation, so a rejected request never holds a slot —
     // and release it on stream end / client cancel (via buildStreamResponse's
     // `onRelease`). The reserve/release wrapper releases BEFORE rethrowing if
@@ -1273,20 +1272,20 @@ async function handleSyncStream(
 }
 
 /**
- * The stateless managed-session sync path (plan §4/§5). Every managed request
+ * The stateless managed-session sync path. Every managed request
  * (which REQUIRES `session_id`, validated in resolveChatRequest) lands here: the
  * in-memory `sessionStore` is the only conversation state, and the graph is
  * compiled WITHOUT a checkpointer.
  *
- * Establish vs delta is classified by BODY SHAPE (F1/F2/§6), not session
+ * Establish vs delta is classified by BODY SHAPE , not session
  * liveness alone:
  *   - a FULL-HISTORY body (more than one message) is an ESTABLISH — the
  *     request's `messages` replace the session under `session_id`
- *     (`x-conversation-state: seeded`). This includes the §6 compaction
+ *     (`x-conversation-state: seeded`). This includes the compaction
  *     re-base, which re-establishes under the SAME live session_id.
  *   - a single-message body against a MISSING session is an ESTABLISH when the
  *     store has no tombstone (fresh first turn, `"restart"` reason) and a 409
- *     `session_missing` when the store reports `"evicted"` (F1).
+ *     `session_missing` when the store reports `"evicted"` .
  *   - a single-message body against a LIVE session is a DELTA — appended via
  *     the store's exactly-once `appendDelta` (`x-conversation-state: resumed`);
  *     the graph runs on the session's accumulated messages (full context, R12).
@@ -1318,17 +1317,17 @@ async function handleManagedSessionStream(
 
   let state: "seeded" | "resumed";
   let sessionMessages: BaseMessage[];
-  // The session incarnation this turn was anchored against (F4): threaded into
+  // The session incarnation this turn was anchored against: threaded into
   // finalization so a stale turn never writes into a re-seeded session.
   let turnGeneration: number | undefined;
   const messages = toLangChainMessages(rawMessages);
   const existing = sessionStore.getMessages(owner, sessionId);
   if (existing === null) {
-    // MISSING SESSION (§5, F1): a multi-message body is an establish. A
+    // MISSING SESSION: a multi-message body is an establish. A
     // SINGLE-message body establishes when the store has no tombstone (reason
     // `"restart"` — a brand-new conversation's first turn, or the first turn
     // after a gateway restart); only a tombstoned (`"evicted"`) session keeps
-    // the §4 eviction signal (409) so the client re-establishes with a
+    // the eviction signal (409) so the client re-establishes with a
     // full-history body.
     if (
       messages.length <= 1 &&
@@ -1389,7 +1388,7 @@ async function handleManagedSessionStream(
     }
     state = "seeded";
   } else if (messages.length > 1) {
-    // LIVE SESSION + FULL HISTORY (F2/§6): classify by BODY SHAPE, not
+    // LIVE SESSION + FULL HISTORY: classify by BODY SHAPE, not
     // liveness. A multi-message body under the SAME session_id is the client's
     // compaction re-base — `store.reestablish` atomically dedupes the messageId
     // (a retransmitted body short-circuits to already_completed WITHOUT
@@ -1453,7 +1452,7 @@ async function handleManagedSessionStream(
   // Build the agent exactly like the stateless sync branch: model from the
   // plugin + request, real ToolExecutor (or the test seam), NO checkpointer.
   //
-  // EXACTLY-ONCE PRE-STREAM ROLLBACK (plan §4 step 6): the user message was
+  // EXACTLY-ONCE PRE-STREAM ROLLBACK: the user message was
   // appended and `outcomes[messageId]` set to `in_progress` before this section
   // (dedupe must be atomic at append time), so EVERY failure before the stream
   // reaches the wire must roll the turn back with `markFailed` — a model-build
@@ -1474,7 +1473,7 @@ async function handleManagedSessionStream(
     toolCredentialsByPlugin,
     requestParameters,
   } = resolved;
-  // Step 3.2/3.5: same per-request credential source as the stateless path.
+  // same per-request credential source as the stateless path.
   const requestCredentials = new RequestBodyCredentialResolver({
     toolCredentialsByPlugin,
     model: { pluginId: modelPluginId, credentials },
@@ -1482,7 +1481,7 @@ async function handleManagedSessionStream(
   if (isDeleting(owner)) return accountDeletedResponse(c);
   // The generation captured at append time (in scope on every path that reaches
   // this section — all four append/seed branches above set it) keeps the rollback
-  // from stamping a re-seeded incarnation (F4).
+  // from stamping a re-seeded incarnation.
   const rollbackTurn = () =>
     sessionStore.markFailed(owner, sessionId, messageId, turnGeneration).catch(() => {});
   let model;
@@ -1666,7 +1665,7 @@ async function handleManagedSessionStream(
       } catch (err) {
         reservation.release();
         // Construction failure (never reached the wire): mark failed so a retry
-        // with the same messageId is a clean re-run (plan §4 step 6) rather than
+        // with the same messageId is a clean re-run rather than
         // a half-appended turn.
         await rollbackTurn();
         return preStreamError(c, err);
@@ -1678,7 +1677,7 @@ async function handleManagedSessionStream(
     // An unexpected pre-stream throw — an MCP bind rejection, or a graph/
     // tool-merging failure — surfaces exactly as an uncaught handler error
     // (Hono 500) but FIRST rolls the appended turn back so the same messageId
-    // stays retryable (plan §4 step 6).
+    // stays retryable.
     await rollbackTurn();
     throw err;
   }
@@ -1693,15 +1692,15 @@ async function handleManagedSessionStream(
  *     back `GET /v1/sessions/:id` includes it, then mark the messageId
  *     completed;
  *   - failed/cancelled -> mark the messageId failed (the store rolls the
- *     appended user turn back; §4 step 6).
+ *     appended user turn back; ).
  * `generation` is the session incarnation captured when the turn's user message
  * was appended. Both the reply append (via `expectedGeneration`) and the marks
  * no-op against a re-seeded session — an evicted-then-reseeded session must not
- * receive the stale reply or be stamped by the stale turn (F4). The reply
+ * receive the stale reply or be stamped by the stale turn. The reply
  * append is `evictOnOverflow: false`: an over-cap reply is dropped rather than
  * evicting the session (the client cannot control reply size, F5). An
  * evicted-mid-turn mark is logged and ignored — the client re-establishes
- * under the same session_id (§5). Never throws into the stream.
+ * under the same session_id. Never throws into the stream.
  */
 async function finalizeSessionTurn(
   sessionStore: SessionStore,
@@ -1765,7 +1764,7 @@ async function finalizeSessionTurn(
 }
 
 /**
- * 409 `session_missing` (plan §5): the session_id is gone — the client must
+ * 409 `session_missing`: the session_id is gone — the client must
  * re-establish under the SAME session_id (not mint a new one). `reason` is the
  * store's tombstone-backed `"evicted" | "restart"`.
  */
@@ -1778,7 +1777,7 @@ function sessionMissingResponse(c: Context, sessionId: string, reason: SessionMi
 /**
  * Map a non-`resumed` `appendDelta` result to HTTP on the managed-session path:
  *   - already_completed -> 200 `{ status, sessionId, messageId }` (NO taskId,
- *     terminalStatus, or threadId per §5) with BOTH `x-session-id` and
+ *     terminalStatus, or threadId ) with BOTH `x-session-id` and
  *     `x-conversation-state: resumed` (F3 — the client requires
  *     `x-conversation-state` on every managed 2xx); the reply is read back via
  *     `GET /v1/sessions/:id`;
@@ -1789,7 +1788,7 @@ function sessionMissingResponse(c: Context, sessionId: string, reason: SessionMi
  * generation guard is only passed by `finalizeSessionTurn`, which handles it
  * itself); it is mapped defensively as a logged 500 invariant guard.
  * A `failed` outcome is NOT mapped here: `appendDelta` treats it as a clean
- * re-run (plan §4 step 6) and returns `resumed`, so the retry streams normally.
+ * re-run  and returns `resumed`, so the retry streams normally.
  */
 function mapSessionAppend(
   c: Context,
@@ -1843,7 +1842,7 @@ function managedDuplicateResponse(c: Context, admission: ManagedAdmission): Resp
 }
 
 /**
- * Wave C2 async delegation. See the module doc (ASYNC DELEGATION) for the
+ * async delegation. See the module doc (ASYNC DELEGATION) for the
  * step-by-step contract and IDEMPOTENCY for the `messageId` key.
  */
 async function handleBackground(
@@ -1894,7 +1893,7 @@ async function handleBackground(
   // the ledger `worker` column at admission.
   const clientThread = clientThreadId ?? messageId;
 
-  // Idempotent retry (Wave C2 IDEMPOTENCY): a request whose (owner, messageId)
+  // Idempotent retry: a request whose (owner, messageId)
   // already has a ledger task is a re-submit of an admitted job, NOT a fresh
   // snapshot. De-dupe BEFORE admission: a running task -> 409
   // `conversation_in_flight`, a terminal task -> 200 `already_completed`
@@ -1966,7 +1965,7 @@ async function handleBackground(
      mcpServers,
    });
 
-  // Phase 4 Wave A, budget: reserve the per-user slot BEFORE ledger admission
+  // Budget: reserve the per-user slot BEFORE ledger admission
   // so a queue-full 503 leaves no phantom task row. A queued admission parks
   // in the owner's bounded FIFO queue and waits (up to the budget's waitMs)
   // for a free slot; the pool is shared with sync streams. Releasing when the
@@ -1995,7 +1994,7 @@ async function handleBackground(
       owner,
       intentKey: messageId,
       spec: intentSpec(rawMessages),
-      // M2: persist the RAW client thread id so a restart-loss replay
+      // Persist the RAW client thread id so a restart-loss replay
       // (`resumeStuckJobs`) resumes under the same worker label instead of
       // re-deriving one from the intent key.
        worker: clientThread,
@@ -2068,7 +2067,7 @@ async function handleBackground(
 }
 
 /**
- * Validate + collect every TOOL plugin credential the request supplies (H2).
+ * Validate + collect every TOOL plugin credential the request supplies.
  * Missing credentials for a tool plugin do NOT fail — the model may never call
  * that tool — so only what the client explicitly provided is validated, and
  * only what passes is returned. Credentials for ids that are not installed
@@ -2186,7 +2185,7 @@ function buildStreamResponse(
   // assistant message (`captureAssistantReply` fires `onReply` at that point,
   // which precedes [DONE]). It lets the outcome decision treat a client abort
   // AFTER the full reply was emitted to the wire as `succeeded` instead of
-  // `cancelled` — a delivered reply must not be rolled back (F4).
+  // `cancelled` — a delivered reply must not be rolled back.
   let replyComplete = false;
   const eventSource = onReply
     ? captureAssistantReply(events, (finalReply) => {
@@ -2322,7 +2321,7 @@ async function* captureAssistantReply(
 }
 
 /** Short human-readable intent for the ledger spec (last user message text).
- *  Capped at SPEC_MAX_LENGTH (D4) — the label is non-sensitive, never a
+ *  Capped at SPEC_MAX_LENGTH  — the label is non-sensitive, never a
  *  content store. */
 function intentSpec(rawMessages: unknown[]): string {
   const lastUser = lastUserMessage(rawMessages);
@@ -2337,7 +2336,7 @@ function intentSpec(rawMessages: unknown[]): string {
 }
 
 /**
- * Phase 4 Wave A budget rejection: `429 { error: "busy" }` (sync — the user's
+ * budget rejection: `429 { error: "busy" }` (sync — the user's
  * concurrency pool is full) or `503 { error: "busy" }` (async — the background
  * queue is full), always with a `Retry-After` header so the client knows when
  * to retry. Deliberately DISTINCT from `rate_limited`: budget exhaustion is a
@@ -2444,7 +2443,7 @@ function resolveModelSelection(body: Record<string, unknown>): ModelSelection | 
 }
 
 /**
- * Translate OpenAI chat messages into LangChain messages (Phase 3 wave C1).
+ * Translate OpenAI chat messages into LangChain messages .
  * Roles: system -> SystemMessage, user -> HumanMessage, assistant -> AIMessage
  * (with `tool_calls` normalized from the OpenAI shape), tool/function ->
  * ToolMessage (a missing `tool_call_id` gets a stable synthetic id so a

@@ -71,9 +71,8 @@ export type OpenPinnedStreamOptions = {
   /**
    * Retained, admin-validated address pins (e.g. a plugin/catalog store pin).
    * When supplied the host is NOT re-resolved: the pins are re-authorized
-   * through `createEgressPolicy` + `authorizeEgressRequest`, mirroring MCP's
-   * `validateMcpRetainedPins`. When omitted the host is resolved and validated
-   * through `resolveAndValidateHost`.
+   * through `createEgressPolicy` + `authorizeEgressRequest`. When omitted the
+   * host is resolved and validated through `resolveAndValidateHost`.
    */
   readonly pinnedIps?: readonly string[];
   /**
@@ -123,10 +122,9 @@ export type EgressClientOptions = {
 };
 
 /**
- * Re-authorizes retained pins exactly as `agents/mcp.ts`'s
- * `validateMcpRetainedPins` does today: build a single-destination policy over
- * the pinned URL and run `authorizeEgressRequest`, which re-checks scheme,
- * range and pin validity but performs no DNS lookup.
+ * Re-authorizes retained pins: build a single-destination policy over the
+ * pinned URL and run `authorizeEgressRequest`, which re-checks scheme, range
+ * and pin validity but performs no DNS lookup.
  */
 async function authorizeRetainedPins(
   parsed: URL,
@@ -216,8 +214,8 @@ export type ResolvePinsOptions = {
  * bound to — the same static validation + pin resolution `openPinned`
  * performs, exposed so install-time / binding-time callers (MCP catalog, MCP
  * binding, plugin store) share ONE trust-construction path instead of
- * re-inlining the `trustedHosts` / `httpAllowedHosts` pairing (plan Phase 2,
- * M1). Throws `SsrfValidationError` on any static or DNS rejection.
+ * re-inlining the `trustedHosts` / `httpAllowedHosts` pairing. Throws
+ * `SsrfValidationError` on any static or DNS rejection.
  */
 export async function resolvePins(
   url: string,

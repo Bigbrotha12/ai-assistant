@@ -20,7 +20,7 @@ import type {
  * names with a `console.warn`, and construct a `DynamicStructuredTool` whose
  * `func` builds a `ToolCall` + `ToolCallScope` and calls `pipeline.dispatch`.
  * `bindTools` owns that skeleton — including the per-binding anonymous
- * `actionId` sequence counter (plan §4.1) — so neither channel re-implements
+ * `actionId` sequence counter  — so neither channel re-implements
  * the loop. Only three things are channel-specific, supplied as hooks:
  *
  *   - `select` — the plugin gate (sync: `enabledPlugins` allow-set; job:
@@ -31,7 +31,7 @@ import type {
  *   - `duplicateLogPrefix` — verbatim `[agents]` / `[jobs]` on the duplicate
  *     warning.
  *
- * Step 1.11 extends this seam to MCP (`source: "mcp"`): {@link createBoundTool}
+ *  extends this seam to MCP (`source: "mcp"`): {@link createBoundTool}
  * is the shared per-tool constructor, and `bindMcpServers` (`agents/mcp.ts`)
  * uses it to build MCP tools that dispatch through the pipeline with
  * `pluginId: "mcp:<serverName>"`. The plugin-wins/MCP-loses tie-break lives in
@@ -68,7 +68,7 @@ export type BindToolHooks = {
   readonly buildCall: (ctx: BindToolContext) => ToolCall;
   /**
    * Builds the per-call `ToolBodies` + `ToolCallScope` together, because the
-   * channel owns the raw-body promise (plan §4.2). Receives the `call` so the
+   * channel owns the raw-body promise . Receives the `call` so the
    * credential reference resolved by `buildCall` is reused verbatim — the job
    * channel must not resolve its credential pin twice.
    */
@@ -95,7 +95,7 @@ export type BindToolsOptions = {
  * Translate installed tool plugins into LangChain tools. Exported for tests.
  *
  * The duplicate-name gate and the anonymous-sequence counter are per binding,
- * matching the pre-1.10 `bindPluginTools`/`bindJobTools` exactly.
+ * matching the  `bindPluginTools`/`bindJobTools` exactly.
  */
 export function bindTools(opts: BindToolsOptions): DynamicStructuredTool[] {
   const tools: DynamicStructuredTool[] = [];
@@ -164,7 +164,7 @@ export function createBoundTool(opts: {
         config as { toolCall?: { id?: string } } | undefined
       )?.toolCall?.id;
       // The anonymous sequence counter belongs to the binding layer; it is only
-      // consulted when the model supplied no tool-call id (plan §4.1).
+      // consulted when the model supplied no tool-call id .
       const actionId =
         toolCallId ?? `${opts.actionIdPrefix}:${opts.nextAnonymousToolSequence()}`;
       const ctx: BindInvocationContext = {
@@ -180,7 +180,7 @@ export function createBoundTool(opts: {
 }
 
 /**
- * The per-binding anonymous-sequence counter (plan §4.1). Shared by `bindTools`
+ * The per-binding anonymous-sequence counter . Shared by `bindTools`
  * (plugin sources) and `bindMcpServers` (MCP source) so the "1-based, per
  * binding, only consulted when the model supplied no tool-call id" rule is
  * written once. Returns the next sequence number; `createBoundTool` composes
@@ -195,8 +195,8 @@ export function createAnonymousSequence(): () => number {
  * The channel-owned `ToolCallScope` extras (`track`/`trackUntil`/
  * `onToolStart`/`onToolEnd`), assembled once for every binder. `rawSettled` and
  * `onBodySkipped` are NOT here: the channel's `ToolBodies` wrapper owns those
- * (plan §4.2). A `undefined` field is omitted rather than set to `undefined`,
- * matching the pre-1.13 inline bundles.
+ * . A `undefined` field is omitted rather than set to `undefined`,
+ * matching the  inline bundles.
  */
 export function channelScopeHooks(opts: {
   readonly track?: ToolCallScope["track"];
@@ -236,7 +236,7 @@ function bindTool(
 
 /**
  * `makeToolBodies` — shared channel-side construction of a dispatch's
- * `ToolBodies` and `ToolCallScope` for ONE source (plan §4.2).
+ * `ToolBodies` and `ToolCallScope` for ONE source .
  *
  * Every binding needs the same three things, and only the source and the raw
  * executor call differ:
@@ -249,10 +249,10 @@ function bindTool(
  *      starts;
  *   3. a `scope` carrying `rawSettled` + `onBodySkipped` (which resolves the
  *      SAME deferred when the core reports the body never started, so budget
- *      releases rather than quarantines — D9) plus any channel-owned extras
+ *      releases rather than quarantines) plus any channel-owned extras
  *      (`track`/`trackUntil`/`onToolStart`/`onToolEnd`).
  *
- * Step 1.11: the real body is placed under the binding's OWN source key. The
+ * the real body is placed under the binding's OWN source key. The
  * other source key is a shared fail-loud guard, so a dispatch whose source does
  * not match its binding aborts loudly instead of silently running the wrong
  * body or returning an empty string. MCP bindings pass `source: "mcp"`; plugin
@@ -298,7 +298,7 @@ export function makeToolBodies(
   };
   const scope: ToolCallScope = {
     rawSettled,
-    // REQUIRED wiring (D9): resolve the SAME deferred when the core reports the
+    // REQUIRED wiring : resolve the SAME deferred when the core reports the
     // body never started, so budget releases rather than quarantines.
     onBodySkipped: () => settleRaw(),
     ...opts.scope,

@@ -29,14 +29,14 @@ import type { ToolDispatch, ToolInterceptor } from "../pipeline.ts";
  *
  * Anonymous JOB calls bypass the cache entirely. Production's anonymous branch
  * (`runner.ts:931-935`) does `return await execute()` — skipping both the
- * ledger and the cache; a cache hit would be a behaviour change outside D1–D8.
+ * ledger and the cache; a cache hit would be a behaviour change outside .
  * Sync/warmup anonymous calls are unaffected (they have no replay branch).
  *
  * The cache key's `credentialFingerprint` is read from
  * `call.credentialFingerprint`, which the CHANNEL computes with its own
  * derivation (warmup fingerprints `validateCredentials(...)`; sync fingerprints
  * the raw per-plugin body credentials; job prefers the pin fingerprint). This
- * interceptor deliberately does NOT unify those derivations (plan §10.1); when a
+ * interceptor deliberately does NOT unify those derivations; when a
  * channel does not supply the fingerprint (or an owner/version), the call
  * executes directly and is not cached.
  *

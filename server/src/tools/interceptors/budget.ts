@@ -11,7 +11,7 @@ import type { ToolInterceptor } from "../pipeline.ts";
  * Registered OUTER of `execution` so `withToolCallBudget` wraps the bounded
  * body: its `finally` therefore runs when the bounded race settles, which is
  * what lets it observe an unsettled raw body and quarantine the plugin (the
- * sync channel's current slot-leak / no-quarantine behaviour, D7, is fixed by
+ * sync channel's former slot-leak / no-quarantine behaviour is fixed by
  * this ordering for every channel).
  *
  * `rawSettled` is the CHANNEL-owned deferred that resolves when the RAW body
@@ -31,11 +31,11 @@ import type { ToolInterceptor } from "../pipeline.ts";
  * calls `scope.onBodySkipped`, and the channel (not this interceptor) resolves
  * `rawSettled`. `withToolCallBudget` then releases rather than quarantines: the
  * plugin did nothing wrong and there is no in-flight raw work to be uncertain
- * about (plan D9). This interceptor deliberately does not register the hook
+ * about . This interceptor deliberately does not register the hook
  * itself; the deferred is channel-owned (`ToolCallScope.rawSettled`).
  *
  * `middleware/budget.ts` is intentionally NOT modified: the only change is this
- * caller, which now threads the effective `call.timeoutMs` (fixing D8) and the
+ * caller, which now threads the effective `call.timeoutMs` and the
  * channel's raw-settlement promise.
  */
 export function createBudgetInterceptor(opts: {

@@ -1,5 +1,5 @@
 /**
- * Stateless-gateway session store (plan §4, D2/D3).
+ * Stateless-gateway session store.
  *
  * The gateway's in-memory, evictable mirror of a client-owned conversation.
  * Sessions are keyed by `(owner, sessionId)` where `sessionId` is a
@@ -10,7 +10,7 @@
  * recovery path — the client re-establishes under the SAME `session_id` and the
  * server answers `session_missing` with a reason (`"evicted"` | `"restart"`).
  *
- * CONCURRENCY (§4): sync turns on one session are serialized by a per-session
+ * CONCURRENCY: sync turns on one session are serialized by a per-session
  * `AsyncMutex` (reuses `src/jobs/mutex.ts`). The mutex is held ONLY for the
  * short critical section (dedupe check → append → outcome recording, or the
  * outcome write); the graph run happens after the lock is released. The mutex
@@ -23,72 +23,71 @@
  *   - per-owner active-session cap (default 32), evicts that owner's LRU;
  *   - global cap (default 1000) with OWNER-AWARE LRU: evict the requesting
  *     owner's own least-recently-used sessions first, only touching other
- *     owners' sessions when the requesting owner has none (R10);
+ *     owners' sessions when the requesting owner has none;
  *   - per-session byte cap (default `CONTEXT_TOKEN_LIMIT × 4` = 131072) that
  *     counts text chars (~1 byte/char) PLUS the raw byte length of inline
  *     base64 image content; over-cap sessions are evicted. The sync path
- *     (step 2) additionally rejects establishes over the cap — here we only
- *     enforce eviction/measurement and expose `sessionBytes()`.
+ *     additionally rejects establishes over the cap — here we only enforce
+ *     eviction/measurement and expose `sessionBytes()`.
  *
  *   Evicted sessions leave a bounded tombstone so a later delta can distinguish
  *   `reason: "evicted"` (this process dropped it) from `"restart"` (never seen
  *   in this process). Explicit `deleteSession` leaves NO tombstone.
  *
- * BYTE COUNTING (D7 backstop): `estimateSessionBytes` sums text content
- * characters 1:1 (chars ≈ bytes) and adds `image_url.url.length` for image
- * blocks (base64 data URIs are ASCII, chars ≈ bytes). This reproduces the
- * plan's "≈ CONTEXT_TOKEN_LIMIT × 4 for text" budget: a session whose text
- * exceeds the token limit measures above the cap and is evicted, and images
- * push it over faster. Non-text/non-image blocks fall back to serialized JSON
- * length; `name` and AIMessage `tool_calls` are counted as text.
+ * BYTE COUNTING: `estimateSessionBytes` sums text content characters 1:1
+ * (chars ≈ bytes) and adds `image_url.url.length` for image blocks (base64 data
+ * URIs are ASCII, chars ≈ bytes). This reproduces the "≈ CONTEXT_TOKEN_LIMIT ×
+ * 4 for text" budget: a session whose text exceeds the token limit measures
+ * above the cap and is evicted, and images push it over faster. Non-text/
+ * non-image blocks fall back to serialized JSON length; `name` and AIMessage
+ * `tool_calls` are counted as text.
  *
  * OUTCOMES PRUNING: outcomes are capped at `maxOutcomesPerSession` (default
  * 64), pruning strictly-oldest entries by insertion order (the messageId
  * arrival order). We deliberately do NOT prune the corresponding `messages[]`
  * entries — the messages array is bounded by the byte cap and the client is
- * authoritative on history (documented choice per step-1 scope).
+ * authoritative on history.
  *
- * ORPHANED `in_progress` OUTCOMES (N9): a turn in flight against one
- * incarnation cannot be finalized after a re-seed — `establish`/`reestablish`
- * bump the generation, and F4 makes the stale turn's `markFailed`/
- * `markCompleted` no-ops. Without intervention that outcome would sit
- * `in_progress` forever, wedging a same-messageId retry into a permanent 409
- * `conversation_in_flight`. Every re-seed therefore downgrades the previous
- * incarnation's `in_progress` outcomes to `failed` (the plan §4 step 6 clean
- * re-run anchor) — the orphaned append is already gone (messages were
- * replaced), so no rollback is needed. Genuinely-running turns are never
- * touched: a plain delta does not bump the generation, so its `in_progress`
- * outcome survives re-seed-free turns untouched. The residual after this —
- * an `in_progress` outcome for a turn whose process genuinely hangs mid-stream
- * with no re-seed — is accepted: the stream owns it, eviction clears it, and
- * age-based pruning was deliberately NOT chosen because it would let a
- * same-messageId retry double-execute a long-running turn.
+ * ORPHANED `in_progress` OUTCOMES: a turn in flight against one incarnation
+ * cannot be finalized after a re-seed — `establish`/`reestablish` bump the
+ * generation, so the stale turn's `markFailed`/`markCompleted` no-op. Without
+ * intervention that outcome would sit `in_progress` forever, wedging a
+ * same-messageId retry into a permanent 409 `conversation_in_flight`. Every
+ * re-seed therefore downgrades the previous incarnation's `in_progress`
+ * outcomes to `failed` (the clean re-run anchor) — the orphaned append is
+ * already gone (messages were replaced), so no rollback is needed.
+ * Genuinely-running turns are never touched: a plain delta does not bump the
+ * generation, so its `in_progress` outcome survives re-seed-free turns
+ * untouched. The residual after this — an `in_progress` outcome for a turn
+ * whose process genuinely hangs mid-stream with no re-seed — is accepted: the
+ * stream owns it, eviction clears it, and age-based pruning was deliberately
+ * NOT chosen because it would let a same-messageId retry double-execute a
+ * long-running turn.
  *
- * RETRY-ON-FAILED (plan §4 step 6): a `failed` outcome is NOT terminal for
- * dedupe. Re-sending the SAME messageId is a clean re-run — `appendDelta`
- * re-appends the user message, resets the outcome to `in_progress` (dropping
- * the failed flags), and returns `resumed` exactly as on a fresh delta. We
- * deliberately reuse the `resumed` status (rather than minting a `retried`
- * one): a retry-after-failure is indistinguishable from a normal delta append
- * on a live session, so the HTTP layer streams it as a normal `resumed` turn
- * with no extra wiring. A `completed` outcome still dedupes to
- * `already_completed`; an `in_progress` outcome still answers `in_progress`.
- * The client may therefore retry a failed turn with the same messageId
- * (idempotent sends only, §10) or mint a new one.
+ * RETRY-ON-FAILED: a `failed` outcome is NOT terminal for dedupe. Re-sending
+ * the SAME messageId is a clean re-run — `appendDelta` re-appends the user
+ * message, resets the outcome to `in_progress` (dropping the failed flags),
+ * and returns `resumed` exactly as on a fresh delta. We deliberately reuse the
+ * `resumed` status (rather than minting a `retried` one): a retry-after-failure
+ * is indistinguishable from a normal delta append on a live session, so the
+ * HTTP layer streams it as a normal `resumed` turn with no extra wiring. A
+ * `completed` outcome still dedupes to `already_completed`; an `in_progress`
+ * outcome still answers `in_progress`. The client may therefore retry a failed
+ * turn with the same messageId (idempotent sends only) or mint a new one.
  *
  * EVICTED-MID-TURN: `markCompleted`/`markFailed` return `{ evicted: true }`
  * when the session was dropped while its turn ran (the session's mutex may be
  * orphaned but is reaped lazily when idle). Eviction itself never waits on a
- * session mutex — RAM is volatile by design (§10).
+ * session mutex — RAM is volatile by design.
  *
- * INCARNATION/GENERATION (F4): `SessionRecord.generation` is bumped on EVERY
- * `establish` (seed AND re-seed — the §6 compaction re-base is an establish).
+ * INCARNATION/GENERATION: `SessionRecord.generation` is bumped on EVERY
+ * `establish` (seed AND re-seed — the compaction re-base is an establish).
  * A turn captures the generation at append time; `markCompleted`/`markFailed`
  * (and an `appendDelta` called with `expectedGeneration`) no-op when the
  * session's generation has since changed — an evicted-then-reseeded session
  * must never be stamped by the stale turn or receive its stale reply.
  *
- * REPLY APPENDS (F5): the assistant-reply append at turn finalization is a
+ * REPLY APPENDS: the assistant-reply append at turn finalization is a
  * NON-USER append. `appendDelta` with `evictOnOverflow: false` drops an
  * over-cap reply (returns `resumed` without storing it) instead of evicting the
  * whole session — the client cannot control reply size.
@@ -114,7 +113,7 @@ export type SessionRecord = {
   outcomes: Map<string, SessionOutcomeState>;
   createdAt: number;
   lastTouchedAt: number;
-  /** Incarnation token, bumped on every `establish` (F4). */
+  /** Incarnation token, bumped on every `establish`.*/
   generation: number;
 };
 
@@ -122,8 +121,8 @@ export type SessionMissingReason = "evicted" | "restart";
 
 /**
  * What a sync turn's write resolved to. `session_missing` is the signal for
- * step 2 to emit `409 { error: "session_missing", reason }`; the client then
- * re-establishes under the SAME session_id (§5).
+ * the transport to emit `409 { error: "session_missing", reason }`; the client then
+ * re-establishes under the same session_id.
  */
 export type EstablishResult =
   | { status: "established"; generation: number }
@@ -133,11 +132,11 @@ export type AppendDeltaResult =
   | { status: "resumed"; generation: number }
   | { status: "already_completed"; reply?: BaseMessage }
   | { status: "in_progress" }
-  | { status: "generation_changed" } // F4: expectedGeneration append on a re-seeded session
+  | { status: "generation_changed" } // Append with a stale expectedGeneration: the session was re-seeded.
   | { status: "session_missing"; reason: SessionMissingReason };
 
 /**
- * Atomic re-establish of a LIVE session (§6 compaction re-base / F2): dedupe-
+ * Atomic re-establish of a LIVE session: dedupe-
  * checks `messageId` under the same mutex hold as the message replacement, so a
  * retransmitted body (already_completed / in_progress) short-circuits WITHOUT
  * replacing the session.
@@ -186,7 +185,7 @@ export type SessionStore = {
    * Seed/re-seed a session's messages (first turn, client reseed, or client
    * compaction re-base). Replaces `messages`; on a re-establish of a LIVE
    * session the `outcomes` map is preserved (it is the exactly-once anchor) and
-   * `generation` is bumped (F4 — a stale in-flight turn cannot stamp the new
+   * `generation` is bumped (a stale in-flight turn cannot stamp the new
    * incarnation). Returns `established` + the new generation, or
    * `session_missing` when the seed exceeds the byte cap (evicted) — the client
    * must trim and re-seed.
@@ -197,16 +196,16 @@ export type SessionStore = {
     messages: BaseMessage[],
   ): Promise<EstablishResult>;
   /**
-   * Exactly-once delta (§4 steps 1–3): atomic under the per-session mutex.
+   * Exactly-once delta: atomic under the per-session mutex.
    * `resumed` on first sight AND on a retry of a `failed` messageId (a clean
-   * re-run per §4 step 6 — the message is re-appended and the outcome reset to
+   * re-run — the message is re-appended and the outcome reset to
    * in_progress); `already_completed`/`in_progress` on a duplicate messageId;
    * `session_missing` when the session is gone.
    *
-   * `opts.expectedGeneration` (F4): when provided and the session's generation
+   * `opts.expectedGeneration`: when provided and the session's generation
    * has moved on (re-seeded), returns `generation_changed` without appending —
    * used by the assistant-reply append so a stale turn cannot write into a new
-   * incarnation. `opts.evictOnOverflow === false` (F5): an over-cap append
+   * incarnation. `opts.evictOnOverflow === false`: an over-cap append
    * DROPS the message instead of evicting the session (the assistant-reply
    * path — the client cannot control reply size); the session survives with
    * `lastTouchedAt` bumped and the outcome stays `in_progress`.
@@ -219,7 +218,7 @@ export type SessionStore = {
     opts?: { expectedGeneration?: number; evictOnOverflow?: boolean },
   ): Promise<AppendDeltaResult>;
   /**
-   * Atomic re-establish of a LIVE session (F2/§6 compaction re-base). Under the
+   * Atomic re-establish of a LIVE session. Under the
    * per-session mutex: dedupe-check `messageId` FIRST (a completed/in-flight
    * duplicate short-circuits WITHOUT replacing messages — a retransmitted body
    * is not a re-base and must not clobber the session), then REPLACE `messages`
@@ -236,7 +235,7 @@ export type SessionStore = {
   /**
    * Record a successful outcome. `{ evicted: true }` if evicted mid-turn. When
    * `generation` is provided and the session's generation has since changed
-   * (re-seeded mid-turn), the write is a no-op (F4) and returns `{ evicted:
+   * (re-seeded mid-turn), the write is a no-op and returns `{ evicted:
    * false }` — the stale turn must not stamp the new incarnation.
    */
   markCompleted(
@@ -247,10 +246,10 @@ export type SessionStore = {
     generation?: number,
   ): Promise<SessionMutationResult>;
   /**
-   * Record a failure AND roll back the appended user message (§4 step 6).
+   * Record a failure AND roll back the appended user message.
    * `{ evicted: true }` if evicted mid-turn (nothing to roll back). When
    * `generation` is provided and the session's generation has since changed
-   * (re-seeded mid-turn), the write is a no-op (F4) — nothing to roll back in
+   * (re-seeded mid-turn), the write is a no-op — nothing to roll back in
    * the new incarnation.
    */
   markFailed(
@@ -457,12 +456,12 @@ export function createSessionStore(
   };
 
   /**
-   * N9: downgrade every `in_progress` outcome to `failed`. Called only on a
+   * Downgrade every `in_progress` outcome to `failed`. Called only on a
    * re-seed (which bumps the generation): a turn that was in flight against
-   * the PREVIOUS incarnation can never be finalized by its own stream (F4 — a
+   * the PREVIOUS incarnation can never be finalized by its own stream (a
    * mark against the bumped generation no-ops), so leaving it `in_progress`
    * would wedge a same-messageId retry into a permanent 409
-   * `conversation_in_flight`. `failed` keeps the plan §4 step 6 retry contract
+   * `conversation_in_flight`. `failed` keeps the retry contract
    * (a clean re-run). No message rollback is needed — the re-seed REPLACED
    * `messages`, so the orphaned append is already gone. Genuinely-running
    * turns are never touched: a normal delta does not bump the generation, so
@@ -537,9 +536,9 @@ export function createSessionStore(
           outcomes: existing ? redactOutcomes(existing.record.outcomes) : new Map(),
           createdAt: existing ? existing.record.createdAt : t,
           lastTouchedAt: t,
-          // Every establish — seed AND re-seed (§6 compaction re-base) — mints
+          // Every establish — seed AND re-seed (compaction re-base) — mints
           // a new incarnation so a mid-turn eviction+re-establish cannot be
-          // stamped by the stale turn (F4).
+          // stamped by the stale turn.
           generation: (existing?.record.generation ?? 0) + 1,
         };
         // Size-aware eviction: an over-cap seed (or re-seed) cannot be held.
@@ -549,7 +548,7 @@ export function createSessionStore(
         }
         if (!existing) {
           // Owner-aware global cap: prefer evicting the requesting owner's own
-          // LRU sessions; fall back to the globally LRU session (R10).
+          // LRU sessions; fall back to the globally LRU session.
           while (sessions.size >= maxSessions) {
             const victim = lruForOwner(owner) ?? lruGlobal();
             if (!victim) break;
@@ -566,8 +565,8 @@ export function createSessionStore(
             ownerCount -= 1;
           }
         }
-        // N9: a re-seed orphans every in-flight turn of the previous
-        // incarnation (its finalization no-ops under F4), so downgrade those
+        // A re-seed orphans every in-flight turn of the previous
+        // incarnation (its finalization no-ops), so downgrade those
         // outcomes to `failed` instead of leaving them `in_progress` forever.
         if (existing) orphanInProgress(record);
         sessions.set(k, { key: { owner, sessionId }, record });
@@ -589,7 +588,7 @@ export function createSessionStore(
           };
         }
         const record = existing.record;
-        // Dedupe FIRST (F2): a retransmitted body whose messageId is already
+        // Dedupe FIRST: a retransmitted body whose messageId is already
         // completed/in-flight is NOT a compaction re-base — short-circuit
         // without touching the session's messages.
         const existingOutcome = record.outcomes.get(messageId);
@@ -618,8 +617,8 @@ export function createSessionStore(
           lastTouchedAt: t,
           generation: record.generation + 1,
         };
-        // N9: the generation bump orphans every in-flight turn of the previous
-        // incarnation (its finalization no-ops under F4); downgrade those
+        // the generation bump orphans every in-flight turn of the previous
+        // incarnation (its finalization no-ops); downgrade those
         // outcomes to `failed` so a same-messageId retry is a clean re-run
         // rather than a permanent 409. The re-base's own messageId is NOT
         // in_progress here (the dedupe check above short-circuited), so it is
@@ -653,7 +652,7 @@ export function createSessionStore(
           };
         }
         const record = stored.record;
-        // Generation guard (F4): a caller holding a generation captured earlier
+        // Generation guard: a caller holding a generation captured earlier
         // (the assistant-reply append at turn finalization) must not append
         // into a session that was re-seeded since. Checked before any mutation.
         if (
@@ -670,7 +669,7 @@ export function createSessionStore(
           if (existingOutcome.status !== "failed") {
             return { status: "in_progress" };
           }
-          // A `failed` outcome is a clean re-run (plan §4 step 6): fall
+          // A `failed` outcome is a clean re-run: fall
           // through to re-append the user message and reset the outcome to
           // in_progress (markFailed already rolled the previous append back).
         }
@@ -681,7 +680,7 @@ export function createSessionStore(
         pruneOutcomes(record);
         if (estimateSessionBytes(record.messages) > maxSessionBytes) {
           if (opts?.evictOnOverflow === false) {
-            // Non-user (assistant-reply) append (F5): the client cannot control
+            // Non-user (assistant-reply) append: the client cannot control
             // reply size, so an over-cap reply is DROPPED rather than evicting
             // the session. The session survives (lastTouchedAt already bumped)
             // and the messageId outcome stays in_progress so markCompleted can
@@ -707,7 +706,7 @@ export function createSessionStore(
         if (!stored) return { evicted: true };
         if (generation !== undefined && stored.record.generation !== generation) {
           // The session was re-seeded since this turn's append: a stale
-          // finalization must not stamp the new incarnation (F4).
+          // finalization must not stamp the new incarnation.
           return { evicted: false };
         }
         stored.record.outcomes.set(messageId, {
@@ -728,7 +727,7 @@ export function createSessionStore(
         if (!stored) return { evicted: true };
         if (generation !== undefined && stored.record.generation !== generation) {
           // Stale finalization after a re-seed: nothing to roll back in the new
-          // incarnation (F4).
+          // incarnation.
           return { evicted: false };
         }
         const record = stored.record;

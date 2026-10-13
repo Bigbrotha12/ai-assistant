@@ -5,7 +5,7 @@ import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import type { SessionStore } from "./store.ts";
 
 /**
- * In-memory session read-back + delete surface (plan §5), mounted under `/v1`.
+ * In-memory session read-back + delete surface, mounted under `/v1`.
  *
  * The client reads a session's accumulated `messages` under the `session_id`
  * it sent (the `reconcileFromServer`/`_reconcileAlreadyCompleted` fetch) and
@@ -87,7 +87,7 @@ export function createSessionRoutes(opts: SessionRoutesOptions): Hono<OwnerVaria
     // Not the caller's live session. Another owner's -> 404 (never leaks the
     // messages); the caller's own missing session -> 409 session_missing with
     // the tombstone-backed reason so the client re-establishes under the same
-    // session_id (§5).
+    // session_id.
     const ownerOf = store.lookupOwner(sessionId);
     if (ownerOf !== null && ownerOf !== owner) {
       return c.json({ error: "not_found" }, 404);
@@ -98,7 +98,7 @@ export function createSessionRoutes(opts: SessionRoutesOptions): Hono<OwnerVaria
     );
   });
 
-  // Conversation delete (§5): owner-scoped. Another owner's session, or an
+  // Conversation delete: owner-scoped. Another owner's session, or an
   // absent one, is a 404 — never a successful delete and never a leak.
   routes.delete("/sessions/:id", (c) => {
     const owner = c.get("owner");

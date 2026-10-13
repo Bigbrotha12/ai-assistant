@@ -5,13 +5,11 @@ import type { JsonSchema } from "../plugins/types.ts";
 /**
  * `schema.ts` — the single JSON-Schema → Zod translation, in a neutral module.
  *
- * Historically this lived in `agents/mcp.ts`, but `tools/bind.ts` imports it
- * while `agents/mcp.ts` imports `createBoundTool`/`makeToolBodies` from
- * `tools/bind.ts` (finding m2). Moving it here breaks that import cycle: both
- * the plugin-binding path and the MCP binder depend on this module, and neither
- * depends on the other for schema translation. `agents/mcp.ts` and
- * `agents/orchestrator.ts` re-export `jsonSchemaToZod` so existing importers keep
- * working unchanged.
+ * Both the plugin-binding path (`tools/bind.ts`) and the MCP binder
+ * (`agents/mcp.ts`) depend on this module, and neither depends on the other for
+ * schema translation — which is why it does not live in either.
+ * `agents/mcp.ts` and `agents/orchestrator.ts` re-export `jsonSchemaToZod` so
+ * existing importers keep working unchanged.
  */
 
 /**

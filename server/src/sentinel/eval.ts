@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DEFAULT_RULE_SET, evaluateL1 } from "./l1.ts";
 import { decideSentinel, DEFAULT_SENTINEL_POLICY } from "./policy.ts";
+import { isRecord } from "../shared/util.ts";
 import {
   SENTINEL_CATEGORIES,
   SENTINEL_DIRECTIONS,
@@ -116,10 +117,6 @@ export type SentinelEvalOptions = {
   threshold?: number;
   suiteVersion?: string;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function requiredString(value: unknown, path: string): string {
   if (typeof value !== "string" || value.trim() === "") {
