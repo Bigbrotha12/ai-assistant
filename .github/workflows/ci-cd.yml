@@ -35,6 +35,7 @@ jobs:
             echo "flutter not found at $FLUTTER_HOME/bin. Set the FLUTTER_HOME repo variable." >&2
             exit 1
           }
+          cd clients/mobile
           flutter pub get
           flutter analyze
           flutter test

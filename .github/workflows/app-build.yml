@@ -70,6 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$FLUTTER_HOME/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          cd clients/mobile
           flutter pub get
           flutter build apk --${{ inputs.build_mode }}
 

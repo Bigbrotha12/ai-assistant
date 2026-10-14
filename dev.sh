@@ -322,7 +322,7 @@ fi
 # Run flutter against the configured backend
 # ---------------------------------------------------------------------------
 
-cd "$ROOT_DIR"
+cd "$ROOT_DIR/clients/mobile"
 
 if [ "$GATEWAY_ONLY" = "1" ]; then
   echo "Gateway-only mode: backend is up at http://${HOST_FQDN}:17600 (health: $HEALTH_URL)."
@@ -348,7 +348,7 @@ resolve_adb() {
   if [ -n "${ADB:-}" ] && [ -x "$ADB" ]; then echo "$ADB"; return; fi
   if command -v adb >/dev/null 2>&1; then command -v adb; return; fi
   local sdk
-  sdk="$(grep -E '^sdk\.dir=' "$ROOT_DIR/android/local.properties" 2>/dev/null | cut -d= -f2-)"
+  sdk="$(grep -E '^sdk\.dir=' "$ROOT_DIR/clients/mobile/android/local.properties" 2>/dev/null | cut -d= -f2-)"
   if [ -n "$sdk" ] && [ -x "$sdk/platform-tools/adb" ]; then
     echo "$sdk/platform-tools/adb"
   fi
