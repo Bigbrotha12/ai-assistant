@@ -349,7 +349,7 @@ This is a deliberate deployment choice, not a temporary gap.
 | `DELETE /v1/sessions/:id`      | Owner-scoped hard delete; `404 {"error":"not_found"}` if absent. |
 
 The legacy checkpoint surface (`/v1/threads`, `compileGraphWithCheckpointer`,
-`checkpointThreadId`) was removed with the sync-path cutover (plan §9); the
+`checkpointThreadId`) was removed with the sync-path cutover; the
 client no longer routes through `thread_id`.
 
 ## Notify store
@@ -410,14 +410,14 @@ and rollout strategy.
   the default `"memory"`.
 - **Inference rate limiting**: `/v1/chat/completions` uses an in-memory
   **per-user** token bucket (`INFERENCE_RATE_LIMIT` / `INFERENCE_RATE_BURST`)
-  built by `createPerOwnerRateLimiter` (`src/middleware/rate_limit.ts`): the
+  built by `createPerOwnerRateLimiter` (`src/managers/rate_limit.ts`): the
   bucket key is the authenticated user id, so a user with many API keys cannot
   rotate keys to bypass a rejection. A rejection returns
   `429 { error: "rate_limited" }` + `Retry-After`. It is per-process and not
   shared across instances — acceptable for a single gateway; scale out needs a
   shared limiter (e.g. Redis) instead.
 - **Concurrency budget**: the same route also applies a per-user budget
-  (`src/middleware/budget.ts`, `BUDGET_MAX_CONCURRENT`/`BUDGET_QUEUE_MAX`) that
+  (`src/managers/budget.ts`, `BUDGET_MAX_CONCURRENT`/`BUDGET_QUEUE_MAX`) that
   caps in-flight operations — sync streams and background jobs share one
   per-user pool. Sync with a full pool returns `429 { error: "busy" }` +
   `Retry-After`; an async admission queues on the owner's bounded FIFO (depth

@@ -29,7 +29,8 @@ sends it with each turn.
 ```
 ┌──────────────────────────┐        ┌──────────────────────────────────────┐
 │  Flutter client          │  HTTPS │  LangChain gateway (Node/Hono)      │
-│  ┌────────────────────┐  │  ─────▶│  · better-auth (email/pass)          │
+│  (clients/mobile/)       │  ─────▶│  (server/)                          │
+│  ┌────────────────────┐  │        │  · better-auth (email/pass)          │
 │  │ Chat UI / SSE      │  │        │  · LangChain agent graph            │
 │  │ Voice (STT + TTS)  │  │        │  · Tool execution + budget          │
 │  │ Plugin credentials  │  │  ◀─────│  · Request-scoped execution        │
@@ -53,30 +54,36 @@ sends it with each turn.
 ## Repository layout
 
 ```
-lib/               Flutter client (app, core, features split into data/ + ui/)
-  core/            config, backend settings/probe, SSE, network
-  features/
-    auth/          better-auth sign-up/sign-in + secure credential store
-    chat/          streaming SSE client, conversation UI, tool-call rendering
-    voice/         capture pipeline, VAD, STT/TTS engine registry, controller
-    attachments/   picker, upload queue, files client + store + cache
-    plugins/       plugin system — registry client, credential store,
-    |              staged inference adapters, managed conversation service
-    vision/        image understanding client + VRAM gate
-    memory/        drift-backed AI memory (search/compact)
-    notifications/ ntfy push client
-    onboarding/    setup screen (host, auth, models)
-    settings/      settings screen + preference stores
-server/            Node.js gateway (Hono + better-auth)
+clients/mobile/      Flutter client
+  lib/               app, core, features split into data/ + ui/
+    core/            config, backend settings/probe, SSE, network
+    features/
+      auth/          better-auth sign-up/sign-in + secure credential store
+      chat/          streaming SSE client, conversation UI, tool-call rendering
+      voice/         capture pipeline, VAD, STT/TTS engine registry, controller
+      attachments/   picker, upload queue, files client + store + cache
+      plugins/       plugin system — registry client, credential store,
+      |              staged inference adapters, managed conversation service
+      vision/        image understanding client + VRAM gate
+      memory/        drift-backed AI memory (search/compact)
+      notifications/ ntfy push client
+      onboarding/    setup screen (host, auth, models)
+      settings/      settings screen + preference stores
+  test/              Flutter unit tests (700+)
+server/              Node.js gateway (Hono + better-auth)
   src/
-    auth/          better-auth server configuration
-    plugins/       plugin types, registry, store, SSRF validation
-    transport/     LangChain agent graph, OpenAI-compatible /v1/chat/completions
-    sessions/      ephemeral, owner-scoped conversation mirror
-    notify/        encrypted ntfy notification provisioning + push hook
-    ledger/        task ledger with idempotency and lease management
-  test/            server unit tests (567+, node:test)
-test/              Flutter unit tests (700+)
+    auth/            better-auth server configuration
+    managers/        resource managers (budget, cache, rate limit, warmup)
+    plugins/         plugin types, registry, store, SSRF validation
+    transport/       LangChain agent graph, OpenAI-compatible /v1/chat/completions
+    sessions/        ephemeral, owner-scoped conversation mirror
+    notify/          encrypted ntfy notification provisioning + push hook
+    ledger/          task ledger with idempotency and lease management
+  test/              server unit tests (567+, node:test)
+test/fixtures/       shared test fixtures (used by both server and client)
+docs/                planning and reference documentation (gitignored)
+deploy/              deployment configuration (k8s, Docker)
+scripts/             automation scripts (APK install, etc.)
 ```
 
 ## Getting started
@@ -106,107 +113,25 @@ Persistent configuration lives in an optional `dev.env` (see
 `dev.env.example`; gitignored). Values apply only when the corresponding env
 var is unset, so `FLUTTER_DEVICE=<id> ./dev.sh` overrides for a single run.
 
-### Connecting an Android phone
-
-1. Start `./dev.sh` targeting the device with `FLUTTER_DEVICE` (id or name
-   substring from `flutter devices`).
-2. Both devices must be on the same network.
-3. If sign-up is rejected after a host change, update `BETTER_AUTH_URL` in
-   `server/.env` to match (`http://<backend-ip>:17600`) and restart.
-
-### CI app builds
-
-`ci-cd.yml` deploys the gateway, not the app. For an on-demand app build, run
-the `app-build` workflow (builds a single arm64 APK and uploads it as the
-`app-apk` artifact), then install it:
+## Running the gateway standalone
 
 ```sh
-gh workflow run app-build -f build_mode=debug
-scripts/install-latest-apk.sh
+cd server
+cp .env.example .env
+npm install
+npm run migrate
+npm run dev                       # starts on :17600
 ```
 
-The install script pulls the newest successful run and `adb install -r`s it
-onto the connected device. Signing/version caveats and the Firebase/CI-install
-alternatives are in `scripts/README.md`.
+See `server/README.md` for the full environment reference.
 
-### Configuring inference
-
-Inference routes through the LangChain gateway. Model plugins are installed
-globally on the gateway by an administrator; per account you **select one and
-enter your provider API key** — chat cannot send until a model is selected with
-a key. After signing in, open **Settings → Plugins**:
-
-- Select a model plugin (the built-in OpenRouter by default) and enter your
-  provider API key.
-- Enable tool plugins (Vikunja, Mealie, calendar, etc.) with their credentials.
-- The gateway uses these credentials per-request — they flow in the request
-  body and are never persisted server-side.
-
-The inference endpoint (`LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` dart-defines)
-has been removed: the gateway is the sole inference path. The `main` branch
-retains LibreChat as a fallback.
-
-### Running with Docker
-
-The gateway image is immutable: code and config ship in the image, while
-persistent state and extensible catalogs come from mounted volumes. Two mounts
-are expected:
-
-```
-docker run \
-  -v /host/ai-assistant-data:/app/data \   # persistent DBs + plugin store (created on first boot)
-  -v /host/ai-assistant-config:/config \   # skills/, mcp.json, agents/ catalogs (seeded default agent on first boot)
-  -e BETTER_AUTH_SECRET=... \
-  -e BETTER_AUTH_URL=https://gateway.example.com \
-  -e NOTIFY_STORE_KEY=... \
-  -p 17600:17600 \
-  <image>
-```
-
-- Catalogs load at startup — edit files then `docker restart` to apply. Agent
-  plugin changes (client-held) need no restart.
-- `/app/data` and `/config` are the two volumes; the seed default agent is
-  written to `/config/agents/default.json` only when the agents dir is empty
-  (see docker-entrypoint.sh).
-
-### Tests
+## Tests
 
 ```sh
-cd server && npm test        # server unit tests (567+)
-cd server && npm run typecheck
-flutter test                 # client unit tests (700+)
+cd server && npm test             # server unit tests (567+)
+cd server && npm run typecheck    # static analysis
+cd clients/mobile && flutter test # client unit tests (700+)
 ```
-
-## Roadmap
-
-**Done**
-
-- [x] **Phase 0 — Scaffold** — project structure, config, plan.
-- [x] **Phase 1 — Connectivity & settings** — host + credentials persisted to
-      secure storage; backend probe (auth/inference/vision); status UI.
-- [x] **Phase 2 — Text chat** — streaming SSE conversation, markdown, tool-call
-      chips, conversation history in SQLite, client-side context budget.
-- [x] **Phase 3 — Attachments** — picker → upload → reference in prompt;
-      bot-generated files.
-- [x] **Phase 4 — Voice** — on-device STT/TTS conversation, turn detection,
-      model download + cache, device capability fallback.
-- [x] **Phase 5 — Polish** — image understanding, file storage, ntfy push,
-      launcher shortcuts, error/retry ergonomics.
-- [x] **Phase 6 — LangChain cutover** — plugin architecture (model + tool
-      plugins), managed conversation service, server-side agent graph with tool
-      execution, encrypted ntfy provisioning, async job ledger, server-side
-      tools and budget. The gateway is stateless: the client owns conversation
-      history and sends it per turn with a client-minted `session_id`
-      (seeded/resumed; no server checkpoint store). Inference routes through the
-      LangChain gateway; the old `LLM_*` dart-define path has been retired.
-
-**In progress / planned**
-
-- [ ] **Multi-device / cross-device conversations** — post-cutover there are no
-      server-issued conversation ids (sessions are client-minted); a sync design
-      is still open.
-- [ ] **Background audio** — Android foreground service / iOS background
-      entitlement for screen-off voice (currently foreground-only).
 
 ## Security model
 
