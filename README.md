@@ -1,4 +1,4 @@
-# ai-assistant
+# Minions Assistant
 
 A self-hosted, privacy-first voice assistant that runs entirely on your own
 hardware — Flutter client, on-device speech, plugin model credentials (your own
