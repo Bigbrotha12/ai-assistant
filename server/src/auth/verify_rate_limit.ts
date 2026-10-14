@@ -1,4 +1,4 @@
-import { createTokenBucketLimiter } from "../middleware/token_bucket.ts";
+import { createTokenBucketLimiter } from "../managers/token_bucket.ts";
 
 export type AddressLimitResult = {
   allowed: boolean;

@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { ContextBudgetError } from "../../src/middleware/context.ts";
+import { ContextBudgetError } from "../../src/managers/context.ts";
 
 /**
  * Context-budget error tests. The former server-side truncation/compaction

@@ -754,10 +754,9 @@ export function parseTrustedHostEntries(
  * notify hook: an admin-listed private homelab ntfy is also the plain-`http:`
  * carve-out, so passing one without the other silently drops notifications.
  *
- * Phase 2 migration complete: `agents/mcp.ts` and `catalog/mcp.ts` now pair
- * their lists through this helper and feed the result to
- * `EgressClient.resolvePins` instead of inlining the pairing. Do not add new
- * inline pairings.
+ * `agents/mcp.ts` and `catalog/mcp.ts` pair their lists through this helper
+ * and feed the result to `EgressClient.resolvePins` instead of inlining the
+ * pairing. Do not add new inline pairings.
  */
 export function egressTrustOptions(trustedHosts: readonly string[]): {
   trustedHosts: readonly string[];

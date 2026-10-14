@@ -11,7 +11,7 @@ import { createSerializeInterceptor } from "../../src/tools/interceptors/seriali
 import { createExecutionInterceptor } from "../../src/tools/interceptors/execution.ts";
 import { createBudgetInterceptor } from "../../src/tools/interceptors/budget.ts";
 import { makePluginBodies } from "../../src/tools/bind.ts";
-import { createBudgetManager } from "../../src/middleware/budget.ts";
+import { createBudgetManager } from "../../src/managers/budget.ts";
 import { ToolResourceError } from "../../src/tools/bounds.ts";
 import { makeBodies, makeCall, tracingInterceptor } from "./support.ts";
 

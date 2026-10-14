@@ -8,9 +8,9 @@ import { logger } from "../observability/logger.ts";
 import {
   createMcpToolListCache,
   type McpToolListCache,
-} from "../middleware/cache.ts";
-import type { ToolResultCache } from "../middleware/cache.ts";
-import type { BudgetManager } from "../middleware/budget.ts";
+} from "../managers/cache.ts";
+import type { ToolResultCache } from "../managers/cache.ts";
+import type { BudgetManager } from "../managers/budget.ts";
 import type { Ledger } from "../ledger/index.ts";
 import { SsrfValidationError, validateMcpHeaderName } from "../plugins/ssrf.ts";
 import type { LookupFn, Mode } from "../plugins/ssrf.ts";

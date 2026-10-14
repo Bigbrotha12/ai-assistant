@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /**
- * Schema version of the persisted plugin store (Step 4's `plugins.json`).
+ * Schema version of the persisted plugin store (`plugins.json`).
  * Bump this when the *shape of the store* changes — top-level `schemaVersion`
  * is the version of this file, NOT of any individual plugin definition.
  */
@@ -54,7 +54,7 @@ export const baseUrlAllowlistEntrySchema: z.ZodType<BaseUrlAllowlistEntry> =
   z.object({
     id: pluginIdSchema,
     // Format-level validation only (must parse as URL). SSRF IP/range
-    // allow-listing is Step 2's job; don't duplicate it here.
+    // allow-listing lives in `ssrf.ts`; don't duplicate it here.
     url: z.string().url("must be an absolute URL"),
     label: z.string().trim().min(1).optional(),
   });
@@ -97,8 +97,8 @@ export const toolPluginDefinitionSchema = z.object({
     category: z.string().trim().min(1).optional(),
     // A tool plugin with no tools is meaningless; require at least one.
     tools: z.array(toolDefinitionSchema).min(1),
-    // Read-only, zero-arg tools the gateway may pre-warm per owner (Phase 4
-    // warmups). Declared in plugin metadata instead of a hardcoded list so the
+    // Read-only, zero-arg tools the gateway may pre-warm per owner.
+    // Declared in plugin metadata instead of a hardcoded list so the
     // admin's installed set controls what is warmed. Only `readOnly` tools with
     // no required args are actually scheduled (defense in depth at schedule
     // time too).
@@ -230,7 +230,7 @@ export class PluginSchemaError extends Error {
 /**
  * Parse a persisted plugin store and fail fast when the on-disk schema version
  * no longer matches this build. Mirrors `env.ts`'s load-time fail-fast
- * philosophy, but throws so the caller (Step 4's store) can route the error.
+ * philosophy, but throws so the caller (the store) can route the error.
  */
 export type PluginStoreMigration = {
   config: PluginStoreConfig;
@@ -395,7 +395,7 @@ export type ManifestHashMismatch = {
   actual: string;
 };
 
-/** The persisted shape of `plugins.json` (Step 4's store). */
+/** The persisted shape of `plugins.json`. */
 export interface PluginStoreConfig {
   /** Store schema version (not plugin schema version) */
   schemaVersion: number;

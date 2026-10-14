@@ -1,7 +1,7 @@
 /**
- * Context budget error, shared by the sync/async paths (F8): the client owns
- * truncation/compaction (plan §6); the gateway's only remaining context concern
- * is surfacing a budget-budget-busting input as a distinct, actionable error.
+ * Context budget error, shared by the sync/async paths: the client owns
+ * truncation/compaction; the gateway's only remaining context concern is
+ * surfacing a budget-exceeding input as a distinct, actionable error.
  * The former server-side truncation/compaction helpers
  * (`truncatePairAware`, `createContextManager`, `maybeCompactAfterStream`,
  * `estimateMessageTokens`) were removed with the sync-path checkpoint cutover —

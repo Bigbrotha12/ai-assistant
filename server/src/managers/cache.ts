@@ -3,7 +3,7 @@ import type { McpTool } from "../agents/mcp.ts";
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../tools/bounds.ts";
 
 /**
- * In-memory tool-result cache (Phase 4, Wave B).
+ * In-memory tool-result cache.
  *
  * A per-process LRU+TLL cache keyed by
  * `(owner, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)`

@@ -15,7 +15,7 @@ import { PluginStore } from "./store.ts";
  * what the plugin routes and (later) the chat route resolve plugin IDs
  * against.
  *
- * SECURITY CONTRACT (Phase 1, plan §3.3): `GET /v1/models` and
+ * SECURITY CONTRACT: `GET /v1/models` and
  * `GET /v1/plugins` must never leak allowlisted base URLs — they can point at
  * admin-trusted internal hosts (`vikunja.local`, RFC1918 IPs, ...). That is
  * enforced here by design: `listAvailablePlugins()` REDACTS `baseUrls` url

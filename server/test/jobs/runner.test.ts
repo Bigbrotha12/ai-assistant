@@ -50,12 +50,12 @@ import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import type { ToolPluginDefinition, ModelPluginDefinition } from "../../src/plugins/types.ts";
-import { createToolResultCache } from "../../src/middleware/cache.ts";
-import type { ToolCacheKey } from "../../src/middleware/cache.ts";
+import { createToolResultCache } from "../../src/managers/cache.ts";
+import type { ToolCacheKey } from "../../src/managers/cache.ts";
 import {
   BudgetExhaustedError,
   createBudgetManager,
-} from "../../src/middleware/budget.ts";
+} from "../../src/managers/budget.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
 import {
   TOOL_RESULT_TRUNCATION_MARKER,

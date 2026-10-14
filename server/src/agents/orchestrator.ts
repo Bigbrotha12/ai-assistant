@@ -7,8 +7,8 @@ import {
 } from "../tools/bounds.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
 import type { CredentialResolver } from "../credentials/resolver.ts";
-import type { BudgetManager } from "../middleware/budget.ts";
-import type { ToolResultCache } from "../middleware/cache.ts";
+import type { BudgetManager } from "../managers/budget.ts";
+import type { ToolResultCache } from "../managers/cache.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
 import { bindTools, makePluginBodies } from "../tools/bind.ts";
 import { buildPipelineForChannel } from "../tools/channel.ts";

@@ -16,8 +16,8 @@ import {
   DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_TURN,
   DEFAULT_MAX_TOOL_CALLS_PER_OWNER_PLUGIN_PER_WINDOW,
   DEFAULT_MAX_TOOL_CALLS_PER_PLUGIN,
-} from "../../src/middleware/budget.ts";
-import { createToolResultCache } from "../../src/middleware/cache.ts";
+} from "../../src/managers/budget.ts";
+import { createToolResultCache } from "../../src/managers/cache.ts";
 import { JobError } from "../../src/jobs/errors.ts";
 import Database from "better-sqlite3";
 import { Ledger, migrateLedger } from "../../src/ledger/index.ts";

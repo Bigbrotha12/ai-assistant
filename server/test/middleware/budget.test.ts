@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { BudgetExhaustedError, createBudgetManager } from "../../src/middleware/budget.ts";
+import { BudgetExhaustedError, createBudgetManager } from "../../src/managers/budget.ts";
 import { logger } from "../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,
@@ -12,7 +12,7 @@ import type {
   BudgetClearTimeout,
   BudgetSetTimeout,
   SyncReservation,
-} from "../../src/middleware/budget.ts";
+} from "../../src/managers/budget.ts";
 
 /** Narrow a reservation union to the admitted variant (throws otherwise). */
 function claimed(r: AsyncReservation): { release: () => void; queued: boolean };

@@ -1,10 +1,8 @@
 /**
  * Job error primitives — extracted from `jobs/runner.ts` into a leaf module so
  * the tool-pipeline interceptors (`fence`, `replay`) can raise them without
- * importing `runner.ts`.
- *
- * Phase 1.9 makes `runner.ts` import the pipeline; importing `JobError` from
- * `runner.ts` in the interceptors would close the cycle
+ * importing `runner.ts`. Importing `JobError` from `runner.ts` in the
+ * interceptors would close the cycle
  * `runner → pipeline → interceptors → runner`. `runner.ts` re-exports these so
  * every existing importer (`index.ts`, tests) is unaffected.
  */

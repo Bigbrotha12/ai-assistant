@@ -8,8 +8,8 @@ import {
 } from "../../../src/tools/interceptors/order.ts";
 import { bindPluginTools } from "../../../src/agents/orchestrator.ts";
 import { RequestBodyCredentialResolver } from "../../../src/credentials/request_body.ts";
-import { createToolResultCache } from "../../../src/middleware/cache.ts";
-import { createBudgetManager } from "../../../src/middleware/budget.ts";
+import { createToolResultCache } from "../../../src/managers/cache.ts";
+import { createBudgetManager } from "../../../src/managers/budget.ts";
 import { credentialFingerprint } from "../../../src/plugins/credential.ts";
 import {
   DEFAULT_TOOL_ARGS_MAX_BYTES,

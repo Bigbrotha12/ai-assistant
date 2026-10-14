@@ -52,17 +52,17 @@ import type {
   JobRunner,
   RunJobResult,
 } from "../../src/jobs/runner.ts";
-import { createPerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
-import type { PerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
-import { createBudgetManager } from "../../src/middleware/budget.ts";
-import type { BudgetManager } from "../../src/middleware/budget.ts";
-import { createToolResultCache } from "../../src/middleware/cache.ts";
-import type { ToolResultCache } from "../../src/middleware/cache.ts";
+import { createPerOwnerRateLimiter } from "../../src/managers/rate_limit.ts";
+import type { PerOwnerRateLimiter } from "../../src/managers/rate_limit.ts";
+import { createBudgetManager } from "../../src/managers/budget.ts";
+import type { BudgetManager } from "../../src/managers/budget.ts";
+import { createToolResultCache } from "../../src/managers/cache.ts";
+import type { ToolResultCache } from "../../src/managers/cache.ts";
 import { clearDeleting, markDeleting } from "../../src/auth/account_deletion.ts";
 import { redactForOutbound } from "../../src/security/redact.ts";
-import { createWarmupManager } from "../../src/middleware/warmup.ts";
+import { createWarmupManager } from "../../src/managers/warmup.ts";
 import type { SentinelShadowSink } from "../../src/sentinel/shadow.ts";
-import type { WarmupManager } from "../../src/middleware/warmup.ts";
+import type { WarmupManager } from "../../src/managers/warmup.ts";
 
 /**
  * Wave C1 chat-transport tests. Everything is fake/in-memory: a real

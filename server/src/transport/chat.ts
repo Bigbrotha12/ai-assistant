@@ -47,18 +47,18 @@ import { isModelPlugin, isToolPlugin, pluginIdSchema } from "../plugins/types.ts
 import { composeAgentPrompt } from "../agents/skills.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import type { Catalogs, ResolvedAgentDef } from "../catalog/index.ts";
-import type { ToolResultCache } from "../middleware/cache.ts";
+import type { ToolResultCache } from "../managers/cache.ts";
 import type { RateLimiterFn } from "../plugins/routes.ts";
 import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
-import { BudgetExhaustedError, createBudgetManager } from "../middleware/budget.ts";
-import { ContextBudgetError } from "../middleware/context.ts";
-import type { WarmupManager } from "../middleware/warmup.ts";
-import type { BudgetManager } from "../middleware/budget.ts";
-import { createPerOwnerRateLimiter } from "../middleware/rate_limit.ts";
+import { BudgetExhaustedError, createBudgetManager } from "../managers/budget.ts";
+import { ContextBudgetError } from "../managers/context.ts";
+import type { WarmupManager } from "../managers/warmup.ts";
+import type { BudgetManager } from "../managers/budget.ts";
+import { createPerOwnerRateLimiter } from "../managers/rate_limit.ts";
 import type {
   PerOwnerRateLimiter,
   RateLimitResult,
-} from "../middleware/rate_limit.ts";
+} from "../managers/rate_limit.ts";
 import type { Ledger, TaskRow } from "../ledger/index.ts";
 import { SPEC_MAX_LENGTH } from "../ledger/index.ts";
 import { toOpenAiSse } from "./openai.ts";

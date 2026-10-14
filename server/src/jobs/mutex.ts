@@ -1,5 +1,5 @@
 /**
- * Per-thread invocation mutex (Phase 2, Wave C1: background jobs).
+ * Per-thread invocation mutex for background job concurrency control.
  *
  * Node is single-threaded, but two concurrent `graph.invoke` calls on the SAME
  * checkpoint thread still interleave at await points: both would read the same

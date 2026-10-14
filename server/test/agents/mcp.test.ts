@@ -39,7 +39,7 @@ import {
 import {
   createMcpToolListCache,
   DEFAULT_MCP_TOOL_LIST_TTL_MS,
-} from "../../src/middleware/cache.ts";
+} from "../../src/managers/cache.ts";
 
 type CallRecord = {
   server: string;

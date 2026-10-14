@@ -1,7 +1,7 @@
 import { emitPluginToolAudit } from "../audit/telemetry.ts";
 
 /**
- * Per-user concurrency budget (Phase 4, Wave A middleware).
+ * Per-user concurrency budget.
  *
  * A single in-memory pool per owner caps how many in-flight operations a user
  * may have at once — SYNC SSE streams and ASYNC background jobs share the SAME

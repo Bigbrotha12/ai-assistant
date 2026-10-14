@@ -7,11 +7,11 @@ import {
   BudgetExhaustedError,
   createBudgetManager,
   DEFAULT_TOOL_CALL_QUARANTINE_MS,
-} from "../../../src/middleware/budget.ts";
+} from "../../../src/managers/budget.ts";
 import type {
   BudgetManager,
   ToolCallBudgetOptions,
-} from "../../../src/middleware/budget.ts";
+} from "../../../src/managers/budget.ts";
 import { ToolResourceError } from "../../../src/tools/bounds.ts";
 import type { ToolCallScope, ToolInterceptor } from "../../../src/tools/pipeline.ts";
 import { createTrackedExecution } from "../../../src/agents/execution.ts";

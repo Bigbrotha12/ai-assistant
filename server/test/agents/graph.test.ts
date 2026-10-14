@@ -21,7 +21,7 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import { MemorySaver, Overwrite } from "@langchain/langgraph";
 import { SUPERVISOR_PROMPT, SYSTEM_PROMPT } from "../../src/agents/prompts.ts";
-import { ContextBudgetError } from "../../src/middleware/context.ts";
+import { ContextBudgetError } from "../../src/managers/context.ts";
 import {
   createAgentGraph,
   MAX_TOOL_ROUNDS,

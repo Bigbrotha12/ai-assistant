@@ -8,13 +8,13 @@ import type { ToolPluginDefinition } from "../types.ts";
  * Optional SpielIndexer tool plugin manifest (admin-installable template).
  *
  * This is NOT a builtin: the admin opts in by installing it into the plugin
- * store (Step 4's `plugins.json`) and supplying a personal access token.
+ * store (`plugins.json`) and supplying a personal access token.
  *
  * SSRF requirement: `https://spiel.local` is a private homelab hostname that
- * the Step 2 SSRF module (`src/plugins/ssrf.ts`) rejects by default (it
+ * the SSRF module (`src/plugins/ssrf.ts`) rejects by default (it
  * resolves to a non-public address). The admin MUST add this host to the
- * trusted-host config — Step 4 wires that from env — before any SpielIndexer
- * tool may connect.
+ * trusted-host config — wired from env — before any SpielIndexer tool may
+ * connect.
  */
 const parsed = pluginDefinitionSchema.parse({
   id: "spiel",

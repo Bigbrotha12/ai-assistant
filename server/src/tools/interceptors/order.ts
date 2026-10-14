@@ -1,6 +1,6 @@
 import type { Ledger } from "../../ledger/index.ts";
-import type { BudgetManager } from "../../middleware/budget.ts";
-import type { ToolResultCache } from "../../middleware/cache.ts";
+import type { BudgetManager } from "../../managers/budget.ts";
+import type { ToolResultCache } from "../../managers/cache.ts";
 import { createBudgetInterceptor } from "./budget.ts";
 import { createCacheInterceptor } from "./cache.ts";
 import { createExecutionInterceptor } from "./execution.ts";

@@ -1,7 +1,7 @@
 import {
   DEFAULT_TOOL_CALL_QUARANTINE_MS,
-} from "../../middleware/budget.ts";
-import type { BudgetManager } from "../../middleware/budget.ts";
+} from "../../managers/budget.ts";
+import type { BudgetManager } from "../../managers/budget.ts";
 import type { ToolInterceptor } from "../pipeline.ts";
 
 /**

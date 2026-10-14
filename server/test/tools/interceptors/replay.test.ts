@@ -6,7 +6,7 @@ import { createCacheInterceptor } from "../../../src/tools/interceptors/cache.ts
 import type { ToolCallResult } from "../../../src/tools/pipeline.ts";
 import type { Ledger, StepRow } from "../../../src/ledger/index.ts";
 import { recordToolResult } from "../../../src/credentials/idempotency.ts";
-import { createToolResultCache } from "../../../src/middleware/cache.ts";
+import { createToolResultCache } from "../../../src/managers/cache.ts";
 import { JobError } from "../../../src/jobs/runner.ts";
 import { makeBodies, makeCall, makeLedger, makeRunningTask } from "../support.ts";
 

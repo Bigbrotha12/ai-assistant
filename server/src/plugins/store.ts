@@ -44,9 +44,9 @@ import { AsyncMutex } from "../jobs/mutex.ts";
  * Builtin plugins (shipped in the build, injected via `builtinPlugins`) are
  * ALWAYS available and are NEVER persisted: `install`/`uninstall` operate on
  * manifests only, and uninstalling a builtin is a `BUILTIN_UNINSTALL` error.
- * This keeps the decision minimal — there is no disabling toggle for builtins
- * in Phase 1; a "disable openrouter" knob can be added later as a distinct
- * `toggleBuiltin` operation without disturbing the manifest lifecycle.
+ * This keeps the decision minimal — there is no disabling toggle for builtins;
+ * a "disable openrouter" knob can be added as a distinct `toggleBuiltin`
+ * operation without disturbing the manifest lifecycle.
  *
  * SSRF posture (see `ssrf.ts`): EVERY allowlisted baseUrl of a plugin being
  * installed is re-validated through the egress facade's `resolvePins`
@@ -57,8 +57,8 @@ import { AsyncMutex } from "../jobs/mutex.ts";
  * store written under an older/looser trusted-hosts policy cannot survive a
  * tightening. Validation failures at load/reload leave the store unapplied
  * (last known-good config wins on reload). Validated resolutions are retained
- * (`getPinnedIps`) so Phase 2/3 outbound calls consume the pins instead of
- * re-resolving. `trustedHosts` (from `PLUGINS_TRUSTED_HOSTS`) bypasses RANGE
+ * (`getPinnedIps`) so outbound calls consume the pins instead of re-resolving.
+ * `trustedHosts` (from `PLUGINS_TRUSTED_HOSTS`) bypasses RANGE
  * checks only; scheme enforcement (https in prod) is never bypassed.
  *
  * Accidental-publication safety: the persisted store is re-validated with
@@ -163,8 +163,8 @@ export class PluginStore {
   private readonly mode: Mode;
   /**
    * Validated, pinned IPs per plugin, populated whenever a plugin's URLs pass
-   * SSRF validation (install and store load/reload). Phase 2/3 outbound-call
-   * consumers fetch these via `getPinnedIps` instead of re-resolving, so the
+   * SSRF validation (install and store load/reload). Outbound-call consumers
+   * fetch these via `getPinnedIps` instead of re-resolving, so the
    * resolve-then-validate result is never discarded.
    */
   private pinnedUrls: PinnedUrls = new Map();
@@ -345,11 +345,10 @@ export class PluginStore {
         `Invalid plugin store JSON at ${this.storePath}: ${(err as Error).message}`,
       );
     }
-    // Fail-fast on schema shape AND on schemaVersion mismatch (Step 1's
-    // parsePluginStoreConfig throws PluginSchemaError either way), then
-    // re-validate the persisted URLs against the CURRENT network policy so a
-    // store written under a looser trusted-hosts setting cannot survive a
-    // policy tightening (Fix 6).
+    // Fail-fast on schema shape AND on schemaVersion mismatch (schema
+    // validation throws PluginSchemaError either way), then re-validate the
+    // persisted URLs against the CURRENT network policy so a store written
+    // under a looser trusted-hosts setting cannot survive a tightening.
     const migration = migratePluginStoreConfig(parsed);
     const parsedConfig = migration.config;
     this.assertNoBuiltinCollisions(parsedConfig);
@@ -694,8 +693,7 @@ export class PluginStore {
   /**
    * Install-time SSRF gate: every allowlisted URL is statically + DNS-validated.
    * Returns per-entry pinned IPs (never discarded — it is the only place that
-   * resolves the URL, and Phase 2/3 outbound callers consume them via
-   * `getPinnedIps`).
+   * resolves the URL, and outbound callers consume them via `getPinnedIps`).
    */
   private async validateAllowedUrls(
     plugin: PluginDefinition,
@@ -720,7 +718,7 @@ export class PluginStore {
     const validated: Array<{ entryId: string; url: string; pinned: string[] }> = [];
     for (const entry of entries) {
       try {
-        // M1: use the facade's single trust-construction path. Plugins are
+        // Use the facade's single trust-construction path. Plugins are
         // https-only and never get the production `http:` carve-out, so unlike
         // MCP/notify this caller passes only `trustedHosts` (no
         // `httpAllowedHosts`) — the facade, not an inline pairing, decides what
@@ -790,8 +788,8 @@ export class PluginStore {
 
   /**
    * Validated, pinned IP addresses for a plugin's allowlisted URLs (populated
-   * at install and store load/reload). Phase 2/3 consumers building an outbound
-   * call MUST pass these pins (the resolve-then-validate result) into
+   * at install and store load/reload). Consumers building an outbound call
+   * MUST pass these pins (the resolve-then-validate result) into
    * `validatedFetch`; never resolve a plugin URL ad-hoc.
    */
   retainCatalogMcpPins(entries: readonly CatalogMcpPinRetention[]): void {

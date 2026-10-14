@@ -18,8 +18,8 @@ import { isRecord } from "../shared/util.ts";
 import { AsyncMutex } from "../jobs/mutex.ts";
 
 /**
- * Encrypted-at-rest store for per-owner ntfy push credentials (plan §
- * Notifications: the topic + access token are a secret, stored encrypted
+ * Encrypted-at-rest store for per-owner ntfy push credentials. The topic
+ * + access token are a secret, stored encrypted
  * server-side, provisioned via an authenticated endpoint).
  *
  * SECURITY CONTRACT

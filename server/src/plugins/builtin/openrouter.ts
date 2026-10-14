@@ -14,7 +14,7 @@ import { env } from "../../config/env.ts";
  * OpenRouter aggregates many providers under its own terms against a single
  * user-supplied key, so it is the safe built-in default. Every other provider
  * — OpenAI/Anthropic included — must be added as an admin-installable
- * manifest/allowlist entry (Step 4's store), never as more builtin code.
+ * manifest/allowlist entry, never as more builtin code.
  *
  * The endpoint + default model are env-configurable via
  * DEFAULT_MODEL_PROVIDER_BASE_URL / DEFAULT_MODEL_PROVIDER_MODEL so a

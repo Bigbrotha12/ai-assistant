@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { redactForOutbound } from "../security/redact.ts";
-import { BudgetExhaustedError } from "../middleware/budget.ts";
-import { ContextBudgetError } from "../middleware/context.ts";
+import { BudgetExhaustedError } from "../managers/budget.ts";
+import { ContextBudgetError } from "../managers/context.ts";
 
 function exhaustionCode(error: unknown): string | undefined {
   return error instanceof BudgetExhaustedError || error instanceof ContextBudgetError

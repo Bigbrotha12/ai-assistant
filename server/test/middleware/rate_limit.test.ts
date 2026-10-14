@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createPerOwnerRateLimiter } from "../../src/middleware/rate_limit.ts";
+import { createPerOwnerRateLimiter } from "../../src/managers/rate_limit.ts";
 import { createSendVerificationRateLimiter } from "../../src/auth/verify_rate_limit.ts";
 
 describe("createPerOwnerRateLimiter", () => {

@@ -7,8 +7,8 @@ import {
   createMcpToolListCache,
   createToolResultCache,
   DEFAULT_MCP_TOOL_LIST_TTL_MS,
-} from "../../src/middleware/cache.ts";
-import type { ToolCacheKey } from "../../src/middleware/cache.ts";
+} from "../../src/managers/cache.ts";
+import type { ToolCacheKey } from "../../src/managers/cache.ts";
 
 /**
  * Phase 4, Wave B: unit tests for the in-memory tool-result cache.

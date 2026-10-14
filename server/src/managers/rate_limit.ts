@@ -1,7 +1,7 @@
 import { createTokenBucketLimiter } from "./token_bucket.ts";
 
 /**
- * Per-OWNER rate limiting (Phase 4, Wave A middleware).
+ * Per-OWNER rate limiting.
  *
  * The gateway's existing `createTokenBucketLimiter`
  * (`src/middleware/token_bucket.ts`) is

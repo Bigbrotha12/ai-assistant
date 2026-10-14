@@ -27,13 +27,13 @@ import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { CredentialPinError } from "../credentials/pins.ts";
 import type { CredentialPinHandle, CredentialPinStore } from "../credentials/pins.ts";
 import { credentialFingerprint } from "../plugins/credential.ts";
-import type { ToolResultCache } from "../middleware/cache.ts";
-import type { BudgetManager } from "../middleware/budget.ts";
-import { BudgetExhaustedError } from "../middleware/budget.ts";
+import type { ToolResultCache } from "../managers/cache.ts";
+import type { BudgetManager } from "../managers/budget.ts";
+import { BudgetExhaustedError } from "../managers/budget.ts";
 import type { ToolPipeline } from "../tools/pipeline.ts";
 import { bindTools, channelScopeHooks, makePluginBodies } from "../tools/bind.ts";
 import { buildPipelineForChannel } from "../tools/channel.ts";
-import { ContextBudgetError } from "../middleware/context.ts";
+import { ContextBudgetError } from "../managers/context.ts";
 import { JobError } from "./errors.ts";
 import type { JobErrorCode } from "./errors.ts";
 import { LedgerError, projectTaskProgress } from "../ledger/index.ts";
@@ -125,8 +125,8 @@ import {
 
 // Job error primitives live in a leaf module so the tool-pipeline interceptors
 // can import them without importing this file (which would close the
-// `runner → pipeline → interceptors → runner` cycle in Phase 1.9). Re-exported
-// here so every existing importer is unaffected.
+// `runner → pipeline → interceptors → runner` cycle). Re-exported here so
+// every existing importer is unaffected.
 export { JobError } from "./errors.ts";
 export type { JobErrorCode } from "./errors.ts";
 
@@ -189,8 +189,8 @@ export type ToolEndpointResolver = (
 ) => string | Promise<string>;
 
 /**
- * The sanctioned outbound-call convention for Wave C1: the FIRST allowlisted
- * base URL + `/<toolName>`. Phase 3/5 refines per-plugin endpoint routing.
+ * The sanctioned outbound-call convention: the FIRST allowlisted base URL +
+ * `/<toolName>`. Per-plugin endpoint routing refines this later.
  */
 const DEFAULT_ENDPOINT_RESOLVER: ToolEndpointResolver = (
   _pluginId,
@@ -403,12 +403,12 @@ export class ToolExecutor implements ToolCallHandler {
   }
 }
 
-/** Notification seam (Phase 5 wires the real ntfy push; no-op for now). */
+/** Notification seam (noop until configured via NOTIFY_BASE_URL). */
 export interface NotificationHook {
   notifyJobComplete(owner: string, taskId: string, summary: string): void | Promise<void>;
 }
 
-/** Default: no-op. The real ntfy target resolution lands in Phase 5/6. */
+/** Default no-op: no notification service is configured. */
 export const noopNotificationHook: NotificationHook = {
   notifyJobComplete() {},
 };
@@ -448,7 +448,7 @@ export type JobDescriptor = {
   modelPluginId: string;
   /** Provider request config forwarded to `buildModel`. */
   modelRequestConfig?: unknown;
-  /** Agent system prompt override (Wave 1, Step 4). */
+  /** Agent system prompt override. */
   systemPrompt?: string;
   /** Override the real executor (tests use a recording fake). */
   toolHandler?: JobToolHandler;
@@ -679,7 +679,7 @@ export type JobRunnerDeps = {
       assertActive: () => void;
     },
   ) => Promise<BaseChatModel> | BaseChatModel;
-  /** Restart-loss re-pin seam (Phase 5 credential vault). */
+  /** Restart-loss re-pin seam (future credential vault). */
   credentialSource?: CredentialSource;
   /** Override the real ToolExecutor (tests inject a real one with a stubbed fetch). */
   executor?: ToolExecutor;
@@ -694,7 +694,7 @@ export type JobRunnerDeps = {
   heartbeatIntervalMs?: number;
   /** Optional periodic pin GC. `dispose()` stops it. */
   sweepIntervalMs?: number;
-  /** Shared in-memory tool-result cache (Phase 4, Wave B). Wraps the async
+  /** Shared in-memory tool-result cache. Wraps the async
    * tool handler so a repeated READ-ONLY tool call — same (owner, pluginId,
    * pluginVersion, credentialFingerprint, tool, argsHash) — is served without
    * re-executing the backend, even across different tasks/jobs. Mutating
@@ -704,14 +704,14 @@ export type JobRunnerDeps = {
    */
   toolCache?: ToolResultCache;
   /**
-   * Budget manager (Phase 4, Wave A). When supplied, every model dispatch
+   * Budget manager. When supplied, every model dispatch
    * (after fence/pin checks) consumes one `beforeModelCall(owner, "async")`
    * slot; an exhausted window fails the job `budget_exhausted`. Absent →
    * no per-owner model-call budget.
    */
   budget?: BudgetManager;
   /**
-   * Composition-root-owned job-channel engine factory (plan task 1.13). The
+   * Composition-root-owned job-channel engine factory. The
    * job shape is the ONLY engine that cannot be a root singleton: its `fence`
    * interceptor closes over the per-job `assertActive` guard, which the runner
    * builds for each admitted task. The root supplies the factory (with the
@@ -758,7 +758,7 @@ export type BindJobToolsOptions = {
   pipeline?: ToolPipeline;
   credentialsByPlugin: Record<string, Record<string, string>>;
   /**
-   * Per-job credential source (plan §5 Phase 3, steps 3.3/3.5). When provided
+   * Per-job credential source. When provided
    * (the runner always injects `PinStoreCredentialResolver`) it is the sole
    * source of a tool call's credentials + fingerprint, replacing the former
    * inline `getCredentials` closure. `credentialsByPlugin` remains the
@@ -778,7 +778,7 @@ export type BindJobToolsOptions = {
   handlerTimeoutMs?: number;
   maxResultChars?: number;
   /**
-   * Optional in-memory tool-result cache (Phase 4, Wave B): a READ-ONLY tool
+   * Optional in-memory tool-result cache: a READ-ONLY tool
    * call that missed the ledger replay dedupe is served from here when
    * (owner, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)
    * match, without re-executing the backend. Mutating tools are never cached,
@@ -827,7 +827,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
   // over the per-job `assertActive`); the fallback preserves the unit-test call
   // shape. Either way the channel→interceptor mapping lives in
   // `buildPipelineForChannel` and every per-call value rides
-  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2).
+  // `ToolCall`/`ToolCallScope`.
   const pipeline = opts.pipeline ??
     buildPipelineForChannel("job", {
       ledger: opts.ledger,
@@ -844,7 +844,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
       // Ownership gate: the job may call only plugins whose credentials it owns.
       select: (plugin) => Object.hasOwn(opts.credentialsByPlugin, plugin.id),
       buildCall: (ctx) => {
-        // Step 3.3/3.5: the per-job pin provider is the credential source when
+        // the per-job pin provider is the credential source when
         // injected; the map fallback preserves the unit-test shape (no explicit
         // resolver, no pin store). Either way the call's credentials + the
         // channel's OWN fingerprint derivation (the pin's precomputed value)
@@ -887,7 +887,7 @@ export function bindJobTools(opts: BindJobToolsOptions): DynamicStructuredTool[]
       // settles, so the `budget` interceptor can tell an unsettled timeout
       // (quarantine) from a release. When the body never starts, the core calls
       // `onBodySkipped`, which resolves the SAME deferred so budget releases and
-      // the job's `settle()` is not held open for the quarantine deadline (D9).
+      // the job's `settle()` is not held open for the quarantine deadline.
       // `call.credentials` is reused so the pin is resolved exactly once.
       buildExecution: (ctx, call) =>
         makePluginBodies({
@@ -1248,11 +1248,11 @@ export class JobRunner {
       }
       signal.throwIfAborted();
     };
-    // Step 3.3/3.5: the per-job credential source. It closes over THIS job's
+    // The per-job credential source. It closes over THIS job's
     // owner + admitted handles (`descriptor.pinHandles`) and the running-fence
     // guard, so `resolve({pluginId, kind, channel})` is the whole call surface.
     // Constructed here — not in `index.ts` — because the handles and the guard
-    // only exist once the task is admitted (plan §5 Phase 3: the resolver is
+    // only exist once the task is admitted (the resolver is
     // per-job, not a root singleton).
     const credentialResolver = new PinStoreCredentialResolver({
       pins: this.deps.pins,
@@ -1277,7 +1277,7 @@ export class JobRunner {
       // 5. Pin credentials per plugin. A missing/expired pin fails the job
       //    BEFORE any graph invoke.
       const credentialsByPlugin: Record<string, Record<string, string>> = {};
-      // Phase 4, Wave B: reuse the pin's precomputed credential fingerprint as
+      // Reuse the pin's precomputed credential fingerprint as
       // the cache-key component (never re-derive, never store raw values).
       const fingerprintsByPlugin: Record<string, string> = {};
       for (const pluginId of toolPlugins) {
@@ -1339,7 +1339,7 @@ export class JobRunner {
       // ONE job-channel engine per job, shared by the plugin and MCP bindings
       // below. Built through the composition root's factory (which owns the
       // shared ledger/budget/cache) so the per-job `assertActive` rides the
-      // `fence` interceptor exactly once (plan task 1.13).
+      // `fence` interceptor exactly once.
       const jobPipeline = (this.deps.createToolPipeline ?? ((assertActive: () => void) =>
         buildPipelineForChannel("job", {
           ledger: this.deps.ledger,
@@ -1391,10 +1391,10 @@ export class JobRunner {
               )?.[0];
               return entry?.pinned === undefined ? undefined : [...entry.pinned];
             },
-            // Step 1.11: MCP now dispatches through the SAME job engine as the
-            // plugin tools, so the deleted `trackMcpTools` wrapper's replay,
+            // MCP dispatches through the SAME job engine as the
+            // plugin tools, so the `trackMcpTools` wrapper's replay,
             // fence, budget and cache behaviour is provided by the pipeline.
-            // Task 1.13: that engine is the ONE `jobPipeline` built above and
+            // The engine is the ONE `jobPipeline` built above and
             // shared with `bindJobTools`, not a second hand-built pipeline.
             channel: "job",
             pipeline: jobPipeline,
@@ -1741,7 +1741,7 @@ export class JobRunner {
       registry: this.deps.registry,
       getPinnedIps: this.deps.getPinnedIps ?? (() => undefined),
       trustedHosts: this.deps.trustedHosts,
-      // D3: honor the job's effective handler bound at the executor's HTTP
+      // Honor the job's effective handler bound at the executor's HTTP
       // guard too, so a `toolHandlerTimeoutMs` override is not silently capped
       // by `env.TOOL_CALL_TIMEOUT_MS`. Absent (the default) preserves today's
       // env-derived executor timeout exactly.

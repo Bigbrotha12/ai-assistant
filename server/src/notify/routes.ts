@@ -11,7 +11,7 @@ import {
 import type { NotifyStore } from "./store.ts";
 
 /**
- * ntfy push-notification provisioning surface (plan §Notifications), mounted
+ * ntfy push-notification provisioning surface, mounted
  * under `/api/notify` at the app root — alongside `/api/auth/*` — so the same
  * authenticated caller (the device) provisions its push credentials.
  *

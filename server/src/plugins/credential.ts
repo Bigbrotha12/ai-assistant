@@ -3,19 +3,18 @@ import type { CredentialSpec } from "./types.ts";
 import { isRecord } from "../shared/util.ts";
 
 /**
- * Per-request credential extraction & validation (Phase 1, Step 5).
+ * Per-request credential extraction & validation.
  *
  * Credentials are USER-OWNED and transient: the client submits them per
  * request over HTTPS, the server uses them for a single outbound call, then
  * discards them. This module NEVER stores, caches, or pins credentials — the
- * in-memory pin mechanism is Phase 2's admitted-background-jobs feature and
- * explicitly out of scope here (docs/archive/backend-langchain-plan.md line 64,
- * Phase 2 §211-218).
+ * in-memory pin mechanism for admitted background jobs is a separate feature
+ * and explicitly out of scope here.
  *
- * BODY CONTRACT (standardized) — transport (Phase 3) and client (Phase 5)
- * speak this shape. Credentials ride the `credentials` request field, keyed by
- * plugin id so one request can carry keys for many plugins (the plan's wire
- * shape nests them per plugin):
+ * BODY CONTRACT (standardized) — transport and client speak this shape.
+ * Credentials ride the `credentials` request field, keyed by
+ * plugin id so one request can carry keys for many plugins (the wire shape
+ * nests them per plugin):
  *
  *   {
  *     credentials: {
@@ -103,7 +102,7 @@ const INVALID_KEY_MATERIAL = /[\x00-\x1f\x7f\s]/;
  *   declares — unknown/extra input fields are never echoed.
  * - A MODEL plugin (`options.isModel`) may also carry `baseUrlEntry`, a ROUTING
  *   field (not a credential secret) that selects a base-URL instance from the
- *   plugin's allowlisted `baseUrls` (docs/archive/backend-langchain-plan.md §329-335).
+ *   plugin's allowlisted `baseUrls`.
  *   It is passed through untrimmed-validated here — resolved against the
  *   allowlist only at model build time; a blank entry counts as absent, and it
  *   never receives the key-material check above.
@@ -204,8 +203,8 @@ export function extractCredentialsFromBody(
 
 /**
  * Stable, non-reversible SHA-256 over a versioned, canonical JSON encoding of
- * sorted `[key, value]` pairs from a validated credential set (Phase 4's
- * tool-result cache key:
+ * sorted `[key, value]` pairs from a validated credential set (the tool-result
+ * cache key:
  * `(userId, pluginId, pluginVersion, credentialFingerprint, tool, argsHash)`).
  * JSON escaping makes the encoding collision-free for arbitrary string keys
  * and values; the version prefix separates it from the previous delimiter-

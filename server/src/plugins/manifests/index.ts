@@ -9,10 +9,10 @@ export { defaultAgentPlugin, builtinAgentPlugins };
 
 /**
  * Catalog of admin-installable tool plugin templates. These are NOT loaded
- * automatically and are NOT part of `builtinPlugins` — the store (Step 4)
- * lists them as optional installs the admin can copy into `plugins.json`,
- * after which the admin must also wire the matching trusted hosts and
- * credential (see the per-manifest SSRF comments).
+ * automatically and are NOT part of `builtinPlugins` — the store lists them
+ * as optional installs the admin can copy into `plugins.json`, after which
+ * the admin must also wire the matching trusted hosts and credential (see the
+ * per-manifest SSRF comments).
  */
 export const availableToolManifests: readonly ToolPluginDefinition[] = [
   vikunjaManifest,

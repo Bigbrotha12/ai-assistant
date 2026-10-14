@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import { createToolPipeline } from "../../../src/tools/pipeline.ts";
 import { createCacheInterceptor } from "../../../src/tools/interceptors/cache.ts";
 import type { ToolCallResult, ToolInterceptor } from "../../../src/tools/pipeline.ts";
-import { createToolResultCache } from "../../../src/middleware/cache.ts";
-import type { ToolResultCache } from "../../../src/middleware/cache.ts";
+import { createToolResultCache } from "../../../src/managers/cache.ts";
+import type { ToolResultCache } from "../../../src/managers/cache.ts";
 import {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   TOOL_RESULT_TRUNCATION_MARKER,

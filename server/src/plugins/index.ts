@@ -5,7 +5,7 @@ import { PluginRegistry } from "./registry.ts";
 import { PluginStore } from "./store.ts";
 
 /**
- * Composition root for the plugin subsystem (Phase 1, Step 4).
+ * Composition root for the plugin subsystem.
  *
  * DEFAULT wiring only: env-provided store path/trusted hosts + the bundled
  * builtin plugins (`builtin/openrouter.ts`) + the curated manifest catalog
@@ -31,9 +31,9 @@ export function createPluginRegistry(): PluginRegistry {
 }
 
 /**
- * App-facing composition (Step 6 routes): hands back BOTH the registry and its
- * backing store so the app can construct `/v1/plugins` routes and load the
- * store once at startup. The registry alone cannot install/uninstall, and the
+ * App-facing composition: hands back BOTH the registry and its backing store
+ * so the app can construct `/v1/plugins` routes and load the store once at
+ * startup. The registry alone cannot install/uninstall, and the
  * store alone cannot resolve/hot-reload; the routes need both, pinned to the
  * SAME store instance so state stays consistent.
  */

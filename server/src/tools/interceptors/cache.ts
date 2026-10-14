@@ -1,6 +1,6 @@
 import { canRetryTool } from "../../credentials/idempotency.ts";
 import { boundToolResult } from "../bounds.ts";
-import type { ToolCacheKey, ToolResultCache } from "../../middleware/cache.ts";
+import type { ToolCacheKey, ToolResultCache } from "../../managers/cache.ts";
 import type { ToolDispatch, ToolInterceptor } from "../pipeline.ts";
 
 /**

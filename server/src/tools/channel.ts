@@ -1,6 +1,6 @@
 import type { Ledger } from "../ledger/index.ts";
-import type { BudgetManager } from "../middleware/budget.ts";
-import type { ToolResultCache } from "../middleware/cache.ts";
+import type { BudgetManager } from "../managers/budget.ts";
+import type { ToolResultCache } from "../managers/cache.ts";
 import { createPluginAuditSink } from "./audit.ts";
 import {
   createJobToolInterceptors,

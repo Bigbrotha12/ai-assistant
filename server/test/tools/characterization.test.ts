@@ -31,14 +31,14 @@ import type {
 import { createChatRoutes } from "../../src/transport/chat.ts";
 import type { BuildModelInput } from "../../src/transport/model.ts";
 import type { buildModel } from "../../src/transport/model.ts";
-import { createBudgetManager } from "../../src/middleware/budget.ts";
-import type { BudgetManager } from "../../src/middleware/budget.ts";
+import { createBudgetManager } from "../../src/managers/budget.ts";
+import type { BudgetManager } from "../../src/managers/budget.ts";
 import {
   DEFAULT_TOOL_CALL_QUARANTINE_MS,
-} from "../../src/middleware/budget.ts";
-import { createToolResultCache } from "../../src/middleware/cache.ts";
-import type { ToolCacheKey } from "../../src/middleware/cache.ts";
-import { createWarmupManager } from "../../src/middleware/warmup.ts";
+} from "../../src/managers/budget.ts";
+import { createToolResultCache } from "../../src/managers/cache.ts";
+import type { ToolCacheKey } from "../../src/managers/cache.ts";
+import { createWarmupManager } from "../../src/managers/warmup.ts";
 import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
 import type { StepRow } from "../../src/ledger/index.ts";
 import {
@@ -58,7 +58,7 @@ import {
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
 import { invokeBoundedToolHandler, ToolResourceError } from "../../src/tools/bounds.ts";
 import { env } from "../../src/config/env.ts";
-import { BudgetExhaustedError } from "../../src/middleware/budget.ts";
+import { BudgetExhaustedError } from "../../src/managers/budget.ts";
 import { logger } from "../../src/observability/logger.ts";
 import {
   configureAuditTelemetry,

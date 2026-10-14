@@ -52,7 +52,7 @@ export type WarmupOptions = {
    * Composition-root-supplied sync-shaped engine. Warmup is a sync-shaped
    * channel (`serialize → cache → budget → execution`) and the root shares the
    * one sync engine with it; the shared `onResult` sink skips
-   * `channel === "warmup"`, so no `plugin.tool` audit is emitted (D6). When
+   * `channel === "warmup"`, so no `plugin.tool` audit is emitted. When
    * absent the manager falls back to {@link buildPipelineForChannel} (the
    * unit-test path).
    */
@@ -64,7 +64,7 @@ export const DEFAULT_WARMUP_MAX_CONCURRENT = 2;
 export const DEFAULT_WARMUP_TIMEOUT_MS = 10_000;
 
 /**
- * Warmup — the proactive, best-effort pre-execution channel (plan §5, task 1.12).
+ * Warmup — the proactive, best-effort pre-execution channel.
  *
  * Admission stays here: the disabled/disposed/global-concurrency gates, the
  * read-only + credential validation, the args re-serialization, the
@@ -78,11 +78,11 @@ export const DEFAULT_WARMUP_TIMEOUT_MS = 10_000;
  *   - `timeoutMs` (default 10 s) rides `ToolCall.timeoutMs` and bounds the
  *     pipeline's `execution` interceptor; the `ToolExecutor` handed in by the
  *     composition root keeps its own env-derived guard. Warmup is explicitly
- *     out of D3's scope.
+ *     out of the executor's env-derived guard's scope.
  *   - The credential fingerprint is derived from
- *     `validateCredentials(...)`-canonicalised credentials (plan §10.1),
+ *     `validateCredentials(...)`-canonicalised credentials,
  *     unlike the sync (raw body) and job (pin-preferred) channels.
- *   - No `plugin.tool` audit is emitted (D6): the pipeline is constructed
+ *   - No `plugin.tool` audit is emitted: the pipeline is constructed
  *     WITHOUT an `onResult` sink, so the intent is explicit rather than relying
  *     on `createPluginAuditSink` skipping the channel.
  *   - `handlerSettled`/`releaseAfterHandler`: `cleanup()` (which releases the
@@ -101,8 +101,8 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
   }
   // One shared engine per manager (injected by the root; the fallback builds
   // the sync shape through the same helper). Every per-call value rides
-  // `ToolCall`/`ToolCallScope` (plan §4.1/§4.2). Warmup emits no `plugin.tool`
-  // audit (D6): the shared `onResult` sink skips `channel === "warmup"`.
+  // `ToolCall`/`ToolCallScope`. Warmup emits no `plugin.tool`
+  // audit: the shared `onResult` sink skips `channel === "warmup"`.
   const pipeline = opts.pipeline ??
     buildPipelineForChannel("warmup", {
       budget: opts.budget,
@@ -213,7 +213,7 @@ export function createWarmupManager(opts: WarmupOptions): WarmupManager {
           timeoutMs,
           maxResultChars: DEFAULT_TOOL_RESULT_MAX_CHARS,
         };
-        // The channel owns the raw-body promise (plan §4.2). `makePluginBodies`
+        // The channel owns the raw-body promise. `makePluginBodies`
         // builds the `plugin` body, the `rawSettled`/`onBodySkipped` pair the
         // `budget` interceptor reads, and the fail-loud `mcp` stub. The handler
         // is created inside `invoke`, i.e. only once every interceptor has

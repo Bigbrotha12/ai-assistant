@@ -1,9 +1,9 @@
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as tick, setTimeout as delay } from "node:timers/promises";
-import { createBudgetManager } from "../../src/middleware/budget.ts";
-import { createToolResultCache } from "../../src/middleware/cache.ts";
-import { createWarmupManager, type WarmupAdmission, type WarmupOptions } from "../../src/middleware/warmup.ts";
+import { createBudgetManager } from "../../src/managers/budget.ts";
+import { createToolResultCache } from "../../src/managers/cache.ts";
+import { createWarmupManager, type WarmupAdmission, type WarmupOptions } from "../../src/managers/warmup.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
 import type { ToolPluginDefinition } from "../../src/plugins/types.ts";
 

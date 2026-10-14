@@ -25,7 +25,7 @@ import {
   runWithAccountDeletionRequest,
 } from "../src/auth/account_deletion.ts";
 import { CredentialPinStore } from "../src/credentials/pins.ts";
-import { createToolResultCache } from "../src/middleware/cache.ts";
+import { createToolResultCache } from "../src/managers/cache.ts";
 import { createSessionStore } from "../src/sessions/store.ts";
 import { createLedgerRoutes } from "../src/ledger/routes.ts";
 import { Ledger, migrateLedger } from "../src/ledger/index.ts";
