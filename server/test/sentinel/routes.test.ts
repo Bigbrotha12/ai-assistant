@@ -5,7 +5,6 @@ import { Hono } from "hono";
 import { describe, test } from "node:test";
 import { clearDeleting, markDeleting } from "../../src/auth/account_deletion.ts";
 import { Ledger, migrateLedger } from "../../src/ledger/index.ts";
-import { createLedgerRoutes } from "../../src/ledger/routes.ts";
 import { createSentinelRoutes } from "../../src/sentinel/routes.ts";
 import type { SentinelVerifyKey } from "../../src/sentinel/routes.ts";
 
@@ -189,24 +188,5 @@ describe("POST /v1/sentinel/check", () => {
     });
     assert.equal(response.status, 413);
     assert.deepEqual(await response.json(), { error: "request_too_large" });
-  });
-
-  test("public completion can no longer select awaiting_review", async () => {
-    const { ledger } = makeApp();
-    const app = new Hono();
-    app.route(
-      "/ledger",
-      createLedgerRoutes(ledger, { verifyKey: async () => ({ ok: true, owner: "owner-1" }) }),
-    );
-    const task = ledger.createTask({ owner: "owner-1", intentKey: "public-review", spec: "s" });
-    ledger.claimTask(task.id, "owner-1");
-    const response = await app.request(`/ledger/tasks/${task.id}/complete`, {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ status: "awaiting_review" }),
-    });
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: "invalid_request" });
-    assert.equal(ledger.getTask(task.id, "owner-1")?.status, "running");
   });
 });

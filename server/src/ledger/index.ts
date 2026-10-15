@@ -1,6 +1,27 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Database as DatabaseType } from "better-sqlite3";
 import { redactForOutbound } from "../security/redact.ts";
+import {
+  createAppendOnlyDeleteTriggers,
+  dropAppendOnlyDeleteTriggers,
+} from "./schema.ts";
+
+export {
+  applyMigrations,
+  CURRENT_LEDGER_VERSION,
+  LEDGER_MIGRATIONS,
+  migrateLedger,
+  type Migration,
+} from "./schema.ts";
+import {
+  aggregateTaskStepMetadata,
+  boundPublicText,
+  getPublicStepStats,
+  listPublicSteps,
+  listPublicTasks,
+  listTaskStepMetadata,
+  readPublicChain,
+} from "./read_model.ts";
 
 export const TASK_STATUSES = [
   "queued",
@@ -249,70 +270,6 @@ export type PublicTaskProgress = TaskProgress & {
   resultBytes: number;
 };
 
-function utf8ByteLength(value: string): number {
-  return Buffer.byteLength(value, "utf8");
-}
-
-function truncateUtf8(value: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  if (utf8ByteLength(value) <= maxBytes) return value;
-  let low = 0;
-  let high = value.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (utf8ByteLength(value.slice(0, middle)) <= maxBytes) low = middle;
-    else high = middle - 1;
-  }
-  return value.slice(0, low);
-}
-
-function boundPublicResult(value: string): string {
-  if (utf8ByteLength(value) <= PUBLIC_STEP_RESULT_MAX_BYTES) return value;
-  const markerBytes = utf8ByteLength(PUBLIC_RESULT_TRUNCATION_MARKER);
-  return `${truncateUtf8(
-    value,
-    PUBLIC_STEP_RESULT_MAX_BYTES - markerBytes,
-  )}${PUBLIC_RESULT_TRUNCATION_MARKER}`;
-}
-
-function boundPublicText(value: string, maxBytes: number): string {
-  return truncateUtf8(value, maxBytes);
-}
-
-function publicLimit(limit: number): number {
-  if (!Number.isSafeInteger(limit) || limit <= 0) return PUBLIC_STEP_LIMIT;
-  return Math.min(limit, PUBLIC_STEP_LIMIT);
-}
-
-function publicTaskPageLimit(limit: number): number {
-  if (!Number.isSafeInteger(limit) || limit <= 0) {
-    return PUBLIC_TASK_PAGE_DEFAULT_LIMIT;
-  }
-  return Math.min(limit, PUBLIC_TASK_PAGE_MAX_LIMIT);
-}
-
-function publicTaskPageOffset(offset: number): number {
-  if (!Number.isSafeInteger(offset) || offset < 0) return 0;
-  return offset;
-}
-
-function taskStepMetadataLimit(limit: number | undefined): number {
-  if (limit === undefined) return TASK_STEP_METADATA_DEFAULT_LIMIT;
-  if (!Number.isSafeInteger(limit) || limit <= 0) {
-    return TASK_STEP_METADATA_DEFAULT_LIMIT;
-  }
-  return Math.min(limit, TASK_STEP_METADATA_MAX_LIMIT);
-}
-
-function taskStepMetadataOffset(offset: number | undefined): number {
-  if (offset === undefined || !Number.isSafeInteger(offset) || offset < 0) return 0;
-  return offset;
-}
-
-function metadataPathIsValid(path: string): boolean {
-  return path.startsWith("$") && path.length > 1 && !path.includes("\0");
-}
-
 function publicAction(step: PublicStepRow): PublicTaskAction {
   return {
     id: boundPublicText(step.id, PUBLIC_STEP_ID_MAX_BYTES),
@@ -499,203 +456,6 @@ function canonicalStepContent(step: {
   result: string | null;
 }): string {
   return `${step.seq}|${step.stage}|${step.action}|${String(step.result ?? "")}`;
-}
-
-/** Migration list index 0 == schema version 1. */
-type Migration = (db: DatabaseType) => void;
-
-const LEDGER_MIGRATIONS: readonly Migration[] = [
-  // v1 — initial ledger schema.
-  // intentKey is stored raw; the unique (owner, intent_key) constraint is added
-  // by a later migration, so do NOT add one here.
-  (db) => {
-    db.exec(`
-      CREATE TABLE ledger_task (
-        id               TEXT PRIMARY KEY,
-        owner            TEXT NOT NULL,
-        intent_key       TEXT NOT NULL,
-        spec             TEXT NOT NULL,
-        worker           TEXT,
-        status           TEXT NOT NULL CHECK (
-          status IN ('queued','running','succeeded','failed','cancelled','stuck','awaiting_review')
-        ),
-        created_ts       INTEGER NOT NULL,
-        updated_ts       INTEGER NOT NULL,
-        lease_expires_at INTEGER,
-        lease_owner      TEXT
-      );
-
-      CREATE TABLE ledger_step (
-        id      TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL REFERENCES ledger_task(id),
-        seq     INTEGER NOT NULL,
-        stage   TEXT NOT NULL,
-        action  TEXT NOT NULL,
-        result  TEXT,
-        ts      INTEGER NOT NULL,
-        UNIQUE (task_id, seq)
-      );
-
-      CREATE TABLE ledger_chain (
-        seq         INTEGER NOT NULL,
-        task_id     TEXT NOT NULL,
-        step_id     TEXT NOT NULL,
-        digest      TEXT NOT NULL,
-        prev_digest TEXT,
-        ts          INTEGER NOT NULL,
-        PRIMARY KEY (task_id, seq),
-        UNIQUE (task_id, step_id)
-      );
-
-      -- Append-only enforcement: steps and chain records are write-once.
-      CREATE TRIGGER ledger_step_append_only_update
-      BEFORE UPDATE ON ledger_step
-      BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
-
-      CREATE TRIGGER ledger_step_append_only_delete
-      BEFORE DELETE ON ledger_step
-      BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
-
-      CREATE TRIGGER ledger_chain_append_only_update
-      BEFORE UPDATE ON ledger_chain
-      BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
-
-      CREATE TRIGGER ledger_chain_append_only_delete
-      BEFORE DELETE ON ledger_chain
-      BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
-    `);
-  },
-  // v2 — heartbeat-based stuck detection.
-  // Adds `last_heartbeat_ts`, which `claimTask`/`resumeTask`/`heartbeat` stamp
-  // (the gateway clock) and `markStuckIfHeartbeatStale` keys off of. Stuck
-  // detection keys off this rather than `updated_ts`, which `appendStep` also
-  // bumps and would therefore mask a dead worker that only appends steps.
-  // Data-preserving.
-  (db) => {
-    db.exec(`
-      ALTER TABLE ledger_task
-        ADD COLUMN last_heartbeat_ts INTEGER NOT NULL DEFAULT 0;
-    `);
-  },
-  // v3 — monotonic fence token.
-  // Adds `fence_token`, rotated by every `claimTask`/`resumeTask`. Workers hold
-  // the token granted at claim/resume and present it on `heartbeat`/
-  // `appendStep`; a superseded worker (whose task was resumed under a new
-  // fence) is rejected with `FENCE_CONFLICT`, killing duplicate-execution races
-  // between overlapping workers. Data-preserving (existing rows default to `''`
-  // = no fence held; calls that pass no token skip the check).
-  (db) => {
-    db.exec(`
-      ALTER TABLE ledger_task
-        ADD COLUMN fence_token TEXT NOT NULL DEFAULT '';
-    `);
-  },
-  // v4 — idempotency.
-  //
-  // (a) Unique (owner, intent_key): a client's idempotency key (messageId)
-  // maps to EXACTLY ONE task, forever, under one owner. This is the
-  // owner-scoped uniqueness that makes get-or-create-by-key race-safe; the
-  // get-or-create catches the SQLITE_CONSTRAINT violation and re-reads the
-  // existing row instead of erroring (no raw-INSERT 500 on a repeat). An
-  // UNCONDITIONAL index (no partial WHERE) is deliberate: a terminal task's
-  // intentKey is never re-sent as a new message (the client generates messageId
-  // once per send), so a partial index would only introduce "which row wins"
-  // ambiguity when a terminal and a fresh task share a key.
-  //
-  // A database written through the raw-insert path can already hold duplicate
-  // (owner, intent_key) rows; creating the UNIQUE index over them would abort
-  // the whole migration at import. So BEFORE the index, delete the older
-  // duplicates, keeping the NEWEST row per group (newest by updated_ts, id as
-  // the deterministic tie-breaker) — the same "newest wins" rule the
-  // get-or-create re-read applies. (Orphaned steps/chain rows of the deleted
-  // duplicates remain — they are never surfaced because reads are keyed by
-  // task_id, and ledger_step's append-only trigger forbids cleanup.)
-  //
-  // (b) Replay dedupe: `ledger_step` gains a nullable `tool_call_id` (an
-  // OpenAI-style tool call id) recorded atomically with the tool's result, so
-  // a resumed checkpoint can look it up and NEVER re-execute a tool whose
-  // result was already stored. Partial unique index (only tool steps carry a
-  // tool_call_id) makes `hasToolResult` an indexed point lookup, not a scan,
-  // and makes a duplicate record a SQLITE_CONSTRAINT that `recordToolResult`
-  // catches (idempotent record). The column is intentionally NOT part of the
-  // hash-chain content (`canonicalStepContent`): adding it would change the
-  // digest computation and invalidate existing chains. Data-preserving
-  // (existing steps get NULL tool_call_id).
-  (db) => {
-    db.exec(`
-      DELETE FROM ledger_task AS older
-      WHERE EXISTS (
-        SELECT 1 FROM ledger_task AS newer
-        WHERE newer.owner = older.owner
-          AND newer.intent_key = older.intent_key
-          AND (newer.updated_ts > older.updated_ts
-               OR (newer.updated_ts = older.updated_ts AND newer.id > older.id))
-      );
-
-      CREATE UNIQUE INDEX idx_ledger_task_owner_intent
-        ON ledger_task(owner, intent_key);
-
-      ALTER TABLE ledger_step ADD COLUMN tool_call_id TEXT;
-      CREATE UNIQUE INDEX idx_ledger_step_tool_call
-        ON ledger_step(task_id, tool_call_id)
-        WHERE tool_call_id IS NOT NULL;
-    `);
-  },
-  // v5 — job snapshot payload.
-  // `ledger_task.payload` stores the JSON-encoded snapshot messages a job runs
-  // on. The JobRunner writes it at admission and `resumeStuckJobs` reads it to
-  // re-run a stuck task from the stored snapshot. It is transient user content:
-  // purged WITH the task by the retention sweep (no separate purge), and never
-  // exposed on the ledger routes. Data-preserving (existing rows get NULL
-  // payload).
-  (db) => {
-    db.exec(`
-      ALTER TABLE ledger_task ADD COLUMN payload TEXT;
-    `);
-  },
-  (db) => {
-    db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
-        ON ledger_task(status, updated_ts);
-    `);
-  },
-  (db) => {
-    db.exec(`
-      ALTER TABLE ledger_task ADD COLUMN job_spec TEXT;
-    `);
-  },
-  (db) => {
-    db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_ledger_task_metadata_window
-        ON ledger_task(worker, owner, status, spec, created_ts DESC, id DESC);
-    `);
-  },
-];
-
-export const CURRENT_LEDGER_VERSION = LEDGER_MIGRATIONS.length;
-
-/** Applies `migrations` to bring `db` up to `targetVersion` (idempotent). */
-export function applyMigrations(
-  db: DatabaseType,
-  migrations: readonly Migration[],
-  targetVersion: number,
-): void {
-  const current = db.pragma("user_version", { simple: true }) as number;
-  for (let v = current + 1; v <= targetVersion; v++) {
-    const migration = migrations[v - 1];
-    if (!migration) {
-      throw new Error(
-        `no migration registered for ledger schema version ${v}`,
-      );
-    }
-    migration(db);
-    db.pragma(`user_version = ${v}`);
-  }
-}
-
-/** Migrates the ledger database to the current schema version (idempotent). */
-export function migrateLedger(db: DatabaseType): void {
-  applyMigrations(db, LEDGER_MIGRATIONS, CURRENT_LEDGER_VERSION);
 }
 
 /**
@@ -910,54 +670,11 @@ export class Ledger {
     limit = PUBLIC_TASK_PAGE_DEFAULT_LIMIT,
     offset = 0,
   ): PublicTaskPage {
-    const safeLimit = publicTaskPageLimit(limit);
-    const safeOffset = publicTaskPageOffset(offset);
-    const rows = this.db
-      .prepare(
-        `SELECT id, owner, intent_key, spec, worker, status, created_ts,
-                updated_ts, last_heartbeat_ts, lease_expires_at, lease_owner,
-                fence_token
-         FROM ledger_task
-         WHERE owner = ?
-         ORDER BY created_ts, id
-         LIMIT ? OFFSET ?`,
-      )
-      .all(owner, safeLimit + 1, safeOffset) as PublicTaskRow[];
-    const hasMore = rows.length > safeLimit;
-    return {
-      tasks: hasMore ? rows.slice(0, safeLimit) : rows,
-      nextOffset: hasMore ? safeOffset + safeLimit : null,
-    };
+    return listPublicTasks(this.db, owner, limit, offset);
   }
 
   listTaskStepMetadata(query: TaskStepMetadataPageQuery): TaskStepMetadataPage {
-    const safeLimit = taskStepMetadataLimit(query.limit);
-    const safeOffset = taskStepMetadataOffset(query.offset);
-    const source = this.taskStepMetadataSource(query);
-    const totalRow = this.db
-      .prepare(`${source.sql}\nSELECT COUNT(*) AS total FROM report`)
-      .get(source.params) as { total: number };
-    const pageParams = {
-      ...source.params,
-      limit: safeLimit + 1,
-      offset: safeOffset,
-    };
-    const rows = this.db
-      .prepare(
-        `${source.sql}
-         SELECT task_id, created_ts, result
-         FROM report
-         ORDER BY created_ts DESC, task_id DESC
-         LIMIT @limit OFFSET @offset`,
-      )
-      .all(pageParams) as TaskStepMetadataRow[];
-    const hasMore = rows.length > safeLimit;
-    const page = hasMore ? rows.slice(0, safeLimit) : rows;
-    return {
-      rows: page,
-      total: Number(totalRow.total),
-      nextOffset: hasMore ? safeOffset + page.length : null,
-    };
+    return listTaskStepMetadata(this.db, query);
   }
 
   aggregateTaskStepMetadata(
@@ -965,183 +682,7 @@ export class Ledger {
     distinctPath: string,
     groups: readonly TaskStepMetadataAggregateSpec[],
   ): TaskStepMetadataAggregate {
-    if (!metadataPathIsValid(distinctPath)) {
-      throw new LedgerError("INVALID_CONFIG", "distinct metadata path is invalid");
-    }
-    const source = this.taskStepMetadataSource(query);
-    const totals = this.db
-      .prepare(
-        `${source.sql}
-         SELECT COUNT(*) AS total,
-                COUNT(DISTINCT json_extract(result, @distinctPath)) AS distinctCount
-         FROM report`,
-      )
-      .get({ ...source.params, distinctPath }) as {
-      total: number;
-      distinctCount: number;
-    };
-    const grouped: TaskStepMetadataAggregate["groups"] = {};
-    for (const group of groups) {
-      if (
-        !metadataPathIsValid(group.path) ||
-        (group.mode !== "value" &&
-          group.mode !== "array_distinct" &&
-          group.mode !== "utc_day")
-      ) {
-        throw new LedgerError("INVALID_CONFIG", "metadata aggregate spec is invalid");
-      }
-      const groupLimit =
-        group.limit === undefined ||
-        !Number.isSafeInteger(group.limit) ||
-        group.limit <= 0
-          ? TASK_STEP_METADATA_MAX_LIMIT
-          : Math.min(group.limit, TASK_STEP_METADATA_MAX_LIMIT);
-      const groupParams = {
-        ...source.params,
-        path: group.path,
-        groupLimit,
-      };
-      let sql: string;
-      if (group.mode === "array_distinct") {
-        sql = `${source.sql}
-          SELECT value, COUNT(*) AS count
-          FROM (
-            SELECT DISTINCT report.task_id, CAST(item.value AS TEXT) AS value
-            FROM report
-            JOIN json_each(report.result, @path) AS item
-            WHERE item.value IS NOT NULL
-          ) AS distinct_values
-          GROUP BY value
-          ORDER BY count DESC, value ASC
-          LIMIT @groupLimit`;
-      } else {
-        const expression =
-          group.mode === "utc_day"
-            ? "date(CAST(json_extract(report.result, @path) AS INTEGER) / 1000, 'unixepoch')"
-            : "CAST(json_extract(report.result, @path) AS TEXT)";
-        sql = `${source.sql}
-          SELECT ${expression} AS value, COUNT(*) AS count
-          FROM report
-          WHERE ${expression} IS NOT NULL
-          GROUP BY value
-          ORDER BY count DESC, value ASC
-          LIMIT @groupLimit`;
-      }
-      grouped[group.key] = this.db.prepare(sql).all(groupParams) as Array<{
-        value: string;
-        count: number;
-      }>;
-    }
-    return {
-      total: Number(totals.total),
-      distinct: Number(totals.distinctCount),
-      groups: grouped,
-    };
-  }
-
-  private taskStepMetadataSource(query: TaskStepMetadataQuery): {
-    sql: string;
-    params: Record<string, string | number | boolean>;
-  } {
-    if (
-      query.owner.trim() === "" ||
-      query.worker.trim() === "" ||
-      query.specPrefix === "" ||
-      query.stage === "" ||
-      query.action === "" ||
-      !Number.isSafeInteger(query.from) ||
-      !Number.isSafeInteger(query.to) ||
-      query.from < 0 ||
-      query.from > query.to
-    ) {
-      throw new LedgerError("INVALID_CONFIG", "task step metadata query is invalid");
-    }
-    const params: Record<string, string | number | boolean> = {
-      owner: query.owner,
-      worker: query.worker,
-      status: query.status,
-      specPrefix: query.specPrefix,
-      specPrefixUpper: `${query.specPrefix}\uffff`,
-      stage: query.stage,
-      action: query.action,
-      from: query.from,
-      to: query.to,
-      resultLimit: TASK_STEP_METADATA_MAX_RESULT_CHARS,
-    };
-    const filterClauses: string[] = [];
-    for (const [index, filter] of (query.filters ?? []).entries()) {
-      if (!metadataPathIsValid(filter.path)) {
-        throw new LedgerError("INVALID_CONFIG", "task step metadata filter is invalid");
-      }
-      if ("value" in filter) {
-        const key = `filterPath${index}`;
-        const valueKey = `filterValue${index}`;
-        params[key] = filter.path;
-        params[valueKey] = filter.value;
-        filterClauses.push(
-          `json_extract(result, @${key}) = @${valueKey}`,
-        );
-      } else if ("values" in filter) {
-        if (filter.values.length === 0) {
-          filterClauses.push("0 = 1");
-          continue;
-        }
-        const key = `filterPath${index}`;
-        params[key] = filter.path;
-        const placeholders = filter.values.map((_, valueIndex) => {
-          const valueKey = `filterValue${index}_${valueIndex}`;
-          params[valueKey] = filter.values[valueIndex]!;
-          return `@${valueKey}`;
-        });
-        filterClauses.push(
-          `json_extract(result, @${key}) IN (${placeholders.join(", ")})`,
-        );
-      } else {
-        const pathKey = `filterPath${index}`;
-        const valueKey = `filterValue${index}`;
-        params[pathKey] = filter.path;
-        params[valueKey] = filter.contains;
-        filterClauses.push(
-          `EXISTS (
-            SELECT 1 FROM json_each(result, @${pathKey}) AS filter_item
-            WHERE filter_item.value = @${valueKey}
-          )`,
-        );
-      }
-    }
-    return {
-      sql: `WITH candidates AS (
-        SELECT t.id AS task_id,
-               t.created_ts AS created_ts,
-               substr(s.result, 1, @resultLimit) AS result
-        FROM ledger_task AS t
-        JOIN ledger_step AS s
-          ON s.task_id = t.id
-         AND s.seq = (
-           SELECT MIN(previous.seq)
-           FROM ledger_step AS previous
-           WHERE previous.task_id = t.id
-             AND previous.stage = @stage
-             AND previous.action = @action
-             AND previous.result IS NOT NULL
-             AND json_valid(substr(previous.result, 1, @resultLimit)) = 1
-         )
-        WHERE t.worker = @worker
-          AND t.owner = @owner
-          AND t.status = @status
-          AND t.spec >= @specPrefix
-          AND t.spec < @specPrefixUpper
-          AND t.created_ts >= @from
-          AND t.created_ts <= @to
-      ),
-      report AS (
-        SELECT task_id, created_ts, result
-        FROM candidates
-        WHERE json_valid(result) = 1
-          ${filterClauses.length === 0 ? "" : `AND ${filterClauses.join("\n          AND ")}`}
-      )`,
-      params,
-    };
+    return aggregateTaskStepMetadata(this.db, query, distinctPath, groups);
   }
 
   /**
@@ -1168,83 +709,14 @@ export class Ledger {
     if (owner !== undefined && this.getTask(taskId, owner) === null) {
       return [];
     }
-    const safeLimit = publicLimit(limit);
-    const rows = this.db
-      .prepare(
-        `SELECT substr(id, 1, ?) AS id,
-                substr(task_id, 1, ?) AS task_id,
-                seq,
-                substr(stage, 1, ?) AS stage,
-                substr(action, 1, ?) AS action,
-                CASE WHEN result IS NULL THEN NULL ELSE substr(result, 1, ?) END AS result,
-                ts,
-                CASE WHEN tool_call_id IS NULL THEN NULL ELSE substr(tool_call_id, 1, ?) END AS tool_call_id,
-                CASE WHEN result IS NULL THEN 0 ELSE length(CAST(result AS BLOB)) END AS resultBytes
-         FROM ledger_step
-         WHERE task_id = ?
-         ORDER BY seq DESC
-         LIMIT ?`,
-      )
-      .all(
-        PUBLIC_STEP_ID_MAX_BYTES,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        PUBLIC_STEP_FIELD_MAX_BYTES,
-        PUBLIC_STEP_FIELD_MAX_BYTES,
-        PUBLIC_STEP_RESULT_MAX_BYTES,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        taskId,
-        safeLimit,
-      ) as PublicStepRow[];
-    return rows.reverse().map((step) => ({
-      ...step,
-      id: boundPublicText(step.id, PUBLIC_STEP_ID_MAX_BYTES),
-      task_id: boundPublicText(step.task_id, PUBLIC_STEP_ID_MAX_BYTES),
-      stage: boundPublicText(step.stage, PUBLIC_STEP_FIELD_MAX_BYTES),
-      action: boundPublicText(step.action, PUBLIC_STEP_FIELD_MAX_BYTES),
-      result: step.result === null ? null : boundPublicResult(step.result),
-      tool_call_id:
-        step.tool_call_id === null
-          ? null
-          : boundPublicText(step.tool_call_id, PUBLIC_STEP_ID_MAX_BYTES),
-    }));
+    return listPublicSteps(this.db, taskId, limit);
   }
 
   getPublicStepStats(taskId: string, owner?: string): PublicStepStats | null {
     if (owner !== undefined && this.getTask(taskId, owner) === null) {
       return null;
     }
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS stepCount,
-                COALESCE(SUM(
-                  CASE WHEN result IS NULL THEN 0
-                       ELSE length(CAST(result AS BLOB)) END
-                ), 0) AS resultBytes,
-                (
-                  SELECT substr(action, 1, ?)
-                  FROM ledger_step
-                  WHERE task_id = ? AND stage = 'error' AND substr(action, 1, 6) = 'error:'
-                  ORDER BY seq DESC
-                  LIMIT 1
-                ) AS lastErrorAction
-         FROM ledger_step
-         WHERE task_id = ?`,
-      )
-      .get(PUBLIC_STEP_FIELD_MAX_BYTES, taskId, taskId) as unknown as {
-      stepCount: number;
-      resultBytes: number;
-      lastErrorAction: string | null;
-    };
-    const lastErrorCode =
-      typeof row.lastErrorAction === "string" &&
-      row.lastErrorAction.startsWith("error:")
-        ? row.lastErrorAction.slice("error:".length)
-        : undefined;
-    return {
-      stepCount: Number(row.stepCount),
-      resultBytes: Number(row.resultBytes),
-      ...(lastErrorCode === undefined ? {} : { lastErrorCode }),
-    };
+    return getPublicStepStats(this.db, taskId);
   }
 
   readPublicChain(
@@ -1255,38 +727,7 @@ export class Ledger {
     if (owner !== undefined && this.getTask(taskId, owner) === null) {
       return [];
     }
-    const safeLimit = publicLimit(limit);
-    const rows = this.db
-      .prepare(
-        `SELECT seq,
-                substr(task_id, 1, ?) AS task_id,
-                substr(step_id, 1, ?) AS step_id,
-                substr(digest, 1, ?) AS digest,
-                CASE WHEN prev_digest IS NULL THEN NULL ELSE substr(prev_digest, 1, ?) END AS prev_digest,
-                ts
-         FROM ledger_chain
-         WHERE task_id = ?
-         ORDER BY seq DESC
-         LIMIT ?`,
-      )
-      .all(
-        PUBLIC_STEP_ID_MAX_BYTES,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        taskId,
-        safeLimit,
-      ) as ChainRow[];
-    return rows.reverse().map((record) => ({
-      ...record,
-      task_id: boundPublicText(record.task_id, PUBLIC_STEP_ID_MAX_BYTES),
-      step_id: boundPublicText(record.step_id, PUBLIC_STEP_ID_MAX_BYTES),
-      digest: boundPublicText(record.digest, PUBLIC_STEP_ID_MAX_BYTES),
-      prev_digest:
-        record.prev_digest === null
-          ? null
-          : boundPublicText(record.prev_digest, PUBLIC_STEP_ID_MAX_BYTES),
-    }));
+    return readPublicChain(this.db, taskId, limit);
   }
 
   /**
@@ -1617,23 +1058,13 @@ export class Ledger {
     if (rows.length === 0) return 0;
 
     const purge = this.db.transaction((ids: string[]) => {
-      this.db.exec("DROP TRIGGER IF EXISTS ledger_step_append_only_delete");
-      this.db.exec("DROP TRIGGER IF EXISTS ledger_chain_append_only_delete");
+      dropAppendOnlyDeleteTriggers(this.db);
       for (const id of ids) {
         this.db.prepare("DELETE FROM ledger_chain WHERE task_id = ?").run(id);
         this.db.prepare("DELETE FROM ledger_step WHERE task_id = ?").run(id);
         this.db.prepare("DELETE FROM ledger_task WHERE id = ?").run(id);
       }
-      this.db.exec(`
-        CREATE TRIGGER ledger_step_append_only_delete
-        BEFORE DELETE ON ledger_step
-        BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
-      `);
-      this.db.exec(`
-        CREATE TRIGGER ledger_chain_append_only_delete
-        BEFORE DELETE ON ledger_chain
-        BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
-      `);
+      createAppendOnlyDeleteTriggers(this.db);
     });
     purge(rows.map((r) => r.id));
     return rows.length;
@@ -1686,8 +1117,7 @@ export class Ledger {
         }
         result.cancelled.push({ id: task.id, from: task.status });
       }
-      this.db.exec("DROP TRIGGER IF EXISTS ledger_step_append_only_delete");
-      this.db.exec("DROP TRIGGER IF EXISTS ledger_chain_append_only_delete");
+      dropAppendOnlyDeleteTriggers(this.db);
       const ids = tasks.map((t) => t.id);
       const placeholders = ids.map(() => "?").join(", ");
       this.db
@@ -1697,16 +1127,7 @@ export class Ledger {
         .prepare(`DELETE FROM ledger_step WHERE task_id IN (${placeholders})`)
         .run(...ids);
       this.db.prepare("DELETE FROM ledger_task WHERE owner = ?").run(owner);
-      this.db.exec(`
-        CREATE TRIGGER ledger_step_append_only_delete
-        BEFORE DELETE ON ledger_step
-        BEGIN SELECT RAISE(ABORT, 'ledger_step is append-only'); END;
-      `);
-      this.db.exec(`
-        CREATE TRIGGER ledger_chain_append_only_delete
-        BEFORE DELETE ON ledger_chain
-        BEGIN SELECT RAISE(ABORT, 'ledger_chain is append-only'); END;
-      `);
+      createAppendOnlyDeleteTriggers(this.db);
     });
     purge();
     return result;

@@ -587,8 +587,9 @@ void main() {
     });
 
     test('deliberately-absent server code degrades to server_error', () {
-      // `fence_conflict` comes only from the ledger worker routes, which this
-      // app never calls; it is intentionally not allowlisted.
+      // `fence_conflict` is an internal LedgerError from the in-process fence
+      // checks and is never emitted over HTTP; the app's ledger surface only
+      // cancels and reads, so it is intentionally not allowlisted.
       expect(
         safePluginErrorCode(const {'error': 'fence_conflict'}),
         'server_error',

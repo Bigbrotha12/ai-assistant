@@ -273,11 +273,11 @@ user id):
 | `GET  /ledger/tasks`            | List tasks as the existing JSON array. Optional `limit=1..100` (default 50) and non-negative safe-integer `offset`; responses include `X-Ledger-Page-Limit`, `X-Ledger-Page-Offset`, and `X-Ledger-Next-Offset` when another page exists. The list SQL selects only public task columns, never `payload`/`job_spec`. |
 | `GET  /ledger/tasks/by-key/:intentKey` | Owner-scoped status projection; `intentKey` follows the nonblank/no-C0-or-DEL/1,024-byte ID rules above, and optional `limit=1..64` selects the latest metadata window. |
 | `GET  /ledger/tasks/:id`        | Owner-scoped task detail with a bounded projection and the latest `1..64` (default 64) step/chain records; IDs follow the nonblank/no-C0-or-DEL/1,024-byte rules above, and step fields/results are capped at 256 UTF-8 bytes for stage/action, 1,024 bytes for IDs, and 65,536 bytes for result text. |
-| `POST /ledger/tasks/:id/claim`  | Take the lease; `queued → running`; the task ID follows the same nonblank/no-C0-or-DEL/1,024-byte rules. |
-| `POST /ledger/tasks/:id/steps`  | Append a public step + chain record (task must be `running`); `stage`/`action` must be nonblank strings without C0/DEL controls and at most 256 UTF-8 bytes, `result` is at most 65,536 bytes, and `fenceToken` follows the 1,024-byte ID rules. Bodies use the same `MAX_REQUEST_BODY_BYTES` cap as every task write route. |
-| `POST /ledger/tasks/:id/heartbeat` | Renew the lease (owner must hold it); IDs/fence tokens follow the same nonblank/no-C0-or-DEL/1,024-byte rules.                       |
-| `POST /ledger/tasks/:id/resume` | Resume a `stuck`/`awaiting_review` task (owner only); the task ID follows the same nonblank/no-C0-or-DEL/1,024-byte rules. |
-| `POST /ledger/tasks/:id/complete` | Set a terminal status (`succeeded|failed|cancelled`); IDs/fence tokens follow the same nonblank/no-C0-or-DEL/1,024-byte rules; `awaiting_review` is internal-only and is rejected. |
+| `POST /ledger/tasks/:id/cancel` | Owner-scoped cancellation; the task ID follows the same nonblank/no-C0-or-DEL/1,024-byte rules (`400 invalid_request` / `413 request_too_large`). Returns the versioned `TaskCancelReport` with `202` when the job is aborting (`stage: "cancelling"`) and `200` otherwise (`stage` ∈ `cancelled`, `already-terminal`, `not-cancellable`); a cross-owner or absent task is `404 not_found`, a deployment with no in-process job runner is `503 background_unavailable`, and a deletion tombstone is `403 account_deleted`. |
+
+Worker transitions (`claim`, `appendStep`, `heartbeat`, `resume`, `complete`)
+are **not** exposed over HTTP; the in-process `JobRunner` drives them by calling
+the `Ledger` methods directly.
 
 **Tests.** `npm test` runs the suite with Node's built-in runner via `tsx`
 (`tsx --test test/**/*.test.ts`). It covers lifecycle transitions,
