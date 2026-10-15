@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:ai_assistant/features/sentinel/sentinel.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../../support/repo_paths.dart';
+
 void main() {
   test('normalization matches the shared NFKC, case, punctuation, and whitespace contract', () {
     expect(
@@ -37,7 +39,7 @@ const normalized = records.map(({input}) =>
 );
 process.stdout.write(JSON.stringify(normalized));
 ''';
-    final fixture = File('test/fixtures/sentinel/normalization.v1.jsonl');
+    final fixture = repoFile('test/fixtures/sentinel/normalization.v1.jsonl');
     final records = fixture
         .readAsLinesSync()
         .where((line) => line.trim().isNotEmpty)
@@ -129,7 +131,7 @@ process.stdout.write(JSON.stringify(normalized));
   });
 
   test('generated Dart rules are the exact canonical source bundle', () {
-    final source = File('server/src/sentinel/rules.v1.json').readAsStringSync();
+    final source = repoFile('server/src/sentinel/rules.v1.json').readAsStringSync();
     expect(generatedSentinelRuleSetSourceJson, source);
     expect(generatedSentinelRuleSetVersion, sentinelRuleSetVersion);
     expect(generatedSentinelRuleSetSourceSha256, isA<String>());
@@ -146,7 +148,7 @@ process.stdout.write(JSON.stringify(normalized));
   });
 
   test('client evaluator matches the server golden fixture corpus', () {
-    final source = File('test/fixtures/sentinel/cases.v1.jsonl')
+    final source = repoFile('test/fixtures/sentinel/cases.v1.jsonl')
         .readAsLinesSync();
     final gate = SentinelInputGate();
     var checked = 0;
