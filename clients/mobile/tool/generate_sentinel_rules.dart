@@ -158,8 +158,11 @@ String _dartLiteral(String value) {
 
 void main() {
   final script = File(Platform.script.toFilePath());
-  final root = script.parent.parent;
-  final sourceFile = File('${root.path}/server/src/sentinel/rules.v1.json');
+  // `tool/` sits under the Flutter package root; the server and the shared
+  // golden fixtures live two levels up at the repository root.
+  final packageRoot = script.parent.parent;
+  final repoRoot = packageRoot.parent.parent;
+  final sourceFile = File('${repoRoot.path}/server/src/sentinel/rules.v1.json');
   final source = sourceFile.readAsStringSync();
   final parsed = jsonDecode(source) as Map<String, dynamic>;
   final version = parsed['version'];
@@ -168,7 +171,7 @@ void main() {
   }
   final hash = _sha256Hex(utf8.encode(source));
   final jsonLiteral = jsonEncode(source);
-  final tsFile = File('${root.path}/server/src/sentinel/rules.generated.ts');
+  final tsFile = File('${repoRoot.path}/server/src/sentinel/rules.generated.ts');
   tsFile.writeAsStringSync(
     'export const SENTINEL_RULE_SET_VERSION = ${jsonEncode(version)};\n'
     'export const SENTINEL_RULE_SET_SOURCE_SHA256 = '
@@ -176,7 +179,7 @@ void main() {
     'export const SENTINEL_RULE_SET_SOURCE_JSON = $jsonLiteral;\n',
   );
   final dartFile = File(
-    '${root.path}/lib/features/sentinel/data/rules.generated.dart',
+    '${packageRoot.path}/lib/features/sentinel/data/rules.generated.dart',
   );
   dartFile.writeAsStringSync(
     "import 'dart:convert';\n\n"
