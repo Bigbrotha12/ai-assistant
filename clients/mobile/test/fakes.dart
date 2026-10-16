@@ -19,6 +19,7 @@ import 'package:ai_assistant/features/attachments/data/file_store.dart';
 import 'package:ai_assistant/features/chat/data/chat_store.dart';
 import 'package:ai_assistant/features/chat/data/context_trimmer.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/chat/data/sse.dart';
 import 'package:ai_assistant/features/memory/data/memory_model.dart';
 import 'package:ai_assistant/features/memory/data/memory_store.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_client.dart';
@@ -28,7 +29,30 @@ import 'package:ai_assistant/features/plugins/data/managed_conversation_reposito
 import 'package:ai_assistant/features/plugins/data/managed_conversation_service.dart';
 import 'package:ai_assistant/features/plugins/data/managed_resolution.dart';
 import 'package:ai_assistant/features/plugins/data/plugin_http.dart';
-import 'package:ai_assistant/features/sentinel/sentinel.dart';
+import 'package:ai_assistant/features/notifications/data/notif_client.dart';
+
+/// In-memory owner-wide [NotifClient] for tests: push events into [messages]
+/// with [add] and observe transport teardown via [disposed].
+class FakeNotifClient implements NotifClient {
+  final _controller = StreamController<NotifMessage>.broadcast();
+
+  bool disposed = false;
+
+  void add(NotifMessage message) => _controller.add(message);
+
+  /// Whether the adapter (or any other consumer) is still subscribed.
+  bool get hasListener => _controller.hasListener;
+
+  @override
+  Stream<NotifMessage> get messages => _controller.stream;
+
+  @override
+  Future<void> dispose() async {
+    if (disposed) return;
+    disposed = true;
+    if (!_controller.isClosed) await _controller.close();
+  }
+}
 
 /// In-memory [AppTierStore] for widget tests.
 class FakeAppTierStore implements AppTierStore {
@@ -288,6 +312,11 @@ class FakeChatClient {
   List<List<(int index, String name, String argsFragment)>> toolCallDeltas =
       const [];
 
+  /// Scripted Sentinel advisory frames delivered via [onSentinelAdvisory]
+  /// before [onContent], in order, modeling the server's two-phase advisory:
+  /// the L1 frame, then the semantic frame, both leading a finding turn.
+  List<SentinelAdvisoryEvent> sentinelAdvisories = const [];
+
   /// When set, [sendTurn] awaits this before returning, letting tests pause
   /// mid-stream (for stop / dispose scenarios).
   Completer<ChatResult>? hang;
@@ -313,9 +342,9 @@ class FakeChatClient {
   /// P4b): mirrors [ManagedConversationService.sendTurn]'s dispatch leg so
   /// [FakeManagedChatAdapter] — and, post-P4b, the chat/voice tests — script
   /// turns through this seam. Replays the scripted knobs
-  /// ([streamDeltas] → [onContent], [toolCallDeltas] → [onToolCallDelta],
-  /// [results], [error], [hang], [fireOnReceived] → [onReceived]) and records
-  /// [calls] / [callCount].
+  /// ([sentinelAdvisories] → [onSentinelAdvisory], [streamDeltas] → [onContent],
+  /// [toolCallDeltas] → [onToolCallDelta], [results], [error], [hang],
+  /// [fireOnReceived] → [onReceived]) and records [calls] / [callCount].
   ///
   /// [messages] overrides the wire list derived from [history]: the voice
   /// tests' inline [VoiceTurnSender] adapters pass the controller-built
@@ -336,6 +365,7 @@ class FakeChatClient {
     CancelToken? cancelToken,
     void Function(int index, String name, String argsFragment)? onToolCallDelta,
     void Function()? onReceived,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
     final wire = messages ?? toApiMessages(history);
     // Mirror the legacy client's DioExceptionType.cancel
@@ -349,6 +379,9 @@ class FakeChatClient {
     lastSystemPrompt = systemPrompt;
     lastTools = tools;
     if (fireOnReceived) onReceived?.call();
+    for (final advisory in sentinelAdvisories) {
+      onSentinelAdvisory?.call(advisory);
+    }
     // The last scripted result repeats once exhausted: the index is clamped
     // to `results.length - 1` so a scripted client never runs dry mid-turn.
     final index = callCount < results.length ? callCount : results.length - 1;
@@ -985,7 +1018,6 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     required this.store,
     required this.script,
     this._poller,
-    this.sentinelGate,
   });
 
   /// Store admission/completion writes go to — usually the same instance as
@@ -995,8 +1027,6 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
   /// Scripted client driving stream deltas / errors / hangs through the
   /// managed sender seam ([FakeChatClient.sendTurn]).
   final FakeChatClient script;
-
-  final SentinelInputGate? sentinelGate;
 
   /// Controllable [LedgerPoller] for background-job tests. When null,
   /// background submits are unavailable (existing streaming tests never touch
@@ -1374,13 +1404,8 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
     required String userText,
     String? sessionId,
     void Function(String delta)? onContent,
-    void Function(SentinelAdvisory advisory)? onAdvisory,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
-    final gate = sentinelGate;
-    if (gate != null) {
-      final advisory = gate.advisory(userText);
-      if (advisory != null) onAdvisory?.call(advisory);
-    }
     sends.add((
       conversationId: conversationId,
       history: history,
@@ -1484,6 +1509,7 @@ class FakeManagedChatAdapter implements ManagedChatAdapter {
         history: historyWithUser,
         userText: userText,
         onContent: onContent,
+        onSentinelAdvisory: onSentinelAdvisory,
       );
     } on PluginClientException catch (e) {
       // Mirror the real service: post-admission dispatch failures surface as

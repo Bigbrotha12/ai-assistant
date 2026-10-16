@@ -200,6 +200,7 @@ class StagedInferenceAdapters implements VisionClient {
     required String userText,
     CancelToken? cancelToken,
     void Function(String delta)? onContent,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
     void Function(ManagedTurnOutcome outcome)? onCompleted,
   }) async {
     final epoch = _repo.epoch(_scope);
@@ -235,6 +236,7 @@ class StagedInferenceAdapters implements VisionClient {
         history: history,
         userText: userText,
         onContent: onContent,
+        onSentinelAdvisory: onSentinelAdvisory,
       );
       _check(epoch, cancelToken);
       onCompleted?.call(outcome);
@@ -332,6 +334,7 @@ class _CurrentManagedClient implements LangChainClient {
     LangChainRequest request, {
     CancelToken? cancelToken,
     void Function(String text)? onContent,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) => _current(
     () => client.managedTurn(
       request,
@@ -341,6 +344,12 @@ class _CurrentManagedClient implements LangChainClient {
           : (text) {
               check();
               onContent(text);
+            },
+      onSentinelAdvisory: onSentinelAdvisory == null
+          ? null
+          : (advisory) {
+              check();
+              onSentinelAdvisory(advisory);
             },
     ),
   );
@@ -359,6 +368,7 @@ class _CurrentManagedClient implements LangChainClient {
     void Function()? onReceived,
     void Function(String text)? onContent,
     void Function(ToolCallDelta delta)? onToolCallDelta,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) => throw UnsupportedError('Managed voice turns only.');
 
   @override

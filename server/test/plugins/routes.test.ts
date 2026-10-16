@@ -10,7 +10,12 @@ import { PluginStore } from "../../src/plugins/store.ts";
 import { computeManifestDigest } from "../../src/plugins/digest.ts";
 import { PluginRegistry } from "../../src/plugins/registry.ts";
 import { createPluginRoutes } from "../../src/plugins/routes.ts";
-import type { VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
+import {
+  isSuperuserToken,
+  requireSuperuser,
+  SUPERUSER_OWNER,
+} from "../../src/auth/request_auth.ts";
+import type { OwnerVariables, VerifyApiKeyFn } from "../../src/auth/request_auth.ts";
 import type { AgentPluginDefinition, ModelPluginDefinition, ToolPluginDefinition } from "../../src/plugins/types.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 import { logger } from "../../src/observability/logger.ts";
@@ -35,6 +40,7 @@ function openRouterBuiltin(): ModelPluginDefinition {
       supportsStreaming: true,
       visionCapable: true,
       parameters: {},
+      mode: "chat",
     },
     baseUrls: [{ id: "openrouter-api", url: "https://openrouter.ai" }],
     credentials: { apiKey: { label: "OpenRouter API key", required: true } },
@@ -151,6 +157,14 @@ async function makeEnv(
 }
 
 /**
+ * A configured superuser ops secret. Detail + management endpoints require
+ * this (or any entry of the rotation list) instead of an ordinary owner key.
+ */
+const SUPERUSER_KEY = "test-superuser-key";
+const superAuth = { authorization: `Bearer ${SUPERUSER_KEY}` };
+const auth = { authorization: "Bearer test-key" };
+
+/**
  * Build the app the way src/index.ts does (`app.route("/v1", routes)`) but
  * with the auth verifier swapped for a deterministic stub, so tests exercise
  * the full HTTP surface without better-auth's DB.
@@ -159,6 +173,7 @@ async function makeApp(
   t: TestContext,
   verifyKey?: VerifyApiKeyFn,
   limiter?: (key: string) => boolean,
+  superuserKeysOption: readonly string[] = [SUPERUSER_KEY],
 ): Promise<{
   app: Hono;
   store: PluginStore;
@@ -174,13 +189,12 @@ async function makeApp(
       registry,
       store,
       verifyKey: verifyKey ?? (async () => ({ ok: true as const, owner: "test-user" })),
+      superuserKeys: superuserKeysOption,
       limiter,
     }),
   );
   return { app, store, registry, storePath };
 }
-
-const auth = { authorization: "Bearer test-key" };
 
 async function json(res: Response): Promise<unknown> {
   return (await res.json()) as unknown;
@@ -232,7 +246,7 @@ describe("plugin routes — details endpoint", () => {
   test("GET /v1/plugins/:id returns the full definition incl. baseUrl urls and endpoint", async (t) => {
     const { app } = await makeApp(t);
 
-    const openrouter = (await (await app.request("/v1/plugins/openrouter", { headers: auth })).json()) as any;
+    const openrouter = (await (await app.request("/v1/plugins/openrouter", { headers: superAuth })).json()) as any;
     assert.equal(openrouter.installed, true);
     assert.deepEqual(openrouter.baseUrls, [
       { id: "openrouter-api", url: "https://openrouter.ai" },
@@ -240,7 +254,7 @@ describe("plugin routes — details endpoint", () => {
     assert.equal(openrouter.inference.endpoint, "https://openrouter.ai/api/v1");
     assert.equal(openrouter.credentials.apiKey.label, "OpenRouter API key");
 
-    const vikunja = (await (await app.request("/v1/plugins/vikunja", { headers: auth })).json()) as any;
+    const vikunja = (await (await app.request("/v1/plugins/vikunja", { headers: superAuth })).json()) as any;
     assert.equal(vikunja.installed, false);
     assert.equal(vikunja.baseUrls[0].url, "https://vikunja.example.com");
     assert.equal(vikunja.tools[0].name, "list_tasks");
@@ -278,10 +292,11 @@ describe("plugin routes — details endpoint", () => {
         registry,
         store,
         verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
+        superuserKeys: [SUPERUSER_KEY],
       }),
     );
 
-    const response = await app.request("/v1/plugins/private-agent", { headers: auth });
+    const response = await app.request("/v1/plugins/private-agent", { headers: superAuth });
     assert.equal(response.status, 200);
     const text = await response.text();
     assert.equal(text.includes("secret-value"), false);
@@ -294,9 +309,16 @@ describe("plugin routes — details endpoint", () => {
 
   test("unknown id → 404 plugin_not_found", async (t) => {
     const { app } = await makeApp(t);
-    const res = await app.request("/v1/plugins/ghost", { headers: auth });
+    const res = await app.request("/v1/plugins/ghost", { headers: superAuth });
     assert.equal(res.status, 404);
     assert.deepEqual(await json(res), { error: "plugin_not_found" });
+  });
+
+  test("an ordinary owner key cannot read full detail → 403 forbidden", async (t) => {
+    const { app } = await makeApp(t);
+    const res = await app.request("/v1/plugins/openrouter", { headers: auth });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await json(res), { error: "forbidden" });
   });
 });
 
@@ -306,7 +328,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
 
     const install = await app.request("/v1/plugins/vikunja/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(install.status, 200);
     assert.deepEqual(await json(install), { status: "ok" });
@@ -316,7 +338,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
 
     const reinstall = await app.request("/v1/plugins/vikunja/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(reinstall.status, 409);
     assert.deepEqual(await json(reinstall), { error: "plugin_already_installed" });
@@ -326,7 +348,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     const { app } = await makeApp(t, undefined, () => true);
     const res = await app.request("/v1/plugins/openrouter/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 409);
     assert.deepEqual(await json(res), { error: "plugin_already_installed" });
@@ -336,7 +358,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     const { app } = await makeApp(t);
     const res = await app.request("/v1/plugins/ghost/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 404);
     assert.deepEqual(await json(res), { error: "plugin_not_found" });
@@ -348,12 +370,17 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createPluginRoutes({ registry, store, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
+      createPluginRoutes({
+        registry,
+        store,
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
+        superuserKeys: [SUPERUSER_KEY],
+      }),
     );
 
     const res = await app.request("/v1/plugins/evil/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 400);
     const body = (await res.json()) as { error: string; reason: string };
@@ -372,11 +399,11 @@ describe("plugin routes — install/uninstall lifecycle", () => {
 
   test("uninstall installed → 200 and list flips to not installed", async (t) => {
     const { app } = await makeApp(t);
-    await app.request("/v1/plugins/vikunja/install", { method: "POST", headers: auth });
+    await app.request("/v1/plugins/vikunja/install", { method: "POST", headers: superAuth });
 
     const uninstall = await app.request("/v1/plugins/vikunja/uninstall", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(uninstall.status, 200);
     assert.deepEqual(await json(uninstall), { status: "ok" });
@@ -389,7 +416,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     const { app } = await makeApp(t);
     const res = await app.request("/v1/plugins/openrouter/uninstall", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 403);
     assert.deepEqual(await json(res), { error: "builtin_plugin" });
@@ -399,7 +426,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     const { app } = await makeApp(t);
     const res = await app.request("/v1/plugins/mealie/uninstall", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 404);
     assert.deepEqual(await json(res), { error: "plugin_not_found" });
@@ -416,7 +443,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
       const { app } = await makeApp(t, undefined, () => true);
       const response = await app.request("/v1/plugins/vikunja/install", {
         method: "POST",
-        headers: { ...auth, "x-request-id": "mgmt-request-1" },
+        headers: { ...superAuth, "x-request-id": "mgmt-request-1" },
       });
       assert.equal(response.status, 200);
       await flushAuditTelemetry();
@@ -432,7 +459,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
       assert.equal(management[0]?.operation, "install");
       assert.equal(management[0]?.pluginId, "vikunja");
       assert.equal(management[0]?.requestId, "mgmt-request-1");
-      assert.equal(lines.some((line) => line.includes("test-key")), false);
+      assert.equal(lines.some((line) => line.includes(SUPERUSER_KEY)), false);
     } finally {
       await flushAuditTelemetry();
       logger.info = originalInfo;
@@ -440,7 +467,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     }
   });
 
-  test("unauthenticated management mutations emit an ownerless redacted rejection record", async (t) => {
+  test("a denied management request emits an ownerless redacted rejection record", async (t) => {
     const originalInfo = logger.info;
     const lines: string[] = [];
     logger.info = (...args: unknown[]) => {
@@ -448,12 +475,14 @@ describe("plugin routes — install/uninstall lifecycle", () => {
     };
     configureAuditTelemetry({ enabled: true, level: "info" });
     try {
-      const { app } = await makeApp(t, async () => ({ ok: false as const, reason: "bad_key" as const }));
+      // Superuser gate disabled (empty key list): every management request 403s.
+      const { app } = await makeApp(t, undefined, undefined, []);
       const response = await app.request("/v1/plugins/vikunja/install", {
         method: "POST",
         headers: { authorization: "Bearer test-key", "x-request-id": "mgmt-unauth" },
       });
-      assert.equal(response.status, 401);
+      assert.equal(response.status, 403);
+      assert.deepEqual(await json(response), { error: "forbidden" });
       await flushAuditTelemetry();
       const management = lines.flatMap((line) => {
         try {
@@ -468,7 +497,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
       assert.equal(management[0]?.pluginId, "vikunja");
       assert.equal(management[0]?.requestId, "mgmt-unauth");
       assert.equal(management[0]?.outcome, "error");
-      assert.equal(management[0]?.errorCode, "BAD_KEY");
+      assert.equal(management[0]?.errorCode, "FORBIDDEN");
       assert.equal("ownerHash" in management[0]!, false);
       assert.equal(lines.some((line) => line.includes("test-key")), false);
     } finally {
@@ -496,7 +525,7 @@ describe("plugin routes — install/uninstall lifecycle", () => {
         const response = await app.request(path, {
           method: "POST",
           headers: {
-            ...auth,
+            ...superAuth,
             "x-request-id": requestId,
           },
         });
@@ -540,7 +569,7 @@ describe("plugin routes — reload", () => {
     const { app } = await makeApp(t);
     const res = await app.request("/v1/plugins/reload", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 200);
     assert.deepEqual(await json(res), { status: "ok" });
@@ -553,12 +582,17 @@ describe("plugin routes — reload", () => {
     const app = new Hono();
     app.route(
       "/v1",
-      createPluginRoutes({ registry, store, verifyKey: async () => ({ ok: true as const, owner: "test-user" }) }),
+      createPluginRoutes({
+        registry,
+        store,
+        verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
+        superuserKeys: [SUPERUSER_KEY],
+      }),
     );
 
     const res = await app.request("/v1/plugins/reload", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(res.status, 500);
     assert.deepEqual(await json(res), { error: "invalid_config" });
@@ -570,7 +604,7 @@ describe("plugin routes — manifest pin mismatch", () => {
     const { app, store, storePath } = await makeApp(t, undefined, () => true);
     const install = await app.request("/v1/plugins/vikunja/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(install.status, 200);
 
@@ -590,7 +624,7 @@ describe("plugin routes — manifest pin mismatch", () => {
 
     const reload = await app.request("/v1/plugins/reload", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(reload.status, 409);
     assert.deepEqual(await json(reload), { error: "pin_mismatch" });
@@ -607,7 +641,7 @@ describe("plugin routes — manifest pin mismatch", () => {
     assert.equal(JSON.stringify(list).includes("https://"), false);
 
     const detail = (await (
-      await app.request("/v1/plugins/vikunja", { headers: auth })
+      await app.request("/v1/plugins/vikunja", { headers: superAuth })
     ).json()) as Record<string, unknown>;
     assert.equal(detail.hashMismatch, true);
     assert.equal(detail.expected, expected);
@@ -615,7 +649,7 @@ describe("plugin routes — manifest pin mismatch", () => {
 
     const reinstall = await app.request("/v1/plugins/vikunja/install", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(reinstall.status, 200);
     assert.equal(store.getManifestHashMismatch("vikunja"), undefined);
@@ -627,7 +661,7 @@ describe("plugin routes — manifest pin mismatch", () => {
 
     const uninstall = await app.request("/v1/plugins/vikunja/uninstall", {
       method: "POST",
-      headers: auth,
+      headers: superAuth,
     });
     assert.equal(uninstall.status, 200);
     const afterUninstall = JSON.parse(await readFile(storePath, "utf8")) as {
@@ -651,6 +685,7 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
         registry,
         store,
         verifyKey: async () => ({ ok: true as const, owner: "test-user" }),
+        superuserKeys: [SUPERUSER_KEY],
         limiter,
       }),
     );
@@ -662,11 +697,11 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
     const limiter = () => allowed-- > 0;
     const app = await makeLimitedApp(t, limiter);
 
-    const first = await app.request("/v1/plugins/reload", { method: "POST", headers: auth });
+    const first = await app.request("/v1/plugins/reload", { method: "POST", headers: superAuth });
     assert.equal(first.status, 200);
     assert.deepEqual(await json(first), { status: "ok" });
 
-    const second = await app.request("/v1/plugins/reload", { method: "POST", headers: auth });
+    const second = await app.request("/v1/plugins/reload", { method: "POST", headers: superAuth });
     assert.equal(second.status, 429);
     assert.deepEqual(await json(second), { error: "rate_limited" });
   });
@@ -676,7 +711,7 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
     const app = await makeLimitedApp(t, limiter);
 
     for (const path of ["/v1/plugins/vikunja/install", "/v1/plugins/vikunja/uninstall"]) {
-      const res = await app.request(path, { method: "POST", headers: auth });
+      const res = await app.request(path, { method: "POST", headers: superAuth });
       assert.equal(res.status, 429, path);
       assert.deepEqual(await json(res), { error: "rate_limited" }, path);
     }
@@ -698,29 +733,26 @@ describe("plugin routes — rate limiting (Fix 5)", () => {
 });
 
 describe("plugin routes — auth", () => {
-  test("every endpoint → 401 unauthorized when the verifier returns bad_key", async (t) => {
+  test("GET /v1/plugins stays owner-gated → 401 when the owner verifier rejects", async (t) => {
     const { app } = await makeApp(t, async () => ({ ok: false as const, reason: "bad_key" as const }));
-    const cases: Array<[string, string]> = [
-      ["GET", "/v1/plugins"],
-      ["GET", "/v1/plugins/openrouter"],
-      ["POST", "/v1/plugins/vikunja/install"],
-      ["POST", "/v1/plugins/vikunja/uninstall"],
-      ["POST", "/v1/plugins/reload"],
-    ];
-    for (const [method, path] of cases) {
-      const res = await app.request(path, { method, headers: auth });
-      assert.equal(res.status, 401, `${method} ${path}`);
-      assert.deepEqual(await json(res), { error: "unauthorized" }, `${method} ${path}`);
-    }
+    const res = await app.request("/v1/plugins", { headers: auth });
+    assert.equal(res.status, 401);
+    assert.deepEqual(await json(res), { error: "unauthorized" });
   });
 
-  test("every endpoint → 403 email_not_verified when the owner's email is unverified", async (t) => {
+  test("GET /v1/plugins stays owner-gated → 403 email_not_verified for an unverified owner", async (t) => {
     const { app } = await makeApp(t, async () => ({
       ok: false as const,
       reason: "email_not_verified" as const,
     }));
+    const res = await app.request("/v1/plugins", { headers: auth });
+    assert.equal(res.status, 403);
+    assert.deepEqual(await json(res), { error: "email_not_verified" });
+  });
+
+  test("an ordinary owner key is denied on every superuser-gated endpoint → 403", async (t) => {
+    const { app } = await makeApp(t);
     const cases: Array<[string, string]> = [
-      ["GET", "/v1/plugins"],
       ["GET", "/v1/plugins/openrouter"],
       ["POST", "/v1/plugins/vikunja/install"],
       ["POST", "/v1/plugins/vikunja/uninstall"],
@@ -729,7 +761,85 @@ describe("plugin routes — auth", () => {
     for (const [method, path] of cases) {
       const res = await app.request(path, { method, headers: auth });
       assert.equal(res.status, 403, `${method} ${path}`);
-      assert.deepEqual(await json(res), { error: "email_not_verified" }, `${method} ${path}`);
+      assert.deepEqual(await json(res), { error: "forbidden" }, `${method} ${path}`);
     }
+  });
+
+  test("with no superuser key configured every gated endpoint is disabled → 403", async (t) => {
+    const { app } = await makeApp(t, undefined, undefined, []);
+    const cases: Array<[string, string]> = [
+      ["GET", "/v1/plugins/openrouter"],
+      ["POST", "/v1/plugins/vikunja/install"],
+      ["POST", "/v1/plugins/vikunja/uninstall"],
+      ["POST", "/v1/plugins/reload"],
+    ];
+    for (const [method, path] of cases) {
+      // Even the value that WOULD be the secret is refused when the list is empty.
+      const res = await app.request(path, { method, headers: superAuth });
+      assert.equal(res.status, 403, `${method} ${path}`);
+      assert.deepEqual(await json(res), { error: "forbidden" }, `${method} ${path}`);
+    }
+  });
+
+  test("the owner list is retained when the superuser gate is disabled", async (t) => {
+    const { app } = await makeApp(t, undefined, undefined, []);
+    const res = await app.request("/v1/plugins", { headers: auth });
+    assert.equal(res.status, 200);
+  });
+
+  test("any entry of a rotated superuser secret list authorizes gated endpoints", async (t) => {
+    const { app } = await makeApp(t, undefined, () => true, ["old-secret", SUPERUSER_KEY]);
+    const viaOld = await app.request("/v1/plugins/openrouter", {
+      headers: { authorization: "Bearer old-secret" },
+    });
+    assert.equal(viaOld.status, 200);
+    const viaNew = await app.request("/v1/plugins/reload", {
+      method: "POST",
+      headers: superAuth,
+    });
+    assert.equal(viaNew.status, 200);
+  });
+});
+
+describe("plugin routes — superuser gate mechanics", () => {
+  test("requireSuperuser stamps the synthetic owner and superuser flag", async () => {
+    const app = new Hono<OwnerVariables>();
+    app.get("/probe", requireSuperuser([SUPERUSER_KEY]), (c) =>
+      c.json({ owner: c.get("owner"), superuser: c.get("superuser") ?? false }),
+    );
+
+    const ok = await app.request("/probe", { headers: superAuth });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { owner: SUPERUSER_OWNER, superuser: true });
+
+    const denied = await app.request("/probe", {
+      headers: { authorization: "Bearer not-the-secret" },
+    });
+    assert.equal(denied.status, 403);
+    assert.deepEqual(await denied.json(), { error: "forbidden" });
+  });
+
+  test("isSuperuserToken: empty list never matches (gate disabled)", () => {
+    assert.equal(isSuperuserToken(`Bearer ${SUPERUSER_KEY}`, []), false);
+    assert.equal(isSuperuserToken(undefined, []), false);
+  });
+
+  test("isSuperuserToken: matches only a configured secret", () => {
+    assert.equal(isSuperuserToken(`Bearer ${SUPERUSER_KEY}`, [SUPERUSER_KEY]), true);
+    assert.equal(isSuperuserToken("Bearer wrong", [SUPERUSER_KEY]), false);
+    assert.equal(isSuperuserToken(undefined, [SUPERUSER_KEY]), false);
+    assert.equal(isSuperuserToken("Basic abc", [SUPERUSER_KEY]), false);
+  });
+
+  test("isSuperuserToken: accepts any rotation entry", () => {
+    const keys = ["old-secret", "new-secret"];
+    assert.equal(isSuperuserToken("Bearer old-secret", keys), true);
+    assert.equal(isSuperuserToken("Bearer new-secret", keys), true);
+    assert.equal(isSuperuserToken("Bearer other", keys), false);
+  });
+
+  test("isSuperuserToken: differing-length tokens do not throw", () => {
+    assert.equal(isSuperuserToken("Bearer x", ["a-much-longer-configured-secret"]), false);
+    assert.equal(isSuperuserToken("Bearer a-much-longer-configured-secret", ["x"]), false);
   });
 });

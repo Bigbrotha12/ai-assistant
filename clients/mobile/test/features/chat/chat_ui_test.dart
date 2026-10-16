@@ -10,6 +10,7 @@ import 'package:ai_assistant/features/auth/data/auth_client_provider.dart';
 import 'package:ai_assistant/features/auth/data/auth_credentials_providers.dart';
 import 'package:ai_assistant/core/backend_settings.dart';
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
+import 'package:ai_assistant/features/chat/data/sse.dart';
 import 'package:ai_assistant/features/attachments/data/file_cache.dart';
 import 'package:ai_assistant/features/attachments/data/files_providers.dart';
 import 'package:ai_assistant/core/probe_providers.dart';
@@ -26,7 +27,6 @@ import 'package:ai_assistant/features/voice/data/voice_capture_providers.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller_provider.dart';
 import 'package:ai_assistant/features/voice/ui/voice_screen.dart';
 import 'package:ai_assistant/features/voice/ui/voice_settings_providers.dart';
-import 'package:ai_assistant/features/sentinel/sentinel.dart';
 
 import '../../fakes.dart';
 import '../voice/voice_test_fakes.dart';
@@ -141,20 +141,24 @@ void main() {
       stored: const BackendSettings(host: 'myhost'),
     );
     final chatStore = FakeChatStore();
-    final client = FakeChatClient(
-      results: const [
-        ChatResult(
-          content: 'The message was sent.',
-          toolCalls: [],
-          finishReason: 'stop',
-        ),
-      ],
-    );
-    final adapter = FakeManagedChatAdapter(
-      store: chatStore,
-      script: client,
-      sentinelGate: SentinelInputGate(),
-    );
+    final client =
+        FakeChatClient(
+            results: const [
+              ChatResult(
+                content: 'The message was sent.',
+                toolCalls: [],
+                finishReason: 'stop',
+              ),
+            ],
+          )
+          ..sentinelAdvisories = const [
+            SentinelAdvisoryEvent(
+              categories: ['jailbreak_attempt'],
+              severity: 'high',
+              matchedRules: ['jailbreak_attempt.instruction_override'],
+            ),
+          ];
+    final adapter = FakeManagedChatAdapter(store: chatStore, script: client);
     await tester.pumpWidget(
       chatApp(
         store: store,
@@ -174,7 +178,7 @@ void main() {
     await tester.tap(find.byIcon(Icons.send));
     await tester.pumpAndSettle();
 
-    expect(find.text(sentinelAdvisoryMessage), findsOneWidget);
+    expect(find.text(sentinelAdvisoryNotice), findsOneWidget);
     expect(find.text('The message was sent.'), findsOneWidget);
     expect(adapter.sends, hasLength(1));
   });

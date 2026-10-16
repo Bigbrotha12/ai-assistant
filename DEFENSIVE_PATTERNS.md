@@ -118,7 +118,7 @@ and predictable temp paths invited symlink races and disclosure.
 **Status: aspirational here.** We run no subprocesses over untrusted input and have no
 tool-result temp/spill path yet, so there is nothing to scrub or isolate. The closest
 precedent is atomic config persistence, which already uses a random `randomUUID()` suffix,
-`0600`, and a same-directory rename (`plugins/store.ts:601-606`, `notify/store.ts:215-220`) —
+`0600`, and a same-directory rename (`plugins/store.ts:601-606`) —
 but that handles *trusted* server config and uses `writeFile`, not an exclusive `'wx'` open.
 When tool results spool to disk, this pattern becomes mandatory; it is not a general rule
 today.

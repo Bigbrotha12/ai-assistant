@@ -19,6 +19,7 @@ import {
   errorFrame,
   finishFrame,
   finishReasonFromOutput,
+  sentinelAdvisoryFrame,
   toOpenAiSse,
 } from "../../src/transport/openai.ts";
 import type { StreamEvent } from "../../src/transport/openai.ts";
@@ -598,6 +599,287 @@ describe("transport — pure helpers", () => {
       'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
     );
     assert.equal(DONE_FRAME, "data: [DONE]\n\n");
+  });
+
+  test("sentinelAdvisoryFrame renders the §3.5 standalone advisory payload", () => {
+    assert.equal(
+      sentinelAdvisoryFrame({
+        categories: ["jailbreak_attempt"],
+        severity: "high",
+        matchedRules: ["jailbreak_attempt.instruction_override"],
+        findings: [
+          {
+            ruleId: "jailbreak_attempt.instruction_override",
+            category: "jailbreak_attempt",
+            severity: "high",
+            source: "l1",
+          },
+        ],
+        action: { cannedResponseId: "sentinel_advisory_v1" },
+      }),
+      'data: {"sentinel":{"advisory":true,"phase":"l1","source":"l1","categories":["jailbreak_attempt"],"severity":"high","matchedRules":["jailbreak_attempt.instruction_override"],"findings":[{"ruleId":"jailbreak_attempt.instruction_override","category":"jailbreak_attempt","severity":"high","source":"l1"}],"action":{"cannedResponseId":"sentinel_advisory_v1"}}}\n\n',
+    );
+  });
+});
+
+describe("transport — input L1 advisory frame (§3.5)", () => {
+  const l1Advisory = {
+    categories: ["jailbreak_attempt"] as const,
+    severity: "high" as const,
+    matchedRules: ["jailbreak_attempt.instruction_override"],
+    findings: [
+      {
+        ruleId: "jailbreak_attempt.instruction_override",
+        category: "jailbreak_attempt" as const,
+        severity: "high" as const,
+        source: "l1" as const,
+      },
+    ],
+    action: { cannedResponseId: "sentinel_advisory_v1" },
+  };
+  const semanticFindings = {
+    advisory: true,
+    semanticAvailable: true as const,
+    findings: [
+      {
+        ruleId: "semantic.self_harm",
+        category: "self_harm" as const,
+        severity: "high" as const,
+        source: "semantic" as const,
+        confidence: 0.9,
+      },
+    ],
+    categories: ["self_harm"] as const,
+    severity: "high" as const,
+    matchedRules: ["semantic.self_harm"],
+    action: { cannedResponseId: "sentinel_advisory_v1" },
+  };
+  const semanticClear = {
+    advisory: false,
+    semanticAvailable: true as const,
+    findings: [] as const,
+    categories: [] as const,
+    severity: null,
+    matchedRules: [] as const,
+    action: { cannedResponseId: null },
+  };
+
+  function replyEvents(content = "hi"): AsyncGenerator<StreamEvent, void, unknown> {
+    return (async function* () {
+      yield {
+        event: "on_chain_start",
+        name: "LangGraph",
+        run_id: "root-1",
+        metadata: {},
+        data: {},
+      };
+      yield {
+        event: "on_chat_model_stream",
+        name: "ScriptedChatModel",
+        run_id: "run-1",
+        metadata: {},
+        data: { chunk: { content } },
+      };
+      yield {
+        event: "on_chain_end",
+        name: "LangGraph",
+        run_id: "root-1",
+        metadata: {},
+        data: { output: { messages: [{ type: "ai", content }] } },
+      };
+    })();
+  }
+
+  // A finding turn: the advisory is the first frame and the first
+  // chat.completion.chunk still carries the envelope — the standalone advisory
+  // frame must not consume it (§2/§3.5).
+  test("advisory leads the stream; the first choice frame still carries the envelope", async () => {
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(replyEvents(), {
+      modelId: "gpt-4o",
+      created: 1726080400,
+      id: "chatcmpl-adv",
+      sentinelAdvisory: l1Advisory,
+    })) {
+      frames.push(frame);
+    }
+
+    assert.deepEqual(JSON.parse(frames[0]!.slice("data: ".length)), {
+      sentinel: {
+        advisory: true,
+        phase: "l1",
+        source: "l1",
+        categories: ["jailbreak_attempt"],
+        severity: "high",
+        matchedRules: ["jailbreak_attempt.instruction_override"],
+        findings: [
+          {
+            ruleId: "jailbreak_attempt.instruction_override",
+            category: "jailbreak_attempt",
+            severity: "high",
+            source: "l1",
+          },
+        ],
+        action: { cannedResponseId: "sentinel_advisory_v1" },
+      },
+    });
+    assert.equal(frames[0]!.includes("choices"), false, "standalone frame has no choices");
+    assert.equal(frames[0]!.includes('"error"'), false, "standalone frame has no error");
+
+    const firstChoice = JSON.parse(frames[1]!.slice("data: ".length));
+    assert.equal(firstChoice.object, "chat.completion.chunk");
+    assert.equal(firstChoice.id, "chatcmpl-adv");
+    assert.equal(firstChoice.created, 1726080400);
+    assert.equal(firstChoice.model, "gpt-4o");
+    assert.equal(firstChoice.choices[0].delta.content, "hi");
+    assert.equal(countOccurrences(frames.join(""), "data: [DONE]"), 1);
+  });
+
+  test("no advisory option: no sentinel frame is emitted", async () => {
+    const model = new ScriptedChatModel({ turns: [[{ content: "hi" }]] });
+    const graph = createAgentGraph({ model, tools: [] });
+    const frames = await collectFrames(graph);
+
+    assert.equal(
+      frames.some((frame) => frame.includes('"sentinel"')),
+      false,
+      "clean turns emit no advisory frame",
+    );
+    assert.equal(frames[0]!.includes("chat.completion.chunk"), true);
+  });
+
+  test("L1 provisional + semantic findings: semantic frame lands after content and before finish/[DONE]", async () => {
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(replyEvents(), {
+      modelId: "gpt-4o",
+      created: 1726080400,
+      id: "chatcmpl-adv",
+      sentinelAdvisory: l1Advisory,
+      sentinelSemantic: Promise.resolve(semanticFindings),
+    })) {
+      frames.push(frame);
+    }
+
+    const payloads = frames.map((frame) =>
+      frame === DONE_FRAME ? "[DONE]" : JSON.parse(frame.slice("data: ".length)),
+    );
+    assert.equal(payloads.length, 5);
+    assert.equal((payloads[0] as { sentinel: { phase: string } }).sentinel.phase, "l1");
+    assert.equal(
+      (payloads[1] as { choices: unknown }).choices !== undefined,
+      true,
+      "content chunk precedes the semantic frame",
+    );
+    const semantic = (payloads[2] as { sentinel: Record<string, unknown> }).sentinel;
+    assert.equal(semantic.advisory, true);
+    assert.equal(semantic.phase, "semantic");
+    assert.equal(semantic.final, true);
+    assert.equal(semantic.source, "semantic");
+    assert.equal(semantic.semanticAvailable, true);
+    assert.deepEqual(semantic.categories, ["self_harm"]);
+    assert.equal(semantic.severity, "high");
+    assert.deepEqual(semantic.matchedRules, ["semantic.self_harm"]);
+    assert.deepEqual(semantic.findings, [
+      {
+        ruleId: "semantic.self_harm",
+        category: "self_harm",
+        severity: "high",
+        source: "semantic",
+        confidence: 0.9,
+      },
+    ]);
+    assert.deepEqual(semantic.action, { cannedResponseId: "sentinel_advisory_v1" });
+    assert.equal(
+      (payloads[3] as { choices: Array<{ finish_reason: string }> }).choices[0]!.finish_reason,
+      "stop",
+      "the finish chunk follows the semantic frame",
+    );
+    assert.equal(payloads[4], "[DONE]");
+  });
+
+  test("semantic-only (clean L1): the semantic frame is emitted alone", async () => {
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(replyEvents(), {
+      modelId: "gpt-4o",
+      created: 1726080400,
+      id: "chatcmpl-sem",
+      sentinelSemantic: Promise.resolve(semanticFindings),
+    })) {
+      frames.push(frame);
+    }
+
+    assert.equal(frames[0]!.includes('"sentinel"'), false, "content chunk leads — no L1 frame");
+    assert.equal(frames[0]!.includes("chat.completion.chunk"), true);
+    const semantic = JSON.parse(frames[1]!.slice("data: ".length)).sentinel;
+    assert.equal(semantic.phase, "semantic");
+    assert.equal(semantic.advisory, true);
+    assert.equal(frames[2]!.includes('"finish_reason":"stop"'), true);
+    assert.equal(frames[3], DONE_FRAME);
+  });
+
+  test("semantic clean clears the L1 provisional frame with advisory:false", async () => {
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(replyEvents(), {
+      modelId: "gpt-4o",
+      created: 1726080400,
+      id: "chatcmpl-clear",
+      sentinelAdvisory: l1Advisory,
+      sentinelSemantic: Promise.resolve(semanticClear),
+    })) {
+      frames.push(frame);
+    }
+
+    const payloads = frames.map((frame) =>
+      frame === DONE_FRAME ? "[DONE]" : JSON.parse(frame.slice("data: ".length)),
+    );
+    assert.equal(payloads.length, 5);
+    assert.equal((payloads[0] as { sentinel: { phase: string } }).sentinel.phase, "l1");
+    const clear = (payloads[2] as { sentinel: Record<string, unknown> }).sentinel;
+    assert.equal(clear.advisory, false, "explicit clear frame");
+    assert.equal(clear.phase, "semantic");
+    assert.equal(clear.final, true);
+    assert.equal(clear.semanticAvailable, true);
+    assert.deepEqual(clear.categories, []);
+    assert.equal(clear.severity, null);
+    assert.deepEqual(clear.matchedRules, []);
+    assert.deepEqual(clear.findings, []);
+    assert.deepEqual(clear.action, { cannedResponseId: null });
+    assert.equal((payloads[3] as { choices: unknown }).choices !== undefined, true);
+    assert.equal(payloads[4], "[DONE]");
+  });
+
+  test("no semantic frame when the enrichment resolves null (disabled/unavailable/dropped)", async () => {
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(replyEvents(), {
+      modelId: "gpt-4o",
+      created: 1726080400,
+      id: "chatcmpl-unavail",
+      sentinelAdvisory: l1Advisory,
+      sentinelSemantic: Promise.resolve(null),
+    })) {
+      frames.push(frame);
+    }
+
+    assert.equal(frames.filter((frame) => frame.includes('"semantic"')).length, 0);
+    assert.equal(frames[0]!.includes('"phase":"l1"'), true, "L1 stays the fallback");
+    assert.equal(countOccurrences(frames.join(""), "data: [DONE]"), 1);
+  });
+
+  test("a never-resolving enrichment does not stall [DONE] past the timeout", async () => {
+    const frames: string[] = [];
+    for await (const frame of toOpenAiSse(replyEvents(), {
+      modelId: "gpt-4o",
+      created: 1726080400,
+      id: "chatcmpl-timeout",
+      sentinelAdvisory: l1Advisory,
+      sentinelSemantic: new Promise(() => {}),
+      sentinelSemanticTimeoutMs: 10,
+    })) {
+      frames.push(frame);
+    }
+
+    assert.equal(frames.filter((frame) => frame.includes('"semantic"')).length, 0);
+    assert.equal(frames[frames.length - 1], DONE_FRAME);
   });
 });
 

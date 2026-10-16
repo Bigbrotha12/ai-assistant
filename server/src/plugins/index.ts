@@ -8,8 +8,9 @@ import { PluginStore } from "./store.ts";
  * Composition root for the plugin subsystem.
  *
  * DEFAULT wiring only: env-provided store path/trusted hosts + the bundled
- * builtin plugins (`builtin/openrouter.ts`) + the curated manifest catalog
- * (`manifests/index.ts`), both owned by a parallel agent. Tests construct
+ * builtin plugins (`builtin/openrouter.ts` and `builtin/kev4b.ts`) + the
+ * curated manifest catalog (`manifests/index.ts`), both owned by a parallel
+ * agent. Tests construct
  * `PluginStore`/`PluginRegistry` directly with injected fixtures and never
  * import this module, so the wired defaults stay out of the test graph.
  *

@@ -103,6 +103,7 @@ function modelPlugin(): ModelPluginDefinition {
         baseUrlValue: "https://example.com",
         nested: { apiUrl: "https://admin.internal.example", keep: true },
       },
+      mode: "chat",
     },
     baseUrls: [
       { id: "openrouter-api", url: "https://openrouter.ai/api/v1", label: "OpenRouter API" },

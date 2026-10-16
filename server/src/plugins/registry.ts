@@ -1,7 +1,7 @@
 import { watch } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
-import { isModelPlugin, isToolPlugin, isAgentPlugin } from "./types.ts";
+import { isModelPlugin, isToolPlugin, isAgentPlugin, isDecisionModelPlugin } from "./types.ts";
 import type {
   CredentialSpec,
   ManifestHashMismatch,
@@ -23,6 +23,12 @@ import { PluginStore } from "./store.ts";
  * only). Only `getPluginDetails()` (reserved for the auth-gated
  * `GET /v1/plugins/:id`) may include URLs. Neither shape ever carries
  * credential VALUES — the store persists spec-only credentials.
+ *
+ * Decisions-mode model plugins (`isDecisionModelPlugin`) are internal-only:
+ * they are dropped from BOTH `listAvailablePlugins()` and `getPluginDetails()`
+ * so an internal endpoint (e.g. `http://llama-kev.local:19096`) is not even
+ * discoverable by id. `requirePlugin()` still resolves them for the internal
+ * decision transport.
  */
 
 export type PluginRegistryErrorCode =
@@ -113,6 +119,9 @@ export class PluginRegistry {
     const installedIds = new Set(this.listInstalledPlugins().map((p) => p.id));
     return this.store
       .listAvailable()
+      // Decisions-mode model plugins are internal-only: never expose them (or
+      // their endpoint) through the marketplace list.
+      .filter((plugin) => !isDecisionModelPlugin(plugin))
       .map((plugin) =>
         summarizePlugin(
           plugin,
@@ -134,6 +143,10 @@ export class PluginRegistry {
     const installedIds = new Set(this.listInstalledPlugins().map((p) => p.id));
     const plugin = this.store.listAvailable().find((p) => p.id === id);
     if (!plugin) return undefined;
+    // Decisions-mode plugins are internal-only. The detail route reveals full
+    // base URLs and `inference.endpoint`; returning undefined (→ 404) keeps an
+    // internal endpoint (e.g. llama-kev.local) out of the response entirely.
+    if (isDecisionModelPlugin(plugin)) return undefined;
     const detail = isAgentPlugin(plugin)
       ? {
           ...plugin,

@@ -5,7 +5,7 @@ import {
   SENTINEL_SEVERITIES,
 } from "./types.ts";
 import type {
-  L1Finding,
+  SentinelFinding,
   SentinelAction,
   SentinelCategory,
   SentinelDecision,
@@ -108,7 +108,7 @@ function sortCategories(categories: readonly SentinelCategory[]): SentinelCatego
   );
 }
 
-function highestSeverity(findings: readonly L1Finding[]): SentinelSeverity | null {
+function highestSeverity(findings: readonly SentinelFinding[]): SentinelSeverity | null {
   let highest: SentinelSeverity | null = null;
   for (const finding of findings) {
     if (highest === null || SEVERITY_ORDER[finding.severity] > SEVERITY_ORDER[highest]) {
@@ -130,7 +130,7 @@ function actionFor(verdict: SentinelVerdictValue): SentinelAction {
 
 function rowFor(
   direction: SentinelPolicyContext["direction"],
-  finding: L1Finding,
+  finding: SentinelFinding,
   recentCategories: ReadonlySet<SentinelCategory>,
   policy: SentinelPolicy,
 ): SentinelDecisionRow {
@@ -157,7 +157,7 @@ function rowFor(
 }
 
 export function decideSentinel(
-  findings: readonly L1Finding[],
+  findings: readonly SentinelFinding[],
   context: SentinelPolicyContext,
   policy: SentinelPolicy = DEFAULT_SENTINEL_POLICY,
 ): SentinelDecision {

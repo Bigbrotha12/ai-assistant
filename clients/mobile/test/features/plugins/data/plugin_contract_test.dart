@@ -4,19 +4,21 @@ import 'dart:io';
 import 'package:ai_assistant/features/plugins/data/plugin_dto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../../../support/repo_paths.dart';
+
 /// Wire-shape contract check (plan §5, task 0.4b).
 ///
 /// Parses the SAME golden fixture the server asserts in
 /// `server/test/transport/contract.test.ts` with the matching Dart parsers.
 /// Drift on either side of the wire fails a test.
 ///
-/// Flutter tests run with the package root (repo root) as CWD, so the fixture
-/// resolves at its repo-root-relative path.
+/// The fixture lives at the repository root (shared with the server suite), so
+/// it resolves through [repoFile] rather than a CWD-relative path.
 void main() {
   late Map<String, dynamic> golden;
 
   setUpAll(() {
-    final file = File('test/fixtures/plugin_contract.json');
+    final file = repoFile('test/fixtures/plugin_contract.json');
     expect(
       file.existsSync(),
       isTrue,

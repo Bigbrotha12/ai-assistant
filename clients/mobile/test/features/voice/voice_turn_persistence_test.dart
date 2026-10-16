@@ -82,6 +82,7 @@ ProviderContainer _container({
         onReceived,
         onContent,
         onToolCallDelta,
+        onSentinelAdvisory,
       }) {
         return chatClient.sendTurn(
           conversationId,
@@ -93,6 +94,7 @@ ProviderContainer _container({
           onReceived: onReceived,
           onContent: onContent,
           onToolCallDelta: onToolCallDelta,
+          onSentinelAdvisory: onSentinelAdvisory,
         );
       }),
       chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),

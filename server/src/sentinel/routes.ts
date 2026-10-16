@@ -196,7 +196,7 @@ export function createSentinelRoutes(opts: SentinelRoutesOptions): Hono<OwnerVar
     }
     if (isDeleting(owner)) return accountDeletedResponse(c);
     try {
-      const result = service.check(owner, parsed.value);
+      const result = await service.check(owner, parsed.value);
       const responseBody = {
         ...result.verdict,
         ...(result.ledgerTaskId === null ? {} : { ledgerTaskId: result.ledgerTaskId }),

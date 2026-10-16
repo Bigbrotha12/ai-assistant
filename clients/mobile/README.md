@@ -41,7 +41,7 @@ lib/
     plugins/                       Plugin registry client, credential store
     attachments/                   File picker, upload, cache
     vision/                        Image understanding
-    notifications/                 ntfy push client
+    notifications/                 owner-scoped SSE notification client
     settings/                      Preferences, account management
     memory/                        Local AI memory store
     onboarding/                    First-run setup screens

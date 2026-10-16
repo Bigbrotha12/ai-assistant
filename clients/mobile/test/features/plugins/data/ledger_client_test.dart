@@ -166,6 +166,10 @@ class Rig {
   AuthCredentials? auth = credentials;
   late final FakeAdapter adapter;
   late final LedgerPoller poller;
+
+  /// The final path segment of each request, i.e. the lookup value polled.
+  List<String> get paths =>
+      adapter.requests.map((r) => r.uri.pathSegments.last).toList();
 }
 
 void main() {
@@ -946,7 +950,8 @@ void main() {
     await rig.clock.advance(const Duration(seconds: 1));
     final result = await handle.done;
     expect(result.task?.status, LedgerTaskStatus.succeeded);
-    expect(handle.isCurrent, isTrue);
+    // Observed completion evicts the watch, so it is no longer current.
+    expect(handle.isCurrent, isFalse);
     final history = await service.reconcileFromServer('conversation');
     expect(history.last.content, 'checkpoint answer');
     expect(
@@ -985,6 +990,187 @@ void main() {
       await scheduler.advance(Duration.zero);
       expect(adapter.requests, hasLength(2));
       expect(adapter.requests.every((r) => r.method == 'GET'), isTrue);
+    },
+  );
+
+  Map<String, dynamic> runningTask(String key) => {
+    ...taskJson(messageId: key),
+    'id': 'task-$key',
+  };
+
+  test('accelerate re-arms only the matching watch, by expected or observed id', () async {
+    final rig = Rig((request) => jsonResponse(runningTask(request.uri.pathSegments.last)));
+    rig.poller.setForeground(true);
+    rig.poller.watch(
+      const LedgerLookup.byMessageId('a'),
+      expectedTaskId: 'task-a',
+    );
+    final observed = rig.poller.watch(const LedgerLookup.byMessageId('b'));
+    rig.poller.watch(
+      const LedgerLookup.byMessageId('c'),
+      expectedTaskId: 'task-c',
+    );
+    await rig.clock.advance(Duration.zero);
+    expect(rig.paths, ['a', 'b', 'c']);
+
+    // An id no watch knows about accelerates nothing.
+    rig.poller.accelerate('task-x');
+    await rig.clock.advance(Duration.zero);
+    expect(rig.paths, ['a', 'b', 'c']);
+
+    // Expected-id match touches only `c`.
+    rig.poller.accelerate('task-c');
+    await rig.clock.advance(Duration.zero);
+    expect(rig.paths, ['a', 'b', 'c', 'c']);
+
+    // `b` matches through the id it observed on its first poll.
+    expect(observed.isCurrent, isTrue);
+    rig.poller.accelerate('task-b');
+    await rig.clock.advance(Duration.zero);
+    expect(rig.paths, ['a', 'b', 'c', 'c', 'b']);
+
+    // Expected-id match touches only `a`.
+    rig.poller.accelerate('task-a');
+    await rig.clock.advance(Duration.zero);
+    expect(rig.paths, ['a', 'b', 'c', 'c', 'b', 'a']);
+  });
+
+  test('accelerate never starts a second request while one is in flight', () async {
+    final pending = Completer<ResponseBody>();
+    final rig = Rig((_) => pending.future);
+    final handle = rig.poller.watch(
+      const LedgerLookup.byMessageId('a'),
+      expectedTaskId: 'task-a',
+    );
+    rig.poller.setForeground(true);
+    await rig.clock.advance(Duration.zero);
+    expect(rig.adapter.requests, hasLength(1));
+
+    rig.poller.accelerate('task-a');
+    await rig.clock.advance(const Duration(seconds: 5));
+    expect(rig.adapter.requests, hasLength(1));
+
+    // The settled request owns the next schedule; accelerate added no timer.
+    pending.complete(jsonResponse(runningTask('a')));
+    await flush();
+    expect(rig.adapter.requests, hasLength(1));
+    await rig.clock.advance(const Duration(seconds: 1));
+    expect(rig.adapter.requests, hasLength(2));
+    expect(handle.isCurrent, isTrue);
+  });
+
+  test('accelerate is inert while suspended and leaves no residue on resume', () async {
+    final rig = Rig((_) => jsonResponse(runningTask('a')));
+    final handle = rig.poller.watch(
+      const LedgerLookup.byMessageId('a'),
+      expectedTaskId: 'task-a',
+    );
+    rig.poller.setForeground(true);
+    await rig.clock.advance(Duration.zero);
+    expect(rig.adapter.requests, hasLength(1));
+
+    // Suspension cancels the backoff timer; accelerate must not re-arm it.
+    rig.poller.setForeground(false);
+    rig.poller.accelerate('task-a');
+    await rig.clock.advance(Duration.zero);
+    expect(rig.adapter.requests, hasLength(1));
+
+    // Resume honors the original backoff rather than an expedited poll.
+    rig.poller.setForeground(true);
+    await rig.clock.advance(Duration.zero);
+    expect(rig.adapter.requests, hasLength(1));
+    await rig.clock.advance(const Duration(seconds: 1));
+    expect(rig.adapter.requests, hasLength(2));
+    expect(handle.isCurrent, isTrue);
+  });
+
+  test('accelerate is inert after dispose and on a completed watch', () async {
+    final rig = Rig((_) => jsonResponse(runningTask('a')));
+    rig.poller.setForeground(true);
+    final handle = rig.poller.watch(
+      const LedgerLookup.byMessageId('a'),
+      expectedTaskId: 'task-a',
+    );
+    await rig.clock.advance(Duration.zero);
+    rig.poller.dispose();
+    rig.poller.accelerate('task-a');
+    await rig.clock.advance(const Duration(seconds: 30));
+    expect(rig.adapter.requests, hasLength(1));
+    expect((await handle.done).end, LedgerPollEnd.cancelled);
+
+    final settled = Rig(
+      (_) => jsonResponse({
+        ...taskJson(messageId: 'b', status: 'succeeded'),
+        'id': 'task-b',
+      }),
+    );
+    settled.poller.setForeground(true);
+    final done = settled.poller.watch(
+      const LedgerLookup.byMessageId('b'),
+      expectedTaskId: 'task-b',
+    );
+    await settled.clock.advance(Duration.zero);
+    expect((await done.done).end, LedgerPollEnd.observed);
+    settled.poller.accelerate('task-b');
+    await settled.clock.advance(const Duration(seconds: 30));
+    expect(settled.adapter.requests, hasLength(1));
+  });
+
+  test('terminal completion evicts the watch and acceleration does not revive it', () async {
+    var calls = 0;
+    final rig = Rig(
+      (_) => jsonResponse(
+        ++calls == 1 ? taskJson(status: 'succeeded') : taskJson(),
+      ),
+    );
+    rig.poller.setForeground(true);
+    final handle = rig.poller.watch(const LedgerLookup.byTaskId('task'));
+    await rig.clock.advance(Duration.zero);
+    expect((await handle.done).end, LedgerPollEnd.observed);
+    expect(rig.adapter.requests, hasLength(1));
+
+    // The finished watch is no longer current — it was evicted, not retained.
+    expect(handle.isCurrent, isFalse);
+
+    // Accelerating its task must not re-arm the evicted, completed watch.
+    rig.poller.accelerate('task');
+    await rig.clock.advance(const Duration(seconds: 30));
+    expect(rig.adapter.requests, hasLength(1));
+  });
+
+  test(
+    're-watch of the same lookup stays current and usable after the old watch completes',
+    () async {
+      var calls = 0;
+      final rig = Rig(
+        (_) => jsonResponse(
+          ++calls == 1 ? taskJson(status: 'succeeded') : taskJson(),
+        ),
+      );
+      rig.poller.setForeground(true);
+      const lookup = LedgerLookup.byTaskId('task');
+      final first = rig.poller.watch(lookup);
+      await rig.clock.advance(Duration.zero);
+      expect((await first.done).end, LedgerPollEnd.observed);
+      expect(first.isCurrent, isFalse);
+      expect(rig.adapter.requests, hasLength(1));
+
+      // A fresh watch for the same lookup is current and polls even though the
+      // completed handle once occupied that key.
+      final second = rig.poller.watch(lookup);
+      expect(second.isCurrent, isTrue);
+      await rig.clock.advance(Duration.zero);
+      expect(rig.adapter.requests, hasLength(2));
+      expect(second.isCurrent, isTrue);
+
+      // The superseded handle settling again must not evict the newer watch
+      // (identity-guarded eviction).
+      first.cancel();
+      expect(second.isCurrent, isTrue);
+
+      second.cancel();
+      expect((await second.done).end, LedgerPollEnd.cancelled);
+      expect(second.isCurrent, isFalse);
     },
   );
 }

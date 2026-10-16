@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { auth, getUserById } from "./index.ts";
 import { isDeleting } from "./account_deletion.ts";
 
@@ -29,7 +30,9 @@ export type KeyAuthFailure = Extract<KeyAuth, { ok: false }>;
 export type VerifyApiKeyFn = (c: Context) => Promise<KeyAuth>;
 
 /** Hono environment for routers that read the authenticated owner from context. */
-export type OwnerVariables = { Variables: { owner: string } };
+export type OwnerVariables = {
+  Variables: { owner: string; superuser?: boolean };
+};
 
 /** Hook run after the gate builds its denial response, e.g. to emit an audit event. */
 export type OnDenied = (
@@ -98,6 +101,71 @@ export function requireOwner(
       return response;
     }
     c.set("owner", auth.owner);
+    await next();
+  };
+}
+
+/** Owner id stamped on a request authenticated by a superuser ops secret. */
+export const SUPERUSER_OWNER = "admin";
+
+/**
+ * Constant-time comparison of a candidate token against a configured secret.
+ * Both sides are hashed to a fixed-length SHA-256 digest first, so tokens of
+ * differing lengths still compare in constant time — raw `timingSafeEqual`
+ * throws on unequal buffer lengths, and its byte-by-byte early exit can leak a
+ * shared prefix.
+ */
+function constantTimeTokenEqual(candidate: string, secret: string): boolean {
+  const candidateDigest = createHash("sha256").update(candidate, "utf8").digest();
+  const secretDigest = createHash("sha256").update(secret, "utf8").digest();
+  return timingSafeEqual(candidateDigest, secretDigest);
+}
+
+/**
+ * True when `authorization` bears one of the configured superuser secrets.
+ * An empty list never matches (the gate stays disabled). EVERY configured
+ * secret is compared — no early return — so the comparison count does not
+ * reveal which rotation entry matched.
+ */
+export function isSuperuserToken(
+  authorization: string | undefined,
+  secrets: readonly string[],
+): boolean {
+  if (secrets.length === 0) return false;
+  const match = /^Bearer\s+(.+)$/i.exec((authorization ?? "").trim());
+  const token = match ? match[1]!.trim() : null;
+  if (!token) return false;
+  let matched = false;
+  for (const secret of secrets) {
+    if (constantTimeTokenEqual(token, secret)) matched = true;
+  }
+  return matched;
+}
+
+/**
+ * Hono middleware gating the ops-only superuser surface. It accepts only a
+ * configured `SUPERUSER_API_KEY` bearer secret, then stamps `owner` as the
+ * synthetic {@link SUPERUSER_OWNER} and marks the request `superuser`, so the
+ * existing owner-scoped audit/rate-limit/deletion reads keep working.
+ *
+ * This is NOT a better-auth gate: the synthetic owner has no user row and is
+ * not revoked by account deletion. An empty secret list — or any bearer token
+ * that is not a configured secret — is refused with 403 (never 401), keeping
+ * the surface invisible to ordinary keys. Secrets are never logged or echoed;
+ * `onDenied` runs after the response is built so callers can audit the denial.
+ */
+export function requireSuperuser(
+  secrets: readonly string[] = [],
+  onDenied?: (c: Context, response: Response) => void | Promise<void>,
+): MiddlewareHandler<OwnerVariables> {
+  return async (c, next) => {
+    if (!isSuperuserToken(c.req.header("authorization"), secrets)) {
+      const response = c.json({ error: "forbidden" }, 403);
+      await onDenied?.(c, response);
+      return response;
+    }
+    c.set("owner", SUPERUSER_OWNER);
+    c.set("superuser", true);
     await next();
   };
 }

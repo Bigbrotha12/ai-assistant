@@ -114,6 +114,7 @@ void main() {
           onReceived,
           onContent,
           onToolCallDelta,
+          onSentinelAdvisory,
         }) {
           return script.sendTurn(
             conversationId,
@@ -125,6 +126,7 @@ void main() {
             onReceived: onReceived,
             onContent: onContent,
             onToolCallDelta: onToolCallDelta,
+            onSentinelAdvisory: onSentinelAdvisory,
           );
         }),
         chatStoreProvider.overrideWithValue(FakeChatStore()),

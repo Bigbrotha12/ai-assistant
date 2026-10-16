@@ -1,5 +1,11 @@
 export const SENTINEL_SCHEMA_VERSION = 1 as const;
 export const SENTINEL_SHADOW_SCHEMA_VERSION = 1 as const;
+export const SENTINEL_SHADOW_SCHEMA_VERSION_SEMANTIC = 2 as const;
+export const SENTINEL_SHADOW_SCHEMA_VERSIONS = [
+  SENTINEL_SHADOW_SCHEMA_VERSION,
+  SENTINEL_SHADOW_SCHEMA_VERSION_SEMANTIC,
+] as const;
+export type SentinelShadowSchemaVersion = (typeof SENTINEL_SHADOW_SCHEMA_VERSIONS)[number];
 
 export const SENTINEL_DIRECTIONS = [
   "input",
@@ -37,7 +43,12 @@ export type SentinelSeverity = (typeof SENTINEL_SEVERITIES)[number];
 export const SENTINEL_VERDICTS = ["allow", "flag", "block"] as const;
 export type SentinelVerdictValue = (typeof SENTINEL_VERDICTS)[number];
 
+export const SENTINEL_FINDING_SOURCES = ["l1", "semantic"] as const;
+export type SentinelFindingSource = (typeof SENTINEL_FINDING_SOURCES)[number];
+
 export const SENTINEL_RUNTIME_MODE = "l1_only" as const;
+export const SENTINEL_RUNTIME_MODES = ["l1_only", "l1_semantic"] as const;
+export type SentinelRuntimeMode = (typeof SENTINEL_RUNTIME_MODES)[number];
 
 export const SENTINEL_POLICY_MODES = ["advisory", "blocking"] as const;
 export type SentinelPolicyMode = (typeof SENTINEL_POLICY_MODES)[number];
@@ -62,10 +73,18 @@ export type SentinelRuleSet = {
   rules: readonly SentinelRule[];
 };
 
-export type L1Finding = {
+/**
+ * A detector hit. `source` records which stage produced it so the two layers
+ * stay auditable side by side: L1 findings carry a real rule id, semantic
+ * findings carry a synthetic `semantic.<category>` id and the model
+ * probability in `confidence`.
+ */
+export type SentinelFinding = {
   ruleId: string;
   category: SentinelCategory;
   severity: SentinelSeverity;
+  source: SentinelFindingSource;
+  confidence?: number;
 };
 
 export type SentinelContext = {
@@ -86,7 +105,12 @@ export type SentinelAction = {
 };
 
 export type SentinelVerdict = {
-  mode: typeof SENTINEL_RUNTIME_MODE;
+  mode: SentinelRuntimeMode;
+  /**
+   * Independent from `mode`: the stage can be configured (`mode:"l1_semantic"`)
+   * yet unavailable for one text, in which case the verdict falls back to L1.
+   */
+  semanticAvailable: boolean;
   verdict: SentinelVerdictValue;
   categories: readonly SentinelCategory[];
   severity: SentinelSeverity | null;
@@ -132,6 +156,6 @@ export type SentinelDecision = {
 
 export type SentinelCheckResult = {
   verdict: SentinelVerdict;
-  findings: readonly L1Finding[];
+  findings: readonly SentinelFinding[];
   ledgerTaskId: string | null;
 };

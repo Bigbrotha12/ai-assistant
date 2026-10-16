@@ -9,6 +9,7 @@ import {
   builtinPluginIds,
   openRouterPlugin,
 } from "../../src/plugins/builtin/openrouter.ts";
+import { kev4bPlugin } from "../../src/plugins/builtin/kev4b.ts";
 import {
   availableToolManifests,
   vikunjaManifest,
@@ -17,7 +18,7 @@ import {
 } from "../../src/plugins/manifests/index.ts";
 
 const toolManifests = [vikunjaManifest, mealieManifest, spielManifest];
-const allPlugins = [openRouterPlugin, ...toolManifests];
+const allPlugins = [openRouterPlugin, kev4bPlugin, ...toolManifests];
 
 describe("boot validation contract (pluginDefinitionSchema)", () => {
   for (const plugin of allPlugins) {
@@ -62,6 +63,26 @@ describe("openrouter builtin model plugin", () => {
   test("credentials require a user-owned api key", () => {
     assert.equal(openRouterPlugin.credentials?.apiKey.required, true);
     assert.equal(openRouterPlugin.credentials?.apiKey.label, "Default provider API key");
+  });
+});
+
+describe("kev-4b builtin internal decision plugin", () => {
+  test("is a decisions-mode model plugin with fixed internal settings", () => {
+    assert.equal(kev4bPlugin.id, "kev-4b");
+    assert.equal(kev4bPlugin.type, "model");
+    assert.equal(kev4bPlugin.schemaVersion, CURRENT_PLUGIN_DEFINITION_SCHEMA_VERSION);
+    assert.equal(kev4bPlugin.inference.mode, "decisions");
+    assert.equal(kev4bPlugin.inference.endpoint, "http://llama-kev.local:19096");
+    assert.equal(kev4bPlugin.inference.defaultModel, "Kev-4B-Q8_0.gguf");
+    assert.equal(kev4bPlugin.inference.tokenLimit, 512);
+    assert.equal(kev4bPlugin.inference.supportsStreaming, false);
+    assert.equal(kev4bPlugin.inference.visionCapable, false);
+    assert.deepEqual(kev4bPlugin.inference.parameters, {});
+    assert.equal(kev4bPlugin.credentials, undefined);
+  });
+
+  test("the OpenRouter builtin still defaults to chat mode", () => {
+    assert.equal(openRouterPlugin.inference.mode, "chat");
   });
 });
 
@@ -150,11 +171,12 @@ describe("catalog membership", () => {
     );
   });
 
-  test("builtinPlugins has exactly one entry, openrouter", () => {
+  test("builtinPlugins has exactly two entries, openrouter and kev-4b", () => {
     // Guards against accidentally adding OpenAI/Anthropic (or any third-party
-    // provider) as builtins later.
-    assert.equal(builtinPlugins.length, 1);
+    // chat provider) as builtins later.
+    assert.deepEqual(builtinPluginIds, ["openrouter", "kev-4b"]);
+    assert.equal(builtinPlugins.length, 2);
     assert.equal(builtinPlugins[0]!.id, "openrouter");
-    assert.deepEqual(builtinPluginIds, ["openrouter"]);
+    assert.equal(builtinPlugins[1]!.id, "kev-4b");
   });
 });

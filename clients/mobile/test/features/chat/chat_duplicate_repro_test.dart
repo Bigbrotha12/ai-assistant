@@ -10,6 +10,7 @@ import 'package:ai_assistant/features/chat/data/chat_store.dart';
 import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/chat/data/sse.dart';
 import 'package:ai_assistant/features/chat/ui/chat_providers.dart';
 import 'package:ai_assistant/features/chat/ui/chat_screen.dart';
 import 'package:ai_assistant/features/chat/ui/message_bubble.dart';
@@ -46,6 +47,7 @@ class _SlowClient extends FakeChatClient {
     void Function(int index, String name, String argsFragment)?
         onToolCallDelta,
     void Function()? onReceived,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
     for (final (text, delay) in _deltas) {
       await Future<void>.delayed(delay);

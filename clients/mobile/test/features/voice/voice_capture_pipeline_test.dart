@@ -48,6 +48,7 @@ void main() {
             onReceived,
             onContent,
             onToolCallDelta,
+            onSentinelAdvisory,
           }) {
             return chat.sendTurn(
               '',
@@ -59,6 +60,7 @@ void main() {
               onReceived: onReceived,
               onContent: onContent,
               onToolCallDelta: onToolCallDelta,
+              onSentinelAdvisory: onSentinelAdvisory,
             );
           },
       micCapture: mic,
@@ -422,6 +424,7 @@ void main() {
               onReceived,
               onContent,
               onToolCallDelta,
+              onSentinelAdvisory,
             }) {
               return restartChat.sendTurn(
                 '',
@@ -433,6 +436,7 @@ void main() {
                 onReceived: onReceived,
                 onContent: onContent,
                 onToolCallDelta: onToolCallDelta,
+                onSentinelAdvisory: onSentinelAdvisory,
               );
             },
         micCapture: restartMic,
@@ -746,6 +750,7 @@ class _TrackedPipelineHarness {
             onReceived,
             onContent,
             onToolCallDelta,
+            onSentinelAdvisory,
           }) {
             return chat.sendTurn(
               '',
@@ -757,6 +762,7 @@ class _TrackedPipelineHarness {
               onReceived: onReceived,
               onContent: onContent,
               onToolCallDelta: onToolCallDelta,
+              onSentinelAdvisory: onSentinelAdvisory,
             );
           },
       micCapture: mic,

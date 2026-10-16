@@ -6,8 +6,10 @@ import type {
 } from "../ledger/index.ts";
 import {
   SENTINEL_CATEGORIES,
+  SENTINEL_RUNTIME_MODES,
   SENTINEL_SEVERITIES,
   SENTINEL_SHADOW_DIRECTIONS,
+  SENTINEL_SHADOW_SCHEMA_VERSIONS,
   SENTINEL_VERDICTS,
 } from "./types.ts";
 import type {
@@ -225,9 +227,9 @@ function matchesQuery(
 
 function metadataFilters(query: SentinelReportQuery): TaskStepMetadataFilter[] {
   const filters: TaskStepMetadataFilter[] = [
-    { path: "$.schemaVersion", value: 1 },
+    { path: "$.schemaVersion", values: SENTINEL_SHADOW_SCHEMA_VERSIONS },
     { path: "$.shadow", value: 1 },
-    { path: "$.mode", value: "l1_only" },
+    { path: "$.mode", values: SENTINEL_RUNTIME_MODES },
     { path: "$.policyMode", values: ["blocking", "advisory"] },
     {
       path: "$.direction",

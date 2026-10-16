@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
+import {
+  accountDeletedResponse,
+  requireApiKey,
+  requireOwner,
+  requireSuperuser,
+} from "../auth/request_auth.ts";
 import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import { isDeleting } from "../auth/account_deletion.ts";
+import { env } from "../config/env.ts";
 import { createTokenBucketLimiter } from "../managers/token_bucket.ts";
 import { PluginRegistryError } from "./registry.ts";
 import type { PluginRegistry } from "./registry.ts";
@@ -27,15 +33,20 @@ import {
  * "email_not_verified" }` the 403 path without ever touching auth. The
  * `limiter` seam swaps the default token bucket for a deterministic stub.
  *
- * AUTHORIZATION MODEL (single-owner homelab): this gateway is a personal
- * homelab appliance. Every ApiKey issued by better-auth belongs to the owner;
- * there is NO multi-tenant / admin-role concept anywhere in the system. All
- * plugin-management endpoints are therefore gated only by "is a valid key"
- * (which means "is the owner") and must NOT grow a role system. If this ever
- * becomes multi-tenant, the /v1/plugins/:id detail endpoint — which reveals
- * allowlisted base URLs pointing at admin-trusted internal hosts — needs an
- * explicit admin gate; today it is already auth-gated, and that single gate IS
- * the owner gate.
+ * AUTHORIZATION MODEL (two gates):
+ *   - `GET /v1/plugins` (the public-ish catalog list) sits behind
+ *     `requireOwner` — any valid better-auth API key (the single homelab owner)
+ *     may read the redacted `PluginSummary[]`.
+ *   - The plugin-MANAGEMENT endpoints (`reload`, `install`, `uninstall`) AND
+ *     the full-detail `GET /v1/plugins/:id` (which reveals allowlisted baseUrls
+ *     pointing at admin-trusted internal hosts) require the process-wide
+ *     superuser ops secret (`SUPERUSER_API_KEY`), presented as `Authorization:
+ *     Bearer <secret>` and validated in constant time. The secret is NOT a
+ *     better-auth key: it names a synthetic "admin" owner, has no user row, and
+ *     is deliberately not revoked by account deletion. Empty
+ *     `SUPERUSER_API_KEY` leaves the gate disabled (403), so an unconfigured
+ *     gateway cannot manage plugins. (This supersedes the earlier "no role
+ *     system anywhere" claim: the detail/management surface now has one.)
  *
  * SECURITY / PAYLOAD DECISION (list vs details):
  *   - `GET /v1/plugins` (the public-ish list) returns `registry.
@@ -48,7 +59,7 @@ import {
  *     them avoids a redundant detail round-trip. The registry's own security
  *     contract (registry.ts) is the single authority on what each shape may
  *     carry — the routes do no extra reshaping.
- *   - `GET /v1/plugins/:id` (auth-gated) returns the FULL definition via
+ *   - `GET /v1/plugins/:id` (superuser-gated) returns the FULL definition via
  *     `registry.getPluginDetails(id)` — baseUrls WITH `url` values and the
  *     model `inference.endpoint` included — so the client can render the
  *     install/config form. Credentials remain spec-only (label/required) in
@@ -85,6 +96,12 @@ export type PluginRoutesOptions = {
   store: PluginStore;
   /** Test seam; defaults to the real `requireApiKey` from auth/request_auth.ts. */
   verifyKey?: VerifyApiKeyFn;
+  /**
+   * Test seam; defaults to `env.SUPERUSER_API_KEY`, a comma-separated rotated
+   * ops-secret list. Empty leaves the superuser gate disabled (gated endpoints
+   * answer 403).
+   */
+  superuserKeys?: readonly string[];
   /** Test seam; defaults to a real token bucket (30 req/min, burst 10). */
   limiter?: RateLimiterFn;
 };
@@ -151,39 +168,47 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono<OwnerVariabl
   const { registry, store } = opts;
   const verifyKey = opts.verifyKey ?? requireApiKey;
   const limiter = opts.limiter ?? managementLimiter;
+  const superuserKeys = opts.superuserKeys ?? env.SUPERUSER_API_KEY;
 
   const routes = new Hono<OwnerVariables>();
-  routes.use(
-    "/plugins/*",
-    requireOwner(verifyKey, (c, auth, response) => {
-      const target = managementTarget(c);
-      if (target === null) return;
-      emitManagementAudit({
-        requestId: managementRequestId(c),
-        operation: target.operation,
-        ...(target.pluginId === undefined ? {} : { pluginId: target.pluginId }),
-        startedAt: Date.now(),
-        outcome: "error",
-        status: response.status,
-        errorCode: auth.reason.toUpperCase(),
-      });
-    }),
-  );
+
+  // Owner gate: the catalog list only. Every management/detail route uses
+  // `superuserGate` below, so this gate never sees a management request.
+  const ownerGate = requireOwner(verifyKey);
+
+  // Superuser gate: management mutations + full detail. Denial audits cover the
+  // POST management mutations only — `managementTarget` matches POST only, so a
+  // denied full-detail GET returns 403 but creates no management audit record.
+  // Records are ownerless (no owner exists until the secret validates).
+  const superuserGate = requireSuperuser(superuserKeys, (c, response) => {
+    const target = managementTarget(c);
+    if (target === null) return;
+    emitManagementAudit({
+      requestId: managementRequestId(c),
+      operation: target.operation,
+      ...(target.pluginId === undefined ? {} : { pluginId: target.pluginId }),
+      startedAt: Date.now(),
+      outcome: "error",
+      status: response.status,
+      errorCode: "FORBIDDEN",
+    });
+  });
 
   // Public marketplace list. Auth-gated: the CLI/UI client needs a valid key
   // to see the catalog. Never leaks baseUrl url values (registry redacts).
-  routes.get("/plugins", (c) => {
+  routes.get("/plugins", ownerGate, (c) => {
     return c.json({ plugins: registry.listAvailablePlugins() });
   });
 
   // Full detail incl. baseUrl urls + inference.endpoint for the config form.
-  routes.get("/plugins/:id", (c) => {
+  // Superuser-gated: it reveals admin-trusted internal baseUrl values.
+  routes.get("/plugins/:id", superuserGate, (c) => {
     const detail = registry.getPluginDetails(c.req.param("id"));
     if (!detail) return c.json({ error: "plugin_not_found" }, 404);
     return c.json(detail);
   });
 
-  routes.post("/plugins/reload", async (c) => {
+  routes.post("/plugins/reload", superuserGate, async (c) => {
     const requestId = managementRequestId(c);
     const startedAt = Date.now();
     const owner = c.get("owner");
@@ -230,7 +255,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono<OwnerVariabl
 
   // Install an admin-curated manifest. No credentials ride this request; keys
   // are configured client-side per request at call time (credential.ts).
-  routes.post("/plugins/:id/install", async (c) => {
+  routes.post("/plugins/:id/install", superuserGate, async (c) => {
     const id = c.req.param("id");
     const requestId = managementRequestId(c);
     const startedAt = Date.now();
@@ -292,7 +317,7 @@ export function createPluginRoutes(opts: PluginRoutesOptions): Hono<OwnerVariabl
     }
   });
 
-  routes.post("/plugins/:id/uninstall", async (c) => {
+  routes.post("/plugins/:id/uninstall", superuserGate, async (c) => {
     const id = c.req.param("id");
     const requestId = managementRequestId(c);
     const startedAt = Date.now();

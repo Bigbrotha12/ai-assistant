@@ -1,41 +1,34 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../core/config.dart';
 import '../../../core/http/dio_provider.dart';
+import '../../auth/data/auth_credentials_providers.dart';
+import '../../plugins/data/plugin_credentials_providers.dart';
 import './notif_client.dart';
 
-/// The notifier server URL, from compile-time env. Empty (default) disables
-/// notifications — the notifier server is out of scope until it exists.
-final notifBaseUrlProvider = Provider<String>((ref) {
-  final url = BackendConfig.defaultNotifUrl.trim();
-  return url.isEmpty ? '' : url;
-});
-
-/// The ntfy access token for authenticated topics. Empty (default) until a
-/// later phase provisions and stores the real token.
-final notifAccessTokenProvider = Provider<String>((ref) => '');
-
-/// Provides the active [NotifClient].
+/// The account-scoped owner-wide notification client.
 ///
-/// Dependency-gated: returns [NoOpNotifClient] when no notifier server URL is
-/// configured, and a live [NtfyNotifClient] otherwise.
+/// [pluginAccountScopeProvider] supplies the gateway origin and rebuilds (via
+/// [ref.onDispose]) when the account changes; it throws
+/// `PluginReauthenticationRequired` while the account is not ready. The client
+/// resolves the gateway API key fresh on every reconnect through the injected
+/// closure, so a rotated key is picked up without rebuilding this provider.
 final notifClientProvider = Provider<NotifClient>((ref) {
-  final baseUrl = ref.watch(notifBaseUrlProvider);
-  if (baseUrl.isEmpty) return const NoOpNotifClient();
-  final accessToken = ref.watch(notifAccessTokenProvider);
-  final client = NtfyNotifClient(
-    baseUrl: baseUrl,
+  final scope = ref.watch(pluginAccountScopeProvider);
+  final client = GatewaySseNotifClient(
     dio: ref.watch(dioProvider),
-    accessToken: accessToken.isEmpty ? null : accessToken,
+    backendOrigin: scope.backendOrigin,
+    resolveApiKey: () async {
+      final auth = ref.read(authCredentialsProvider).value;
+      if (auth == null || auth.apiKey.trim().isEmpty) return null;
+      if (auth.accountScope != scope) return null;
+      return auth.apiKey;
+    },
   );
   ref.onDispose(client.dispose);
   return client;
 });
 
-/// Incoming notification messages from the active client, or an empty stream
-/// when notifications are disabled.
+/// Incoming notification messages for the signed-in owner.
 final notifMessagesProvider = StreamProvider<NotifMessage>((ref) {
-  final client = ref.watch(notifClientProvider);
-  if (client is NtfyNotifClient) return client.messages;
-  return const Stream<NotifMessage>.empty();
+  return ref.watch(notifClientProvider).messages;
 });

@@ -720,9 +720,8 @@ export class PluginStore {
       try {
         // Use the facade's single trust-construction path. Plugins are
         // https-only and never get the production `http:` carve-out, so unlike
-        // MCP/notify this caller passes only `trustedHosts` (no
-        // `httpAllowedHosts`) — the facade, not an inline pairing, decides what
-        // that omission means.
+        // MCP this caller passes only `trustedHosts` (no `httpAllowedHosts`) —
+        // the facade, not an inline pairing, decides what that omission means.
         const pinned = await resolvePins(entry.url, {
           trustedHosts: this.trustedHosts,
           mode: this.mode,

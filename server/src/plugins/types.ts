@@ -75,6 +75,8 @@ export const toolDefinitionSchema: z.ZodType<ToolDefinition> = z.object({
   inputSchema: jsonSchemaSchema,
 });
 
+export type InferenceMode = "chat" | "decisions";
+
 export const inferenceDefinitionSchema: z.ZodType<InferenceDefinition> =
   z.object({
     endpoint: z
@@ -85,6 +87,11 @@ export const inferenceDefinitionSchema: z.ZodType<InferenceDefinition> =
     supportsStreaming: z.boolean(),
     visionCapable: z.boolean(),
     parameters: z.record(z.string(), z.unknown()),
+    // Inference role. Omitted input (every definition written before this
+    // field existed) parses as "chat", so the plugin definition schema
+    // version does not need to move. `decisions` plugins are internal-only:
+    // they are hidden from /v1/models and the plugin list/detail surfaces.
+    mode: z.enum(["chat", "decisions"]).default("chat"),
   });
 
 export const toolPluginDefinitionSchema = z.object({
@@ -294,6 +301,26 @@ export function isModelPlugin(
   return plugin.type === "model";
 }
 
+/**
+ * A model plugin available to the chat surface. `mode: "decisions"` plugins
+ * (e.g. the Kev-4B internal decision model) are deliberately excluded — they
+ * are consumed by the decision transport, never by `/v1/models` or chat.
+ * A definition predating the `mode` field parses as `"chat"` (schema default),
+ * and an unparsed literal with no `mode` is treated as chat here too.
+ */
+export function isChatModelPlugin(
+  plugin: PluginDefinition,
+): plugin is ModelPluginDefinition {
+  return isModelPlugin(plugin) && plugin.inference.mode !== "decisions";
+}
+
+/** A model plugin reserved for the internal decision path (never chat). */
+export function isDecisionModelPlugin(
+  plugin: PluginDefinition,
+): plugin is ModelPluginDefinition {
+  return isModelPlugin(plugin) && plugin.inference.mode === "decisions";
+}
+
 export function isAgentPlugin(
   plugin: PluginDefinition,
 ): plugin is AgentPluginDefinition {
@@ -368,6 +395,16 @@ export interface InferenceDefinition {
   /** Has a vision route */
   visionCapable: boolean;
   parameters: Record<string, unknown>;
+  /**
+   * Inference role. `"chat"` serves `/v1/chat/completions`; `"decisions"` marks
+   * an internal model reached only by the decision transport and hidden from
+   * the chat model list and plugin surfaces.
+   *
+   * The wire definition may omit this (`.default("chat")` in
+   * `inferenceDefinitionSchema`), but a PARSED `InferenceDefinition` always
+   * carries it, so it is required here.
+   */
+  mode: InferenceMode;
 }
 
 /**

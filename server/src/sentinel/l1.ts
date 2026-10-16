@@ -6,8 +6,8 @@ import {
   SENTINEL_SEVERITIES,
 } from "./types.ts";
 import type {
-  L1Finding,
   SentinelCategory,
+  SentinelFinding,
   SentinelRule,
   SentinelRuleContext,
   SentinelRuleSet,
@@ -152,7 +152,7 @@ function ruleMatches(rule: SentinelRule, text: string): boolean {
 export function evaluateL1(
   text: string,
   ruleSet: SentinelRuleSet = loadRuleSet(),
-): L1Finding[] {
+): SentinelFinding[] {
   if (typeof text !== "string" || text.trim() === "") return [];
   return ruleSet.rules
     .filter((rule) => ruleMatches(rule, text))
@@ -160,6 +160,7 @@ export function evaluateL1(
       ruleId: rule.id,
       category: rule.category,
       severity: rule.severity,
+      source: "l1" as const,
     }))
     .sort((left, right) => left.ruleId.localeCompare(right.ruleId));
 }

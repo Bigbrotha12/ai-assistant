@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { bodyLimit } from "hono/body-limit";
@@ -11,18 +11,16 @@ import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import { AccountDeletedError, isDeleting } from "../auth/account_deletion.ts";
 import {
   Ledger,
-  LedgerError,
   migrateLedger,
   projectPublicTaskProgress,
-  PUBLIC_STEP_FIELD_MAX_BYTES,
   PUBLIC_STEP_ID_MAX_BYTES,
-  PUBLIC_STEP_RESULT_MAX_BYTES,
   PUBLIC_STEP_LIMIT,
   PUBLIC_TASK_PAGE_DEFAULT_LIMIT,
   PUBLIC_TASK_PAGE_MAX_LIMIT,
   PUBLIC_TASK_SPEC_MAX_BYTES,
 } from "./index.ts";
 import type { PublicStepRow, PublicTaskRow, TaskRow } from "./index.ts";
+import { configureLedgerConnection, hardenLedgerFiles } from "./schema.ts";
 import type { JobRunner } from "../jobs/runner.ts";
 
 /**
@@ -36,11 +34,14 @@ import type { JobRunner } from "../jobs/runner.ts";
  */
 mkdirSync(dirname(env.LEDGER_DB_PATH), { recursive: true });
 const ledgerDb = new Database(env.LEDGER_DB_PATH);
+configureLedgerConnection(ledgerDb);
 migrateLedger(ledgerDb);
 // The ledger persists user conversation content (`spec` = last user message
-// text, tool results in ledger_step.result), so its file must be hardened like
-// the sibling stores — SQLite creates it 0644 under a default umask otherwise.
-chmodSync(env.LEDGER_DB_PATH, 0o600);
+// text, tool results in ledger_step.result), so its file AND the WAL/SHM
+// sidecars WAL creates must be hardened like the sibling stores — SQLite
+// creates them 0644 under a default umask otherwise. Runs after the
+// user_version read inside migrateLedger, which materializes the sidecars.
+hardenLedgerFiles(env.LEDGER_DB_PATH);
 export const ledger = new Ledger(ledgerDb, {
   stuckTimeoutMs: env.LEDGER_STUCK_TIMEOUT_MS,
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,
@@ -230,200 +231,7 @@ export function createLedgerRoutes(
     return c.json(report, report.stage === "cancelling" ? 202 : 200);
   });
 
-  routes.post("/tasks/:id/claim", async (c) => {
-    const owner = c.get("owner");
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const id = c.req.param("id");
-    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
-    if (idError !== null) return publicFieldError(c, idError);
-    try {
-      return c.json(toPublicTask(l.claimTask(id, owner)));
-    } catch (e) {
-      if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
-      return ledgerError(c, e);
-    }
-  });
-
-  routes.post("/tasks/:id/steps", async (c) => {
-    const owner = c.get("owner");
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const id = c.req.param("id");
-    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
-    if (idError !== null) return publicFieldError(c, idError);
-    const body = (await c.req.json().catch(() => null)) as {
-      stage?: unknown;
-      action?: unknown;
-      result?: unknown;
-      fenceToken?: unknown;
-    } | null;
-    if (!body) return c.json({ error: "invalid_request" }, 400);
-    const stageError = publicTextError(
-      body.stage,
-      PUBLIC_STEP_FIELD_MAX_BYTES,
-      false,
-    );
-    const actionError = publicTextError(
-      body.action,
-      PUBLIC_STEP_FIELD_MAX_BYTES,
-      false,
-    );
-    if (stageError !== null) return publicFieldError(c, stageError);
-    if (actionError !== null) return publicFieldError(c, actionError);
-    if (
-      body.result !== undefined &&
-      body.result !== null &&
-      typeof body.result !== "string"
-    ) {
-      return c.json({ error: "invalid_request" }, 400);
-    }
-    if (
-      typeof body.result === "string" &&
-      exceedsByteLimit(body.result, PUBLIC_STEP_RESULT_MAX_BYTES)
-    ) {
-      return c.json({ error: "request_too_large" }, 413);
-    }
-    if (body.fenceToken !== undefined && body.fenceToken !== null) {
-      const fenceError = publicTextError(
-        body.fenceToken,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        true,
-      );
-      if (fenceError !== null) return publicFieldError(c, fenceError);
-    }
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const task = l.getTask(id, owner);
-    if (!task) return c.json({ error: "not_found" }, 404);
-    const fenceToken =
-      typeof body.fenceToken === "string" ? body.fenceToken : undefined;
-    // A RUNNING task is fence-protected — a caller appending steps without
-    // the claim/resume fence token is (or may be) a superseded worker and must
-    // not write. Queued/terminal transitions never carry a fence, so the gate
-    // is conditional on `running`.
-    if (task.status === "running" && !fenceToken) {
-      return c.json({ error: "fence_conflict" }, 403);
-    }
-    try {
-      const out = l.appendStep(
-        id,
-        owner,
-        {
-          stage: body.stage as string,
-          action: body.action as string,
-          result:
-            body.result === undefined || body.result === null
-              ? null
-              : body.result,
-        },
-        fenceToken,
-      );
-      return c.json(out, 201);
-    } catch (e) {
-      return ledgerError(c, e);
-    }
-  });
-
-  routes.post("/tasks/:id/heartbeat", async (c) => {
-    const owner = c.get("owner");
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const id = c.req.param("id");
-    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
-    if (idError !== null) return publicFieldError(c, idError);
-    const body = (await c.req.json().catch(() => null)) as {
-      fenceToken?: unknown;
-    } | null;
-    if (body?.fenceToken !== undefined && body.fenceToken !== null) {
-      const fenceError = publicTextError(
-        body.fenceToken,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        true,
-      );
-      if (fenceError !== null) return publicFieldError(c, fenceError);
-    }
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const task = l.getTask(id, owner);
-    if (!task) return c.json({ error: "not_found" }, 404);
-    const fenceToken =
-      body && typeof body.fenceToken === "string" ? body.fenceToken : undefined;
-    if (task.status === "running" && !fenceToken) {
-      return c.json({ error: "fence_conflict" }, 403);
-    }
-    try {
-      return c.json(toPublicTask(l.heartbeat(id, owner, fenceToken)));
-    } catch (e) {
-      return ledgerError(c, e);
-    }
-  });
-
-  routes.post("/tasks/:id/resume", async (c) => {
-    const owner = c.get("owner");
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const id = c.req.param("id");
-    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
-    if (idError !== null) return publicFieldError(c, idError);
-    const ownerTask = l.getTask(id, owner);
-    const sentinelError = rejectSentinelTaskTransition(c, ownerTask);
-    if (sentinelError !== null) return sentinelError;
-    try {
-      return c.json(toPublicTask(l.resumeTask(id, owner)));
-    } catch (e) {
-      if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
-      return ledgerError(c, e);
-    }
-  });
-
-  routes.post("/tasks/:id/complete", async (c) => {
-    const owner = c.get("owner");
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const id = c.req.param("id");
-    const idError = publicTextError(id, PUBLIC_STEP_ID_MAX_BYTES, true);
-    if (idError !== null) return publicFieldError(c, idError);
-    const body = (await c.req.json().catch(() => null)) as {
-      status?: unknown;
-      fenceToken?: unknown;
-    } | null;
-    const status = body?.status;
-    if (status !== "succeeded" && status !== "failed" && status !== "cancelled") {
-      return c.json({ error: "invalid_request" }, 400);
-    }
-    if (body?.fenceToken !== undefined && body.fenceToken !== null) {
-      const fenceError = publicTextError(
-        body.fenceToken,
-        PUBLIC_STEP_ID_MAX_BYTES,
-        true,
-      );
-      if (fenceError !== null) return publicFieldError(c, fenceError);
-    }
-    if (isDeleting(owner)) return accountDeletedResponse(c);
-    const task = l.getTask(id, owner);
-    if (!task) return c.json({ error: "not_found" }, 404);
-    const sentinelError = rejectSentinelTaskTransition(c, task);
-    if (sentinelError !== null) return sentinelError;
-    const fenceToken =
-      typeof body?.fenceToken === "string" ? body.fenceToken : undefined;
-    if (task.status === "running" && !fenceToken) {
-      return c.json({ error: "fence_conflict" }, 403);
-    }
-    try {
-      return c.json(
-        toPublicTask(l.completeTaskWithFence(id, owner, status, fenceToken).task),
-      );
-    } catch (e) {
-      return ledgerError(c, e);
-    }
-  });
-
   return routes;
-}
-
-function rejectSentinelTaskTransition(
-  c: Context,
-  task: TaskRow | null,
-): Response | null {
-  if (task?.worker !== "sentinel") return null;
-  return ledgerError(
-    c,
-    new LedgerError("INVALID_TRANSITION", "sentinel tasks are internal-only"),
-  );
 }
 
 const PUBLIC_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -519,18 +327,4 @@ function toPublicTask(
   const { payload: _payload, job_spec: _jobSpec, ...publicTask } =
     task as TaskRow;
   return publicTask;
-}
-
-function ledgerError(c: Context, e: unknown): Response {
-  if (e instanceof AccountDeletedError) return accountDeletedResponse(c);
-  if (e instanceof LedgerError) {
-    if (e.code === "TASK_NOT_FOUND") return c.json({ error: "not_found" }, 404);
-    if (e.code === "FORBIDDEN" || e.code === "LEASE_CONFLICT" || e.code === "FENCE_CONFLICT") {
-      return c.json({ error: e.code.toLowerCase() }, 403);
-    }
-    if (e.code === "INVALID_CONFIG") return c.json({ error: "invalid_config" }, 500);
-    return c.json({ error: e.code.toLowerCase() }, 409);
-  }
-  console.error("ledger: unexpected error", e);
-  return c.json({ error: "internal" }, 500);
 }

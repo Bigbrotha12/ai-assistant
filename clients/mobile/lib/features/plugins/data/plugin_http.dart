@@ -28,8 +28,12 @@ class PluginClientException implements Exception {
 // - `plugin_rejected` — install (SSRF-rejected manifest); no install path.
 // - `plugin_already_installed` — install pre-check; no install path.
 // - `builtin_plugin` — uninstall; no uninstall path.
-// - `fence_conflict` — ledger worker claim/heartbeat/complete
-//   (`server/src/ledger.routes.ts`); the ledger client only cancels and reads.
+// - `fence_conflict` — internal `LedgerError` (`FENCE_CONFLICT`) from the
+//   in-process fence checks in `server/src/ledger/index.ts`, driven by
+//   `server/src/jobs/runner.ts`. Worker claim/heartbeat/appendStep/complete
+//   are never exposed over HTTP (`server/src/ledger/routes.ts`), so this never
+//   reaches the client as a wire `error` envelope; the ledger client only
+//   cancels and reads.
 // - `not_configured` — `server/src/notify/routes.ts`; `notif_client.dart`
 //   reaches it through its own `Dio`, never through [PluginHttp].
 const _safeCodes = {

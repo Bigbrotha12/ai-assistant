@@ -7,11 +7,11 @@ import 'package:flutter/foundation.dart';
 
 import '../../chat/data/chat_client.dart';
 import '../../chat/data/message_model.dart';
-import '../../chat/data/sse.dart' show stripStructuredTokens;
+import '../../chat/data/sse.dart'
+    show SentinelAdvisoryEvent, sentinelAdvisoryNotice, stripStructuredTokens;
 import '../../chat/data/status_tracker.dart';
 import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_http.dart';
-import '../../sentinel/sentinel.dart';
 import './voice_conversation_state.dart';
 import '../data/audio_playback_service.dart';
 import '../data/mic_capture_service.dart';
@@ -98,6 +98,7 @@ typedef VoiceTurnSender = Future<ChatResult> Function({
   void Function()? onReceived,
   void Function(String text)? onContent,
   void Function(int index, String name, String argsFragment)? onToolCallDelta,
+  void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
 });
 
 /// Turn flow: the pipeline flushes buffered mic audio to the on-device STT
@@ -122,15 +123,13 @@ final class VoiceController {
     this.onUserMessage,
     this.onError,
     this.onNetworkError,
-    SentinelInputGate? sentinelGate,
     this.contextBuilder,
     this.systemPrompt,
     Duration? echoGateDuration,
     Duration? synthesisTimeout,
   }) : _echoGateDuration =
            echoGateDuration ?? const Duration(milliseconds: 300),
-       _synthesisTimeout = synthesisTimeout ?? const Duration(seconds: 60),
-       sentinelGate = sentinelGate ?? SentinelInputGate() {
+       _synthesisTimeout = synthesisTimeout ?? const Duration(seconds: 60) {
     // Mic frames → local buffer for on-device STT. The capture pipeline is
     // the single error reporter for mic streams (it routes into
     // [reportError]); this listener only logs so a broadcast error can never
@@ -209,8 +208,6 @@ final class VoiceController {
   /// Called when a network-level error is detected. Null when the caller
   /// does not need network status notifications.
   final void Function()? onNetworkError;
-
-  final SentinelInputGate sentinelGate;
 
   /// Builds the full request message list (history + new user message) for a
   /// turn. When set, [sendText] uses its result instead of a bare user
@@ -862,13 +859,6 @@ final class VoiceController {
           onDeviceTranscript: null,
         ),
       );
-      SentinelAdvisory? advisory;
-      try {
-        advisory = sentinelGate.advisory(trimmed);
-      } catch (_) {}
-      if (advisory != null) {
-        _update(_state.copyWith(notice: sentinelAdvisoryMessage));
-      }
       final builder = contextBuilder;
       final messages = builder != null
           ? await builder(trimmed)
@@ -927,6 +917,15 @@ final class VoiceController {
               for (final sentence in accumulator.takeCompleteSentences()) {
                 _enqueueText(sentence);
               }
+            }
+          },
+          onSentinelAdvisory: (advisory) {
+            if (advisory.advisory) {
+              _update(_state.copyWith(notice: sentinelAdvisoryNotice));
+            } else if (_state.notice == sentinelAdvisoryNotice) {
+              // Semantic-clean clears only the notice these events raised, so
+              // an unrelated notice (e.g. a dropped utterance) survives.
+              _update(_state.copyWith(notice: null));
             }
           },
           onToolCallDelta: (index, name, argsFragment) {

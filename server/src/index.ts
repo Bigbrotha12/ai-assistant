@@ -9,13 +9,14 @@ import { createHealthRoutes } from "./observability/health.ts";
 import { createAuthCheckRoutes, requireApiKey } from "./auth/request_auth.ts";
 import { createSentinelRoutes } from "./sentinel/routes.ts";
 import { createSentinelService } from "./sentinel/service.ts";
+import { buildSentinelSemanticOptions } from "./sentinel/semantic_wiring.ts";
 import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
 import type { JobRunner } from "./jobs/runner.ts";
 import { createLedgerRoutes, ledger } from "./ledger/routes.ts";
-import { createNtfyNotificationHook, notifyEgressConfigWarning } from "./notify/hook.ts";
-import { createNotifyRoutes } from "./notify/routes.ts";
-import { NotifyStore } from "./notify/store.ts";
+import { createSseHub } from "./notify/sse_hub.ts";
+import { createSseNotificationHook } from "./notify/sse_hook.ts";
+import { createSseNotifyRoutes } from "./notify/sse_routes.ts";
 import { createPluginWiring } from "./plugins/index.ts";
 import { createPluginRoutes } from "./plugins/routes.ts";
 import { createResetPasswordRoutes } from "./auth/reset_password.ts";
@@ -45,10 +46,12 @@ import type { Catalogs } from "./catalog/index.ts";
 // SINGLE-REPLICA ASSUMPTION (deliberate deployment choice): the composition root
 // wires process-local deletion state, the RAM-only session store, per-process
 // tool-cache, budget, and rate-limit state, runner pin/controller registries,
-// and file-backed notify/ledger stores. These require **exactly one gateway
+// the in-memory SSE notify registry, and the file-backed ledger store.
+// These require **exactly one gateway
 // replica; no overlapping rolling deployments**. A second or overlapping
 // process can miss a deletion tombstone, admit work that raced deletion, lose
-// session state, or overwrite a stale notify snapshot. There is no in-process
+// session state, or route a job completion to the wrong replica's notify
+// streams. There is no in-process
 // way to detect the
 // real replica count; an environment flag cannot assert it, so ops must enforce
 // the Deployment and rollout. Multi-replica deletion coordination is a
@@ -90,25 +93,6 @@ app.use("/api/auth/delete-user", (c, next) => {
 });
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 app.route("/v1", createAuthCheckRoutes());
-const sentinelService = createSentinelService({
-  ledger,
-  policy: policyForMode(env.SENTINEL_POLICY_MODE ?? "advisory"),
-});
-const sentinelShadowReporter = sentinelService.shadow;
-app.route(
-  "/v1",
-  createSentinelRoutes({
-    ledger,
-    service: sentinelService,
-    verifyKey: requireApiKey,
-    policyMode: env.SENTINEL_POLICY_MODE,
-    maxBodyBytes: env.SENTINEL_MAX_BODY_BYTES,
-    rateLimiter: createPerOwnerRateLimiter({
-      ratePerMinute: env.SENTINEL_RATE_LIMIT,
-      burst: env.SENTINEL_RATE_BURST,
-    }),
-  }),
-);
 
 // Password-reset completion page — the emailed link targets `GET
 // /reset-password?token=…`, not better-auth's /api/auth callback redirect
@@ -136,17 +120,58 @@ for (const base of ["./data/checkpoints.db"]) {
   }
 }
 
-// ntfy push-notification provisioning: the topic +
-// access token are encrypted at rest with the NOTIFY_STORE_KEY secret; the
-// NOTIFY_BASE_URL env var (empty = disabled) gates the push hook. The store
-// lazy-loads, so a corrupt notify file degrades provision 500s rather than
-// taking down the gateway.
-const notifyStore = new NotifyStore({ key: env.NOTIFY_STORE_KEY });
-authModule.configureAccountDeletionNotifyStore?.(notifyStore);
-app.route("/api/notify", createNotifyRoutes({ store: notifyStore }));
+// In-memory, owner-scoped SSE registry for job-completion notifications: the
+// job runner broadcasts through it (`sse_hook.ts`) and `/v1/notify/events`
+// opens one stream per connected client. Process-local by design (see the
+// single-replica contract above); a job completing on another replica could not
+// reach a stream held here.
+const sseHub = createSseHub();
+// Mounted at the exclusive `/v1/notify`, NOT the shared `/v1` root: the router's
+// wildcard owner gate would otherwise leak onto every sibling.
+app.route("/v1/notify", createSseNotifyRoutes({ hub: sseHub }));
 
 const { registry: pluginRegistry, store: pluginStore } = createPluginWiring();
 await pluginStore.load();
+
+// The Sentinel semantic (Kev-4B) stage is a boot dependency of the plugin
+// registry/store, so it is wired AFTER the store loads (the decision plugin is
+// not resolvable before that) and BEFORE any request is accepted. A disabled
+// stage builds no client and makes no calls; an enabled-but-unavailable stage
+// fails open (the shared options object carries an evaluator that reports the
+// stage unavailable) so the gateway still starts and the check and shadow paths
+// both fall back to L1. ONE options object is shared by the service's shadow
+// reporter and its `check()` path, so they use the same client and cache.
+const sentinelSemantic = buildSentinelSemanticOptions({
+  enabled: env.SENTINEL_SEMANTIC_ENABLED,
+  pluginId: env.SENTINEL_SEMANTIC_PLUGIN_ID,
+  threshold: env.SENTINEL_SEMANTIC_THRESHOLD,
+  contextAware: env.SENTINEL_SEMANTIC_CONTEXT_AWARE,
+  timeoutMs: env.SENTINEL_SEMANTIC_TIMEOUT_MS,
+  trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+  registry: pluginRegistry,
+  pluginStore,
+});
+const sentinelService = createSentinelService({
+  ledger,
+  policy: policyForMode(env.SENTINEL_POLICY_MODE ?? "advisory"),
+  semantic: sentinelSemantic,
+});
+const sentinelShadowReporter = sentinelService.shadow;
+app.route(
+  "/v1",
+  createSentinelRoutes({
+    ledger,
+    service: sentinelService,
+    verifyKey: requireApiKey,
+    policyMode: env.SENTINEL_POLICY_MODE,
+    maxBodyBytes: env.SENTINEL_MAX_BODY_BYTES,
+    rateLimiter: createPerOwnerRateLimiter({
+      ratePerMinute: env.SENTINEL_RATE_LIMIT,
+      burst: env.SENTINEL_RATE_BURST,
+    }),
+  }),
+);
+
 // Load catalogs (skills, mcps, agent templates) from CONFIG_DIR
 const configDir = env.CONFIG_DIR;
 const catalogs: Catalogs = await loadCatalogs(configDir, pluginStore);
@@ -227,15 +252,6 @@ let jobPins: CredentialPinStore | undefined;
 //     (it closes over the admitted pin handles + running-fence guard).
 // Neither can be a root singleton: a shared one would either hold one
 // request's credentials for another's turn or lose the per-job handle/fence.
-// Tie NOTIFY_BASE_URL's host to NOTIFY_TRUSTED_HOSTS at boot. A private-
-// address (or production http:) ntfy that is not trusted would otherwise be
-// refused by SSRF validation and its pushes SILENTLY dropped — best-effort by
-// design, so warn loudly rather than exit.
-const notifyConfigWarning = notifyEgressConfigWarning(env.NOTIFY_BASE_URL, {
-  trustedHosts: env.NOTIFY_TRUSTED_HOSTS,
-  mode: env.NODE_ENV,
-});
-if (notifyConfigWarning) console.warn(notifyConfigWarning);
 try {
   jobPins = new CredentialPinStore();
   jobRunner = createJobRunner({
@@ -249,15 +265,9 @@ try {
     // admin-trusted internal plugin backend (`*.local`, RFC1918) would be
     // rejected as DNS_REBINDING on every tool call.
     trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
-    // ntfy push: the real hook behind the runner's DI seam. Empty
-    // NOTIFY_BASE_URL (the default) makes it a silent no-op.
-    notification: createNtfyNotificationHook({
-      store: notifyStore,
-      baseUrl: env.NOTIFY_BASE_URL,
-      // Admin-vouched ntfy hosts (private-range bypass + production http:
-      // carve-out), scoped to notify egress only.
-      trustedHosts: env.NOTIFY_TRUSTED_HOSTS,
-    }),
+    // Job-completion notifications fan out to the owner's open SSE streams
+    // (`/v1/notify/events`); a no-op when the owner has none.
+    notification: createSseNotificationHook(sseHub),
     // The shared in-memory tool-result cache so a repeated
     // read-only tool call is never executed twice across sync and async.
     toolCache,
@@ -336,6 +346,9 @@ const chatRateLimiter = createPerOwnerRateLimiter({
 // managed-session path.
 const sessionStore = createSessionStore();
 authModule.configureAccountDeletionRuntime?.({
+  // FIRST (DEFENSIVE_PATTERNS §4): close the owner's notification streams
+  // before aborting/purging, so a late job completion stays silent.
+  closeOwner: (owner) => sseHub.closeOwner(owner),
   abortOwner: (owner) => jobRunner?.abortOwner(owner),
   deleteSessionsForOwner: (owner) => sessionStore.deleteSessionsForOwner(owner),
   invalidateForUser: (owner) => toolCache.invalidateForUser(owner),
@@ -415,6 +428,7 @@ const shutdown = async (): Promise<void> => {
     server.close(() => resolve());
     setTimeout(resolve, 5_000).unref?.();
   });
+  cleanup("sse hub", () => sseHub.dispose());
   cleanup("warmups", () => warmups.dispose());
   cleanup("jobs", () => jobRunner?.dispose());
   cleanup("session store", () => sessionStore.dispose());

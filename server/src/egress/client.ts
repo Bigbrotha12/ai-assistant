@@ -33,9 +33,9 @@ import type { EgressPolicy, LookupFn, Mode } from "../plugins/ssrf.ts";
  * that `openPinned` uses internally, so install-time / binding-time callers do
  * not re-inline the `trustedHosts` / `httpAllowedHosts` pairing.
  *
- * Per-domain trust is modelled by CONSTRUCTION, not by request. The three
- * egress domains have different admin-vouched host lists
- * (`PLUGINS_TRUSTED_HOSTS`, `MCP_TRUSTED_HOSTS`, `NOTIFY_TRUSTED_HOSTS`); each
+ * Per-domain trust is modelled by CONSTRUCTION, not by request. The egress
+ * domains have different admin-vouched host lists
+ * (`PLUGINS_TRUSTED_HOSTS`, `MCP_TRUSTED_HOSTS`); each
  * builds its own client with its own list. There is no per-call trust
  * parameter and no shared/global list, so a call site cannot accidentally
  * apply another domain's admin-vouched hosts.
@@ -101,8 +101,8 @@ export type EgressClientOptions = {
   /**
    * Admin-vouched hosts permitted to use `http:` in production for this
    * domain (mirrors `UrlValidateOptions.httpAllowedHosts`). Defaults to empty,
-   * which keeps plugin/model egress https-only; MCP/notify pass their trusted
-   * list here too (`egressTrustOptions`).
+   * which keeps plugin/model egress https-only; MCP passes its trusted list
+   * here too (`egressTrustOptions`).
    *
    * NOTE: this type deliberately has NO `allowHttp` field. The blanket
    * `allowHttp: true` switch (`UrlValidateOptions.allowHttp`) would be a
@@ -196,9 +196,9 @@ export type ResolvePinsOptions = {
   /** Admin-vouched hostnames/IPs that bypass range checks (never scheme). */
   readonly trustedHosts?: readonly string[];
   /**
-   * Per-host production `http:` carve-out. Callers that need it (MCP, notify)
-   * pass `egressTrustOptions(list)` so the pairing can never drift; plugin /
-   * model egress omits it and stays https-only.
+   * Per-host production `http:` carve-out. Callers that need it (MCP) pass
+   * `egressTrustOptions(list)` so the pairing can never drift; plugin / model
+   * egress omits it and stays https-only.
    */
   readonly httpAllowedHosts?: readonly string[];
   /** Scheme-enforcement override (defaults to the process `NODE_ENV`). */

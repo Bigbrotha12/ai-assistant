@@ -62,6 +62,7 @@ void main() {
           onReceived,
           onContent,
           onToolCallDelta,
+          onSentinelAdvisory,
         }) {
           return chat.sendTurn(
             conversationId,
@@ -73,6 +74,7 @@ void main() {
             onReceived: onReceived,
             onContent: onContent,
             onToolCallDelta: onToolCallDelta,
+            onSentinelAdvisory: onSentinelAdvisory,
           );
         }),
         chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),

@@ -61,15 +61,15 @@ describe("immutable-image env overrides (env schema)", () => {
     ]);
   });
 
-  test("NOTIFY_TRUSTED_HOSTS defaults to an empty list", () => {
-    assert.deepEqual(parse().NOTIFY_TRUSTED_HOSTS, []);
+  test("SUPERUSER_API_KEY defaults to an empty list (gate disabled)", () => {
+    assert.deepEqual(parse().SUPERUSER_API_KEY, []);
   });
 
-  test("NOTIFY_TRUSTED_HOSTS parses a comma-separated list", () => {
+  test("SUPERUSER_API_KEY parses a trimmed comma-separated rotation list", () => {
     const env = parse({
-      NOTIFY_TRUSTED_HOSTS: "ntfy.local, 192.168.1.50 ",
+      SUPERUSER_API_KEY: " old-secret , new-secret ,, ",
     });
-    assert.deepEqual(env.NOTIFY_TRUSTED_HOSTS, ["ntfy.local", "192.168.1.50"]);
+    assert.deepEqual(env.SUPERUSER_API_KEY, ["old-secret", "new-secret"]);
   });
 
   test("agent spec caps + skill budget are env-configurable", () => {
@@ -92,6 +92,39 @@ describe("immutable-image env overrides (env schema)", () => {
     assert.equal(parse({ SENTINEL_POLICY_MODE: "blocking" }).SENTINEL_POLICY_MODE, "blocking");
     assert.equal(parse().SENTINEL_MAX_BODY_BYTES, 65_536);
     assert.equal(parse({ SENTINEL_MAX_BODY_BYTES: "1024" }).SENTINEL_MAX_BODY_BYTES, 1_024);
+  });
+
+  test("Sentinel semantic knobs default (disabled, kev-4b, 0.5, 2000ms, context-aware)", () => {
+    const env = parse();
+    assert.equal(env.SENTINEL_SEMANTIC_ENABLED, false);
+    assert.equal(env.SENTINEL_SEMANTIC_PLUGIN_ID, "kev-4b");
+    assert.equal(env.SENTINEL_SEMANTIC_THRESHOLD, 0.5);
+    assert.equal(env.SENTINEL_SEMANTIC_TIMEOUT_MS, 2_000);
+    assert.equal(env.SENTINEL_SEMANTIC_CONTEXT_AWARE, true);
+  });
+
+  test("Sentinel semantic booleans use a strict string enum, not z.coerce.boolean", () => {
+    // "false" must not be coerced to true (the z.coerce.boolean trap).
+    assert.equal(parse({ SENTINEL_SEMANTIC_ENABLED: "true" }).SENTINEL_SEMANTIC_ENABLED, true);
+    assert.equal(parse({ SENTINEL_SEMANTIC_ENABLED: "false" }).SENTINEL_SEMANTIC_ENABLED, false);
+    assert.equal(parse({ SENTINEL_SEMANTIC_CONTEXT_AWARE: "false" }).SENTINEL_SEMANTIC_CONTEXT_AWARE, false);
+    assert.throws(() => parse({ SENTINEL_SEMANTIC_ENABLED: "1" }));
+    assert.throws(() => parse({ SENTINEL_SEMANTIC_ENABLED: "yes" }));
+  });
+
+  test("Sentinel semantic threshold is bounded 0..1", () => {
+    assert.equal(parse({ SENTINEL_SEMANTIC_THRESHOLD: "0.25" }).SENTINEL_SEMANTIC_THRESHOLD, 0.25);
+    assert.throws(() => parse({ SENTINEL_SEMANTIC_THRESHOLD: "1.5" }));
+    assert.throws(() => parse({ SENTINEL_SEMANTIC_THRESHOLD: "-0.1" }));
+  });
+
+  test("Sentinel semantic plugin id + timeout are overridable", () => {
+    const env = parse({
+      SENTINEL_SEMANTIC_PLUGIN_ID: "kev-8b",
+      SENTINEL_SEMANTIC_TIMEOUT_MS: "5000",
+    });
+    assert.equal(env.SENTINEL_SEMANTIC_PLUGIN_ID, "kev-8b");
+    assert.equal(env.SENTINEL_SEMANTIC_TIMEOUT_MS, 5_000);
   });
 
   test("LEDGER_RETENTION_MS / LEDGER_SWEEP_INTERVAL_MS default to 24h / 1h and are overridable", () => {
@@ -190,45 +223,5 @@ describe("MCP_TRUSTED_HOSTS fail-fast (fresh process)", () => {
     const result = run("http://example.com");
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /invalid MCP_TRUSTED_HOSTS/);
-  });
-});
-
-describe("NOTIFY_TRUSTED_HOSTS fail-fast (fresh process)", () => {
-  const run = (notifyTrustedHosts: string) => {
-    const environment = { ...process.env };
-    for (const key of [
-      "NOTIFY_TRUSTED_HOSTS",
-      "MCP_TRUSTED_HOSTS",
-      "PLUGINS_TRUSTED_HOSTS",
-    ]) {
-      delete environment[key];
-    }
-    return spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
-      await import('./src/config/env.ts');
-      process.stdout.write('ok');
-    `], {
-      cwd: new URL("../", import.meta.url),
-      encoding: "utf8",
-      env: {
-        ...environment,
-        DOTENV_CONFIG_PATH: "/dev/null",
-        NODE_ENV: "test",
-        BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
-        BETTER_AUTH_URL: "http://localhost:17600",
-        NOTIFY_TRUSTED_HOSTS: notifyTrustedHosts,
-      },
-    });
-  };
-
-  test("a well-formed allowlist starts the gateway", () => {
-    const result = run("ntfy.local,192.168.1.50");
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, "ok");
-  });
-
-  test("a malformed entry (scheme) fails fast at load", () => {
-    const result = run("http://ntfy.local");
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /invalid NOTIFY_TRUSTED_HOSTS/);
   });
 });
