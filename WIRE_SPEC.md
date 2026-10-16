@@ -362,6 +362,7 @@ by the client's error taxonomy, not serialized.
 | 400 | `invalid_request` | `message?` | Malformed JSON; missing/unknown/non-model/non-streaming model plugin; missing or empty messages; managed request without a valid `session_id`; session delta whose last message is not a user message; invalid `agent` value (conceptual `invalid_request_error`) |
 | 400 | `invalid_credentials` | `message?` | Missing/invalid model-plugin or granted-tool credentials (conceptual `auth_error`, user-fixable) |
 | 400 | `unsupported` | `message` | Model plugin exists but cannot serve this request (e.g. non-streaming) |
+| 400 | `agent_tool_allowlist_background_unsupported` | `message` | Background admission for an agent whose manifest declares `toolAllowlist`; the allowlist is not yet enforced on the background/job path (Phase 1, fail-closed until plumbed) |
 | 400 | `context_length_exceeded` | `message` | Request exceeds the context budget (`ContextBudgetError`) |
 | 401 | `unauthorized` | — | Missing/invalid gateway key |
 | 403 | `email_not_verified` | — | Valid key, owner's email unconfirmed |
@@ -370,6 +371,9 @@ by the client's error taxonomy, not serialized.
 | 409 | `session_missing` | `reason: "evicted" \| "restart"` | Managed-session `session_id` is gone; client re-establishes under the **same** `session_id` |
 | 409 | `conversation_in_flight` | `sessionId`, `messageId` | A managed-session turn with this `messageId` is already running |
 | 409 | `message_thread_conflict` | `taskId`, `threadId` | A background task with this `messageId` belongs to a different worker |
+| 409 | `goal_not_resumable` | — | Goal is not currently resumable |
+| 409 | `goal_not_cancellable` | — | Goal is terminal and cannot be cancelled |
+| 409 | `goal_not_deletable` | — | Goal is non-terminal and must be cancelled before deletion |
 | 413 | `request_too_large` | — | Body exceeds the path's cap |
 | 429 | `rate_limited` | `retry-after` | Per-owner rate limiter rejected the request |
 | 429 | `busy` | `retry-after` | Per-user budget pool full (sync path; concurrent-capacity, retryable) |
@@ -839,6 +843,114 @@ Owner-authenticated. Returns an OpenAI-style list envelope:
 Entries are sorted by `id`. `systemPrompt` and skill contents are never serialized.
 `created` is epoch seconds and reflects response time, not a stored value. `source` is
 currently always `"template"`; the field is reserved for a future `"plugin"` origin.
+
+---
+
+## 12. Goal submission and status
+
+The goal REST endpoints are owner-scoped and use JSON requests and responses. Errors use
+the §5.1 pre-stream envelope, a flat `{"error":"<code>"}` with no `type` field. Auth
+errors are `401 unauthorized`, `403 account_deleted`, and `403 email_not_verified`.
+Credentials travel in the request body and are never persisted.
+
+### `POST /v1/goals`
+
+```jsonc
+{
+  "instruction": "plan tomorrow's meals, no shellfish, high protein",
+  "agent": "voice-assistant",
+  "modelPluginId": "openrouter",
+  "authorisedTools": ["create_mealplan"], // the ONLY authorisation point in v1
+  "tokenBudget": 200000,
+  "clientGoalId": "uuid",
+  "credentials": { "openrouter": { "apiKey": "…" } }   // pinned at admission
+}
+// 201
+{ "goalId": "g_…", "status": "queued", "todos": [], "createdAt": "…" }
+```
+
+Submit-time errors only: `400 invalid_request`, `400 invalid_credentials`,
+`401 unauthorized`, `403 email_not_verified`, `403 account_deleted`, and
+`429 busy` (`retry-after`; the per-owner concurrency cap is full, retryable).
+
+### `GET /v1/goals?status=&limit=&offset=`
+
+`status` is a validated enum. `limit` and `offset` follow `ledger.routes.ts:479-506`;
+pagination uses the `nextOffset` convention without a total (`ledger.ts:915-938`).
+Each list item carries the same goal fields the detail exposes, including
+`modelPluginId` (the goal's pinned model plugin, `null` when none was pinned).
+
+### `GET /v1/goals/:id`
+
+```jsonc
+{
+  "goalId":"g_…", "status":"paused", "pauseReason":"needs_user_input",
+  "pauseQuestion":"High protein — should I include dessert?",
+  "resultSummary": null, "failureReason": null,
+  "instruction":"…", "todos":[…],
+  "tokenBudget":200000, "tokensSpent":41230,
+  "modelPluginId":"openrouter",
+  "effectState":"none_known|completed_steps_only|unknown",
+  "canCancel":true, "canResume":true, "terminal":false,
+  "unresolvedMutations":[{"tool":"create_mealplan","argsHash":"…"}],
+  "steps":[{"seq":1,"kind":"model|tool|plan","status":"…","tokens":1234}],
+  "updatedAt":"…"
+}
+```
+
+`effectState` is one of `none_known`, `completed_steps_only`, or `unknown`.
+`pauseQuestion` is present iff `pauseReason == "needs_user_input"`. `resultSummary` is
+present iff terminal `complete`. `failureReason` is present iff terminal `failed` (this is
+how an M2 `failed(credentials_required)` reaches the client, since M2 has no pause to carry
+it). `unresolvedMutations` is non-empty whenever any `unresolved` mutation exists.
+`modelPluginId` is the goal's pinned model plugin, or `null` when it was admitted without
+one; the resume request keys its `credentials` by this value.
+
+### `POST /v1/goals/:id/resume`
+
+```jsonc
+{ "credentials": { "openrouter": { "apiKey": "…" } },
+  "answer": "no shellfish, and skip dessert",              // required iff needs_user_input
+  "tokenBudget": 400000,                                     // optional raise
+  "resolveMutations": [{ "tool": "create_mealplan", "argsHash": "…",
+                         "resolution": "not_applied" }] }   // M4+
+// 200
+{ "goalId":"g_…", "status":"queued" }
+```
+
+`answer` is **required only when the pause asked a question** — i.e. when the goal's
+`pauseReason == "needs_user_input"` (a question must be answered; a missing answer is
+`400 invalid_request`). For every other pause reason (`credentials_required`,
+`budget_exhausted`, `needs_mutation_resolution`) it is **optional**: when present it must
+still be non-empty and byte-bounded like `instruction` (`413 request_too_large` past the
+same cap); unlike every other public text field, `answer` is **multi-line** — it accepts
+U+000A (`\n`), since the resume sheet's answer input is multi-line (`minLines 3` /
+`maxLines 6`), while every other C0 control and DEL is still `400 invalid_request`. When
+absent nothing is appended to the goal's message log. `not_applied` is a **user assertion**
+(no idempotency key is sent to the target, no query-before-write), surfaced in the
+confirmation copy (R18). `tokenBudget` is optional: it raises a paused goal's per-goal
+token budget (the client's "continue with more" after `paused(budget_exhausted)`); it must
+be an integer strictly greater than the goal's current budget (and greater than
+`tokensSpent`), and its absence leaves the budget unchanged.
+
+Errors: `404 not_found`, `409 goal_not_resumable`, `400 invalid_credentials`,
+`400 invalid_request`, `413 request_too_large`, and `429 busy` (`retry-after`; the
+per-owner concurrency cap is full, retryable).
+
+### `POST /v1/goals/:id/cancel`
+
+```jsonc
+{ "goalId":"g_…", "status":"cancelled",
+  "previousStatus":"queued|running|paused",
+  "effectState":"none_known|completed_steps_only|unknown" }
+```
+
+Errors: `404 not_found` and `409 goal_not_cancellable` (terminal only).
+
+### `DELETE /v1/goals/:id`
+
+Deletes a terminal goal and its steps/messages/mutations/refusals. Returns `204`;
+`404 not_found`; `409 goal_not_deletable` while non-terminal (cancel first).
 
 ---
 

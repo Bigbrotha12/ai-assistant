@@ -10,9 +10,11 @@ import type { ToolDispatch, ToolInterceptor } from "../pipeline.ts";
  * and `fromCache`; the served value goes through `boundToolResult` (redact +
  * default-cap truncate) exactly like the production cache hit (`runner.ts:968`).
  * Post: `await next()` then `set` only when the body actually ran
- * (`dispatch.executed`) — an inner short-circuit must not be cached. The value
- * stored is `boundToolResult(dispatch.content)`, matching production's
- * "store the bounded/redacted result" behaviour (`runner.ts:980-982`).
+ * (`dispatch.executed`) and did not report an in-band domain failure
+ * (`!dispatch.bodyFailed`) — neither an inner short-circuit nor a body-failed
+ * result may be cached. The value stored is `boundToolResult(dispatch.content)`,
+ * matching production's "store the bounded/redacted result" behaviour
+ * (`runner.ts:980-982`).
  *
  * The bound applied here uses the DEFAULT cap, so the stored value is at most
  * `DEFAULT_TOOL_RESULT_MAX_CHARS`. The cache's own `maxValueChars` is
@@ -73,7 +75,12 @@ export function createCacheInterceptor(opts: {
         }
       }
       await next();
-      if (cache !== undefined && key !== undefined && dispatch.executed) {
+      if (
+        cache !== undefined &&
+        key !== undefined &&
+        dispatch.executed &&
+        !dispatch.bodyFailed
+      ) {
         cache.set(key, boundToolResult(dispatch.content));
       }
     },

@@ -14,14 +14,19 @@ import '../../attachments/ui/attachment_picker.dart';
 import '../../attachments/data/file_model.dart';
 import '../../auth/ui/auth_flow.dart';
 import '../../chat/data/chat_client.dart';
+import '../../goals/data/goal_providers.dart';
+import '../../goals/ui/goal_todo_screen.dart';
+import '../../goals/ui/goals_overlay.dart';
 import '../../settings/ui/settings_screen.dart';
 import '../../plugins/data/ledger_client.dart';
+import '../../plugins/data/plugin_credentials_store.dart';
 import '../../plugins/ui/plugins_screen.dart';
 import '../../plugins/ui/plugin_key_card.dart';
 import '../../voice/ui/voice_screen.dart';
 import './chat_providers.dart';
 import './conversation_list.dart';
 import '../data/database_providers.dart';
+import '../data/status_tracker.dart';
 import './message_list.dart';
 import '../data/message_model.dart';
 
@@ -48,6 +53,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   /// Files selected for the next message, cleared after a successful send.
   List<AttachmentDraft> _attachments = [];
+
+  /// Phase 3.7's goal trigger: while armed, the composer submits the text as a
+  /// goal (`POST /v1/goals`) instead of a chat turn, then opens its todo view.
+  /// Off by default, so the chat path is untouched until the user arms it.
+  bool _goalMode = false;
+
+  /// True while a goal admission is in flight (the composer disables Send so
+  /// one tap cannot admit two goals).
+  bool _goalSubmitting = false;
 
   /// Mirrors [ConversationState.attachmentUploads] so the picker can observe
   /// status changes live.
@@ -105,6 +119,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Future<void> _send() async {
     final text = _input.text.trim();
     if (text.isEmpty) return;
+    // Goal trigger (Phase 3.7): the same send surface, a different wire call.
+    if (_goalMode) {
+      await _sendAsGoal(text);
+      return;
+    }
     // Don't clear the input if a send can't actually start (e.g. the notifier
     // is still streaming or not DB-ready), otherwise the user's text would be
     // silently lost.
@@ -161,6 +180,70 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (conversation == null) return false;
     return conversation.messages.any(
       (m) => m.role == MessageRole.user && m.content.startsWith(text),
+    );
+  }
+
+  /// Arms/disarms the goal trigger. Arming is gated on the ONE prerequisite
+  /// the phrase mapper cannot describe (a configured template agent); every
+  /// other gap surfaces from [GoalTrigger.submit] as a typed code with its own
+  /// copy.
+  Future<void> _toggleGoalMode() async {
+    if (_goalMode) {
+      setState(() => _goalMode = false);
+      return;
+    }
+    if (_attachments.isNotEmpty || _goalSubmitting) return;
+    String message;
+    try {
+      final gap = await ref.read(goalTriggerProvider).gate();
+      if (gap == null) {
+        if (mounted) setState(() => _goalMode = true);
+        return;
+      }
+      message = gap;
+    } catch (error) {
+      message = error is PluginReauthenticationRequired
+          ? error.message
+          : statusPhraseForError(error);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Admits the goal and opens its todo view. The input clears only on
+  /// success — a refused admission keeps the instruction for retry, exactly
+  /// like a chat send that never persisted.
+  Future<void> _sendAsGoal(String text) async {
+    if (_goalSubmitting) return;
+    setState(() => _goalSubmitting = true);
+    String? goalId;
+    Object? failure;
+    try {
+      goalId = (await ref.read(goalTriggerProvider).submit(text)).goalId;
+    } catch (error) {
+      failure = error;
+    } finally {
+      if (mounted) setState(() => _goalSubmitting = false);
+    }
+    if (!mounted) return;
+    if (failure != null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(statusPhraseForError(failure))));
+      return;
+    }
+    final admitted = goalId;
+    if (admitted == null) return; // submit either returns an id or throws
+    _input.clear();
+    // Single-shot: the composer returns to a chat send after one goal, so a
+    // later message is never admitted by accident.
+    setState(() => _goalMode = false);
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => GoalTodoScreen(goalId: admitted),
+      ),
     );
   }
 
@@ -229,6 +312,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         if (next.value?.error == null) _pluginKeyDismissed = false;
       },
     );
+
+    // In-app surfacing of push notifications happens at the app root
+    // ([NotifSurfacer] in `main.dart`) so it works on every screen and only
+    // once; this screen no longer listens.
 
     // Map each selected draft to its upload job (by local path) so the row can
     // look up a status overlay; drafts still being composed have none.
@@ -336,16 +423,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             controller: _input,
             isStreaming: isStreaming,
             isDbReady: isDbReady,
-            canSend: canSend,
+            canSend: canSend && !_goalSubmitting,
             onSend: _send,
             onStop: () =>
                 ref.read(conversationProvider(_conversationId).notifier).stop(),
             onChanged: () => setState(() {}),
+            goalMode: _goalMode,
+            // A goal carries text only: attachments keep the trigger disarmed
+            // (and disarm it if picked while armed) so a file can never be
+            // silently dropped from a submission.
+            goalToggleEnabled:
+                !isStreaming && !_goalSubmitting && _attachments.isEmpty,
+            onToggleGoal: _toggleGoalMode,
             attachmentRow: showAttachmentRow
                 ? AttachmentRow(
                     attachments: _attachments,
-                    onChanged: (updated) =>
-                        setState(() => _attachments = updated),
+                    onChanged: (updated) => setState(() {
+                      _attachments = updated;
+                      if (updated.isNotEmpty) _goalMode = false;
+                    }),
                     uploadStatus: _uploadStatus,
                     draftToJobId: draftToJobId,
                     enabled: filesConfigured,
@@ -542,6 +638,9 @@ class _InputBar extends StatelessWidget {
     required this.onSend,
     required this.onStop,
     required this.onChanged,
+    required this.goalMode,
+    required this.goalToggleEnabled,
+    required this.onToggleGoal,
     this.attachmentRow,
   });
 
@@ -552,6 +651,15 @@ class _InputBar extends StatelessWidget {
   final VoidCallback onSend;
   final VoidCallback onStop;
   final VoidCallback onChanged;
+
+  /// True while the composer would submit a goal instead of a chat turn.
+  final bool goalMode;
+
+  /// False while a goal cannot be armed (streaming, an attachment present, or
+  /// an admission already in flight).
+  final bool goalToggleEnabled;
+
+  final VoidCallback onToggleGoal;
 
   /// Rendered above the text field when non-null.
   final Widget? attachmentRow;
@@ -595,6 +703,13 @@ class _InputBar extends StatelessWidget {
               attachmentRow!,
               const SizedBox(height: 8),
             ],
+            // Goals entry (3.7): the gear chip sits right-aligned directly
+            // above the text input.
+            const Align(
+              alignment: Alignment.centerRight,
+              child: GoalsChip(),
+            ),
+            const SizedBox(height: 4),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
@@ -606,10 +721,28 @@ class _InputBar extends StatelessWidget {
                     maxLines: 5,
                     onChanged: (_) => onChanged(),
                     textInputAction: TextInputAction.newline,
-                    decoration: const InputDecoration(hintText: 'Message…'),
+                    // The hint names the wire call the Send button would make
+                    // (§12's goal instruction vs a chat message).
+                    decoration: InputDecoration(
+                      hintText: goalMode ? 'Goal instruction…' : 'Message…',
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
+                IconButton(
+                  key: const Key('goal-mode'),
+                  style: actionStyle,
+                  icon: Icon(
+                    Icons.checklist,
+                    color: goalMode
+                        ? scheme.primary
+                        : scheme.onSurfaceVariant,
+                  ),
+                  tooltip: goalMode
+                      ? 'Sending as a goal (tap for a message)'
+                      : 'Send as a goal',
+                  onPressed: goalToggleEnabled ? onToggleGoal : null,
+                ),
                 if (isStreaming)
                   IconButton(
                     style: actionStyle,

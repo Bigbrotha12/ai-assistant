@@ -30,8 +30,20 @@ import '../../fakes.dart';
 import 'voice_test_fakes.dart';
 
 void main() {
-  const synthDelayMs = 120;
-  const chunkAudioMs = 100;
+  // Real-wall-clock margins, deliberately ~5x the former 120/100ms. Playback
+  // drains at real time and synthesis is a `Future.delayed`, so both are
+  // subject to scheduler jitter under a loaded parallel test run. The
+  // pipeline's correctness signature for the "LLM ahead" case is that the
+  // inter-chunk gap is *less than one full synthesis* (chunk N+1's synthesis
+  // overlaps chunk N's playback). The absolute slack in that comparison — and
+  // in the "synthesis started before the previous playback ended" ordering
+  // check — is `chunkAudioMs` (gap ≈ synthDelay - chunkAudio), while the TTFB
+  // window scales with `synthDelayMs`. Both are sized so tens of ms of jitter
+  // cannot push a gap past the threshold. Keep the 1.2 synth:playback ratio
+  // intact, and do NOT shrink these to speed the suite up — the flake returns.
+  const synthDelayMs = 600;
+  const chunkAudioMs = 500;
+  const llmDelayMs = 2000;
 
   group('voice pipeline chunk timing', () {
     test(
@@ -103,7 +115,7 @@ void main() {
         // With one-ahead pipelining, chunk N+1's synthesis overlaps chunk N's
         // playback: synthesis of the next chunk starts before the current one
         // finishes, and the audible gap shrinks below the full synthesis time
-        // (120ms synth vs 100ms playback → ~20ms residual).
+        // (600ms synth vs 500ms playback → ~100ms residual).
         expect(
           tts.synthStartMs[1],
           lessThan(playback.playEndsMs[0]),
@@ -134,7 +146,6 @@ void main() {
       'pause grows by the LLM catch-up wait when the queue empties mid-reply',
       () async {
         final clock = Stopwatch()..start();
-        const llmDelayMs = 400;
         final chat = StagedChatClient(
           clock: clock,
           stageGapMs: llmDelayMs,
@@ -206,7 +217,7 @@ void main() {
         final emptyQueueWait = llmDelayMs - synthDelayMs - chunkAudioMs;
         expect(
           emptyQueueWait,
-          _approx(180),
+          _approx(llmDelayMs - synthDelayMs - chunkAudioMs),
           reason: 'queue sat empty for the residual LLM delay',
         );
         final expectedGap = llmDelayMs - chunkAudioMs;

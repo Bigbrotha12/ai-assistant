@@ -37,4 +37,24 @@ abstract final class ManagedErrorCodes {
   static const configurationChanged = 'configuration_changed';
   static const networkError = 'network_error';
   static const timeout = 'timeout';
+
+  // Goal lifecycle (server: `server/src/goals/routes.ts`). Each names a
+  // specific, actionable refusal — none of them is a retryable server fault, so
+  // the mapper gives them their own copy rather than a generic "try again".
+
+  /// Resume was refused because the goal is not in a resumable state (terminal,
+  /// or already queued/running). Retrying the same resume will not help.
+  static const goalNotResumable = 'goal_not_resumable';
+
+  /// Cancel was refused because the goal already reached a terminal status.
+  static const goalNotCancellable = 'goal_not_cancellable';
+
+  /// Delete was refused because the goal is still live — cancel it first.
+  static const goalNotDeletable = 'goal_not_deletable';
+
+  /// Background admission for an agent whose manifest declares
+  /// `toolAllowlist` (server: `server/src/transport/chat.ts:1901`). The fix is
+  /// to run that turn synchronously, not to retry it in the background.
+  static const agentToolAllowlistBackgroundUnsupported =
+      'agent_tool_allowlist_background_unsupported';
 }

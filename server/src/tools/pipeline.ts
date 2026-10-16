@@ -89,7 +89,7 @@ export type ToolCall = {
    */
   readonly signal?: AbortSignal;
 
-  readonly channel: "sync-stateless" | "sync-managed" | "job" | "warmup";
+  readonly channel: "sync-stateless" | "sync-managed" | "job" | "goal" | "warmup";
 
   /**
    * Model tool-call id. REQUIRED by `replay`/`fence`: ledger dedupe is keyed on
@@ -116,6 +116,18 @@ export type ToolCall = {
   readonly taskId?: string;
   readonly fenceToken?: string;
   readonly allowMutatingRetry?: boolean;
+
+  /**
+   * Goal channel only. The goal fence reads these to verify the call's step
+   * is still live: `goalId` selects the goal row, `goalLeaseToken` must match
+   * the row's `lease_token`, and `stepSeq` selects the `goal_step` row whose
+   * per-step terminal flag (set by the control tools) must be unset.
+   * `goalAuthorised` is an M4 (`authorize`) field.
+   */
+  readonly goalId?: string;
+  readonly stepSeq?: number;
+  readonly goalLeaseToken?: string;
+  readonly goalAuthorised?: boolean;
 };
 
 /**
@@ -176,6 +188,14 @@ export type ToolDispatch = {
   bodySignal: AbortSignal;
   /** Set by any layer that denies; carried into `onResult`. */
   errorCode?: string;
+  /**
+   * Set by the body when the underlying call RETURNED but the tool reported an
+   * in-band domain failure in its result (e.g. MCP `isError`). Orthogonal to
+   * `errorCode`, which only ever means "denied before/without running": a body
+   * failure is not a denial and must not flip `ok`/`outcome` into the denial
+   * channel (DEFENSIVE_PATTERNS §1).
+   */
+  bodyFailed: boolean;
 };
 
 /**
@@ -231,6 +251,15 @@ export type ToolCallResult = {
   readonly content: string;
   readonly outcome: "ok" | "error" | "timeout" | "cancelled";
   readonly errorCode?: string;
+  /**
+   * The body ran and returned, but the tool reported an in-band failure in its
+   * result (e.g. MCP `isError`). Reported SIDE BY SIDE with `ok`/`outcome`, not
+   * folded into them: `ok` keeps meaning "dispatched and returned", and
+   * `errorCode` keeps meaning "denied" — a caller distinguishes "executed and
+   * clean" from "executed but the tool reported a failure" by reading this
+   * field, never by collapsing the three (DEFENSIVE_PATTERNS §1).
+   */
+  readonly bodyFailed: boolean;
   readonly durationMs: number;
   readonly inputBytes: number;
   readonly outputBytes: number;
@@ -322,6 +351,7 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
         replayed: false,
         inputBytes: 0,
         bodySignal: call.signal ?? NEVER_ABORT_SIGNAL,
+        bodyFailed: false,
       };
       const startedAt = Date.now();
 
@@ -419,6 +449,9 @@ export function createToolPipeline(opts: ToolPipelineOptions): ToolPipeline {
                 : "ok"
               : classifyOutcome(thrown, state),
           ...(errorCode === undefined ? {} : { errorCode }),
+          // Orthogonal body-failure fact: never folded into `ok`/`outcome`/
+          // `errorCode` above (DEFENSIVE_PATTERNS §1).
+          bodyFailed: state.bodyFailed,
           durationMs: Math.max(0, Date.now() - startedAt),
           inputBytes: state.inputBytes,
           outputBytes: Buffer.byteLength(state.content, "utf8"),

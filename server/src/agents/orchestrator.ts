@@ -59,7 +59,23 @@ export type BindPluginToolsOptions = {
    * binding cannot silently masquerade as another channel (the shared audit sink
    * keys off it).
    */
-  channel: "sync-stateless" | "sync-managed";
+  channel: "sync-stateless" | "sync-managed" | "goal";
+  /**
+   * Goal channel only: the per-step goal context the goal fence reads. The
+   * runner passes these (they are constant for one step); `buildCall` sets them
+   * on every `ToolCall` so the fence can verify the call's step is still live.
+   */
+  goalId?: string;
+  stepSeq?: number;
+  goalLeaseToken?: string;
+  /**
+   * Goal channel only: the goal's admission-time `authorised_tools` set. The
+   * binder stamps `goalAuthorised` on each `ToolCall` from it (`has(name)`),
+   * which the `authorize` interceptor reads to refuse an unauthorised MUTATING
+   * call before egress (plan M4/§goalAuthorised). Absent ⇒ the field is left
+   * unset, preserving the non-goal channels' unchanged `ToolCall` shape.
+   */
+  readonly authorisedTools?: ReadonlySet<string>;
   /**
    * Per-request credential source — the SOLE source of a tool call's
    * credentials + fingerprint, closing over the request's validated maps
@@ -167,6 +183,21 @@ export function bindPluginTools(
           credentialFingerprint: fingerprint,
           ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
           channel: options.channel,
+          // Goal channel: the per-step fence context. The runner passes these
+          // as bind options (constant for one step); they ride every call so
+          // the goal fence can verify the step is still live.
+          ...(options.channel === "goal"
+            ? {
+                ...(options.goalId === undefined ? {} : { goalId: options.goalId }),
+                ...(options.stepSeq === undefined ? {} : { stepSeq: options.stepSeq }),
+                ...(options.goalLeaseToken === undefined
+                  ? {}
+                  : { goalLeaseToken: options.goalLeaseToken }),
+                ...(options.authorisedTools === undefined
+                  ? {}
+                  : { goalAuthorised: options.authorisedTools.has(ctx.toolDef.name) }),
+              }
+            : {}),
           ...(ctx.toolCallId === undefined ? {} : { toolCallId: ctx.toolCallId }),
           actionId: ctx.actionId,
           timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_HANDLER_TIMEOUT_MS,
@@ -199,6 +230,10 @@ export function bindPluginTools(
             ...(options.track === undefined ? {} : { track: options.track }),
           },
           channelLabel: "sync",
+          // Phase 7.2: the goal channel retries a transient read-only failure
+          // inside the body (one dispatch = one reservation + one execution
+          // bound). Every other channel keeps its single-invocation behavior.
+          ...(options.channel === "goal" ? { readOnlyRetry: true } : {}),
         }),
     },
   });

@@ -601,10 +601,57 @@ function buildPinnedLookup(expectedHost: string, pinned: readonly string[]): Loo
   };
 }
 
+/**
+ * Races a promise against an optional abort signal (plan R8). When the signal
+ * fires first, the returned promise rejects with an `AbortError` — the caller
+ * stops waiting and the promise chain settles. The underlying work is NOT
+ * cancelled (DNS lookup is not AbortSignal-cancellable); it may still complete
+ * in the background, but nothing awaits it anymore.
+ *
+ * A signal that has ALREADY aborted rejects synchronously (well, on the next
+ * microtask) without subscribing.
+ */
+function raceWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("The operation was aborted.", "AbortError"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      cleanup();
+      reject(new DOMException("The operation was aborted.", "AbortError"));
+    };
+    const cleanup = (): void => {
+      signal.removeEventListener("abort", onAbort);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (err) => {
+        cleanup();
+        reject(err);
+      },
+    );
+  });
+}
+
 export type ResolveOptions = {
   trustedHosts?: readonly string[];
   /** Injectable A/AAAA resolver; defaults to node:dns/promises lookup. */
   lookup?: LookupFn;
+  /**
+   * Abort signal for the DNS lookup (plan R8 / Appendix A #26). `node:dns/
+   * promises.lookup` is NOT AbortSignal-cancellable, so the signal does not
+   * cancel the underlying query — it races the lookup promise against the
+   * signal and rejects with an `AbortError` when the signal fires first. The
+   * caller stops waiting (and the promise chain settles, releasing its
+   * closures); the underlying query may still complete in the background. This
+   * is the resolver-level seam that closes M2's accepted pending-resolve leak.
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -644,8 +691,15 @@ export async function resolveAndValidateHost(
   const lookupFn = opts.lookup ?? defaultLookup;
   let resolved: readonly LookupAddress[];
   try {
-    resolved = await lookupFn(normalized, { all: true, verbatim: true });
-  } catch {
+    resolved = await raceWithSignal(
+      lookupFn(normalized, { all: true, verbatim: true }),
+      opts.signal,
+    );
+  } catch (err) {
+    // A signal abort is NOT a DNS failure — re-throw it unchanged so the
+    // caller (the goal runner's setup wait-race) can distinguish "the step
+    // was cancelled" from "the host did not resolve".
+    if (err instanceof Error && err.name === "AbortError") throw err;
     throw new SsrfValidationError(
       "DNS_RESOLUTION_FAILED",
       `could not resolve host ${normalized}`,

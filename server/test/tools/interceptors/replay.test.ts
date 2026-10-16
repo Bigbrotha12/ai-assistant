@@ -305,4 +305,121 @@ describe("replay interceptor", () => {
     assert.equal(content, "ok");
     assert.equal(bodyCalls, 1);
   });
+
+  test("a body-failed mutating call records body_failed and replay re-serves bodyFailed", async () => {
+    const ledger = makeLedger();
+    const { taskId, fenceToken } = makeRunningTask(ledger);
+    const call = makeCall({
+      channel: "job",
+      tool: "create_task",
+      readOnly: false,
+      toolCallId: "call_bodyfailed",
+      taskId,
+      owner: "user-1",
+      fenceToken,
+      allowMutatingRetry: true,
+    });
+
+    // First dispatch: the body returns (no throw) but flips `bodyFailed`, as an
+    // MCP body does on `isError: true`. The replay interceptor must persist it.
+    let bodyCalls = 0;
+    const firstResults: ToolCallResult[] = [];
+    const pipeline = createToolPipeline({
+      interceptors: [createReplayInterceptor({ ledger })],
+      onResult: (_dispatch, result) => firstResults.push(result),
+    });
+    await pipeline.dispatch({
+      call,
+      bodies: makeBodies({
+        plugin: async (dispatch) => {
+          bodyCalls += 1;
+          dispatch.bodyFailed = true;
+          return '{"error":"domain failure"}';
+        },
+      }),
+    });
+    assert.equal(bodyCalls, 1);
+    assert.equal(firstResults[0]!.bodyFailed, true);
+    const steps = toolSteps(ledger, taskId);
+    assert.equal(steps.length, 1);
+    assert.equal(
+      steps[0]!.body_failed,
+      true,
+      "the domain-failure fact must be persisted on the step",
+    );
+
+    // Second dispatch: replay hit for the same toolCallId. The body must NOT
+    // run, and the replayed result must carry the restored bodyFailed fact.
+    const replayResults: ToolCallResult[] = [];
+    const replayPipeline = createToolPipeline({
+      interceptors: [createReplayInterceptor({ ledger })],
+      onResult: (_dispatch, result) => replayResults.push(result),
+    });
+    const content = await replayPipeline.dispatch({
+      call,
+      bodies: makeBodies({
+        plugin: async () => {
+          bodyCalls += 1;
+          return "never";
+        },
+      }),
+    });
+    assert.equal(bodyCalls, 1, "replay hit must not run the body");
+    assert.equal(content, '{"error":"domain failure"}');
+    assert.equal(replayResults[0]!.replayed, true);
+    assert.equal(
+      replayResults[0]!.bodyFailed,
+      true,
+      "replay must re-serve the domain-failure fact, not a clean success",
+    );
+  });
+
+  test("a clean call records body_failed=false and replay serves bodyFailed=false", async () => {
+    const ledger = makeLedger();
+    const { taskId, fenceToken } = makeRunningTask(ledger);
+    const call = makeCall({
+      channel: "job",
+      tool: "create_task",
+      readOnly: false,
+      toolCallId: "call_clean",
+      taskId,
+      owner: "user-1",
+      fenceToken,
+      allowMutatingRetry: true,
+    });
+
+    let bodyCalls = 0;
+    const pipeline = createToolPipeline({
+      interceptors: [createReplayInterceptor({ ledger })],
+    });
+    await pipeline.dispatch({
+      call,
+      bodies: makeBodies({
+        plugin: async () => {
+          bodyCalls += 1;
+          return "applied";
+        },
+      }),
+    });
+    assert.equal(toolSteps(ledger, taskId)[0]!.body_failed, false);
+
+    const replayResults: ToolCallResult[] = [];
+    const replayPipeline = createToolPipeline({
+      interceptors: [createReplayInterceptor({ ledger })],
+      onResult: (_dispatch, result) => replayResults.push(result),
+    });
+    const content = await replayPipeline.dispatch({
+      call,
+      bodies: makeBodies({
+        plugin: async () => {
+          bodyCalls += 1;
+          return "never";
+        },
+      }),
+    });
+    assert.equal(bodyCalls, 1);
+    assert.equal(content, "applied");
+    assert.equal(replayResults[0]!.replayed, true);
+    assert.equal(replayResults[0]!.bodyFailed, false);
+  });
 });

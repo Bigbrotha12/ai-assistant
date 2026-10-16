@@ -406,11 +406,27 @@ export class ToolExecutor implements ToolCallHandler {
 /** Notification seam (the gateway wires the owner-scoped SSE hub; noop by default). */
 export interface NotificationHook {
   notifyJobComplete(owner: string, taskId: string, summary: string): void | Promise<void>;
+  /**
+   * A goal left the loop needing the user. OPTIONAL so a job-only push target
+   * (or a test double) does not have to grow an arm it never uses; the goal
+   * runner falls back to its own no-op when it is absent. `status` is `paused`
+   * or `failed`; `reason` is the typed pause reason or the failure reason. Both
+   * arms receive no credential material — and the goal arm additionally
+   * receives NO instruction/question text, so a push can never leak goal
+   * content to a third-party service.
+   */
+  notifyGoalStopped?(
+    owner: string,
+    goalId: string,
+    status: "paused" | "failed",
+    reason: string,
+  ): void | Promise<void>;
 }
 
 /** Default no-op: no notification service is configured. */
 export const noopNotificationHook: NotificationHook = {
   notifyJobComplete() {},
+  notifyGoalStopped() {},
 };
 
 export type JobInput = Record<string, unknown> | null;
@@ -1597,9 +1613,10 @@ export class JobRunner {
           outcomes.push(await this.failStuck(task, "credentials_expired"));
           continue;
         }
+        const pinHandles: Record<string, CredentialPinHandle> = {};
         for (const [pluginId, credentials] of Object.entries(reestablished)) {
           if (isDeleting(task.owner)) break;
-          this.deps.pins.pin(task.owner, pluginId, credentials);
+          pinHandles[pluginId] = this.deps.pins.pin(task.owner, pluginId, credentials).handle;
         }
         if (isDeleting(task.owner)) {
           this.deps.pins.releaseOwner(task.owner);
@@ -1632,13 +1649,14 @@ export class JobRunner {
           continue;
         }
         const replay = await this.runJob({
-           owner: task.owner,
-           intentKey: task.intent_key,
-           requestId: task.intent_key,
-           spec: task.spec,
+          owner: task.owner,
+          intentKey: task.intent_key,
+          requestId: task.intent_key,
+          spec: task.spec,
           clientThreadId: task.worker ?? storedSpec.clientThreadId,
           toolPlugins: storedSpec.toolPlugins,
           modelPluginId: storedSpec.modelPluginId,
+          pinHandles,
           modelRequestConfig: storedSpec.modelRequestConfig,
           systemPrompt: storedSpec.systemPrompt,
           mcpServers: storedSpec.mcpServers,

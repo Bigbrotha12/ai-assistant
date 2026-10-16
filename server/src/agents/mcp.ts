@@ -30,6 +30,7 @@ import {
 } from "../tools/bind.ts";
 import type { ToolCall, ToolPipeline } from "../tools/pipeline.ts";
 import { buildPipelineForChannel } from "../tools/channel.ts";
+import { withReadOnlyRetry } from "../tools/read_only_retry.ts";
 import { redactForOutbound } from "../security/redact.ts";
 import {
   emitAuditEvent,
@@ -38,7 +39,7 @@ import {
 } from "../audit/telemetry.ts";
 import { isMcpHeaderReference } from "../plugins/types.ts";
 import { resolveEnvReference } from "../credentials/env_reference.ts";
-import type { JsonSchema } from "../plugins/types.ts";
+import type { AgentToolAllowlistEntry, JsonSchema } from "../plugins/types.ts";
 import { jsonSchemaToZod } from "../tools/schema.ts";
 
 /**
@@ -113,6 +114,13 @@ export type McpTool = {
 
 export type McpCallResult = {
   content?: { type?: string; text?: string }[];
+  /**
+   * MCP `isError`: the RPC transport succeeded but the tool reported a domain
+   * failure inside its result body. This is NOT a denial and NOT a thrown
+   * transport error, so it is carried as its own orthogonal field rather than
+   * being collapsed into an error code (DEFENSIVE_PATTERNS §1).
+   */
+  isError?: boolean;
 };
 
 export const DEFAULT_MCP_MAX_CONNECTIONS_PER_SERVER = 4;
@@ -285,6 +293,9 @@ type McpOperationPermit = {
 const mcpRuntimes = new Map<string, McpRuntime>();
 let mcpConnectionSequence = 0;
 let mcpBindingSequence = 0;
+
+/** A signal that never aborts: defensive fallback for the retry bound. */
+const NEVER_ABORT_SIGNAL = new AbortController().signal;
 
 /**
  * A connected MCP client. The default implementation speaks the SSE transport
@@ -996,11 +1007,23 @@ export type McpBindOptions = {
    * Channel the MCP calls belong to. `warmup` is not a valid MCP channel.
    * Defaults to `sync-stateless`.
    */
-  channel?: "sync-stateless" | "sync-managed" | "job";
+  channel?: "sync-stateless" | "sync-managed" | "job" | "goal";
   /** Job channel: task-fence fields carried on the `ToolCall`. */
   taskId?: string;
   fenceToken?: string;
   allowMutatingRetry?: boolean;
+  /** Goal channel: per-step goal-fence context carried on the `ToolCall`. */
+  goalId?: string;
+  stepSeq?: number;
+  goalLeaseToken?: string;
+  /**
+   * Goal channel only: the goal's admission-time `authorised_tools` set,
+   * mirroring `BindPluginToolsOptions.authorisedTools`. The binder stamps
+   * `goalAuthorised` on each `ToolCall` from it, which the `authorize`
+   * interceptor reads to refuse an unauthorised MUTATING call before egress
+   * (plan M4/§goalAuthorised). Absent leaves the field unset.
+   */
+  authorisedTools?: ReadonlySet<string>;
   /** Job channel: task-fence re-check, also supplied to the `fence` interceptor. */
   assertActive?: () => void;
   /** Channel-owned tracked execution (job/sync `settle()` draining). */
@@ -1014,6 +1037,18 @@ export type McpBindOptions = {
    * the deleted `mergePluginAndMcpTools` emitted.
    */
   excludeToolNames?: ReadonlySet<string>;
+  /**
+   * Positive per-tool allowlist (Phase 1.1). Semantics: absent/undefined ⇒ bind
+   * every MCP tool (current behaviour, minus `excludeToolNames`); present ⇒ only
+   * the listed names bind. An explicit empty array binds nothing. Unlisted tools
+   * are skipped silently — an out-of-allowlist CALL already fails loudly because
+   * the tool is absent from the bound set. A listed name the server does not
+   * expose is simply absent (no error). An entry's `readOnly: true` is also the
+   * D6 declaration: it promotes a tool only when the server does not mark it
+   * non-read-only (`readOnlyHint: false` / `readOnly: false`) and does not mark
+   * it destructive (`destructiveHint: true`).
+   */
+  allowTools?: readonly AgentToolAllowlistEntry[];
   /** Warning prefix for the MCP-loses-tie message (`[chat]` / `[jobs]`). */
   duplicateLogPrefix?: string;
 };
@@ -1395,6 +1430,21 @@ function callResultBytes(value: unknown): number {
   return byteLength(redactForOutbound(content.map((item) => item.text ?? "").join("\n")));
 }
 
+/**
+ * True when a settled call result reports an IN-BAND tool failure (MCP
+ * `isError`). `runMcpOperation` is generic over the result value, so the flag
+ * is read structurally; anything without a literal `isError: true` is not a
+ * body failure. A denial or a transport failure never reaches this predicate —
+ * those throw and are audited by the catch path below.
+ */
+function mcpCallResultIsError(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { isError?: unknown }).isError === true
+  );
+}
+
 type McpAuditEvent = "mcp.connect" | "mcp.list" | "mcp.tool";
 
 function emitMcpAudit(event: AuditEventInput): void {
@@ -1470,6 +1520,46 @@ type McpOperationOptions<T> = {
   run: () => Promise<T>;
   onFailure: () => void;
   outputBytes?: (value: T) => number;
+  /**
+   * Phase 7.2 (finding H1): when `true`, `run` is a read-only MCP call that may
+   * be retried ONCE on a transient transport failure. The retry lives INSIDE
+   * this operation (below `completeMcpOperation`), so a retried dispatch still
+   * emits exactly ONE `mcp.tool` audit, performs one circuit permit / failure
+   * classification, and calls `onFailure` at most once. A first-attempt
+   * transient failure can no longer open the circuit (`openMcpCircuit` also
+   * closes the server's connections) and reject the retry `MCP_CIRCUIT_OPEN`,
+   * which would mask the original transport error.
+   *
+   * Set only by the goal channel for a tool the binder classified read-only;
+   * absent ⇒ the operation is invoked exactly once.
+   */
+  retryReadOnly?: boolean;
+  /**
+   * Finding C: the ACTUAL read-only classification the binder computed (the
+   * conservative AND-merge `toolSafety.get(tool.name) ?? safe`). The retry is
+   * gated on this value, NOT on `retryReadOnly` alone, so a future caller that
+   * sets `retryReadOnly` on a mutating operation cannot silently retry it.
+   * Defaults to `false`: absent ⇒ no retry even when `retryReadOnly` is true.
+   */
+  readOnly?: boolean;
+  /**
+   * Finding B: teardown invoked once before each retry backoff, after the
+   * decision to retry and before the wait. The MCP goal channel passes
+   * `invalidateCurrent` so the first attempt's transient failure closes/removes
+   * the current lease and the retry reconnects a FRESH client instead of
+   * reusing the dead transport. It is pure teardown: it does not count a
+   * failure or take a circuit permit (those happen once, after the final
+   * attempt).
+   */
+  onRetry?: () => void | Promise<void>;
+  /**
+   * The signal that bounds ONE attempt: the pipeline-composed `bodySignal`
+   * (channel + LangChain run + `execution` timeout), so a caller cancel or a
+   * handler timeout stops the retry instead of starting another attempt. Only
+   * consulted when {@link retryReadOnly} is true; falls back to
+   * {@link attributionSignal} defensively.
+   */
+  retrySignal?: AbortSignal;
 };
 
 async function runMcpOperation<T>(
@@ -1500,7 +1590,28 @@ async function runMcpOperation<T>(
       }
       throw err;
     }
-    const value = await options.run();
+    // Phase 7.2 (finding H1): the read-only retry wraps the raw `run` INSIDE
+    // the operation. It sits BELOW `completeMcpOperation`, so a transient
+    // first-attempt failure cannot open the circuit (which would close the
+    // server's connections and make the retry fail `MCP_CIRCUIT_OPEN`, masking
+    // the original transport error). One `runMcpOperation` invocation therefore
+    // still yields exactly one circuit permit, one failure classification, one
+    // `onFailure`, and one `mcp.tool` audit.
+    const invokeRun = (): Promise<T> => options.run();
+    const value = options.retryReadOnly === true
+      ? await withReadOnlyRetry(invokeRun, {
+          // C: retry only when the binder actually classified the call
+          // read-only; `retryReadOnly` alone is not sufficient.
+          readOnly: options.readOnly === true,
+          signal:
+            options.retrySignal ??
+            options.attributionSignal ??
+            NEVER_ABORT_SIGNAL,
+          // B: between attempts, close/remove the current lease so the retry
+          // reconnects a fresh client rather than reusing a dead transport.
+          ...(options.onRetry === undefined ? {} : { onRetry: options.onRetry }),
+        })
+      : await invokeRun();
     const state = completeMcpOperation(runtime, permit, limits, true, false);
     emitMcpCircuitTransition(
        server,
@@ -1509,10 +1620,16 @@ async function runMcpOperation<T>(
       initialCircuitState,
       state,
     );
+    // A result carrying MCP `isError` means the transport succeeded (the
+    // circuit and permits count it as such) but the TOOL reported a domain
+    // failure in its body. The audit must not record that as `outcome: "ok"`.
+    // The fact rides its own `bodyFailed` field — `errorCode` stays unset
+    // because nothing was denied or thrown (DEFENSIVE_PATTERNS §1).
+    const bodyFailed = mcpCallResultIsError(value);
     emitMcpAudit({
       event: options.event,
       kind: "mcp",
-      outcome: "ok",
+      outcome: bodyFailed ? "error" : "ok",
       owner,
       server: server.name,
       tool: options.tool,
@@ -1523,6 +1640,8 @@ async function runMcpOperation<T>(
       cacheHit: options.cacheHit,
       ownerBound: owner !== undefined,
       circuitState: state,
+      // Conditional so a clean call's audit record is byte-identical to before.
+      ...(bodyFailed ? { bodyFailed: true } : {}),
     });
     return value;
   } catch (err) {
@@ -1758,7 +1877,12 @@ export async function defaultSseClientFactory(
       const r = await runRpc("invoke", () =>
         client.callTool(params, undefined, { timeout: rpcTimeoutMs }),
       );
-      return { content: r.content as McpCallResult["content"] };
+      // Preserve the SDK's in-band failure flag; a result without `isError`
+      // keeps its exact previous shape (no `isError` key).
+      return {
+        content: r.content as McpCallResult["content"],
+        ...(r.isError === undefined ? {} : { isError: r.isError }),
+      };
     },
      close: closeClient,
      forceClose,
@@ -1871,6 +1995,13 @@ export async function bindMcpServers(
   // `bindTools`.
   const pluginToolNames = opts?.excludeToolNames;
   const boundToolNames = new Set<string>(pluginToolNames ?? []);
+  // Phase 1.1: positive per-tool allowlist. `allowTools` absent ⇒ bind every
+  // discovered MCP tool (legacy); present ⇒ only listed names bind. The map
+  // also carries the D6 `readOnly` declarations for the classification below.
+  const allowTools = opts?.allowTools;
+  const allowByName = new Map<string, AgentToolAllowlistEntry>(
+    allowTools?.map((entry): [string, AgentToolAllowlistEntry] => [entry.name, entry]),
+  );
   const duplicateLogPrefix = opts?.duplicateLogPrefix ?? "[mcp]";
   const nextAnonymousToolSequence = createAnonymousSequence();
 
@@ -1902,7 +2033,9 @@ export async function bindMcpServers(
       ? undefined
       : [...server.pinnedIps];
     let retainedPinsPromise: Promise<readonly string[] | undefined> | undefined;
-    const resolvePinsForBinding = async (): Promise<readonly string[] | undefined> => {
+    const resolvePinsForBinding = async (
+      signal?: AbortSignal,
+    ): Promise<readonly string[] | undefined> => {
       if (retainedPins !== undefined) return retainedPins;
       const configuredPinOption = opts?.resolvePins ?? opts?.pinnedIps;
       if (configuredPinOption !== undefined) {
@@ -1942,6 +2075,12 @@ export async function bindMcpServers(
             mode: opts?.mode,
             lookup: opts?.lookup,
             subject: "mcp",
+            // 4.7 (plan R8): race the DNS resolve against the binding's
+            // channel+session signal so an abandoned binding (a goal setup
+            // that lost its wait-race, a request abort, a dispose) stops the
+            // pending resolve instead of leaking the promise. The underlying
+            // query is not cancelled; only the awaiting chain settles.
+            ...(signal === undefined ? {} : { signal }),
           });
           retainedPins = pins;
           return pins;
@@ -1991,7 +2130,7 @@ export async function bindMcpServers(
         ? AbortSignal.any([opts.signal, lease.record.sessionAbortController.signal])
         : lease.record.sessionAbortController.signal;
       const rawFactoryPromise = Promise.resolve().then(async () => {
-        const pinnedIps = await resolvePinsForBinding();
+        const pinnedIps = await resolvePinsForBinding(factorySignal);
         return factory(server, {
           trustedHosts: opts?.trustedHosts ?? env.MCP_TRUSTED_HOSTS,
           lookup: opts?.lookup,
@@ -2024,6 +2163,11 @@ export async function bindMcpServers(
        lease.record.clientPromise = clientPromise;
        void clientPromise.then(
          () => {
+           // D: a `getClient()` that is retried can legitimately emit TWO
+           // `mcp.connect` records for ONE dispatch — connection attempts are
+           // per-attempt (each connect is a real outbound event). Only
+           // `mcp.tool` is pinned to exactly one record per dispatch (finding
+           // H1); `mcp.connect` deliberately is not.
            emitMcpConnectAudit(lease.record, "ok");
          },
          (error: unknown) => {
@@ -2101,9 +2245,32 @@ export async function bindMcpServers(
 
       }
       const resolvedFingerprint = mcpResolvedCredentialFingerprint(server);
+      // Per-server accounting for NIT 4 observability: allowlisted names this
+      // server did not expose (a name may still match on another server).
+      const matchedAllowNames = new Set<string>();
       for (const tool of listed) {
         if (!tool.name) continue;
-        const safe = isMcpToolSafeToRepeat(tool);
+        // Phase 1.1: out-of-allowlist tools never bind — silent skip, no warning
+        // (an out-of-allowlist CALL fails loudly because the tool is absent from
+        // the bound set). An allowlisted name the server does not expose is
+        // simply absent (no error).
+        if (allowTools !== undefined && !allowByName.has(tool.name)) continue;
+        matchedAllowNames.add(tool.name);
+        // D6: a manifest-declared read-only entry promotes a tool to
+        // safe-to-repeat, but server annotations WIN over the operator
+        // declaration: the operator may still promote a genuinely un-annotated
+        // tool, yet it can never promote one the server marks non-read-only
+        // (`readOnly: false` / `readOnlyHint: false`) or destructive
+        // (`destructiveHint: true`). The raw destructive check is separate
+        // because the AND-merge below collapses un-annotated and destructive to
+        // the same `false` — only an explicitly destructive tool keeps its veto.
+        const entry = allowByName.get(tool.name);
+        const declaredReadOnly = entry?.readOnly === true;
+        const explicitlyNotReadOnly =
+          tool.readOnly === false || tool.annotations?.readOnlyHint === false;
+        const rawDestructive = tool.annotations?.destructiveHint === true;
+        let safe = isMcpToolSafeToRepeat(tool);
+        if (declaredReadOnly && !explicitlyNotReadOnly && !rawDestructive) safe = true;
         toolSafety.set(tool.name, (toolSafety.get(tool.name) ?? true) && safe);
         // Plugin-wins tie-break, exactly as the deleted `mergePluginAndMcpTools`:
         // the first occurrence wins and an MCP duplicate (against a plugin or an
@@ -2136,9 +2303,14 @@ export async function bindMcpServers(
             nextAnonymousToolSequence,
             prepare: (ctx) => {
               // Sync account-deletion tombstone, mirroring the plugin channel's
-              // `buildCall` pre-check (the job channel's fence interceptor owns
-              // this instead). Runs before `serialize`/`cache` via `dispatch`.
-              if (channel !== "job") opts?.assertActive?.();
+              // `buildCall` pre-check (the job/goal channels' fence interceptors
+              // own this instead). Runs before `serialize`/`cache` via `dispatch`.
+              if (channel !== "job" && channel !== "goal") opts?.assertActive?.();
+              // The conservative AND-merge across duplicate names, read at
+              // invocation time. Computed ONCE and reused for both the `ToolCall`
+              // and the goal-channel retry decision, so the two can never
+              // disagree about whether this call is repeatable.
+              const readOnly = toolSafety.get(tool.name) ?? safe;
               const { bodies, scope: bodyScope } = makeToolBodies({
                 source: "mcp",
                 channelLabel: "mcp",
@@ -2155,6 +2327,26 @@ export async function bindMcpServers(
                     // composed signal still reaches the outbound call below so a
                     // timeout/cancel genuinely aborts it (contract 3, N1).
                     attributionSignal: dispatch.call.signal,
+                    // Phase 7.2 (finding H1): the goal channel retries a
+                    // transient read-only failure INSIDE `runMcpOperation`, so
+                    // one dispatch still yields one `mcp.tool` audit, one
+                    // circuit classification, and one `onFailure`. The retry is
+                    // bounded by the composed `bodySignal`, so a timeout/cancel
+                    // stops it. Every other channel, and every mutating call,
+                    // invokes once.
+                    // Findings B/C: the retry carries the binder's ACTUAL
+                    // read-only classification, and tears down the current
+                    // connection between attempts (`invalidateCurrent`) so the
+                    // retry reconnects a fresh client rather than re-calling a
+                    // dead transport.
+                    ...(channel === "goal" && readOnly
+                      ? {
+                          retryReadOnly: true,
+                          readOnly,
+                          retrySignal: bodySignal,
+                          onRetry: invalidateCurrent,
+                        }
+                      : {}),
                     event: "mcp.tool",
                     tool: tool.name,
                     // Finding m1: this audit describes the TOOL call, not the
@@ -2202,9 +2394,17 @@ export async function bindMcpServers(
                     onFailure: invalidateCurrent,
                     outputBytes: callResultBytes,
                   }).then((result) => {
+                    // Capture the structured result's in-band failure flag
+                    // BEFORE it is flattened to text below: the body still
+                    // RESOLVES (a domain failure is neither a denial nor a
+                    // throw), so `bodyFailed` is the pipeline's only chance to
+                    // classify this dispatch as "executed but the tool reported
+                    // a failure" (DEFENSIVE_PATTERNS §1).
+                    dispatch.bodyFailed = result.isError === true;
                     // Post-execution tombstone re-check: do not cache a result
                     // produced after the owner began deleting (mirrors plugin sync).
-                    if (channel !== "job") opts?.assertActive?.();
+                    // The goal channel's fence interceptor owns this instead.
+                    if (channel !== "job" && channel !== "goal") opts?.assertActive?.();
                     const content = result.content ?? [];
                     return content.map((item) => item.text ?? "").join("\n");
                   }),
@@ -2226,8 +2426,8 @@ export async function bindMcpServers(
                 // same name destructive; `toolSafety` holds the AND of every
                 // occurrence, so a name any server declares non-repeatable is
                 // never treated as read-only (and therefore never cached or
-                // job-replayed).
-                readOnly: toolSafety.get(tool.name) ?? safe,
+                // job-replayed). Reused by the retry decision above.
+                readOnly,
                 ...(opts?.owner === undefined ? {} : { owner: opts.owner }),
                 ...(opts?.requestId === undefined ? {} : { requestId: opts.requestId }),
                 ...(resolvedFingerprint === undefined
@@ -2250,11 +2450,36 @@ export async function bindMcpServers(
                         : { allowMutatingRetry: opts.allowMutatingRetry }),
                     }
                   : {}),
+                // Goal channel: the per-step fence context, mirroring the plugin
+                // binder's `buildCall`. The runner passes these as bind options.
+                ...(channel === "goal"
+                  ? {
+                      ...(opts?.goalId === undefined ? {} : { goalId: opts.goalId }),
+                      ...(opts?.stepSeq === undefined ? {} : { stepSeq: opts.stepSeq }),
+                      ...(opts?.goalLeaseToken === undefined
+                        ? {}
+                        : { goalLeaseToken: opts.goalLeaseToken }),
+                      ...(opts?.authorisedTools === undefined
+                        ? {}
+                        : { goalAuthorised: opts?.authorisedTools.has(tool.name) }),
+                    }
+                  : {}),
               };
               return { call, bodies, scope: bodyScope };
             },
           }),
         );
+      }
+      if (allowTools !== undefined) {
+        let unmatched = 0;
+        for (const name of allowByName.keys()) {
+          if (!matchedAllowNames.has(name)) unmatched += 1;
+        }
+        if (unmatched > 0) {
+          logger.debug(
+            `[mcp] server '${redactForOutbound(server.name)}' exposed none of ${unmatched} allowlisted tool name(s)`,
+          );
+        }
       }
       disposers.push(dispose);
     } catch (err) {

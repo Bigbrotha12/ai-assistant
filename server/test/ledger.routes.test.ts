@@ -635,6 +635,47 @@ describe("ledger task projection and cancellation route", () => {
     );
   });
 
+  test("body_failed replay metadata never leaks onto the public step wire", async () => {
+    const { app, ledger } = makeApp();
+    const task = ledger.createTask({ owner: "user-1", intentKey: "body-failed", spec: "s" });
+    const claimed = ledger.claimTask(task.id, "user-1");
+    // A tool-call step whose tool returned a structured `isError: true` result:
+    // `body_failed` is stored so replay can re-serve the failure fact, but it
+    // is replay-restoration metadata — never public surface.
+    ledger.appendStep(
+      task.id,
+      "user-1",
+      {
+        stage: "tool",
+        action: "tool:send",
+        result: '{"isError":true}',
+        toolCallId: "call-body-failed",
+        bodyFailed: true,
+      },
+      claimed.fence_token,
+    );
+
+    // The INTERNAL reader still sees the replay flag (unchanged surface).
+    const internal = ledger.listSteps(task.id, "user-1");
+    assert.equal(internal[0]?.body_failed, true);
+
+    const response = await app.request(`/ledger/tasks/${task.id}`, { headers: auth });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      steps: Array<Record<string, unknown>>;
+    };
+    assert.equal(body.steps.length, 1);
+    const publicStep = body.steps[0] as Record<string, unknown>;
+    assert.equal(publicStep["tool_call_id"], "call-body-failed");
+    assert.equal(
+      "body_failed" in publicStep,
+      false,
+      "body_failed is replay metadata, not public surface",
+    );
+    // Parity with the other internal-only field stripped from public steps.
+    assert.equal("resultBytes" in publicStep, false);
+  });
+
   test("a failed task is terminal and is not advertised as retryable", async () => {
     const { app, ledger } = makeApp();
     const task = ledger.createTask({ owner: "user-1", intentKey: "failed", spec: "s" });

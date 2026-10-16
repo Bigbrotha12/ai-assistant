@@ -88,6 +88,29 @@ const pendingErrorPhrases = [
   'A reply is still being prepared…',
 ];
 
+// Goal lifecycle. Distinct from `serverErrorPhrases` on purpose: every one of
+// these is a refusal with a known resolution, so the copy states the resolution
+// instead of inviting a retry that would fail the same way.
+const goalNotResumablePhrases = [
+  'That goal can\'t be resumed from its current state — check whether it\'s already finished or still running.',
+  'I can\'t pick that goal back up right now; it may have already completed.',
+];
+
+const goalNotCancellablePhrases = [
+  'That goal has already finished, so there\'s nothing left to cancel.',
+  'This goal already reached a final state — cancelling it now won\'t do anything.',
+];
+
+const goalNotDeletablePhrases = [
+  'That goal is still running — cancel it first, then delete it.',
+  'I can\'t delete a goal that hasn\'t finished yet; cancel it first.',
+];
+
+const backgroundAllowlistPhrases = [
+  'This agent\'s tool list isn\'t supported for background runs yet — send it as a normal message.',
+  'I can\'t run that agent in the background yet; ask me normally and I\'ll do it in the foreground.',
+];
+
 const domainKeywords = [
   'task',
   'recipe',
@@ -252,6 +275,13 @@ String statusPhraseForError(Object error, {Random? random}) {
       ManagedErrorCodes.sessionMissing =>
         _pick(networkErrorPhrases, rng),
       ManagedErrorCodes.pendingTurnExists => _pick(pendingErrorPhrases, rng),
+      // Goal lifecycle: state refusals, never transient server faults.
+      ManagedErrorCodes.goalNotResumable => _pick(goalNotResumablePhrases, rng),
+      ManagedErrorCodes.goalNotCancellable =>
+        _pick(goalNotCancellablePhrases, rng),
+      ManagedErrorCodes.goalNotDeletable => _pick(goalNotDeletablePhrases, rng),
+      ManagedErrorCodes.agentToolAllowlistBackgroundUnsupported =>
+        _pick(backgroundAllowlistPhrases, rng),
       // A cancelled managed turn is a silent finalization, never an error.
       ManagedErrorCodes.cancelled => '',
       // All other managed codes (and unknown wire codes) are server-ish.

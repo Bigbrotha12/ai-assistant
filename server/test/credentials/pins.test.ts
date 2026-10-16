@@ -6,6 +6,7 @@ import {
   DEFAULT_PIN_MAX_LIFETIME_MS,
 } from "../../src/credentials/pins.ts";
 import { credentialFingerprint } from "../../src/plugins/credential.ts";
+import { GOAL_PIN_TTL_MS } from "../../src/goals/constants.ts";
 
 /**
  * A store with a deterministic, injectable clock so lifetime/expiry behavior
@@ -271,5 +272,45 @@ describe("credential pin store", () => {
       "the snapshot itself is frozen",
     );
     assert.equal(store.get("user-1", "vikunja", pin.handle).credentials.apiKey, "real");
+  });
+});
+
+/**
+ * The goal `goalPins` store (4.5): a flat 3h TTL (no sliding refresh, unlike
+ * the 15-min job/sync pins), driven by the same `CredentialPinStore`. The
+ * runner holds the per-goal registry; this only pins the store's own TTL math.
+ */
+describe("goal pin store TTL (4.5)", () => {
+  test("GOAL_PIN_TTL_MS is a flat 3 hours", () => {
+    assert.equal(GOAL_PIN_TTL_MS, 3 * 60 * 60 * 1_000);
+  });
+
+  test("a goal pin lives exactly the flat TTL: alive at TTL-1ms, expired past it", () => {
+    const { store, advance } = makeStore({ maxLifetimeMs: GOAL_PIN_TTL_MS });
+    store.pin("owner-1", "openrouter", { apiKey: "tok" });
+    advance(GOAL_PIN_TTL_MS - 1);
+    assert.equal(
+      store.get("owner-1", "openrouter").credentials.apiKey,
+      "tok",
+      "still alive 1ms before the flat cap",
+    );
+    advance(2); // now 1ms past the cap
+    assert.throws(() => store.get("owner-1", "openrouter"), isExpired);
+  });
+
+  test("sweep under GOAL_PIN_TTL_MS removes only expired goal pins", () => {
+    const { store, advance } = makeStore({ maxLifetimeMs: GOAL_PIN_TTL_MS });
+    store.pin("owner-1", "old", { apiKey: "a" });
+    advance(GOAL_PIN_TTL_MS - 60_000); // old pin has 1 min left
+    store.pin("owner-1", "new", { apiKey: "b" });
+    advance(61_000); // old is now expired; new still has ~2h59m
+
+    assert.equal(store.sweep(), 1);
+    assert.equal(
+      store.get("owner-1", "new").credentials.apiKey,
+      "b",
+      "the younger pin survives",
+    );
+    assert.throws(() => store.get("owner-1", "old"), isNotFound);
   });
 });

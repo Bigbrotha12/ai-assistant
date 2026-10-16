@@ -22,6 +22,10 @@ import {
   listTaskStepMetadata,
   readPublicChain,
 } from "./read_model.ts";
+import {
+  GOAL_MESSAGE_DELETE_TRIGGER_SQL,
+  GOAL_REFUSAL_DELETE_TRIGGER_SQL,
+} from "../goals/migrate.ts";
 
 export const TASK_STATUSES = [
   "queued",
@@ -78,13 +82,27 @@ export const DEFAULT_LEASE_EXPIRY_MS = 60_000;
 
 export const LEDGER_GENESIS_PREFIX = "ledger-genesis:";
 
-/** Result of {@link Ledger.purgeOwnerData} (account deletion). */
+/**
+ * Result of {@link Ledger.purgeOwnerData} (M12 account deletion).
+ * Reports the ledger and v9 goal-table scopes: every row owned by the purged
+ * owner is deleted and counted here.
+ */
 export type OwnerPurgeResult = {
   /** Non-terminal tasks transitioned to `cancelled` before the delete, with
    *  the status each held when the purge started. */
   cancelled: { id: string; from: TaskStatus }[];
   /** Number of `ledger_task` rows removed for the owner (all statuses). */
   deletedTasks: number;
+  /** Number of `goal` rows removed for the owner (all statuses). */
+  deletedGoals: number;
+  /** Number of `goal_step` rows removed for the owner's goals. */
+  deletedGoalSteps: number;
+  /** Number of `goal_message` rows removed for the owner's goals. */
+  deletedGoalMessages: number;
+  /** Number of `goal_mutation` rows removed for the owner's goals. */
+  deletedGoalMutations: number;
+  /** Number of `goal_refusal` rows removed for the owner's goals. */
+  deletedGoalRefusals: number;
 };
 
 export type LedgerConfig = {
@@ -201,6 +219,13 @@ export type StepRow = {
   ts: number;
   /** Tool-call id (v4) for replay dedupe; null for non-tool steps. */
   tool_call_id: string | null;
+  /**
+   * MCP domain-failure fact (v10). True when the tool RETURNED a structured
+   * `isError: true` result (pipeline `dispatch.bodyFailed`). Stored WITHOUT
+   * entering the chain digest, so replay can restore it. Read as 0/1 from
+   * SQLite and converted at the reader boundary.
+   */
+  body_failed: boolean;
 };
 
 export type PublicStepRow = StepRow & {
@@ -455,6 +480,10 @@ function canonicalStepContent(step: {
   action: string;
   result: string | null;
 }): string {
+  // Deliberately excludes `tool_call_id` (v4) and `body_failed` (v10): both are
+  // replay-restoration metadata, not step content identity. Replay serves the
+  // SAME content with those flags restored, so including either would change
+  // pre-existing chain digests and break `verifyChain` backward compatibility.
   return `${step.seq}|${step.stage}|${step.action}|${String(step.result ?? "")}`;
 }
 
@@ -491,6 +520,11 @@ export interface AppendStepInput {
   /** Tool-call id (v4) recorded with the step for replay dedupe; undefined for
    *  non-tool steps. */
   toolCallId?: string;
+  /** MCP domain-failure fact (v10): the tool returned a structured
+   *  `isError: true` result. Persisted so replay re-serves it instead of
+   *  presenting the replayed mutation as a clean success. Excluded from the
+   *  chain digest (see `canonicalStepContent`). */
+  bodyFailed?: boolean;
 }
 
 function redactStepResult(input: AppendStepInput): string | null {
@@ -632,11 +666,16 @@ export class Ledger {
     }
     const row = this.db
       .prepare(
-        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id,
+                body_failed
          FROM ledger_step WHERE task_id = ? AND tool_call_id = ?`,
       )
-      .get(taskId, toolCallId) as StepRow | undefined;
-    return row ?? null;
+      .get(taskId, toolCallId) as
+      | (Omit<StepRow, "body_failed"> & { body_failed: number | boolean })
+      | undefined;
+    if (!row) return null;
+    // Replay reads this flag, so convert the stored 0/1 to a real boolean here.
+    return { ...row, body_failed: row.body_failed === 1 || row.body_failed === true };
   }
 
   /**
@@ -695,10 +734,17 @@ export class Ledger {
     }
     return this.db
       .prepare(
-        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id
+        `SELECT id, task_id, seq, stage, action, result, ts, tool_call_id,
+                body_failed
          FROM ledger_step WHERE task_id = ? ORDER BY seq`,
       )
-      .all(taskId) as StepRow[];
+      .all(taskId)
+      .map((row) => {
+        const step = row as Omit<StepRow, "body_failed"> & {
+          body_failed: number | boolean;
+        };
+        return { ...step, body_failed: step.body_failed === 1 || step.body_failed === true };
+      });
   }
 
   listPublicSteps(
@@ -864,8 +910,8 @@ export class Ledger {
       this.db
         .prepare(
           `INSERT INTO ledger_step
-             (id, task_id, seq, stage, action, result, ts, tool_call_id)
-           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts, @toolCallId)`,
+             (id, task_id, seq, stage, action, result, ts, tool_call_id, body_failed)
+           VALUES (@id, @taskId, @seq, @stage, @action, @result, @ts, @toolCallId, @bodyFailed)`,
         )
         .run({
           id: stepId,
@@ -876,6 +922,7 @@ export class Ledger {
           result,
           ts,
           toolCallId: input.toolCallId ?? null,
+          bodyFailed: input.bodyFailed === true ? 1 : 0,
         });
 
       const prevDigest = this.readChain(taskId).at(-1)?.digest ?? genesisDigest(taskId);
@@ -906,6 +953,7 @@ export class Ledger {
         result,
         ts,
         tool_call_id: input.toolCallId ?? null,
+        body_failed: input.bodyFailed === true,
       };
     });
     if (!step) throw new LedgerError("APPEND_ONLY_VIOLATION", "step append failed");
@@ -1071,9 +1119,11 @@ export class Ledger {
   }
 
   /**
-   * Account-deletion purge: removes EVERY row owned by [owner] — tasks,
-   * steps and chain — and returns what happened so the caller (the better-auth
-   * `deleteUser` cascade in auth/index.ts) can observe the cleanup.
+   * M12 account-deletion purge: removes EVERY row owned by [owner] — ledger
+   * tasks/steps/chain AND the v9 goal tables (goal, goal_step, goal_message,
+   * goal_mutation, goal_refusal) — and returns what happened so the caller
+   * (the better-auth `deleteUser` cascade in auth/index.ts) can observe the
+   * cleanup.
    *
    * Before any delete, every NON-terminal task of the owner is transitioned to
    * `cancelled` through the legal state machine (`queued`/`running` go
@@ -1085,13 +1135,18 @@ export class Ledger {
    * result is the only observable evidence that the cancel-before-delete
    * ordering held.
    *
-   * The 4 append-only triggers would abort the child deletes, so — following
-   * `purgeTerminalTasks` exactly — the two DELETE guards are dropped, the
-   * chain/step/task rows deleted (children first), and the guards recreated,
-   * all inside ONE transaction: a failure rolls the trigger recreation back
-   * with the deletes. Self-scoped: every statement is keyed by [owner], so a
-   * purge never touches another owner's rows. Idempotent: purging an owner
-   * with no rows is a no-op (triggers are not even touched).
+   * The append-only triggers would abort the child deletes, so — following
+   * `purgeTerminalTasks` exactly — the DELETE guards are dropped, the child
+   * rows deleted before their parents, and the guards recreated, all inside
+   * ONE transaction: a failure rolls the trigger recreation back with the
+   * deletes. Ledger rows (keyed by task_id/owner) and goal rows (owner-scoped
+   * through `goal.owner`) are independent, so their order inside the
+   * transaction is immaterial; the goal cleanup is kept next to the ledger
+   * cleanup so every destructive drop/delete/recreate reads together.
+   *
+   * Self-scoped: every statement is keyed by [owner], so a purge never touches
+   * another owner's rows. Idempotent: purging an owner with no task or goal
+   * rows still runs the transaction and leaves every DELETE guard installed.
    */
   purgeOwnerData(owner: string): OwnerPurgeResult {
     const tasks = this.db
@@ -1103,9 +1158,12 @@ export class Ledger {
     const result: OwnerPurgeResult = {
       cancelled: [],
       deletedTasks: tasks.length,
+      deletedGoals: 0,
+      deletedGoalSteps: 0,
+      deletedGoalMessages: 0,
+      deletedGoalMutations: 0,
+      deletedGoalRefusals: 0,
     };
-    if (tasks.length === 0) return result;
-
     const purge = this.db.transaction(() => {
       for (const task of tasks) {
         if (TERMINAL_TASK_STATUSES.includes(task.status)) continue;
@@ -1127,6 +1185,50 @@ export class Ledger {
         .prepare(`DELETE FROM ledger_step WHERE task_id IN (${placeholders})`)
         .run(...ids);
       this.db.prepare("DELETE FROM ledger_task WHERE owner = ?").run(owner);
+      // Goal-domain cleanup (v9). Goal rows are owner-scoped through
+      // `goal.owner` and share no rows with ledger_task, so this could run
+      // before or after the ledger deletes; it sits here so the destructive
+      // section reads together. Drop the goal DELETE guards FIRST — they would
+      // abort the child deletes; the UPDATE guards do not block DELETEs and
+      // stay in place.
+      this.db.exec("DROP TRIGGER IF EXISTS goal_message_append_only_delete");
+      this.db.exec("DROP TRIGGER IF EXISTS goal_refusal_append_only_delete");
+      // Children first, each via an IN-subquery evaluated against the still
+      // present `goal` rows. No id list is materialised, so there is no `IN ()`
+      // hazard when the owner has no goals and no placeholder list that grows
+      // with the goal count; with no goals every child delete changes 0 rows.
+      result.deletedGoalMutations = this.db
+        .prepare(
+          `DELETE FROM goal_mutation
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoalRefusals = this.db
+        .prepare(
+          `DELETE FROM goal_refusal
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoalMessages = this.db
+        .prepare(
+          `DELETE FROM goal_message
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoalSteps = this.db
+        .prepare(
+          `DELETE FROM goal_step
+           WHERE goal_id IN (SELECT id FROM goal WHERE owner = ?)`,
+        )
+        .run(owner).changes;
+      result.deletedGoals = this.db
+        .prepare("DELETE FROM goal WHERE owner = ?")
+        .run(owner).changes;
+      // Recreate the two DELETE guards from the shared DDL constants that
+      // `goals/migrate.ts` defines, so a later drop/recreate never drifts.
+      this.db.exec(GOAL_MESSAGE_DELETE_TRIGGER_SQL);
+      this.db.exec(GOAL_REFUSAL_DELETE_TRIGGER_SQL);
+
       createAppendOnlyDeleteTriggers(this.db);
     });
     purge();
@@ -1352,4 +1454,3 @@ export class Ledger {
     this.db.close();
   }
 }
-

@@ -7,6 +7,7 @@ import {
   createMcpToolListCache,
   createToolResultCache,
   DEFAULT_MCP_TOOL_LIST_TTL_MS,
+  toolArgsHash,
 } from "../../src/managers/cache.ts";
 import type { ToolCacheKey } from "../../src/managers/cache.ts";
 
@@ -62,6 +63,13 @@ function baseKey(overrides: Partial<ToolCacheKey> = {}): ToolCacheKey {
 }
 
 describe("createToolResultCache", () => {
+  test("toolArgsHash is available without a cache instance", () => {
+    assert.equal(
+      toolArgsHash({ nested: [{ b: 2, a: 1 }] }),
+      toolArgsHash({ nested: [{ a: 1, b: 2 }] }),
+    );
+  });
+
   test("set then get round-trips the raw string; get refreshes MRU recency but not TTL", (t) => {
     const clock = makeClock();
     const cache = createToolResultCache({

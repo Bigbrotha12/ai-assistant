@@ -19,6 +19,7 @@ function fakeResult(overrides: Partial<ToolCallResult> = {}): ToolCallResult {
     ok: true,
     content: "x",
     outcome: "ok",
+    bodyFailed: false,
     durationMs: 5,
     inputBytes: 3,
     outputBytes: 7,

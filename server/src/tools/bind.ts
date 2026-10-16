@@ -3,6 +3,7 @@ import type { PluginRegistry } from "../plugins/registry.ts";
 import { isToolPlugin } from "../plugins/types.ts";
 import type { ToolDefinition, ToolPluginDefinition } from "../plugins/types.ts";
 import { jsonSchemaToZod } from "./schema.ts";
+import { withReadOnlyRetry } from "./read_only_retry.ts";
 import type {
   ToolBodies,
   ToolBody,
@@ -274,6 +275,20 @@ export type MakeToolBodiesOptions = {
   readonly scope?: Omit<ToolCallScope, "rawSettled" | "onBodySkipped">;
   /** Label used in the fail-loud wrong-source guard message. */
   readonly channelLabel?: string;
+  /**
+   * Phase 7.2 read-only retry. When `true`, the raw `invoke` is wrapped with
+   * {@link withReadOnlyRetry}, using the DISPATCH's own `call.readOnly` and the
+   * composed `bodySignal`. The retry lives INSIDE the body, so one dispatch
+   * still performs one reservation (`reserve` txn1) and one `execution` bound;
+   * only the outbound attempt repeats.
+   *
+   * Absent (the default) every other channel invokes once, byte-for-byte as
+   * before. Only the goal channel's PLUGIN path passes `true` (see
+   * `agents/orchestrator.ts`). MCP does NOT use this option: its retry lives
+   * inside `runMcpOperation` (`agents/mcp.ts`, finding H1) so one dispatch still
+   * yields one `mcp.tool` audit and one circuit classification.
+   */
+  readonly readOnlyRetry?: boolean;
 };
 
 export function makeToolBodies(
@@ -286,7 +301,20 @@ export function makeToolBodies(
   const body: ToolBody = async (dispatch, bodySignal) => {
     let raw: Promise<string>;
     try {
-      raw = Promise.resolve(opts.invoke(bodySignal, dispatch));
+      // A mutating call (or any binding without the option) gets the bare
+      // invoke; a retryable read-only call gets the wrapped invoke. In both
+      // cases the raw promise settles only when the outbound work is truly
+      // done, so `budget` sees the body as in-flight across retries and cannot
+      // quarantine a call that is still being retried.
+      const run = (): Promise<string> => opts.invoke(bodySignal, dispatch);
+      raw = Promise.resolve(
+        opts.readOnlyRetry === true
+          ? withReadOnlyRetry(run, {
+              readOnly: dispatch.call.readOnly,
+              signal: bodySignal,
+            })
+          : run(),
+      );
     } catch (error) {
       // The body was invoked (so the core will NOT fire `onBodySkipped`), but
       // the raw work never started; settle now so budget releases.
@@ -337,6 +365,8 @@ export type MakePluginBodiesOptions = {
    * `"job"`, `"warmup"`).
    */
   readonly channelLabel: string;
+  /** Goal channel only: wrap the invoke in {@link withReadOnlyRetry} (Phase 7.2). */
+  readonly readOnlyRetry?: boolean;
 };
 
 export function makePluginBodies(
@@ -346,6 +376,7 @@ export function makePluginBodies(
     source: "plugin",
     invoke: opts.invoke,
     ...(opts.scope === undefined ? {} : { scope: opts.scope }),
+    ...(opts.readOnlyRetry === undefined ? {} : { readOnlyRetry: opts.readOnlyRetry }),
     channelLabel: opts.channelLabel,
   });
 }

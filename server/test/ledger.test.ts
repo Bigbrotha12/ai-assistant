@@ -6,6 +6,7 @@ import {
   LedgerError,
   migrateLedger,
   applyMigrations,
+  LEDGER_MIGRATIONS,
   CURRENT_LEDGER_VERSION,
   heartbeatIntervalMs,
   projectPublicTaskProgress,
@@ -1422,7 +1423,7 @@ describe("migration", () => {
     const db = new Database(":memory:");
     assert.equal(db.pragma("user_version", { simple: true }), 0);
     migrateLedger(db);
-    assert.equal(CURRENT_LEDGER_VERSION, 8);
+    assert.equal(CURRENT_LEDGER_VERSION, 11);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const retentionIndex = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -1432,6 +1433,16 @@ describe("migration", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get("idx_ledger_task_metadata_window") as { name: string } | undefined;
     assert.equal(metadataIndex?.name, "idx_ledger_task_metadata_window");
+    // v11: the goal_mutation lookup indexes exist on a fresh DB.
+    for (const name of [
+      "idx_goal_mutation_goal_tool_hash",
+      "idx_goal_mutation_goal_state",
+    ]) {
+      const index = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(name) as { name: string } | undefined;
+      assert.equal(index?.name, name, `${name} must exist after migrateLedger`);
+    }
     const tables = db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ledger_%'",
@@ -1442,18 +1453,26 @@ describe("migration", () => {
     assert.deepEqual(tables, ["ledger_chain", "ledger_step", "ledger_task"]);
   });
 
-  test("v7-v8 migrations add job-spec storage and the metadata window index from v6", () => {
+  test("v7-v9 migrations add job-spec storage, the metadata window index, and the goal tables from v6", () => {
     const db = new Database(":memory:");
     migrateLedger(db);
     db.exec("DROP INDEX idx_tasks_status_updated");
     db.exec("DROP INDEX idx_ledger_task_metadata_window");
     db.exec("ALTER TABLE ledger_task DROP COLUMN job_spec");
+    // v10 added `ledger_step.body_failed`; drop it too so the simulated v6 DB
+    // does not trip "duplicate column name" when the chain re-applies v10.
+    db.exec("ALTER TABLE ledger_step DROP COLUMN body_failed");
+    // A genuine v6 DB predates the goal-loop tables; the goal tables (and their
+    // append-only triggers, dropped with them) must be removed too so the re-run
+    // from v6 is a faithful simulation. Dropping a table drops its triggers.
+    for (const name of ["goal_message", "goal_refusal", "goal_step", "goal_mutation", "goal"]) {
+      db.exec(`DROP TABLE ${name}`);
+    }
     db.pragma("user_version = 6");
     assert.equal(db.pragma("user_version", { simple: true }), 6);
 
     migrateLedger(db);
 
-    assert.equal(db.pragma("user_version", { simple: true }), 8);
     assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
     const columns = db
       .prepare("PRAGMA table_info(ledger_task)")
@@ -1464,8 +1483,72 @@ describe("migration", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get("idx_ledger_task_metadata_window");
     assert.deepEqual(metadataIndex, { name: "idx_ledger_task_metadata_window" });
+    const goalTables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'goal_%'")
+      .all()
+      .map((row) => (row as { name: string }).name)
+      .sort();
+    assert.deepEqual(goalTables, [
+      "goal_message",
+      "goal_mutation",
+      "goal_refusal",
+      "goal_step",
+    ]);
   });
 
+
+  test("v11 adds the goal_mutation lookup indexes and upgrades a v10 DB with rows preserved", () => {
+    const db = new Database(":memory:");
+    migrateLedger(db);
+    // Simulate a v10 DB: drop the v11 indexes, rewind user_version, and seed a
+    // goal_mutation row the migration must leave untouched.
+    db.exec("DROP INDEX idx_goal_mutation_goal_tool_hash");
+    db.exec("DROP INDEX idx_goal_mutation_goal_state");
+    db.prepare(
+      `INSERT INTO goal
+         (id, owner, instruction, status, token_budget, tokens_spent, created_ts,
+          updated_ts, idempotency_key)
+       VALUES ('g_v10', 'o', 'i', 'queued', 1, 0, 1, 1, 'k')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO goal_mutation
+         (id, goal_id, plugin_id, tool, args_hash, state, step_seq, created_ts)
+       VALUES ('m_v10', 'g_v10', 'p', 'create', 'h', 'unresolved', 1, 1)`,
+    ).run();
+    db.pragma("user_version = 10");
+    assert.equal(db.pragma("user_version", { simple: true }), 10);
+
+    migrateLedger(db);
+
+    assert.equal(db.pragma("user_version", { simple: true }), CURRENT_LEDGER_VERSION);
+    for (const name of [
+      "idx_goal_mutation_goal_tool_hash",
+      "idx_goal_mutation_goal_state",
+    ]) {
+      const index = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(name) as { name: string } | undefined;
+      assert.equal(index?.name, name, `${name} must exist after the v10 -> v11 upgrade`);
+    }
+    const row = db
+      .prepare(
+        "SELECT id, goal_id, tool, args_hash, state FROM goal_mutation WHERE id = 'm_v10'",
+      )
+      .get() as {
+      id: string;
+      goal_id: string;
+      tool: string;
+      args_hash: string;
+      state: string;
+    };
+    assert.deepEqual(row, {
+      id: "m_v10",
+      goal_id: "g_v10",
+      tool: "create",
+      args_hash: "h",
+      state: "unresolved",
+    });
+  });
 
   test("migration is idempotent and preserves data on re-run", () => {
     const db = new Database(":memory:");
@@ -1631,5 +1714,123 @@ describe("migration", () => {
       /UNIQUE/i,
       "the unique (owner, intent_key) index must be in force after migration",
     );
+  });
+
+  test("v9 migration creates the goal tables on a populated v8 DB and preserves v8 data", () => {
+    // Bring a fresh DB up to v8 through the REAL migration list (the first
+    // eight entries are pre-goal), seed v8 data, then run the real v9 step.
+    const db = new Database(":memory:") as DatabaseType;
+    applyMigrations(db, LEDGER_MIGRATIONS.slice(0, 8), 8);
+    assert.equal(db.pragma("user_version", { simple: true }), 8);
+
+    const insertTask = db.prepare(
+      `INSERT INTO ledger_task
+         (id, owner, intent_key, spec, status, created_ts, updated_ts,
+          last_heartbeat_ts, fence_token)
+       VALUES (@id, @owner, @intentKey, @spec, 'queued', @ts, @ts, 0, '')`,
+    );
+    insertTask.run({ id: "t1", owner: "o", intentKey: "k1", spec: "s1", ts: 1 });
+    insertTask.run({ id: "t2", owner: "o", intentKey: "k2", spec: "s2", ts: 2 });
+
+    migrateLedger(db);
+
+    assert.equal(
+      db.pragma("user_version", { simple: true }),
+      CURRENT_LEDGER_VERSION,
+    );
+
+    const tables = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
+           ('goal','goal_step','goal_message','goal_mutation','goal_refusal')`,
+      )
+      .all()
+      .map((row) => (row as { name: string }).name)
+      .sort();
+    assert.deepEqual(tables, [
+      "goal",
+      "goal_message",
+      "goal_mutation",
+      "goal_refusal",
+      "goal_step",
+    ]);
+
+    const triggers = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger'
+           AND name LIKE 'goal%append_only%'`,
+      )
+      .all()
+      .map((row) => (row as { name: string }).name)
+      .sort();
+    assert.deepEqual(triggers, [
+      "goal_message_append_only_delete",
+      "goal_message_append_only_update",
+      "goal_refusal_append_only_delete",
+      "goal_refusal_append_only_update",
+    ]);
+
+    const survived = db
+      .prepare(
+        "SELECT id, owner, intent_key, spec, status FROM ledger_task ORDER BY id",
+      )
+      .all();
+    assert.deepEqual(survived, [
+      { id: "t1", owner: "o", intent_key: "k1", spec: "s1", status: "queued" },
+      { id: "t2", owner: "o", intent_key: "k2", spec: "s2", status: "queued" },
+    ]);
+  });
+
+  test("v10 migration adds body_failed to a populated v9 DB, defaulting old rows to 0", () => {
+    // Bring a fresh DB up to v9 through the REAL migration list, seed a step,
+    // then run the real v10 step. Existing steps must survive with
+    // `body_failed = 0` (a pre-v10 step has no domain-failure fact recorded).
+    const db = new Database(":memory:") as DatabaseType;
+    applyMigrations(db, LEDGER_MIGRATIONS.slice(0, 9), 9);
+    assert.equal(db.pragma("user_version", { simple: true }), 9);
+
+    const colsBefore = db
+      .prepare("PRAGMA table_info(ledger_step)")
+      .all()
+      .map((r) => (r as { name: string }).name);
+    assert.ok(
+      !colsBefore.includes("body_failed"),
+      "body_failed must not exist before v10",
+    );
+
+    db.prepare(
+      `INSERT INTO ledger_task
+         (id, owner, intent_key, spec, status, created_ts, updated_ts,
+          last_heartbeat_ts, fence_token)
+       VALUES ('t1', 'o', 'k1', 's1', 'running', 1, 1, 1, '')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO ledger_step (id, task_id, seq, stage, action, result, ts, tool_call_id)
+       VALUES ('s1', 't1', 1, 'tool', 'tool:create_task', '{"applied":true}', 1, 'call_1')`,
+    ).run();
+
+    migrateLedger(db);
+
+    assert.equal(
+      db.pragma("user_version", { simple: true }),
+      CURRENT_LEDGER_VERSION,
+    );
+
+    const colsAfter = db
+      .prepare("PRAGMA table_info(ledger_step)")
+      .all()
+      .map((r) => (r as { name: string }).name);
+    assert.ok(colsAfter.includes("body_failed"), "v10 must add body_failed");
+
+    const oldRow = db
+      .prepare(
+        "SELECT id, tool_call_id, body_failed FROM ledger_step WHERE id = 's1'",
+      )
+      .get() as { id: string; tool_call_id: string; body_failed: number };
+    assert.deepEqual(oldRow, {
+      id: "s1",
+      tool_call_id: "call_1",
+      body_failed: 0,
+    });
   });
 });

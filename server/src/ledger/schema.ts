@@ -1,5 +1,6 @@
 import { chmodSync } from "node:fs";
 import type { Database as DatabaseType } from "better-sqlite3";
+import { migrateGoals } from "../goals/migrate.ts";
 
 /** A single schema step. Migration list index 0 == schema version 1. */
 export type Migration = (db: DatabaseType) => void;
@@ -248,6 +249,32 @@ export const LEDGER_MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_ledger_task_metadata_window
         ON ledger_task(worker, owner, status, spec, created_ts DESC, id DESC);
     `);
+  },
+  // v9 — goal loop tables. `migrateGoals` creates `goal`/`goal_step`/
+  // `goal_message`/`goal_mutation`/`goal_refusal` and their append-only
+  // guards, so the tables (and the `GOAL_*_TRIGGER_SQL` constants they
+  // reference) exist before `new GoalLedger(ledgerDb)` runs.
+  (db) => {
+    migrateGoals(db);
+  },
+  // v10 — persist the MCP domain-failure fact on tool steps: replay must
+  // re-serve `bodyFailed` so a domain-failed mutation is never re-served as a
+  // clean success. Not part of the hash-chain content (like `tool_call_id`,
+  // v4): it is a replay-restoration flag, not part of a step's identity.
+  // Data-preserving (existing rows get 0 = not failed).
+  (db) => {
+    db.exec(
+      `ALTER TABLE ledger_step ADD COLUMN body_failed INTEGER NOT NULL DEFAULT 0;`,
+    );
+  },
+  // v11 — goal_mutation lookup indexes: resolveMutations matches
+  // (goal_id, tool, args_hash) and listUnresolvedMutations filters
+  // (goal_id, state). Pure index additions, data-preserving.
+  (db) => {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_goal_mutation_goal_tool_hash
+               ON goal_mutation(goal_id, tool, args_hash);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_goal_mutation_goal_state
+               ON goal_mutation(goal_id, state);`);
   },
 ];
 

@@ -23,5 +23,10 @@ export function createSseNotificationHook(hub: SseBroadcaster): NotificationHook
       const event: SseNotification = { title: `Job ${taskId}`, body: summary };
       hub.broadcast(owner, event);
     },
+    notifyGoalStopped(owner, goalId, status, reason) {
+      const title = status === "paused" ? "Goal needs you" : "Goal failed";
+      const event: SseNotification = { title, body: `Goal ${goalId} ${status} (${reason})` };
+      hub.broadcast(owner, event);
+    },
   };
 }

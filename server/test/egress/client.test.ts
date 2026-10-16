@@ -4,7 +4,7 @@ import type { LookupAddress } from "node:dns";
 import type { LookupFunction } from "node:net";
 import tls from "node:tls";
 import { Agent } from "undici";
-import { createPinnedEgressClient } from "../../src/egress/client.ts";
+import { createPinnedEgressClient, resolvePins } from "../../src/egress/client.ts";
 import { createEgressPolicy, SsrfValidationError } from "../../src/plugins/ssrf.ts";
 import type { LookupFn } from "../../src/plugins/ssrf.ts";
 
@@ -424,5 +424,49 @@ describe("per-domain trust isolation", () => {
         error instanceof SsrfValidationError && error.code === "DNS_REBINDING",
     );
     assert.equal(untrustedSpy.callCount, 0);
+  });
+});
+
+/**
+ * The plan R8 signal seam (4.7), exposed through the egress facade:
+ * `resolvePins` passes its `signal` into the DNS race. When the signal
+ * fires first the promise rejects with an `AbortError` and the awaiting
+ * chain settles — the goal runner uses this to abandon a hung setup
+ * without leaking the pending promise. (The underlying DNS query is not
+ * cancellable; the race only stops the await.)
+ */
+describe("resolvePins signal passthrough (4.7)", () => {
+  test("a pre-aborted signal rejects with an AbortError without awaiting the lookup", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("step aborted"));
+    let lookupStarted = false;
+    await assert.rejects(
+      resolvePins("https://example.com/api", {
+        mode: "test",
+        lookup: () => {
+          lookupStarted = true;
+          // Never resolves: proves the rejection comes from the signal,
+          // not from the lookup being awaited.
+          return new Promise<LookupAddress[]>(() => {});
+        },
+        signal: controller.signal,
+      }),
+      (e: unknown) => e instanceof Error && e.name === "AbortError",
+    );
+    assert.equal(
+      lookupStarted,
+      true,
+      "the lookup starts eagerly (argument evaluation) but is never awaited",
+    );
+  });
+
+  test("a live (never-aborted) signal leaves normal resolution untouched", async () => {
+    const controller = new AbortController();
+    const pinned = await resolvePins("https://example.com/api", {
+      mode: "test",
+      lookup: async () => PUBLIC,
+      signal: controller.signal,
+    });
+    assert.deepEqual(pinned, ["1.1.1.1"]);
   });
 });

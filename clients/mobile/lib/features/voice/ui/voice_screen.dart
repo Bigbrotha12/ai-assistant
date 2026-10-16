@@ -31,6 +31,7 @@ import '../data/engine_manager_provider.dart';
 import '../data/voice_capture_providers.dart';
 import '../data/voice_runtime_policy.dart';
 import '../data/voice_runtime_policy_provider.dart';
+import '../../goals/ui/goals_overlay.dart';
 import './voice_controller_provider.dart';
 
 /// Voice-first home screen: a single large hold-to-talk [SpeakButton], a
@@ -555,6 +556,16 @@ class _VoiceScreenState extends ConsumerState<VoiceScreen> {
                     ),
                   );
                 },
+              ),
+            ),
+            // Goals entry (3.7): the gear chip sits right-aligned directly
+            // above the toggler bar, mirroring its placement on the chat
+            // composer.
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 4),
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: GoalsChip(),
               ),
             ),
             // Bottom bar: the shared Voice/Text pill with the settings gear

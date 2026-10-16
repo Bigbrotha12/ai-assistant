@@ -33,6 +33,8 @@ const VALID_TEMPLATE = {
   skills: [{ id: "mealie" }],
   mcpServers: [{ name: "filesystem" }],
   tools: [{ pluginId: "mealie", required: true }],
+  toolAllowlist: [{ name: "search_recipes", readOnly: true }, { name: "add_recipe" }],
+  maxIterations: 3,
   modelRef: "open-router",
   inference: { temperature: 0.3, maxTokens: 2048, visionCapable: true },
 };
@@ -69,6 +71,12 @@ describe("loadAgentsCatalog", () => {
       assert.equal(entry.tools!.length, 1);
       assert.equal(entry.tools![0]!.pluginId, "mealie");
       assert.equal(entry.tools![0]!.required, true);
+      assert.deepEqual(
+        entry.toolAllowlist,
+        [{ name: "search_recipes", readOnly: true }, { name: "add_recipe" }],
+        "toolAllowlist survives loadAgentsCatalog",
+      );
+      assert.equal(entry.maxIterations, 3);
       assert.equal(entry.modelRef, "open-router");
       assert.equal(entry.inference?.temperature, 0.3);
     });
@@ -195,6 +203,8 @@ describe("migrateInstalledAgents", () => {
     systemPrompt: "You are a builtin.",
     skills: [{ id: "mealie", title: "Mealie", content: "Recipe help" }],
     tools: [{ pluginId: "mealie", required: false }],
+    toolAllowlist: [{ name: "search_recipes", readOnly: true }, { name: "add_recipe" }],
+    maxIterations: 2,
     modelRef: "open-router",
     inference: { temperature: 0.5, maxTokens: 1024, visionCapable: false },
   };
@@ -208,6 +218,12 @@ describe("migrateInstalledAgents", () => {
     assert.equal(result[0]!.skills[0]!.id, "mealie");
     assert.equal(result[0]!.skills[0]!.title, "Mealie");
     assert.equal(result[0]!.skills[0]!.content, "Recipe help");
+    assert.deepEqual(
+      result[0]!.toolAllowlist,
+      [{ name: "search_recipes", readOnly: true }, { name: "add_recipe" }],
+      "toolAllowlist survives migrateInstalledAgents",
+    );
+    assert.equal(result[0]!.maxIterations, 2);
   });
 
   test("file template wins over installed agent with same id", async () => {

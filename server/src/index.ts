@@ -12,8 +12,13 @@ import { createSentinelService } from "./sentinel/service.ts";
 import { buildSentinelSemanticOptions } from "./sentinel/semantic_wiring.ts";
 import { policyForMode } from "./sentinel/policy.ts";
 import { createJobRunner, JobError, ToolExecutor } from "./jobs/runner.ts";
-import type { JobRunner } from "./jobs/runner.ts";
-import { createLedgerRoutes, ledger } from "./ledger/routes.ts";
+import type { JobRunner, JobRunnerDeps } from "./jobs/runner.ts";
+import { GOAL_PIN_TTL_MS } from "./goals/constants.ts";
+import { createGoalRunner } from "./goals/runner.ts";
+import type { GoalRunner } from "./goals/runner.ts";
+import { createGoalRoutes } from "./goals/routes.ts";
+import { cleanupAsync, createShutdownBudget } from "./shutdown.ts";
+import { createLedgerRoutes, goalLedger, ledger } from "./ledger/routes.ts";
 import { createSseHub } from "./notify/sse_hub.ts";
 import { createSseNotificationHook } from "./notify/sse_hook.ts";
 import { createSseNotifyRoutes } from "./notify/sse_routes.ts";
@@ -41,7 +46,8 @@ import { createToolResultCache } from "./managers/cache.ts";
 import { createWarmupManager } from "./managers/warmup.ts";
 import { buildPipelineForChannel } from "./tools/channel.ts";
 import { loadCatalogs } from "./catalog/index.ts";
-import type { Catalogs } from "./catalog/index.ts";
+import type { Catalogs, ResolvedAgentDef } from "./catalog/index.ts";
+import { migrateInstalledAgents } from "./catalog/agents.ts";
 
 // SINGLE-REPLICA ASSUMPTION (deliberate deployment choice): the composition root
 // wires process-local deletion state, the RAM-only session store, per-process
@@ -243,6 +249,41 @@ const warmups = createWarmupManager({
 });
 let jobRunner: JobRunner | undefined;
 let jobPins: CredentialPinStore | undefined;
+// Phase 3.1/3.2 (goal loop): a DEDICATED goal credential pin store + the
+// `goalPins` registry (the registry Map lives inside `GoalRunner`; admission
+// registers via `registerGoalPin`). Never shared with `jobPins`: the job
+// path's latest-pin fallback + ref-count release could swap a goal's
+// credential under a concurrent job (the Phase 0.3 bug class).
+let goalRunner: GoalRunner | undefined;
+let goalPins: CredentialPinStore | undefined;
+// Shared model builder for BOTH runners (jobs + goals): same plugin-registry /
+// plugin-store resolution and the same trusted-hosts policy the pins were
+// computed under (H1). Credentials always arrive through the caller's scoped
+// resolver; a model build without them fails `credentials_expired`.
+const runnerBuildModel: NonNullable<JobRunnerDeps["buildModel"]> = (
+  modelPluginId,
+  requestConfig,
+  context,
+) => {
+  context.signal.throwIfAborted();
+  context.assertActive();
+  const cfg = requestConfig as JobModelRequestConfig | undefined;
+  if (!context.credentials) {
+    throw new JobError(
+      "credentials_expired",
+      "no scoped model credentials available for background model builds",
+    );
+  }
+  return buildModel({
+    registry: pluginRegistry,
+    pluginStore,
+    modelPluginId,
+    requestModel: cfg?.requestModel,
+    requestParameters: cfg?.requestParameters,
+    credentials: context.credentials,
+    trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+  });
+};
 // The composition root owns the SHARED credential
 // dependency — the in-memory pin store — but NOT the two providers. Both are
 // inherently per-invocation and are constructed by their consumers:
@@ -288,26 +329,7 @@ try {
     // crash between admission and claim could still leak one; a periodic
     // sweep bounds that window instead of relying on the release paths alone.
     sweepIntervalMs: 60_000,
-    buildModel: (modelPluginId, requestConfig, context) => {
-      context.signal.throwIfAborted();
-      context.assertActive();
-      const cfg = requestConfig as JobModelRequestConfig | undefined;
-      if (!context.credentials) {
-        throw new JobError(
-          "credentials_expired",
-          "no scoped model credentials available for background model builds",
-        );
-      }
-      return buildModel({
-        registry: pluginRegistry,
-        pluginStore,
-        modelPluginId,
-        requestModel: cfg?.requestModel,
-        requestParameters: cfg?.requestParameters,
-        credentials: context.credentials,
-        trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
-      });
-    },
+    buildModel: runnerBuildModel,
   });
   // Restart-loss startup pass: `ledger.reconcileOrphans()` (ledger/routes.ts)
   // already marked orphans `stuck`; resumeStuckJobs re-runs them from their
@@ -319,6 +341,72 @@ try {
   jobRunner = undefined;
   jobPins = undefined;
   console.warn("jobs: JobRunner unavailable; background jobs disabled:", err);
+}
+
+// Phase 3.1/3.2 (goal loop): `GoalRunner` with its OWN BudgetManager (D10:
+// isolated pool + model-call window — goal tool/model load must never starve
+// interactive chat) and its own pin store. A SIBLING try, mirroring the jobs
+// block: goal wiring failing must not disable background jobs (or vice
+// versa). The shared toolCache is safe to reuse — its fingerprint keys
+// (`credentialFingerprint` per pin) keep goal entries isolated from job/sync
+// entries.
+try {
+  goalPins = new CredentialPinStore({ maxLifetimeMs: GOAL_PIN_TTL_MS });
+  goalRunner = createGoalRunner({
+    goalLedger,
+    registry: pluginRegistry,
+    pins: goalPins,
+    getPinnedIps: pluginStore.getPinnedIps.bind(pluginStore),
+    // Admin-trusted hosts for the default executor's PLUGIN egress. MCP
+    // binding takes `env.MCP_TRUSTED_HOSTS` directly inside the runner (the
+    // two trust lists are distinct — see `GoalRunnerDeps.trustedHosts`).
+    trustedHosts: env.PLUGINS_TRUSTED_HOSTS,
+    toolCache,
+    budget: createBudgetManager(),
+    buildModel: runnerBuildModel,
+    // M1: periodic pin GC; the claim timer also sweeps.
+    sweepIntervalMs: 60_000,
+    shadowReporter: sentinelShadowReporter,
+    // 5.5 (plan L9): push on `paused`/terminal so a backgrounded goal that
+    // needs the user announces itself, over the owner-scoped SSE hub (the same
+    // hook the job path uses). Deliberately NOT fired for `complete` (the
+    // result is in the log the user reads) or `cancelled` (they asked for it).
+    notification: createSseNotificationHook(sseHub),
+  });
+  // Boot recovery (plan §Recovery): every persisted step lease is dead at
+  // boot — interrupted steps are marked terminal and `running` goals are
+  // requeued. M2 then fails the re-claimed goal `credentials_required` (the
+  // registry is in-memory); restart-resume is D8/Phase 4.
+  await goalRunner.resumeStuckGoals();
+} catch (err) {
+  await goalRunner?.dispose();
+  goalRunner = undefined;
+  goalPins = undefined;
+  console.warn("goals: GoalRunner unavailable; goals disabled:", err);
+}
+
+// Phase 3.6 goal REST surface, mounted beside the other `/v1` routes. Only
+// mounted when the runner wiring succeeded: a failed runner would otherwise
+// leave handlers that throw on every call. `resolveAgent` mirrors chat's
+// template lookup (`catalogs.agents`); the installed-store fallback covers an
+// agent present in the plugin store but not merged into the catalog.
+if (goalRunner && goalPins) {
+  const installedAgents = migrateInstalledAgents([], pluginStore);
+  const resolveGoalAgent = async (
+    id: string,
+  ): Promise<ResolvedAgentDef | undefined> =>
+    catalogs.agents.find((agent) => agent.id === id) ??
+    installedAgents.find((agent) => agent.id === id);
+  app.route(
+    "/v1",
+    createGoalRoutes({
+      goalLedger,
+      goalRunner,
+      pins: goalPins,
+      resolveAgent: resolveGoalAgent,
+      registry: pluginRegistry,
+    }),
+  );
 }
 
 app.route("/ledger", createLedgerRoutes(ledger, { jobRunner }));
@@ -345,14 +433,25 @@ const chatRateLimiter = createPerOwnerRateLimiter({
 // (GET/DELETE /v1/sessions/:id) and written by the sync transport's
 // managed-session path.
 const sessionStore = createSessionStore();
+// Account deletion runtime (composed, plan §Worker): the `AccountDeletionRuntime`
+// type has exactly these four slots and the job runner already fills each, so
+// the goal loop composes INSIDE the existing slots — `abortOwner` runs the
+// goal abort (cancel running goals + abort in-flight steps) beside the job
+// abort, `releaseOwner` drops the goal pin store beside the job pins.
 authModule.configureAccountDeletionRuntime?.({
   // FIRST (DEFENSIVE_PATTERNS §4): close the owner's notification streams
   // before aborting/purging, so a late job completion stays silent.
   closeOwner: (owner) => sseHub.closeOwner(owner),
-  abortOwner: (owner) => jobRunner?.abortOwner(owner),
+  abortOwner: (owner) => {
+    jobRunner?.abortOwner(owner);
+    goalRunner?.abortOwner(owner);
+  },
   deleteSessionsForOwner: (owner) => sessionStore.deleteSessionsForOwner(owner),
   invalidateForUser: (owner) => toolCache.invalidateForUser(owner),
-  releaseOwner: (owner) => jobPins?.releaseOwner(owner),
+  releaseOwner: (owner) => {
+    jobPins?.releaseOwner(owner);
+    goalRunner?.releaseGoalPinsForOwner(owner);
+  },
 });
 app.route("/v1", createSessionRoutes({ store: sessionStore, verifyKey: requireApiKey }));
 app.route(
@@ -411,16 +510,32 @@ const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
   console.log(`ai-assistant gateway listening on ${host}:${info.port}`);
 });
 const SENTINEL_SHADOW_FLUSH_TIMEOUT_MS = 2_000;
-const cleanup = (name: string, dispose: () => void) => {
-  try {
-    dispose();
-  } catch {
-    console.error(`gateway: ${name} cleanup failed`);
-  }
-};
+// Teardown goes through `cleanupAsync` (src/shutdown.ts), which awaits each
+// disposer under a deadline. Keep this seam awaitable (DEFENSIVE_PATTERNS.md
+// §4) so promise-returning disposers can be awaited; this alone does not make
+// shutdown quiescent. A returned promise is genuinely awaited (a rejection is
+// logged and contained, never aborting the remaining steps), and the deadline
+// keeps a wedged disposer from hanging shutdown. Known residual gaps, tracked
+// separately: `PluginRegistry.disposeWatch` (src/plugins/registry.ts:247-262)
+// is synchronous and cannot await an in-flight `hotReload()`
+// (src/plugins/registry.ts:227-234); `JobRunner.dispose`
+// (src/jobs/runner.ts:1674-1687) is also synchronous, aborts tracked job
+// controllers, and returns without awaiting their unwind. An aborted run may
+// still reach its failure path and write to the ledger while shutdown advances
+// toward `ledger.close()`. The seam means shutdown awaits what a disposer
+// returns; it must not be read as "shutdown is now quiescent." A disposer that
+// returns `void` gains nothing from the awaitable seam.
 const shutdown = async (): Promise<void> => {
   if (stopping) return;
   stopping = true;
+  // ONE shared teardown budget for this shutdown, computed as an absolute
+  // deadline right here: every disposer below receives only the time still
+  // remaining, so a fully-wedged teardown is bounded by a single wall-clock
+  // deadline (SHUTDOWN_TEARDOWN_BUDGET_MS + the 2s flush below) instead of six
+  // additive per-disposer windows. That total must stay below the pod's
+  // `terminationGracePeriodSeconds` (deploy/k8s/health-probes.yaml) or a wedge
+  // gets SIGKILL'd before the sentinel flush and ledger close run.
+  const budget = createShutdownBudget();
   // Stop accepting new requests first; the `stopping` middleware 503s anything
   // new while in-flight requests drain. Bound the drain so a long-lived SSE
   // stream can't hang shutdown forever.
@@ -428,12 +543,18 @@ const shutdown = async (): Promise<void> => {
     server.close(() => resolve());
     setTimeout(resolve, 5_000).unref?.();
   });
-  cleanup("sse hub", () => sseHub.dispose());
-  cleanup("warmups", () => warmups.dispose());
-  cleanup("jobs", () => jobRunner?.dispose());
-  cleanup("session store", () => sessionStore.dispose());
-  cleanup("plugin watcher", () => pluginRegistry.disposeWatch());
-  cleanup("tool cache", () => toolCache.dispose());
+  await cleanupAsync("sse hub", () => sseHub.dispose(), budget);
+  await cleanupAsync("warmups", () => warmups.dispose(), budget);
+  await cleanupAsync("jobs", () => jobRunner?.dispose(), budget);
+  // The FIRST promise-returning disposer through this seam (DEFENSIVE_PATTERNS
+  // §4): `GoalRunner.dispose` aborts its in-flight step controllers and
+  // AWAITS their unwind. Placed AFTER jobs and BEFORE the ledger close — an
+  // aborted step's failure path may still write to the goal tables. Bounded
+  // by this budget's remainder like every other disposer.
+  await cleanupAsync("goals", () => goalRunner?.dispose(), budget);
+  await cleanupAsync("session store", () => sessionStore.dispose(), budget);
+  await cleanupAsync("plugin watcher", () => pluginRegistry.disposeWatch(), budget);
+  await cleanupAsync("tool cache", () => toolCache.dispose(), budget);
   await serverClosed;
   // Drain queued shadow reports before closing the ledger, but never let a stuck report block shutdown.
   let shadowFlushTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -451,8 +572,11 @@ const shutdown = async (): Promise<void> => {
   } finally {
     if (shadowFlushTimeout !== undefined) clearTimeout(shadowFlushTimeout);
   }
-  // Close the ledger DB once no request can touch it anymore.
-  cleanup("ledger", () => ledger.close());
+  // Close the ledger DB once no request can touch it anymore. Must stay AFTER
+  // the sentinel flush above: flushing writes to the ledger. Gets the budget
+  // remainder too — if the earlier steps consumed everything, it still runs and
+  // is contained rather than hanging shutdown.
+  await cleanupAsync("ledger", () => ledger.close(), budget);
 };
 process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);

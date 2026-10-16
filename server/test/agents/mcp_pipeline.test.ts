@@ -27,6 +27,11 @@ import {
   flushAuditTelemetry,
   resetAuditTelemetryConfig,
 } from "../../src/audit/telemetry.ts";
+import { createToolPipeline, type ToolCallResult } from "../../src/tools/pipeline.ts";
+import {
+  createJobToolInterceptors,
+  createSyncToolInterceptors,
+} from "../../src/tools/interceptors/order.ts";
 
 /**
  * Step 1.11 pins: MCP tools now dispatch through the shared tool pipeline.
@@ -301,6 +306,161 @@ describe("mcp → tool pipeline (step 1.11)", () => {
     }
   });
 
+  // --- D6: manifest read-only override (allowTools) -------------------------
+
+  test("D6: an un-annotated tool allowlisted with readOnly:true classifies read-only (its result is cached)", async () => {
+    const calls: string[] = [];
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "read" }] }),
+      callTool: async (params) => {
+        calls.push(params.name);
+        return { content: [{ type: "text", text: "fresh" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [{ name: "declared-server", url: "https://declared.example.com" }],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+        allowTools: [{ name: "read", readOnly: true }],
+      },
+    );
+    try {
+      assert.equal(await binding.tools[0]!.func({}), "fresh");
+      assert.equal(await binding.tools[0]!.func({}), "fresh");
+      assert.equal(calls.length, 1, "the declared read-only tool's result is cached");
+      assert.equal(cache.size, 1);
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
+  test("D6: the override cannot promote a destructiveHint:true tool to read-only (never cached)", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({
+        tools: [{ name: "danger", annotations: { destructiveHint: true } }],
+      }),
+      callTool: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: "applied" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [{ name: "declared-server", url: "https://declared.example.com" }],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+        allowTools: [{ name: "danger", readOnly: true }],
+      },
+    );
+    try {
+      await binding.tools[0]!.func({});
+      await binding.tools[0]!.func({});
+      assert.equal(calls, 2, "a raw destructiveHint:true vetoes the read-only declaration");
+      assert.equal(cache.size, 0);
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
+  test("D6 × M5: the read-only declaration cannot defeat the cross-server destructive AND-merge", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async (server) => ({
+      listTools: async () => ({
+        tools: server.name === "server-a"
+          ? [{ name: "shared" }]
+          : [{ name: "shared", annotations: { destructiveHint: true } }],
+      }),
+      callTool: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: "applied" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [
+        { name: "server-a", url: "https://a.example.com" },
+        { name: "server-b", url: "https://b.example.com" },
+      ],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+        allowTools: [{ name: "shared", readOnly: true }],
+      },
+    );
+    try {
+      assert.equal(binding.tools.length, 1, "the first occurrence binds; the duplicate is skipped");
+      await binding.tools[0]!.func({});
+      await binding.tools[0]!.func({});
+      assert.equal(
+        calls,
+        2,
+        "the destructive occurrence on the second-listed server vetoes read-only",
+      );
+      assert.equal(cache.size, 0, "a name any server declares destructive is never cached");
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
+  test("D6: without the override an un-annotated tool stays mutating (never cached)", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "read" }] }),
+      callTool: async () => {
+        calls += 1;
+        return { content: [{ type: "text", text: "value" }] };
+      },
+      close: async () => {},
+    });
+    const cache = createToolResultCache();
+    const budget = createBudgetManager();
+    const binding = await bindMcpServers(
+      [{ name: "declared-server", url: "https://declared.example.com" }],
+      {
+        clientFactory: factory,
+        owner: "owner-1",
+        requestId: "req-1",
+        channel: "sync-stateless",
+        budget,
+        toolCache: cache,
+      },
+    );
+    try {
+      await binding.tools[0]!.func({});
+      await binding.tools[0]!.func({});
+      assert.equal(calls, 2, "no declaration means the un-annotated tool is never cached");
+      assert.equal(cache.size, 0);
+    } finally {
+      await binding.dispose();
+      cache.dispose();
+    }
+  });
+
   // --- D1 ------------------------------------------------------------------
 
   test("D1: a single owner is capped at the per-owner limit (4) with default budget caps", async () => {
@@ -556,6 +716,237 @@ describe("mcp → tool pipeline (step 1.11)", () => {
       }
     } finally {
       telemetry.restore();
+    }
+  });
+
+  // --- body failure (MCP `isError`) ----------------------------------------
+
+  test("isError:true is not a clean success: bodyFailed:true with ok:true and no errorCode", async () => {
+    // A failed MCP call arrives as `jsonrpc_error: none, isError: true`: the
+    // transport succeeds and the tool reports a domain failure in its result
+    // body. That fact must ride its OWN field (bodyFailed) on the result and
+    // flip the MCP audit to outcome:"error" — never be misreported as a denial
+    // (no errorCode; `ok` keeps meaning "dispatched and returned") and never
+    // become a throw (DEFENSIVE_PATTERNS §1).
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "write", readOnly: false }] }),
+      callTool: async () => ({
+        content: [{ type: "text", text: "domain failure detail" }],
+        isError: true,
+      }),
+      close: async () => {},
+    });
+    const results: ToolCallResult[] = [];
+    const pipeline = createToolPipeline({
+      interceptors: createSyncToolInterceptors({}),
+      onResult: (_dispatch, result) => {
+        results.push(result);
+      },
+    });
+    const telemetry = captureTelemetry();
+    try {
+      const binding = await bindMcpServers(
+        [{ name: "fail-server", url: "https://fail.example.com" }],
+        {
+          clientFactory: factory,
+          owner: "owner-1",
+          requestId: "req-1",
+          channel: "sync-stateless",
+          pipeline,
+        },
+      );
+      try {
+        const content = await binding.tools[0]!.func({});
+        assert.equal(
+          content,
+          "domain failure detail",
+          "the body still resolves with the tool's text (a domain failure does not throw)",
+        );
+        assert.equal(results.length, 1);
+        const result = results[0]!;
+        assert.equal(
+          result.bodyFailed,
+          true,
+          "the domain failure rides its own orthogonal field end-to-end",
+        );
+        assert.equal(
+          result.ok,
+          true,
+          "not a denial: ok keeps meaning dispatched-and-returned",
+        );
+        assert.equal(
+          result.outcome,
+          "ok",
+          "the DISPATCH completed; the tool-domain failure is bodyFailed, not a collapsed outcome",
+        );
+        assert.equal("errorCode" in result, false, "no denial code is fabricated");
+
+        await flushAuditTelemetry();
+        const toolAudits = telemetry.records.filter(
+          (record) => record.event === "mcp.tool" && record.server === "fail-server",
+        );
+        assert.equal(toolAudits.length, 1);
+        assert.equal(
+          toolAudits[0]!.outcome,
+          "error",
+          "the MCP audit reports the failure rather than 'ok'",
+        );
+        assert.equal(toolAudits[0]!.bodyFailed, true);
+        assert.equal(
+          "errorCode" in toolAudits[0]!,
+          false,
+          "the audit does not imply a denial",
+        );
+      } finally {
+        await binding.dispose();
+      }
+    } finally {
+      telemetry.restore();
+    }
+  });
+
+  test("isError absent/false behaves exactly as before (bodyFailed:false, unchanged audit record)", async () => {
+    let calls = 0;
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "write", readOnly: false }] }),
+      callTool: async () => {
+        calls += 1;
+        // First call: `isError` absent. Second call: explicit `isError: false`.
+        return calls === 1
+          ? { content: [{ type: "text", text: "applied" }] }
+          : { content: [{ type: "text", text: "applied" }], isError: false };
+      },
+      close: async () => {},
+    });
+    const results: ToolCallResult[] = [];
+    const pipeline = createToolPipeline({
+      interceptors: createSyncToolInterceptors({}),
+      onResult: (_dispatch, result) => {
+        results.push(result);
+      },
+    });
+    const telemetry = captureTelemetry();
+    try {
+      const binding = await bindMcpServers(
+        [{ name: "clean-server", url: "https://clean.example.com" }],
+        {
+          clientFactory: factory,
+          owner: "owner-1",
+          requestId: "req-1",
+          channel: "sync-stateless",
+          pipeline,
+        },
+      );
+      try {
+        assert.equal(await binding.tools[0]!.func({}), "applied");
+        assert.equal(await binding.tools[0]!.func({}), "applied");
+        assert.equal(results.length, 2);
+        for (const result of results) {
+          assert.equal(result.content, "applied");
+          const { durationMs, inputBytes, outputBytes, ...rest } = result;
+          assert.equal(typeof durationMs, "number");
+          assert.equal(typeof inputBytes, "number");
+          assert.equal(outputBytes, Buffer.byteLength("applied", "utf8"));
+          // The settled result is EXACTLY the pre-change shape plus the
+          // orthogonal flag reading "no body failure".
+          assert.deepEqual(rest, {
+            ok: true,
+            content: "applied",
+            outcome: "ok",
+            bodyFailed: false,
+            fromCache: false,
+            replayed: false,
+          });
+          assert.equal("errorCode" in result, false);
+        }
+
+        await flushAuditTelemetry();
+        const toolAudits = telemetry.records.filter(
+          (record) => record.event === "mcp.tool" && record.server === "clean-server",
+        );
+        assert.equal(toolAudits.length, 2);
+        for (const audit of toolAudits) {
+          assert.equal(audit.outcome, "ok");
+          assert.equal(audit.cacheHit, false);
+          assert.equal(
+            "bodyFailed" in audit,
+            false,
+            "a clean call's audit record keeps its exact old shape",
+          );
+        }
+      } finally {
+        await binding.dispose();
+      }
+    } finally {
+      telemetry.restore();
+    }
+  });
+
+  test("background jobs: a domain-failed MCP call is not recorded as a clean success", async () => {
+    // The bug this fixes affects background jobs today: the job path shares
+    // the same body/`.then`/pipeline seam, so pin it on the job channel too.
+    const factory: McpClientFactory = async () => ({
+      listTools: async () => ({ tools: [{ name: "fetch", readOnly: true }] }),
+      callTool: async () => ({
+        content: [{ type: "text", text: "job domain failure" }],
+        isError: true,
+      }),
+      close: async () => {},
+    });
+    const { ledger, taskId, fenceToken, db } = makeClaimedTask("owner-1");
+    const results: ToolCallResult[] = [];
+    const pipeline = createToolPipeline({
+      interceptors: createJobToolInterceptors({ ledger }),
+      onResult: (_dispatch, result) => {
+        results.push(result);
+      },
+    });
+    const telemetry = captureTelemetry();
+    try {
+      const binding = await bindMcpServers(
+        [{ name: "job-fail-server", url: "https://job-fail.example.com" }],
+        {
+          clientFactory: factory,
+          owner: "owner-1",
+          requestId: "req-1",
+          channel: "job",
+          ledger,
+          taskId,
+          fenceToken,
+          pipeline,
+        },
+      );
+      try {
+        const content = await binding.tools[0]!.func(
+          {},
+          undefined,
+          { toolCall: { id: "call-1" } } as never,
+        );
+        assert.equal(content, "job domain failure");
+        assert.equal(results.length, 1);
+        assert.equal(results[0]!.bodyFailed, true);
+        assert.equal(results[0]!.ok, true);
+        assert.equal(results[0]!.outcome, "ok");
+        assert.equal("errorCode" in results[0]!, false);
+
+        await flushAuditTelemetry();
+        const toolAudits = telemetry.records.filter(
+          (record) => record.event === "mcp.tool" && record.server === "job-fail-server",
+        );
+        assert.equal(toolAudits.length, 1);
+        assert.equal(
+          toolAudits[0]!.outcome,
+          "error",
+          "the background-job audit is not a clean success either",
+        );
+        assert.equal(toolAudits[0]!.bodyFailed, true);
+      } finally {
+        await binding.dispose();
+      }
+    } finally {
+      telemetry.restore();
+      ledger.close();
+      db.close();
     }
   });
 

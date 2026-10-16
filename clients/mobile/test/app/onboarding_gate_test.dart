@@ -16,6 +16,7 @@ import 'package:ai_assistant/features/settings/data/settings_store.dart';
 import 'package:ai_assistant/app/theme_providers.dart';
 import 'package:ai_assistant/app/widgets/speak_button.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
+import 'package:ai_assistant/features/notifications/data/notif_provider.dart';
 import 'package:ai_assistant/features/onboarding/ui/onboarding_screen.dart';
 import 'package:ai_assistant/features/voice/data/engine_manager_provider.dart';
 import 'package:ai_assistant/features/voice/data/screen_wake_lock.dart';
@@ -125,6 +126,10 @@ void main() {
     audioSessionManagerProvider.overrideWithValue(FakeAudioSessionManager()),
     vadProcessorProvider.overrideWithValue(FakeVadProcessor()),
     voiceSettingsStoreProvider.overrideWithValue(FakeVoiceSettingsStore()),
+    // The app root (NotifSurfacer) listens to the owner-wide SSE notification
+    // stream; fake it so the real client never self-connects (and never
+    // schedules reconnect backoff timers) against the test's fake host.
+    notifClientProvider.overrideWithValue(FakeNotifClient()),
     // The platform wakelock channel is unavailable in tests; its provider
     // onDispose fires an uncaught disable() otherwise (same override the
     // other voice-hosting suites use).

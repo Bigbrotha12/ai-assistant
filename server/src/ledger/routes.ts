@@ -22,6 +22,7 @@ import {
 import type { PublicStepRow, PublicTaskRow, TaskRow } from "./index.ts";
 import { configureLedgerConnection, hardenLedgerFiles } from "./schema.ts";
 import type { JobRunner } from "../jobs/runner.ts";
+import { GoalLedger } from "../goals/ledger.ts";
 
 /**
  * The ledger lives in a dedicated SQLite file (`LEDGER_DB_PATH`, default
@@ -47,6 +48,7 @@ export const ledger = new Ledger(ledgerDb, {
   leaseExpiryMs: env.LEDGER_LEASE_EXPIRY_MS,
   terminalRetentionMs: env.LEDGER_RETENTION_MS,
 });
+export const goalLedger = new GoalLedger(ledgerDb);
 // One-time startup orphan reconciliation: tasks left `running` by a crash or
 // restart with a lapsed lease / stale heartbeat become `stuck` before the
 // server accepts requests, so they can be resumed instead of lying false-stuck.

@@ -1,7 +1,6 @@
 import { JobError } from "../../jobs/errors.ts";
 import {
   canRetryTool,
-  hasToolResult,
   recordToolResult,
 } from "../../credentials/idempotency.ts";
 import { boundToolResult } from "../bounds.ts";
@@ -69,9 +68,12 @@ export function createReplayInterceptor(opts: {
         return;
       }
 
-      if (hasToolResult(ledger, { taskId, owner, toolCallId })) {
-        const step = ledger.getStepByToolCallId(taskId, toolCallId, owner);
-        dispatch.content = boundToolResult(step?.result ?? "");
+      const step = ledger.getStepByToolCallId(taskId, toolCallId, owner);
+      if (step !== null) {
+        dispatch.content = boundToolResult(step.result ?? "");
+        // Restore the persisted MCP domain-failure fact (v10): a replayed
+        // domain-failed mutation must never be re-served as a clean success.
+        dispatch.bodyFailed = step.body_failed === true;
         dispatch.replayed = true;
         return;
       }
@@ -88,6 +90,7 @@ export function createReplayInterceptor(opts: {
           toolCallId,
           toolName: call.tool,
           result: dispatch.content,
+          bodyFailed: dispatch.bodyFailed,
         });
       }
     },

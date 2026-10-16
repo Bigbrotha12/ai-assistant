@@ -204,11 +204,20 @@ describe("POST /v1/chat/completions — build-on-the-fly agent resolution", () =
     const result = resolveOk(
       chatBody({ agent: "default" }),
       makeRegistryWithModelAndTool(),
-      makeCatalogs([defaultTemplate]),
+      makeCatalogs([{
+        ...defaultTemplate,
+        maxIterations: 2,
+        toolAllowlist: [{ name: "search_recipes", readOnly: true }],
+      }]),
     );
     assert.equal(result.ok, true);
     if (!result.ok) return;
     assert.equal(result.value.agentOverride?.systemPrompt, "You are a helpful assistant.");
+    assert.equal(result.value.agentOverride?.maxIterations, 2);
+    assert.deepEqual(
+      result.value.agentOverride?.toolAllowlist,
+      [{ name: "search_recipes", readOnly: true }],
+    );
   });
 
   test("2. Unknown template: body { agent: 'nonexistent' } → 400 template_not_found", async (_t) => {
@@ -331,6 +340,40 @@ describe("POST /v1/chat/completions — build-on-the-fly agent resolution", () =
     assert.equal(res.status, 400, "unknown key 'url' rejected by strict schema");
     const json = await res.json() as Record<string, unknown>;
     assert.equal(json.error, "invalid_request");
+  });
+
+  test("6b. Strict schema rejects a request-body agent spec carrying toolAllowlist", async (_t) => {
+    const app = makeApp(
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    const res = await postChat(app, chatBody({
+      agent: {
+        modelRef: "openrouter",
+        toolAllowlist: [{ name: "search_recipes", readOnly: true }],
+      },
+    }));
+    assert.equal(res.status, 400, "toolAllowlist is template-only; strict schema rejects it");
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+    assert.match(String(json.message ?? ""), /invalid agent spec/);
+  });
+
+  test("6c. Strict schema rejects a request-body agent spec carrying maxIterations", async (_t) => {
+    const app = makeApp(
+      makeRegistryWithModelAndTool(),
+      makeCatalogs([defaultTemplate]),
+    );
+    const res = await postChat(app, chatBody({
+      agent: {
+        modelRef: "openrouter",
+        maxIterations: 3,
+      },
+    }));
+    assert.equal(res.status, 400, "maxIterations is template-only; strict schema rejects it");
+    const json = await res.json() as Record<string, unknown>;
+    assert.equal(json.error, "invalid_request");
+    assert.match(String(json.message ?? ""), /invalid agent spec/);
   });
 
   test("7. Custom agent required tool not installed → 400 invalid_credentials", async (_t) => {

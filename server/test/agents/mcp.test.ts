@@ -236,6 +236,104 @@ describe("mcp", () => {
     await binding.dispose();
   });
 
+  test("bindMcpServers binds only allowTools-listed names when allowTools is present", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      {
+        "test-server": [
+          { name: "search_recipes", description: "Search" },
+          { name: "add_recipe", description: "Add" },
+          { name: "delete_recipe", description: "Delete" },
+        ],
+      },
+      callLog,
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      {
+        clientFactory: factory,
+        allowTools: [
+          { name: "search_recipes", readOnly: true },
+          { name: "add_recipe" },
+        ],
+      },
+    );
+
+    assert.deepEqual(binding.tools.map((tool) => tool.name), ["search_recipes", "add_recipe"]);
+    await binding.dispose();
+  });
+
+  test("bindMcpServers with allowTools: [] binds nothing", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      {
+        "test-server": [
+          { name: "search_recipes", description: "Search" },
+          { name: "delete_recipe", description: "Delete" },
+        ],
+      },
+      callLog,
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      { clientFactory: factory, allowTools: [] },
+    );
+
+    assert.deepEqual(binding.tools.map((tool) => tool.name), []);
+    await binding.dispose();
+  });
+
+  test("bindMcpServers binds every tool when allowTools is absent (legacy)", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      {
+        "test-server": [
+          { name: "search_recipes", description: "Search" },
+          { name: "delete_recipe", description: "Delete" },
+        ],
+      },
+      callLog,
+    );
+    const binding = await bindMcpServers(
+      [{ name: "test-server", url: "https://mcp.example.com" }],
+      { clientFactory: factory },
+    );
+
+    assert.deepEqual(binding.tools.map((tool) => tool.name), ["search_recipes", "delete_recipe"]);
+    await binding.dispose();
+  });
+
+  test("bindMcpServers silently ignores an allowTools name the server does not expose", async () => {
+    const callLog: CallRecord[] = [];
+    const factory = makeFactory(
+      { "test-server": [{ name: "search_recipes", description: "Search" }] },
+      callLog,
+    );
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "));
+    };
+    try {
+      const binding = await bindMcpServers(
+        [{ name: "test-server", url: "https://mcp.example.com" }],
+        {
+          clientFactory: factory,
+          allowTools: [
+            { name: "search_recipes", readOnly: true },
+            { name: "not_exposed", readOnly: true },
+          ],
+        },
+      );
+
+      assert.deepEqual(binding.tools.map((tool) => tool.name), ["search_recipes"]);
+      assert.deepEqual(warnings, [], "an unexposed allowlist name is silently absent");
+      await binding.dispose();
+    } finally {
+      console.warn = original;
+    }
+  });
+
   test("bindMcpServers skips a failing server without crashing", async () => {
     const callLog: CallRecord[] = [];
     const factory = makeFactory(
@@ -1597,6 +1695,52 @@ describe("mcp", () => {
     );
     assert.equal(lookups, 1);
     await connected.close();
+  });
+
+  test("default SSE factory's callTool wrapper preserves MCP `isError`", async () => {
+    // The SDK's `callTool` result carries `isError` for an in-band tool
+    // failure; the wrapper must forward it (not drop it) so the pipeline seam
+    // can classify the dispatch as a body failure instead of a clean success.
+    const connected = await defaultSseClientFactory(
+      { name: "is-error", url: "https://is-error.example.com/mcp" },
+      {
+        trustedHosts: [],
+        lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      },
+      {
+        createAgent: () => ({ destroy: async () => {} }),
+        createTransport: () => ({ close: async () => {} }),
+        createClient: () => ({
+          connect: async () => {},
+          listTools: async () => ({ tools: [] }),
+          callTool: async (params) =>
+            params.name === "failing"
+              ? { content: [{ type: "text", text: "domain failure" }], isError: true }
+              : params.name === "explicit-ok"
+                ? { content: [{ type: "text", text: "fine" }], isError: false }
+                : { content: [{ type: "text", text: "fine" }] },
+          close: async () => {},
+        }),
+      },
+    );
+    try {
+      const failed = await connected.callTool({ name: "failing", arguments: {} });
+      assert.equal(failed.isError, true, "isError: true survives the wrapper");
+      assert.deepEqual(failed.content, [{ type: "text", text: "domain failure" }]);
+
+      const explicitOk = await connected.callTool({ name: "explicit-ok", arguments: {} });
+      assert.equal(explicitOk.isError, false, "an explicit isError: false is preserved as false");
+
+      const clean = await connected.callTool({ name: "clean", arguments: {} });
+      assert.deepEqual(clean.content, [{ type: "text", text: "fine" }]);
+      assert.equal(
+        "isError" in clean,
+        false,
+        "a result without isError keeps its exact old shape (no key added)",
+      );
+    } finally {
+      await connected.close();
+    }
   });
 
   // --- MCP-seam SSRF enforcement (plan step 2.4 coverage gap) -----------

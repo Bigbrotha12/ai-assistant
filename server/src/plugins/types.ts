@@ -127,6 +127,24 @@ export const modelPluginDefinitionSchema = z.object({
     credentials: credentialSpecSchema.optional(),
   });
 
+/**
+ * Per-tool MCP allowlist entry (Phase 1.1). Shared by the agent manifest, the
+ * resolved catalog entry, the chat `agentOverride`, and `McpBindOptions`.
+ */
+export type AgentToolAllowlistEntry = { name: string; readOnly?: boolean };
+
+const agentToolAllowlistSchema = z
+  .array(
+    z.object({
+      name: z.string().trim().min(1),
+      readOnly: z.boolean().optional(),
+    }),
+  )
+  .refine(
+    (entries) => new Set(entries.map((entry) => entry.name)).size === entries.length,
+    "toolAllowlist names must be unique",
+  );
+
 export const agentPluginDefinitionSchema = z.object({
     id: pluginIdSchema,
     version: semverSchema,
@@ -168,6 +186,12 @@ export const agentPluginDefinitionSchema = z.object({
         ),
       ).optional(),
     })).optional(),
+    // Per-tool MCP allowlist (Phase 1.1). An entry's `readOnly: true` is also
+    // the D6 declaration: the binder may classify a tool as read-only only when
+    // the server does not mark it non-read-only (`readOnlyHint: false` /
+    // `readOnly: false`) and does not mark it destructive (`destructiveHint: true`).
+    toolAllowlist: agentToolAllowlistSchema.optional(),
+    maxIterations: z.number().int().nonnegative().optional(),
   });
 
 export const templateAgentDefinitionSchema = z.object({
@@ -182,6 +206,8 @@ export const templateAgentDefinitionSchema = z.object({
   skills: z.array(z.object({ id: pluginIdSchema })).optional(),
   mcpServers: z.array(z.object({ name: pluginIdSchema })).optional(),
   tools: z.array(z.object({ pluginId: pluginIdSchema, required: z.boolean().default(false) })).optional(),
+  toolAllowlist: agentToolAllowlistSchema.optional(),
+  maxIterations: z.number().int().nonnegative().optional(),
   modelRef: pluginIdSchema.optional(),
   inference: z.object({
     temperature: z.number().optional(),
@@ -207,6 +233,8 @@ export type ResolvedAgentDef = {
     headerRefs?: Record<string, string>;
   }[];
   tools?: { pluginId: string; required: boolean }[];
+  toolAllowlist?: AgentToolAllowlistEntry[];
+  maxIterations?: number;
   modelRef?: string;
   inference?: { temperature?: number; maxTokens?: number; visionCapable?: boolean };
 };
@@ -370,6 +398,8 @@ export interface AgentPluginDefinition extends PluginDefinition {
   systemPrompt: string;
   skills?: { id: string; title: string; content: string }[];
   tools?: { pluginId: string; required: boolean }[];
+  toolAllowlist?: AgentToolAllowlistEntry[];
+  maxIterations?: number;
   modelRef?: string;
   inference?: { temperature?: number; maxTokens?: number; visionCapable: boolean };
   baseUrls?: BaseUrlAllowlistEntry[];
