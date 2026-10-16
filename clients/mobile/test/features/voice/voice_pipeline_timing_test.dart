@@ -21,6 +21,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/chat/data/chat_client.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/chat/data/sse.dart';
 import 'package:ai_assistant/features/voice/data/audio_playback_service.dart';
 import 'package:ai_assistant/features/voice/data/tts_engine.dart';
 import 'package:ai_assistant/features/voice/ui/voice_controller.dart';
@@ -67,6 +68,7 @@ void main() {
                 onReceived,
                 onContent,
                 onToolCallDelta,
+                onSentinelAdvisory,
               }) {
                 return chat.sendTurn(
                   '',
@@ -78,6 +80,7 @@ void main() {
                   onReceived: onReceived,
                   onContent: onContent,
                   onToolCallDelta: onToolCallDelta,
+                  onSentinelAdvisory: onSentinelAdvisory,
                 );
               },
           micCapture: mic,
@@ -165,6 +168,7 @@ void main() {
                 onReceived,
                 onContent,
                 onToolCallDelta,
+                onSentinelAdvisory,
               }) {
                 return chat.sendTurn(
                   '',
@@ -176,6 +180,7 @@ void main() {
                   onReceived: onReceived,
                   onContent: onContent,
                   onToolCallDelta: onToolCallDelta,
+                  onSentinelAdvisory: onSentinelAdvisory,
                 );
               },
           micCapture: mic,
@@ -345,6 +350,7 @@ class StagedChatClient extends FakeChatClient {
     CancelToken? cancelToken,
     void Function(int index, String name, String argsFragment)? onToolCallDelta,
     void Function()? onReceived,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
     if (cancelToken?.isCancelled ?? false) {
       throw const ChatNetworkError('cancelled');

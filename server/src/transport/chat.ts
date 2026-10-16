@@ -62,6 +62,7 @@ import type {
 import type { Ledger, TaskRow } from "../ledger/index.ts";
 import { SPEC_MAX_LENGTH } from "../ledger/index.ts";
 import { toOpenAiSse } from "./openai.ts";
+import type { SentinelAdvisory, SentinelSemanticEnrichment } from "./openai.ts";
 import { buildModel, ModelBuildError } from "./model.ts";
 import type { BuildModelInput } from "./model.ts";
 import type { SessionStore, SessionMissingReason } from "../sessions/store.ts";
@@ -71,7 +72,10 @@ import {
   sentinelTextFromMessage,
   tryReportSentinelShadow,
 } from "../sentinel/shadow.ts";
-import type { SentinelShadowSink } from "../sentinel/shadow.ts";
+import type { SentinelShadowSink, SentinelShadowWriteResult } from "../sentinel/shadow.ts";
+import { SENTINEL_SHADOW_SCHEMA_VERSION_SEMANTIC } from "../sentinel/types.ts";
+import { DEFAULT_RULE_SET, evaluateL1 } from "../sentinel/l1.ts";
+import { decideSentinel } from "../sentinel/policy.ts";
 
 /**
  * Server-side caps on the CUSTOM agent spec (`body.agent` as an object):
@@ -502,16 +506,138 @@ function resolveMcpServers(
   });
 }
 
+/**
+ * Report the turn's last user message for the input shadow. Returns the
+ * reporter's settlement promise so the SSE adapter can reuse the ALREADY-QUEUED
+ * semantic evaluation instead of issuing a second one in the chat path; `null`
+ * when there is no text, no reporter, or the sink is synchronous (tests). The
+ * promise never rejects (settled to `null`) so an ignored result is safe.
+ */
 function reportShadowInput(
   reporter: SentinelShadowSink | undefined,
   owner: string,
   messages: readonly unknown[],
   requestId: string,
   taskId?: string | null,
-): void {
+): Promise<SentinelShadowWriteResult | null> | null {
   const text = lastUserTextFromMessages(messages);
-  if (text === null) return;
-  reportShadowText(reporter, owner, text, "input", requestId, `input:${requestId}`, taskId);
+  if (text === null || reporter === undefined) return null;
+  try {
+    const result = reporter.report({
+      owner,
+      text,
+      direction: "input",
+      requestId,
+      taskId,
+      reportKey: `input:${requestId}`,
+    });
+    if (
+      result === null ||
+      result === undefined ||
+      typeof (result as PromiseLike<unknown>).then !== "function"
+    ) {
+      return null;
+    }
+    return Promise.resolve(result as Promise<SentinelShadowWriteResult | null>).catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The §3.5 wire advisory for the turn's last user message: its L1 findings
+ * mapped to categories/severity/matchedRules plus the P5 `findings`/`action`.
+ * `undefined` on a clean turn (no finding), so the stream stays byte-identical
+ * to a turn without an advisory.
+ */
+function inputSentinelAdvisory(
+  messages: readonly unknown[],
+): SentinelAdvisory | undefined {
+  const text = lastUserTextFromMessages(messages);
+  if (text === null) return undefined;
+  const findings = evaluateL1(text, DEFAULT_RULE_SET);
+  if (findings.length === 0) return undefined;
+  const decision = decideSentinel(findings, { direction: "input" });
+  if (decision.severity === null) return undefined;
+  return {
+    categories: decision.categories,
+    severity: decision.severity,
+    matchedRules: decision.matchedRuleIds,
+    findings: findings.map((finding) => ({
+      ruleId: finding.ruleId,
+      category: finding.category,
+      severity: finding.severity,
+      source: "l1" as const,
+      ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
+    })),
+    action: { cannedResponseId: decision.action.cannedResponseId },
+  };
+}
+
+/**
+ * Map the settled input shadow report to the §3.5 semantic frame, or `null`
+ * when no enrichment should be emitted. Only advisory-worthy (non-`harmless`)
+ * semantic findings reach the wire: a `harmless` finding means benign content
+ * and policy maps it to `allow`, so it never raises an advisory on its own and
+ * its probability/finding stay in the shadow report metadata. A harmless-only
+ * outcome therefore emits nothing on a clean turn, or the explicit
+ * `advisory:false` clear when an L1 provisional frame was sent. An
+ * unavailable/dropped/timed-out stage leaves the provisional L1 advisory as the
+ * fallback; with no L1 frame and no risky findings there is nothing to add or
+ * clear, so no frame is emitted.
+ */
+function semanticEnrichmentFromReport(
+  result: SentinelShadowWriteResult | null,
+  l1Sent: boolean,
+): SentinelSemanticEnrichment | null {
+  if (result === null) return null;
+  const report = result.report;
+  if (report.schemaVersion !== SENTINEL_SHADOW_SCHEMA_VERSION_SEMANTIC) return null;
+  if (!report.semanticAvailable) return null;
+  const riskyFindings = report.semanticFindings.filter(
+    (finding) => finding.category !== "harmless",
+  );
+  if (riskyFindings.length === 0) {
+    if (!l1Sent) return null;
+    return {
+      advisory: false,
+      semanticAvailable: true,
+      findings: [],
+      categories: [],
+      severity: null,
+      matchedRules: [],
+      action: { cannedResponseId: null },
+    };
+  }
+  const decision = decideSentinel(riskyFindings, { direction: report.direction });
+  return {
+    advisory: true,
+    semanticAvailable: true,
+    findings: riskyFindings.map((finding) => ({
+      ruleId: finding.ruleId,
+      category: finding.category,
+      severity: finding.severity,
+      source: "semantic" as const,
+      ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
+    })),
+    categories: decision.categories,
+    severity: decision.severity,
+    matchedRules: decision.matchedRuleIds,
+    action: { cannedResponseId: decision.action.cannedResponseId },
+  };
+}
+
+/**
+ * The promise the SSE adapter awaits at its terminal event. `undefined` when
+ * there is no shadow result to carry (a synchronous sink), so the stream is
+ * byte-identical to an unenriched turn.
+ */
+function semanticEnrichment(
+  reports: Promise<SentinelShadowWriteResult | null> | null,
+  l1Sent: boolean,
+): Promise<SentinelSemanticEnrichment | null> | undefined {
+  if (reports === null) return undefined;
+  return reports.then((result) => semanticEnrichmentFromReport(result, l1Sent));
 }
 
 /** The compiled agent graph the sync path streams (createAgentGraph's type). */
@@ -1054,7 +1180,12 @@ async function handleSyncStream(
   const resolved = resolveChatRequest(c, body, opts.registry, opts.catalogs ?? { skills: [], mcps: [], agents: [] });
   if (!resolved.ok) return resolved.response;
   if (isDeleting(owner)) return accountDeletedResponse(c);
-  reportShadowInput(opts.shadowReporter, owner, resolved.value.rawMessages, requestId);
+  const inputShadowReport = reportShadowInput(
+    opts.shadowReporter,
+    owner,
+    resolved.value.rawMessages,
+    requestId,
+  );
   const { managed } = resolved.value;
 
   // Managed-session path: a managed request carries a validated
@@ -1069,7 +1200,15 @@ async function handleSyncStream(
         503,
       );
     }
-    return handleManagedSessionStream(c, owner, resolved.value, opts, budget, requestId);
+    return handleManagedSessionStream(
+      c,
+      owner,
+      resolved.value,
+      opts,
+      budget,
+      requestId,
+      inputShadowReport,
+    );
   }
 
   const {
@@ -1241,6 +1380,7 @@ async function handleSyncStream(
     try {
       scheduleWarmups(opts, owner, toolCredentialsByPlugin);
       mcpHandedOff = true;
+      const advisory = inputSentinelAdvisory(rawMessages);
       return buildStreamResponse(
         graph,
         { messages: toLangChainMessages(rawMessages) },
@@ -1261,6 +1401,8 @@ async function handleSyncStream(
             `output:${requestId}`,
           );
         },
+        advisory,
+        semanticEnrichment(inputShadowReport, advisory !== undefined),
       );
     } catch (err) {
       reservation.release();
@@ -1308,6 +1450,7 @@ async function handleManagedSessionStream(
   opts: ChatRoutesOptions,
   budget: BudgetManager,
   requestId: string,
+  inputShadowReport: Promise<SentinelShadowWriteResult | null> | null,
 ): Promise<Response> {
   const sessionStore = opts.sessionStore!;
   const sessionId = resolved.sessionId!; // dispatch gate guarantees non-null
@@ -1632,6 +1775,7 @@ async function handleManagedSessionStream(
       try {
         scheduleWarmups(opts, owner, toolCredentialsByPlugin);
         mcpHandedOff = true;
+        const advisory = inputSentinelAdvisory(rawMessages);
         const stream = buildStreamResponse(
           graph,
           { messages: sessionMessages },
@@ -1657,6 +1801,8 @@ async function handleManagedSessionStream(
             } catch {
             }
           },
+          advisory,
+          semanticEnrichment(inputShadowReport, advisory !== undefined),
         );
 
         stream.headers.set("x-session-id", sessionId);
@@ -2179,6 +2325,8 @@ function buildStreamResponse(
   onOutcome?: (outcome: "succeeded" | "failed" | "cancelled") => void | Promise<void>,
   disposeMcp?: () => Promise<void>,
   onReply?: (reply: BaseMessage) => void,
+  advisory?: SentinelAdvisory,
+  sentinelSemantic?: Promise<SentinelSemanticEnrichment | null>,
 ): Response {
   const events = graph.streamEvents(input, { ...streamOptions, signal: execution.signal });
   // `replyComplete` latches once the root `on_chain_end` has produced the final
@@ -2199,6 +2347,9 @@ function buildStreamResponse(
     onOutcome: (outcome) => {
       if (outcome === "failed") streamFailed = true;
     },
+    sentinelAdvisory: advisory,
+    sentinelSemantic,
+    sentinelSemanticTimeoutMs: env.SENTINEL_SEMANTIC_TIMEOUT_MS,
   });
   const encoder = new TextEncoder();
   let cancelled = false;

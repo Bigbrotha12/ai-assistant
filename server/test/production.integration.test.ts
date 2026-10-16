@@ -45,7 +45,6 @@ test("production context config validates limits and warmups default off", () =>
         BETTER_AUTH_SECRET: "test-secret-at-least-thirty-two-characters",
         BETTER_AUTH_URL: "http://localhost:17600",
         PORT: "17600",
-        NOTIFY_STORE_KEY: "test-notify-store-key",
         PLUGINS_TRUSTED_HOSTS: "",
         ...overrides,
       },
@@ -115,8 +114,11 @@ test("production boot shares phase 4 services and uses scoped model credentials"
     WARMUP_MAX_CONCURRENT: 1,
     WARMUP_TIMEOUT_MS: 1000,
     PLUGINS_TRUSTED_HOSTS: ["tasks.example.test"],
-    NOTIFY_STORE_KEY: "test-notify-store-key",
-    NOTIFY_BASE_URL: "",
+    SENTINEL_SEMANTIC_ENABLED: false,
+    SENTINEL_SEMANTIC_PLUGIN_ID: "kev-4b",
+    SENTINEL_SEMANTIC_THRESHOLD: 0.5,
+    SENTINEL_SEMANTIC_TIMEOUT_MS: 2000,
+    SENTINEL_SEMANTIC_CONTEXT_AWARE: true,
   };
   const modules: Record<string, Record<string, unknown>> = {
     "@hono/node-server": {

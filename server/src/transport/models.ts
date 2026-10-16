@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { requireApiKey, requireOwner } from "../auth/request_auth.ts";
 import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import type { PluginRegistry } from "../plugins/registry.ts";
-import { isModelPlugin } from "../plugins/types.ts";
+import { isChatModelPlugin } from "../plugins/types.ts";
 import type { ModelPluginDefinition } from "../plugins/types.ts";
 import { isRecord } from "../shared/util.ts";
 
@@ -112,7 +112,7 @@ export function createModelsRoutes(opts: ModelsRoutesOptions): Hono<OwnerVariabl
   routes.get("/models", async (c) => {
     let modelPlugins: ModelPluginDefinition[];
     try {
-      modelPlugins = registry.listInstalledPlugins().filter(isModelPlugin);
+      modelPlugins = registry.listInstalledPlugins().filter(isChatModelPlugin);
     } catch (err) {
       console.error("models: plugin registry unavailable", err);
       return c.json({ error: "inference_unavailable" }, 502);

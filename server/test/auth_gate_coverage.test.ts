@@ -4,8 +4,8 @@ import { Hono } from "hono";
 import type { Catalogs } from "../src/catalog/index.ts";
 import type { Ledger } from "../src/ledger/index.ts";
 import { createLedgerRoutes } from "../src/ledger/routes.ts";
-import { createNotifyRoutes } from "../src/notify/routes.ts";
-import type { NotifyStore } from "../src/notify/store.ts";
+import { createSseHub } from "../src/notify/sse_hub.ts";
+import { createSseNotifyRoutes } from "../src/notify/sse_routes.ts";
 import { createPluginRoutes } from "../src/plugins/routes.ts";
 import type { PluginRegistry } from "../src/plugins/registry.ts";
 import type { PluginStore } from "../src/plugins/store.ts";
@@ -44,14 +44,10 @@ const emptyCatalogs = {
 } as unknown as Catalogs;
 const stubRegistry = {
   listInstalledPlugins: () => [],
+  listAvailablePlugins: () => [],
 } as unknown as PluginRegistry;
 const stubStore = {} as unknown as PluginStore;
 const stubLedger = {} as unknown as Ledger;
-const stubNotifyStore = {
-  get: async () => null,
-  set: async () => {},
-  delete: async () => false,
-} as unknown as NotifyStore;
 
 type RouterSpec = { name: string; mount: string; app: Hono<OwnerVariables> };
 
@@ -81,7 +77,11 @@ function gatedRouters(): RouterSpec[] {
       mount: "/v1",
       app: createChatRoutes({ registry: stubRegistry, pluginStore: stubStore, verifyKey: deny }),
     },
-    { name: "notify", mount: "/api/notify", app: createNotifyRoutes({ store: stubNotifyStore, verifyKey: deny }) },
+    {
+      name: "sse-notify",
+      mount: "/v1/notify",
+      app: createSseNotifyRoutes({ hub: createSseHub(), verifyKey: deny }),
+    },
     { name: "ledger", mount: "/ledger", app: createLedgerRoutes(stubLedger, { verifyKey: deny }) },
   ];
 }
@@ -99,17 +99,50 @@ test("every route on every gated router rejects an unauthenticated request", asy
     for (const route of routes) {
       const path = mount + concretePath(route.path);
       const res = await parent.request(path, { method: route.method });
-      assert.equal(
-        res.status,
-        401,
-        `${name}: ${route.method} ${path} must be gated (got ${res.status})`,
+      // Owner-gated routes answer 401; the superuser-gated plugin endpoints
+      // (detail + management) answer 403 when no superuser secret is configured.
+      assert.ok(
+        res.status === 401 || res.status === 403,
+        `${name}: ${route.method} ${path} must be denied (got ${res.status})`,
       );
-      assert.deepEqual(
-        await res.json(),
-        { error: "unauthorized" },
-        `${name}: ${route.method} ${path} must return the canonical body`,
+      const body = (await res.json()) as { error?: unknown };
+      assert.equal(
+        typeof body.error,
+        "string",
+        `${name}: ${route.method} ${path} must return a denial body`,
       );
     }
+  }
+});
+
+test("the plugin detail and management endpoints require the superuser secret, not an owner key", async () => {
+  const allowOwner: VerifyApiKeyFn = async () => ({ ok: true, owner: "owner-1" });
+  const app = new Hono<OwnerVariables>();
+  app.route(
+    "/v1",
+    createPluginRoutes({
+      registry: stubRegistry,
+      store: stubStore,
+      verifyKey: allowOwner,
+      superuserKeys: [],
+    }),
+  );
+  const headers = { authorization: "Bearer owner-key" };
+
+  const list = await app.request("/v1/plugins", { headers });
+  assert.equal(list.status, 200, "the owner list must stay owner-gated");
+  assert.deepEqual(await list.json(), { plugins: [] });
+
+  const gated: Array<[string, string]> = [
+    ["GET", "/v1/plugins/openrouter"],
+    ["POST", "/v1/plugins/reload"],
+    ["POST", "/v1/plugins/vikunja/install"],
+    ["POST", "/v1/plugins/vikunja/uninstall"],
+  ];
+  for (const [method, path] of gated) {
+    const res = await app.request(path, { method, headers });
+    assert.equal(res.status, 403, `${method} ${path} must not accept an owner key`);
+    assert.deepEqual(await res.json(), { error: "forbidden" }, `${method} ${path}`);
   }
 });
 

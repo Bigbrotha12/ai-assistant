@@ -7,7 +7,7 @@ implementation decision may silently change it. The canonical frame sequences in
 golden-test fixtures.
 
 Verified against `8841130`. Sections are numbered stably — code comments reference §3.3,
-§3.4, §4, §5.1, §5.2, §6, §7.4 and Appendix A by number.
+§3.4, §3.5, §4, §5.1, §5.2, §6, §7.4 and Appendix A by number.
 
 ---
 
@@ -90,8 +90,11 @@ Content and tool-call chunks are OpenAI `chat.completion.chunk` objects:
   `enable_thinking`, …).
 - `created` is epoch **seconds**.
 
-The envelope is claimed by whichever frame is emitted first. For a degenerate run whose
-first frame is the finish chunk, that chunk carries the envelope.
+The envelope is claimed by the first `chat.completion.chunk` frame emitted. For a degenerate
+run whose first chunk is the finish chunk, that chunk carries the envelope. The standalone
+input advisory frames (§3.5) are not chat chunks and never claim the envelope: when the L1
+frame leads the stream, the first completion chunk after it still carries
+`id`/`object`/`created`/`model`.
 
 ---
 
@@ -173,6 +176,120 @@ first frame is the finish chunk, that chunk carries the envelope.
   - omitted otherwise.
 - Clients MUST treat an unknown `type`/`code` as `server_error` and always show `message`.
 - An error envelope terminates the stream (§5.2). It is never followed by a finish chunk.
+
+### 3.5 Input Sentinel advisory frames (L1 provisional + semantic)
+
+Two standalone, non-OpenAI frames carry input-derived Sentinel state. Neither is a
+`chat.completion.chunk`; neither carries `choices` or `error`; neither consumes the §2
+envelope (the first completion chunk after either still carries `id`/`object`/`created`/
+`model`). The **L1 frame** is synchronous and, on a finding turn, is the stream's first
+frame. The **semantic frame** is asynchronous, at most one per stream, and when present is
+emitted after the streamed deltas and immediately before the finish chunk/`[DONE]`.
+
+**L1 provisional frame** (first frame on a finding turn; absent on a clean turn):
+
+```json
+{
+  "sentinel": {
+    "advisory": true,
+    "phase": "l1",
+    "source": "l1",
+    "categories": ["jailbreak_attempt"],
+    "severity": "high",
+    "matchedRules": ["jailbreak_attempt.instruction_override"],
+    "findings": [
+      {
+        "ruleId": "jailbreak_attempt.instruction_override",
+        "category": "jailbreak_attempt",
+        "severity": "high",
+        "source": "l1"
+      }
+    ],
+    "action": { "cannedResponseId": "sentinel_advisory_v1" }
+  }
+}
+```
+
+- `advisory` / `categories` / `severity` / `matchedRules` are the §3.5 fields from P3 and
+  remain the authoritative advisory for clients that do not understand `phase`.
+- `phase:"l1"` / `source:"l1"` mark the frame as the deterministic, input-derived
+  provisional.
+- `findings` — one entry per L1 finding, each `source:"l1"` (with `confidence` when the
+  detector supplies one).
+- `action.cannedResponseId` — the advisory canned-response id, or `null` when the L1
+  verdict is `allow` (a harmless-only finding).
+- `severity` is never null on an emitted L1 frame.
+
+**Semantic frame** (at most one, near the end of the stream):
+
+```json
+{
+  "sentinel": {
+    "advisory": true,
+    "phase": "semantic",
+    "final": true,
+    "source": "semantic",
+    "semanticAvailable": true,
+    "categories": ["self_harm"],
+    "severity": "high",
+    "matchedRules": ["semantic.self_harm"],
+    "findings": [
+      {
+        "ruleId": "semantic.self_harm",
+        "category": "self_harm",
+        "severity": "high",
+        "source": "semantic",
+        "confidence": 0.9
+      }
+    ],
+    "action": { "cannedResponseId": "sentinel_advisory_v1" }
+  }
+}
+```
+
+- `phase:"semantic"` / `final:true` mark it as the last word on the turn's input advisory.
+- `source:"semantic"`, `semanticAvailable:true` — the stage answered; an emitted semantic
+  frame is never `semanticAvailable:false`.
+- `findings` — the semantic findings, each `source:"semantic"` with its model `confidence`.
+  Where L1 also fired, the semantic decision fields (`categories`, `severity`,
+  `matchedRules`) are the semantic-only decision; the L1 frame's fields are superseded.
+- `advisory:true` with non-empty `findings` — the semantic stage found something.
+- `advisory:false` with empty `findings` / `categories` / `matchedRules`, `severity:null`,
+  and `action.cannedResponseId:null` — the explicit **clear**: the stage answered and found
+  nothing, so any provisional L1 advisory no longer stands.
+- **Harmless is not advisory-worthy.** The semantic frame carries only findings whose category
+  is not `harmless`. A `harmless` finding means benign content and policy maps it to `allow`, so
+  it never raises an advisory by itself; its probability and finding stay in the shadow report
+  metadata (`semanticFindings`) for audit only. A harmless-only semantic outcome therefore emits
+  no advisory frame on a clean turn, or the `advisory:false` clear when it must retract an L1
+  provisional frame. A **mixed** outcome (harmless plus risky) wires only its non-harmless
+  findings and derives `categories` / `matchedRules` / `severity` / `action` from that risky
+  subset — `harmless` never appears in the wire decision fields.
+- `action.cannedResponseId` — the advisory canned-response id, or `null` (the allow verdict).
+- **Availability.** Emitted only when the stage is available and either produced findings or
+  is clearing an L1 provisional frame. A disabled, unavailable, dropped, or timed-out stage
+  emits **no** semantic frame; the L1 frame (if any) remains the fallback. A semantic frame
+  is therefore never emitted on a clean turn that also had no L1 finding.
+- **Async, non-blocking.** The adapter never waits for it before the first byte. It awaits
+  only at the terminal event, bounded by `SENTINEL_SEMANTIC_TIMEOUT_MS` (default `2000`), so
+  a stuck semantic queue can never withhold `[DONE]`.
+- **Ordering.** The semantic frame follows every content/tool delta and the L1 frame, and
+  precedes the finish chunk (§3.3) and the single `[DONE]`. It is never emitted after
+  `[DONE]`, and never on an error-terminated stream (§5.2).
+
+- **Client handling.**
+  - A client aware of `phase` treats the `phase:"l1"` frame as the provisional advisory and
+    the `phase:"semantic"` frame as final: `advisory:true` replaces the provisional with the
+    semantic findings; `advisory:false` clears it.
+  - A top-level `sentinel` object is parsed into the advisory event (§8.7) and MUST NOT be
+    dropped. A `sentinel` whose `advisory` is not `true` produces no advisory.
+  - **Old-client degradation.** A client that only knows P3 keys ignores `phase`, `source`,
+    `final`, `findings`, `action`, and `semanticAvailable`. A semantic frame with
+    `advisory:true` is surfaced as an additional advisory (the later one supersedes for
+    display); a semantic frame with `advisory:false` produces no advisory, so the client
+    conservatively retains the L1 advisory it already surfaced. The adapter's ordering
+    guarantees the L1 frame precedes the semantic frame, so the fallback is never lost.
+
 
 ### `[DONE]`
 
@@ -293,6 +410,13 @@ MUST tolerate both a trailing `[DONE]` and a bare connection close after the err
 The adapter linearizes LangGraph v2 events in the order they are yielded and translates in
 that order. The run tree (subgraphs, parallel tool nodes) is invisible on the wire.
 
+The §3.5 input advisory frames are not derived from any LangGraph event. The L1 frame is
+computed from the request's input before streaming and, on a finding turn, prepended as the
+first frame. The semantic frame reuses the input shadow report's already-queued semantic
+result; the adapter emits it at the root `on_chain_end` (or the L9 degenerate fallback),
+after the streamed deltas and before the finish chunk/`[DONE]`, bounded by
+`SENTINEL_SEMANTIC_TIMEOUT_MS`.
+
 | LangGraph / LangChain event | Wire effect |
 |---|---|
 | `on_chat_model_start`, `on_llm_start` | none — resets the per-turn tool-call index namespace |
@@ -334,8 +458,9 @@ content nor tool-call deltas emits nothing before `[DONE]` (§7.4).
 
 ## 7. Canonical frame sequences (golden-test fixtures)
 
-Each `data:` line is followed by one blank line. Frames after the first omit
-`id`/`object`/`created`/`model` per §2.
+Each `data:` line is followed by one blank line. Except where noted, frames after the first
+omit `id`/`object`/`created`/`model` per §2 (an advisory header, §7.6, precedes the enveloped
+first completion chunk).
 
 ### 7.1 Simple text completion — `finish_reason: "stop"`
 
@@ -397,6 +522,89 @@ data: [DONE]
 No finish chunk. The accumulated `finish_reason` is `null` (I3) and the client maps that to
 the non-tool path (§4, receive side).
 
+### 7.5 Tool round-trip — real execution, mixed content (M4)
+
+Two parallel tool-call indices in one turn, index 0 a real bound tool whose concatenated
+arguments parse (so the executor runs) and index 1 an unregistered call whose first non-empty
+fragment lacks its leading `{` (the adapter's §3.2 normalization prepends it). A final text
+answer follows, so the terminal chunk carries `"stop"`.
+
+```
+data: {"id":"chatcmpl-006","object":"chat.completion.chunk","created":1726080200,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"list_tasks","arguments":"{\"projectId\":\"p1\""}},{"index":1,"id":"call_1","type":"function","function":{"name":"search_web","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"","arguments":"}"}},{"index":1,"type":"function","function":{"name":"","arguments":"{\"q\":\"dinner "}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"","arguments":"recipes\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Here"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":" you go"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+### 7.6 Input L1 advisory header — finding turn
+
+The turn's last user message produced an L1 finding, so the stream leads with the §3.5 L1
+provisional frame. That frame is standalone (§3.5): it does not consume the envelope, so the
+first completion chunk still carries `id`/`object`/`created`/`model`. On a clean turn the
+advisory line is absent and the sequence is exactly §7.1.
+
+```
+data: {"sentinel":{"advisory":true,"phase":"l1","source":"l1","categories":["jailbreak_attempt"],"severity":"high","matchedRules":["jailbreak_attempt.instruction_override"],"findings":[{"ruleId":"jailbreak_attempt.instruction_override","category":"jailbreak_attempt","severity":"high","source":"l1"}],"action":{"cannedResponseId":"sentinel_advisory_v1"}}}
+
+data: {"id":"chatcmpl-009","object":"chat.completion.chunk","created":1726080600,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"I can't help with that"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+### 7.7 Input advisory with async semantic enrichment — supersede
+
+L1 fired provisionally and the semantic stage (available, async) also found something, so a
+single `phase:"semantic"`, `final:true` frame follows the content and precedes the finish
+chunk/`[DONE]`. The semantic decision fields supersede the provisional L1 advisory.
+
+```
+data: {"sentinel":{"advisory":true,"phase":"l1","source":"l1","categories":["jailbreak_attempt"],"severity":"high","matchedRules":["jailbreak_attempt.instruction_override"],"findings":[{"ruleId":"jailbreak_attempt.instruction_override","category":"jailbreak_attempt","severity":"high","source":"l1"}],"action":{"cannedResponseId":"sentinel_advisory_v1"}}}
+
+data: {"id":"chatcmpl-010","object":"chat.completion.chunk","created":1726080660,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"I can't help with that"},"finish_reason":null}]}
+
+data: {"sentinel":{"advisory":true,"phase":"semantic","final":true,"source":"semantic","semanticAvailable":true,"categories":["self_harm"],"severity":"high","matchedRules":["semantic.self_harm"],"findings":[{"ruleId":"semantic.self_harm","category":"self_harm","severity":"high","source":"semantic","confidence":0.9}],"action":{"cannedResponseId":"sentinel_advisory_v1"}}}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+### 7.8 Semantic clear — explicit `advisory:false`
+
+L1 fired provisionally but the available semantic stage found nothing, so a single explicit
+clear frame follows the content: `advisory:false` with empty decision fields. A client aware
+of `phase` drops the provisional advisory; an older client ignores the frame and keeps the
+L1 advisory (conservative fallback, §3.5). A semantic-only finding turn (clean L1) is the
+§7.7 supersede sequence without the leading L1 frame; a turn where the stage is
+disabled/unavailable/dropped/timed out emits no semantic frame at all.
+
+```
+data: {"sentinel":{"advisory":true,"phase":"l1","source":"l1","categories":["jailbreak_attempt"],"severity":"high","matchedRules":["jailbreak_attempt.instruction_override"],"findings":[{"ruleId":"jailbreak_attempt.instruction_override","category":"jailbreak_attempt","severity":"high","source":"l1"}],"action":{"cannedResponseId":"sentinel_advisory_v1"}}}
+
+data: {"id":"chatcmpl-011","object":"chat.completion.chunk","created":1726080720,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Sure"},"finish_reason":null}]}
+
+data: {"sentinel":{"advisory":false,"phase":"semantic","final":true,"source":"semantic","semanticAvailable":true,"categories":[],"severity":null,"matchedRules":[],"findings":[],"action":{"cannedResponseId":null}}}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
 ---
 
 ## 8. Client parser requirements
@@ -420,13 +628,20 @@ the non-tool path (§4, receive side).
    let the caller treat it as a normal non-tool turn. A zero-byte EOF (no frames read) is a
    connection failure and is retried. The adapter MUST emit `[DONE]`; strictness is a
    producer obligation, tolerance is a client convenience.
-7. **Ignore unknown fields.** `id`, `object`, `created`, `model`, `usage`, `delta.role`, and
-   any future top-level fields MUST NOT affect parsing.
-8. **Single choice.** Parse `choices[0]` only; ignore others.
-9. **Empty content frames.** Any `delta.content` that is not a non-empty string is ignored.
-   Thinking-block and structured-token stripping is client-side and happens before the
-   content is surfaced.
-10. **Brace-prefix tolerance.** The client MAY re-prefix a first argument fragment that lacks
+7. **Parse the top-level `sentinel` advisory.** A payload carrying a top-level `sentinel`
+   object (§3.5) MUST be parsed into the advisory event and emitted as
+   `SseEventType.sentinel`, carrying the DTO fields `categories`, `severity`, and
+   `matchedRules`. It is checked before the `choices`/`error` dispatch, never terminates the
+   stream, and never claims the §2 envelope. A `sentinel` whose `advisory` is not `true`
+   yields no event.
+8. **Ignore unknown fields and frames.** `id`, `object`, `created`, `model`, `usage`,
+   `delta.role`, and any future top-level fields MUST NOT affect parsing. A frame with
+   neither `choices`, `error`, nor a top-level `sentinel` is ignored.
+9. **Single choice.** Parse `choices[0]` only; ignore others.
+10. **Empty content frames.** Any `delta.content` that is not a non-empty string is ignored.
+    Thinking-block and structured-token stripping is client-side and happens before the
+    content is surfaced.
+11. **Brace-prefix tolerance.** The client MAY re-prefix a first argument fragment that lacks
     its leading `{`. This is a defensive fallback for non-conforming producers; the adapter
     (§6) is required to emit conforming frames.
 
@@ -434,18 +649,31 @@ the non-tool path (§4, receive side).
 
 ## 9. Conformance and golden fixtures
 
-- §7.1–§7.4 are the canonical fixtures. Server-side golden tests
+- §7.1–§7.8 are the canonical fixtures. Server-side golden tests
   (`server/test/transport/openai.test.ts`) assert the adapter's output byte-for-byte against
-  them. Client-side tests (`test/features/chat/sse_test.dart`, using the shared fixtures in
+  them; the transport-level advisory behaviour is additionally covered in
+  `server/test/transport/chat.test.ts`. Client-side tests
+  (`test/features/chat/sse_test.dart`, using the shared fixtures in
   `test/features/chat/sse_fixtures.dart`) assert the parser against frames of the same shape,
-  semantics, and framing.
+  semantics, and framing. The P5 semantic fixtures (§7.7–§7.8) are additive on the wire: the
+  older client parser ignores the new fields.
 - Contract behaviours the goldens must cover:
   - sticky finish: §7.2 parses with `finish_reason == "tool_calls"` and the tool calls
     materialized;
   - exactly one `done` event per stream (§7.1 and §7.4);
   - §7.4 yields `done(null)` and maps to the non-tool path;
   - §7.3 yields exactly one error and no `done`, with and without a trailing `[DONE]`;
-  - single `data:` line per frame, envelope on the first frame only, `[DONE]` terminator.
+  - §7.6 parses the leading top-level `sentinel` frame into an advisory event
+    (`SseEventType.sentinel`, carrying `categories` / `severity` / `matchedRules`) before any
+    content; the advisory does not consume the envelope, so the first completion chunk still
+    carries `id`/`object`/`created`/`model`; a clean turn emits no advisory frame; a frame
+    with neither `choices`, `error`, nor `sentinel` is ignored while parsing continues;
+  - §7.7–§7.8: the semantic frame is emitted at most once, after content and before the
+    finish chunk/`[DONE]`; `advisory:true` supersedes the provisional L1 frame and
+    `advisory:false` clears it; a disabled/unavailable/dropped/timed-out stage emits no
+    semantic frame, leaving L1 as the fallback; no frame follows `[DONE]`;
+  - single `data:` line per frame, envelope on the first completion chunk only, `[DONE]`
+    terminator.
 
 ---
 
@@ -627,3 +855,5 @@ currently always `"template"`; the field is reserved for a future `"plugin"` ori
   completion turn (I1).
 - **No `type` field on pre-stream HTTP errors** — the flat error shape is `{"error": code}`
   (§5.1). The `type` field exists only on the in-band error envelope (§3.4).
+- **The input advisory frames are not chat chunks.** Neither §3.5 sentinel frame carries
+  `choices` or `error`, and neither claims the §2 envelope.

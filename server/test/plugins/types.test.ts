@@ -9,10 +9,13 @@ import {
   PluginSchemaError,
   isToolPlugin,
   isModelPlugin,
+  isChatModelPlugin,
+  isDecisionModelPlugin,
   isAgentPlugin,
   pluginIdSchema,
 } from "../../src/plugins/types.ts";
 import type {
+  InferenceDefinition,
   PluginDefinition,
 } from "../../src/plugins/types.ts";
 
@@ -95,6 +98,34 @@ describe("plugin definition schemas", () => {
       assert.equal(parsed.data.inference.tokenLimit, 200_000);
       assert.equal(parsed.data.credentials?.apiKey.required, true);
     }
+  });
+
+  test("a model plugin without `mode` parses as chat (backward compatible)", () => {
+    const parsed = pluginDefinitionSchema.safeParse(modelPlugin());
+    assert.equal(parsed.success, true);
+    if (parsed.success && isModelPlugin(parsed.data)) {
+      assert.equal(parsed.data.inference.mode, "chat");
+      assert.equal(isChatModelPlugin(parsed.data), true);
+      assert.equal(isDecisionModelPlugin(parsed.data), false);
+    }
+  });
+
+  test("a model plugin may declare decisions mode", () => {
+    const plugin = modelPlugin();
+    (plugin.inference as Record<string, unknown>).mode = "decisions";
+    const parsed = pluginDefinitionSchema.safeParse(plugin);
+    assert.equal(parsed.success, true);
+    if (parsed.success && isModelPlugin(parsed.data)) {
+      assert.equal(parsed.data.inference.mode, "decisions");
+      assert.equal(isDecisionModelPlugin(parsed.data), true);
+      assert.equal(isChatModelPlugin(parsed.data), false);
+    }
+  });
+
+  test("an unknown inference mode fails", () => {
+    const plugin = modelPlugin();
+    (plugin.inference as Record<string, unknown>).mode = "chatty";
+    assert.equal(pluginDefinitionSchema.safeParse(plugin).success, false);
   });
 
   test("missing tools on a tool plugin fails", () => {
@@ -302,6 +333,27 @@ describe("jsonSchemaSchema", () => {
 
   test("rejects a non-object", () => {
     assert.equal(jsonSchemaSchema.safeParse("object").success, false);
+  });
+});
+
+describe("InferenceDefinition type contract", () => {
+  test("a parsed inference definition always carries mode (type test)", () => {
+    const parsed = pluginDefinitionSchema.parse(modelPlugin());
+    if (isModelPlugin(parsed)) {
+      const inference: InferenceDefinition = parsed.inference;
+      assert.equal(inference.mode, "chat");
+    }
+
+    // @ts-expect-error mode is required in the parsed output type
+    const missingMode: InferenceDefinition = {
+      endpoint: "https://example.test/v1",
+      defaultModel: "model-1",
+      tokenLimit: 1024,
+      supportsStreaming: false,
+      visionCapable: false,
+      parameters: {},
+    };
+    void missingMode;
   });
 });
 

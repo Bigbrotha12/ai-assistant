@@ -304,7 +304,7 @@ export class ToolExecutor implements ToolCallHandler {
 
   constructor(private readonly opts: ToolExecutorOptions) {
     // Per-domain egress client: the plugin trust list is captured here and
-    // never shared with the model/notify clients. The client mainly supplies the
+    // never shared with the model client. The client mainly supplies the
     // injected `fetchFn` (test seam): `execute` always passes a per-call policy,
     // so the client-level `trustedHosts`/`mode` are INERT on the policy branch
     // (`policyFetch` reads trust/mode from the policy).
@@ -403,7 +403,7 @@ export class ToolExecutor implements ToolCallHandler {
   }
 }
 
-/** Notification seam (noop until configured via NOTIFY_BASE_URL). */
+/** Notification seam (the gateway wires the owner-scoped SSE hub; noop by default). */
 export interface NotificationHook {
   notifyJobComplete(owner: string, taskId: string, summary: string): void | Promise<void>;
 }

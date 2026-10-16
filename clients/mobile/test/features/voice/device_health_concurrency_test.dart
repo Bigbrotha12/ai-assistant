@@ -378,6 +378,7 @@ void main() {
               onReceived,
               onContent,
               onToolCallDelta,
+              onSentinelAdvisory,
             }) => chat.sendTurn(
               '',
               history: const [],
@@ -388,6 +389,7 @@ void main() {
               onReceived: onReceived,
               onContent: onContent,
               onToolCallDelta: onToolCallDelta,
+              onSentinelAdvisory: onSentinelAdvisory,
             ),
         micCapture: mic,
         playback: playback,

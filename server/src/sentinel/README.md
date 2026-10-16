@@ -1,28 +1,54 @@
-# Sentinel S1–S4
+# Sentinel
 
-S1 is the gateway-side deterministic Sentinel backbone. S2 adds the offline on-device input preflight, S3 adds the deterministic JSONL evaluation harness, and S4 adds server-side shadow reporting. None of these slices runs an L2 classifier or enforces Sentinel on the chat path.
+Sentinel is a server-owned deterministic safety layer. The gateway owns L1: it evaluates the turn's last user message at admission and tool/output text at the graph seam against `l1.ts`, serves the standalone `POST /v1/sentinel/check` and `GET /v1/sentinel/reports` surfaces, and records metadata-only shadow reports for chat traffic (S4). The chat and voice user advisory is delivered on the managed stream as the `sentinel` SSE frame; the client holds no matcher and no rule bundle. The deterministic JSONL evaluation harness (S3) scores L1 offline. No slice runs an L2 classifier or enforces a verdict on the chat path.
 
 ## Rule set
 
 `rules.v1.json` is the canonical v1 artifact. Each rule has a stable `id`, one `category`, one `severity`, `match: "phrase"`, literal `patterns`, and optional `context.requires` / `context.excludes` phrases. Phrase matching normalizes Unicode NFKC, case, punctuation, and whitespace, then requires whole-phrase boundaries. Findings are sorted by rule id; the rule set and policy versions are returned with every verdict.
 
-The current version is `sentinel-rules.v1.0.0`. A rule or policy change requires a new version and corresponding tests. The format intentionally uses only literal phrases so the on-device implementation can reproduce it without JavaScript-only regular expressions.
+The current version is `sentinel-rules.v1.0.0`. A rule or policy change requires a new version and corresponding tests. The format intentionally uses only literal phrases so the deterministic evaluator stays reproducible without JavaScript-only regular expressions.
 
-## Shared rule bundle (S2)
+## Rule artifact generation
 
-`server/src/sentinel/rules.v1.json` remains the only hand-edited rule source. From the repository root, run:
+`server/src/sentinel/rules.v1.json` is the only hand-edited rule source. The generator lives in the Flutter package at `clients/mobile/tool/generate_sentinel_rules.dart`. From the repository root, run:
 
 ```sh
-dart run tool/generate_sentinel_rules.dart
+dart run clients/mobile/tool/generate_sentinel_rules.dart
 ```
 
-The generator emits `server/src/sentinel/rules.generated.ts` and `lib/features/sentinel/data/rules.generated.dart`. Both artifacts contain the exact source JSON, `sentinel-rules.v1.0.0`, and the source SHA-256. The Dart bundle is compiled into the app; S2 does not fetch rules or call `/v1/sentinel/check` before sending. The server and Dart tests compare each generated source string with the canonical file and pin the hash, so a rule edit without regeneration fails the test suite.
+It emits the server TS artifact `server/src/sentinel/rules.generated.ts` only. The artifact carries the exact source JSON, `sentinel-rules.v1.0.0`, and the source SHA-256. The server test compares the generated source string with the canonical file and pins the hash, so a rule edit without regeneration fails the test suite.
 
-The Dart evaluator uses the same literal phrase model as `l1.ts`: NFKC-compatible normalization, case folding, punctuation/whitespace folding, whole-phrase boundaries, and `context.requires`/`context.excludes` checks. Findings retain the server rule ids, categories, severities, and deterministic rule-id ordering. Only rule metadata is exposed to the advisory UI; outgoing text is not retained in an advisory object or log.
+`l1.ts` is the sole evaluator. It normalizes Unicode NFKC, folds case, punctuation, and whitespace, requires whole-phrase boundaries, and applies `context.requires`/`context.excludes`. Findings retain the rule ids, categories, severities, and deterministic rule-id ordering. Only rule metadata leaves the gateway; the evaluated text is not retained in an advisory frame, shadow report, or log.
 
-## Client advisory (S2)
+## Chat and voice advisory
 
-`ManagedConversationService.sendTurn` runs the local gate before admission and before the managed request. Text chat and the voice transcript path both use that synchronous send path. S2 is advisory and non-blocking: a high- or medium-severity finding displays a dismissible inline chat banner (or the existing voice notice line), then the message is still sent. A gate failure is fail-open for the send and does not create a server request. `SENTINEL_POLICY_MODE` remains `advisory` by default; the server environment setting is unchanged. Client background submission remains outside the S2 client seam; S4 adds the server-side runner classification.
+The gateway classifies the turn's last user message at admission on the managed chat and voice (`sendVoiceTurn`) stream paths. When at least one L1 finding is present, it prepends a standalone `sentinel` SSE frame as the stream's first frame:
+
+```json
+{
+  "sentinel": {
+    "advisory": true,
+    "phase": "l1",
+    "source": "l1",
+    "categories": ["jailbreak_attempt"],
+    "severity": "high",
+    "matchedRules": ["jailbreak_attempt.instruction_override"],
+    "findings": [
+      {
+        "ruleId": "jailbreak_attempt.instruction_override",
+        "category": "jailbreak_attempt",
+        "severity": "high",
+        "source": "l1"
+      }
+    ],
+    "action": { "cannedResponseId": "sentinel_advisory_v1" }
+  }
+}
+```
+
+When the async semantic stage is available it reuses the input shadow report's already-queued evaluation and emits at most one `phase:"semantic"`, `final:true` frame after the streamed deltas and just before the finish chunk/`[DONE]`: `advisory:true` with the semantic `findings` supersedes the provisional L1 frame, and `advisory:false` (with empty decision fields) explicitly clears it. A disabled, unavailable, dropped, or timed-out stage emits no semantic frame, leaving the L1 frame as the fallback; the terminal wait is bounded by `SENTINEL_SEMANTIC_TIMEOUT_MS`. Byte-level framing, field semantics, and old-client degradation are specified in `WIRE_SPEC.md` §3.5 and §7.6–§7.8.
+
+The frame is informational and non-blocking: the turn streams normally and the message is still sent. The client parses it into a dismissible inline chat banner or the existing voice notice line and never sees the evaluated text. A clean turn emits no frame, so its stream is byte-identical to a turn without an advisory. Background JSON submission (`submitBackground`) returns a plain JSON response, not a stream, so it receives no advisory frame; the server-side runner classification described under `## Shadow reporting` still applies. `SENTINEL_POLICY_MODE` remains `advisory` by default and does not enable chat enforcement.
 
 ## S3 evaluation
 
@@ -67,6 +93,16 @@ The current policy is `sentinel-policy.v1.0.0`.
 
 The severity threshold remains an open product decision. S1 exposes the binary policy mode first so the threshold can be refined without changing the endpoint or rule format.
 
+## Semantic stage (Kev-4B)
+
+The semantic stage is an optional second classifier over the internal Kev-4B decision model. It is **disabled by default** (`SENTINEL_SEMANTIC_ENABLED=false`) and builds no client and makes no model calls when disabled.
+
+When enabled, the gateway resolves `SENTINEL_SEMANTIC_PLUGIN_ID` through the plugin registry **after the plugin store has loaded**. The id must resolve to an installed model plugin whose `inference.mode` is `"decisions"` (the builtin is `kev-4b`, endpoint `http://llama-kev.local:19096`). The decision client is built through the same egress facade as the model path: egress is allowed only for the plugin's own endpoint, and a private/plain-`http:` endpoint is reachable ONLY when its host is admin-vouched in `PLUGINS_TRUSTED_HOSTS` (the same private-range bypass + production `http:` carve-out pairing the facade applies). No raw fetch path is added.
+
+The stage answers one question per Sentinel category in the shadow drain (never on the chat path) and for the standalone `POST /v1/sentinel/check`. When every question answers, the verdict is decided from the semantic findings alone (L1 is not unioned in) while both sources are retained for audit; on any timeout, error, or missing answer — including when the plugin/client could not be constructed at boot — the stage is reported unavailable and both the check and shadow paths fall back to the deterministic L1 findings. A disabled stage records a v2 L1-only report with `semanticAvailable:false`; enabled reports carry the semantic outcome as separate fields.
+
+`SENTINEL_SEMANTIC_THRESHOLD` (0..1, default `0.5`) sets the firing confidence, `SENTINEL_SEMANTIC_CONTEXT_AWARE` (default `true`) selects intent-vs-topical phrasing, and `SENTINEL_SEMANTIC_TIMEOUT_MS` (default `2000`) bounds each decision call. The check and shadow paths share ONE bounded semantic cache (512 entries), keyed on the full text, threshold, phrasing, and model version.
+
 ## Shadow reporting (S4)
 
 `SENTINEL_POLICY_MODE` configures the standalone `POST /v1/sentinel/check` surface only. It is **not enforced on chat, tool, or streaming paths**. Chat traffic is classified in shadow mode and records the hypothetical blocking-policy verdict; it is never blocked, cancelled, withheld, or changed. Chat-path enforcement remains deferred until the owner reviews the shadow data.
@@ -75,7 +111,7 @@ The gateway classifies the last user message at admission, each redacted and bou
 
 Each report is metadata-only. It is stored as a dedicated owner-scoped ledger task with `worker: "sentinel"`, a fence-protected `sentinel:shadow` step, `shadow: true`, and terminal status `awaiting_review`; it contains no evaluated text, matched substring, or rule pattern. Reports use the ledger's existing transient retention window (24 hours by default), so this surface is single-replica and is a tuning aid rather than a durable audit archive.
 
-Shadow persistence is serialized through a process-local bounded queue. The request and graph paths classify and enqueue metadata but never await ledger I/O. The queue holds 256 reports, caps each authenticated owner plus `requestId` turn at 32 reports, and uses an explicit `drop-newest` policy. `SentinelShadowReporter.getQueueStats(owner)` exposes queued, accepted, persisted, dropped, turn-cap, queue-cap, and failed counters; `getDroppedCount()` exposes the process total. Queue entries and turn counters are owner-scoped, and the queued item does not retain evaluated text. `flush()` drains deterministically for shutdown/integration tests; the scheduled immediate otherwise keeps normal process shutdown best-effort and fail-open.
+Shadow persistence is serialized through a process-local bounded queue. The request and graph paths classify and enqueue metadata but never await ledger I/O. The queue holds 256 reports, caps each authenticated owner plus `requestId` turn at 32 reports, and uses an explicit `drop-newest` policy. `SentinelShadowReporter.getQueueStats(owner)` exposes queued, accepted, persisted, dropped, turn-cap, queue-cap, and failed counters; `getDroppedCount()` exposes the process total. Queue entries and turn counters are owner-scoped. The queued item retains no evaluated text unless the semantic stage is enabled, in which case it holds the text in memory only until the drain evaluates it; the text is never persisted or logged. `flush()` drains deterministically for shutdown/integration tests; the scheduled immediate otherwise keeps normal process shutdown best-effort and fail-open.
 
 Persistence uses repair rather than a multi-call transaction. A report intent checks the legacy base key and up to eight `:attempt:<n>` keys. A queued partial task is repaired to `cancelled`; a running or stuck partial task is repaired to `failed` using the current fence; a completed `awaiting_review` step is reused. A retry scans attempts in order and returns the first valid completed report, so a one-shot failure cannot leave an active orphan or create a second visible report. Telemetry runs after completion and remains fail-open.
 
@@ -106,7 +142,7 @@ The `byCategory` and `bySeverity` maps always contain every Sentinel enum key, i
 
 ## Endpoint
 
-`POST /v1/sentinel/check` requires the existing `Authorization: Bearer <api-key>` seam. Owner is always derived from the verified key. A supplied `context.taskId` is accepted only when it belongs to that owner. Caller-supplied `owner` fields are rejected, and `direction: "input"` is rejected because input runs on-device in S2. The request field is `text`; `turn` is accepted as a compatibility alias.
+`POST /v1/sentinel/check` requires the existing `Authorization: Bearer <api-key>` seam. Owner is always derived from the verified key. A supplied `context.taskId` is accepted only when it belongs to that owner. Caller-supplied `owner` fields are rejected, and `direction: "input"` is rejected because input is evaluated server-side at admission rather than through this caller-supplied endpoint. The request field is `text`; `turn` is accepted as a compatibility alias.
 
 Request:
 
@@ -191,4 +227,4 @@ A stored shadow step has this shape (the owner is the ledger task's implicit own
 
 - Enforcement switch: review the shadow data, choose a policy threshold, then add an explicit chat-path enforcement decision; do not infer it from `SENTINEL_POLICY_MODE`.
 - Client report view: add a settings-screen view over `GET /v1/sentinel/reports`; no client UI is included in S4.
-- Client finding aggregation: a future client may send category/rule ids only (never text) if on-device and server rates need to be reconciled.
+- Client finding aggregation: a future client may send category/rule ids only (never text) if the delivered advisory and server rates need to be reconciled.

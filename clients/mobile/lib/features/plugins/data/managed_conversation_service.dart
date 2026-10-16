@@ -9,8 +9,6 @@ import '../../chat/data/chat_client.dart';
 import '../../chat/data/context_trimmer.dart';
 import '../../chat/data/message_model.dart';
 import '../../chat/data/sse.dart';
-import '../../notifications/data/notif_client.dart';
-import '../../sentinel/sentinel.dart';
 import 'langchain_client.dart';
 import 'langchain_request.dart';
 import 'ledger_client.dart';
@@ -125,8 +123,7 @@ class ManagedConversationService {
     this._poller,
     this._dio,
     this.onAccountDeleted,
-    SentinelInputGate? sentinelGate,
-  }) : sentinelGate = sentinelGate ?? SentinelInputGate();
+  });
 
   final LangChainClient client;
   final ManagedConversationRepository repo;
@@ -147,7 +144,6 @@ class ManagedConversationService {
   /// poller-scoped [AuthCredentials].
   LedgerPoller? _poller;
   final Dio? _dio;
-  final SentinelInputGate sentinelGate;
   final Future<void> Function(Object error)? onAccountDeleted;
 
   Future<void> _notifyAccountDeleted(Object error) async {
@@ -204,23 +200,22 @@ class ManagedConversationService {
   /// dispatching. Each delta is epoch-checked first: once the scope is
   /// cancelled the wrapper throws `cancelled` before the caller sees the
   /// delta, and that throw surfaces as [ManagedTurnError] (`cancelled`).
+  ///
+  /// [onSentinelAdvisory] fires at most once per phase (L1, semantic) per
+  /// high-level turn, when the gateway's Sentinel gate emitted an advisory
+  /// frame. The initial L1 frame leads a finding turn; a later semantic frame
+  /// arrives when the semantic stage answered, with its own `advisory` flag
+  /// (`false` clears a provisional L1 notice). The match is server-side and
+  /// advisory only — the user message is still dispatched and the turn
+  /// completes normally.
   Future<ManagedTurnOutcome> sendTurn(
     String conversationId, {
     required List<Message> history,
     required String userText,
     String? sessionId,
     void Function(String delta)? onContent,
-    void Function(SentinelAdvisory advisory)? onAdvisory,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
-    SentinelAdvisory? advisory;
-    try {
-      advisory = sentinelGate.advisory(userText);
-    } catch (_) {}
-    if (advisory != null) {
-      try {
-        onAdvisory?.call(advisory);
-      } catch (_) {}
-    }
     final epoch = repo.epoch(scope);
     final userMessage = Message(
       id: const Uuid().v4(),
@@ -277,6 +272,27 @@ class ManagedConversationService {
         delta: shape.delta,
       );
     });
+    // At-most-once delivery PER PHASE for THIS high-level send: an N2 silent
+    // reseed or a 409 session_missing recovery forwards the same callback into
+    // a second request for the same user message, and the server re-emits that
+    // phase's frame. The first delivery of each phase wins; the semantic phase
+    // is tracked separately from L1 so a semantic update that follows the
+    // provisional L1 frame is never swallowed. A recovery that ran before a
+    // frame was emitted (e.g. a 413 prune) still delivers each exactly once.
+    var l1Delivered = false;
+    var semanticDelivered = false;
+    final onceAdvisory = onSentinelAdvisory == null
+        ? null
+        : (SentinelAdvisoryEvent advisory) {
+            if (advisory.phase == SentinelPhase.semantic) {
+              if (semanticDelivered) return;
+              semanticDelivered = true;
+            } else {
+              if (l1Delivered) return;
+              l1Delivered = true;
+            }
+            onSentinelAdvisory(advisory);
+          };
     return _dispatch(
       conversationId,
       epoch,
@@ -290,6 +306,7 @@ class ManagedConversationService {
       agent: agent,
       delta: prepared.delta,
       onContent: onContent,
+      onSentinelAdvisory: onceAdvisory,
     );
   }
 
@@ -499,6 +516,7 @@ class ManagedConversationService {
     bool delta = false,
     bool tooLargeRetried = false,
     void Function(String delta)? onContent,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
     _checkEpoch(epoch);
     final resolved = await credentials();
@@ -537,6 +555,12 @@ class ManagedConversationService {
                 _checkEpoch(epoch);
                 onContent(text);
               },
+        onSentinelAdvisory: onSentinelAdvisory == null
+            ? null
+            : (advisory) {
+                _checkEpoch(epoch);
+                onSentinelAdvisory(advisory);
+              },
       );
       // abandonTurn may have cancelled this turn's dispatch after the stream
       // resolved but before we got here — a late completion must not persist.
@@ -564,6 +588,7 @@ class ManagedConversationService {
             enabledPlugins: enabledPlugins,
             agent: agent,
             onContent: onContent,
+            onSentinelAdvisory: onSentinelAdvisory,
           );
         }
         final outcome = ManagedStreamedTurn(
@@ -613,6 +638,7 @@ class ManagedConversationService {
           enabledPlugins: enabledPlugins,
           agent: agent,
           onContent: onContent,
+          onSentinelAdvisory: onSentinelAdvisory,
         );
       }
       if (error.code == ManagedErrorCodes.requestTooLarge && !tooLargeRetried) {
@@ -638,6 +664,7 @@ class ManagedConversationService {
             delta: delta,
             tooLargeRetried: true,
             onContent: onContent,
+            onSentinelAdvisory: onSentinelAdvisory,
           );
         }
       }
@@ -729,8 +756,10 @@ class ManagedConversationService {
       agent: agent,
     );
     final token = repo.register(scope);
+    String? backgroundTaskId;
     try {
       final result = await client.backgroundTurn(request, cancelToken: token);
+      backgroundTaskId = result.taskId;
       _checkEpoch(epoch);
       await _persistBackgroundState(
         conversationId,
@@ -752,6 +781,7 @@ class ManagedConversationService {
       epoch,
       lookup: LedgerLookup.byMessageId(messageId),
       history: history,
+      expectedTaskId: backgroundTaskId,
     );
   }
 
@@ -783,14 +813,21 @@ class ManagedConversationService {
   /// visible projected terminal marker; unresolved polling failures retain the
   /// envelope. Epoch-safe: a scope clear mid-poll makes reconciliation a no-op.
   /// Each submitBackground call creates an independent watch by lookup.
+  ///
+  /// [expectedTaskId] (when known) lets [LedgerPoller.accelerate] match this
+  /// watch before the first poll has echoed the task's id — the app-wide
+  /// completion push accelerates by task id, which is unknown at submit until
+  /// the background dispatch returns it.
   LedgerPollHandle _watchBackground(
     String conversationId,
     int epoch, {
     required LedgerLookup lookup,
     required List<Message> history,
+    String? expectedTaskId,
   }) {
     final handle = _ledgerPoller.watch(
       lookup,
+      expectedTaskId: expectedTaskId,
       onUpdate: (task) {
         unawaited(
           _persistBackgroundState(
@@ -846,6 +883,7 @@ class ManagedConversationService {
         epoch,
         lookup: LedgerLookup.byMessageId(pending.messageId),
         history: _historyFromApi(resumed.messages),
+        expectedTaskId: resumed.taskId,
       ),
       projection: resumed.projection ?? LedgerTaskProjection.queued(),
     );
@@ -912,6 +950,7 @@ class ManagedConversationService {
           epoch,
           lookup: LedgerLookup.byMessageId(pending.messageId),
           history: _historyFromApi(resumed.messages),
+          expectedTaskId: resolvedTaskId,
         );
       } else if (report.stage == LedgerTaskCancelStage.cancelled ||
           (report.stage == LedgerTaskCancelStage.alreadyTerminal &&
@@ -1094,48 +1133,6 @@ class ManagedConversationService {
     });
   }
 
-  /// Push-driven re-poll seam (plan §8, D1 optional). Subscribes [push] to
-  /// [topic] and, when a completion notification references the job's task,
-  /// re-watches it immediately so the reply is fetched without waiting for the
-  /// next backoff tick. The re-watch uses the TASK id parsed from the push
-  /// title/body (the server's ntfy hook pushes `Title: "Job <taskId>"` with a
-  /// summary body that does NOT carry the client's `messageId` — documented
-  /// assumption; the mapping requires the hook to keep the task id in the
-  /// title). Returns the subscription for cleanup. No UI is built here.
-  StreamSubscription<NotifMessage> watchWithPush(
-    NotifClient push,
-    String topic,
-    Stream<NotifMessage> messages, {
-    required String conversationId,
-    required String messageId,
-    required List<Message> history,
-  }) {
-    push.subscribe(topic);
-    return messages.listen((message) {
-      final taskId = _notifTaskId(message);
-      if (taskId == null) return;
-      try {
-        final epoch = repo.epoch(scope);
-        _watchBackground(
-          conversationId,
-          epoch,
-          lookup: LedgerLookup.byTaskId(taskId),
-          history: history,
-        );
-      } on PluginClientException {
-        // A malformed push task id must never surface as an unhandled stream
-        // error; the backoff poll still reconciles the job.
-      }
-    });
-  }
-
-  /// Parses the task id from a job-completion notification, or null when the
-  /// event is not one. See [watchWithPush] for the assumption.
-  String? _notifTaskId(NotifMessage message) {
-    final match = RegExp(r'^Job\s+([^\s]+)').firstMatch(message.title.trim());
-    return match?.group(1);
-  }
-
   /// Same-`session_id` re-establish after a `409 session_missing`. Loads the
   /// full conversation from the local store (the client-owned source of truth),
   /// mints a fresh messageId, persists a new pending envelope, and dispatches
@@ -1150,6 +1147,7 @@ class ManagedConversationService {
     required List<String> enabledPlugins,
     Object? agent,
     void Function(String delta)? onContent,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
     _checkEpoch(epoch);
     final stored = await repo.access(
@@ -1197,6 +1195,7 @@ class ManagedConversationService {
       agent: agent,
       reestablishAttempted: true,
       onContent: onContent,
+      onSentinelAdvisory: onSentinelAdvisory,
     );
   }
 

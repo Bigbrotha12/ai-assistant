@@ -32,7 +32,7 @@ import '../../plugins/data/managed_error_codes.dart';
 import '../../plugins/data/plugin_catalog_providers.dart';
 import '../../plugins/data/plugin_credentials_providers.dart';
 import '../../plugins/data/plugin_http.dart';
-import '../../sentinel/sentinel.dart';
+import '../data/sse.dart';
 
 export 'active_conversation_provider.dart';
 
@@ -1183,12 +1183,18 @@ class ConversationNotifier extends AsyncNotifier<ConversationState> {
               // sessionId omitted: the service resolves the mapped session itself
               // (first turn seeds; later turns resume/delta/compact).
               onContent: (text) => _onContent(assistant.id, text),
-              onAdvisory: (_) {
+              onSentinelAdvisory: (advisory) {
                 if (!ref.mounted) return;
                 final current = state.value;
                 if (current == null) return;
+                // Advisory true raises the banner; a semantic-clean frame
+                // (advisory false) clears any provisional L1 banner.
                 _setState(
-                  current.copyWith(sentinelNotice: sentinelAdvisoryMessage),
+                  current.copyWith(
+                    sentinelNotice: advisory.advisory
+                        ? sentinelAdvisoryNotice
+                        : null,
+                  ),
                 );
               },
             );

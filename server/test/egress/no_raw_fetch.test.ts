@@ -65,10 +65,9 @@ const FETCH_ALLOWLIST: ReadonlyArray<{ readonly file: string; readonly reason: s
 ];
 
 /**
- * Files permitted to import a direct protocol client. Only the SSRF core and
- * the notify host classifier need these; neither opens a connection outside the
- * facade (`ssrf.ts` builds the pinned agent, `notify/hook.ts` only classifies an
- * address literal).
+ * Files permitted to import a direct protocol client. Only the SSRF core needs
+ * these, and it opens no connection outside the facade (`ssrf.ts` builds the
+ * pinned agent).
  */
 const DEREFERENCE_IMPORT_ALLOWLIST: ReadonlyArray<{
   readonly file: string;
@@ -80,13 +79,6 @@ const DEREFERENCE_IMPORT_ALLOWLIST: ReadonlyArray<{
       "The SSRF core imports `Agent`/`buildConnector` from `undici` and " +
       "`isIP` from `node:net` to build the pinned connector. This IS the " +
       "enforcement.",
-  },
-  {
-    file: "notify/hook.ts",
-    reason:
-      "Imports `isIP` from `node:net` only to classify a host literal during " +
-      "config validation; it never opens a socket directly (egress goes through " +
-      "the facade).",
   },
 ];
 

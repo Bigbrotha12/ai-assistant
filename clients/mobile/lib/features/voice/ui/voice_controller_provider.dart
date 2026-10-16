@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/network_banner.dart';
 import '../../chat/data/chat_client.dart';
+import '../../chat/data/sse.dart' show SentinelAdvisoryEvent;
 import '../../chat/ui/chat_providers.dart';
 import '../../chat/data/database_providers.dart';
 import '../../chat/data/message_model.dart';
@@ -38,6 +39,7 @@ typedef VoiceManagedTurnSender = Future<ChatResult> Function({
   void Function()? onReceived,
   void Function(String text)? onContent,
   void Function(int index, String name, String argsFragment)? onToolCallDelta,
+  void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
 });
 
 /// Production managed voice sender (plan P2): `sendVoiceTurn` over the
@@ -60,6 +62,7 @@ final voiceTurnSenderProvider = Provider<VoiceManagedTurnSender>((ref) {
     onReceived,
     onContent,
     onToolCallDelta,
+    onSentinelAdvisory,
   }) async {
     final StagedInferenceAdapters adapters;
     try {
@@ -74,6 +77,7 @@ final voiceTurnSenderProvider = Provider<VoiceManagedTurnSender>((ref) {
       userText: userText,
       cancelToken: cancelToken,
       onContent: onContent,
+      onSentinelAdvisory: onSentinelAdvisory,
     );
     if (outcome is ManagedStreamedTurn) return outcome.result;
     // ManagedAlreadyCompleted: the turn already ran and the service
@@ -198,6 +202,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
         onReceived,
         onContent,
         onToolCallDelta,
+        onSentinelAdvisory,
       }) {
         if (!ref.mounted) {
           throw const PluginClientException(ManagedErrorCodes.cancelled);
@@ -216,6 +221,7 @@ class VoiceControllerNotifier extends Notifier<VoiceController> {
           onReceived: onReceived,
           onContent: onContent,
           onToolCallDelta: onToolCallDelta,
+          onSentinelAdvisory: onSentinelAdvisory,
         );
       },
       abandonActiveTurn: () async {

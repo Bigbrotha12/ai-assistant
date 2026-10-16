@@ -30,12 +30,10 @@ import { createSessionStore } from "../src/sessions/store.ts";
 import { createLedgerRoutes } from "../src/ledger/routes.ts";
 import { Ledger, migrateLedger } from "../src/ledger/index.ts";
 import type { OwnerPurgeResult } from "../src/ledger/index.ts";
-import { NotifyStore } from "../src/notify/store.ts";
-import { createNotifyRoutes } from "../src/notify/routes.ts";
+import { createSseHub } from "../src/notify/sse_hub.ts";
 import { testPasswordHasher } from "./better_auth_test_password.ts";
 
 const BASE = "http://localhost:17600";
-const NOTIFY_KEY = "account-delete-test-notify-key-32";
 const PASSWORD = "password-123";
 
 // In-memory ledger with a controlled clock (mirrors test/ledger.test.ts):
@@ -114,20 +112,15 @@ function seedOwnerTasks(
 /**
  * Throwaway better-auth instance mirroring src/auth/index.ts over a temp SQLite DB,
  * with the production apiKey options and `createAccountDeletionHooks` wired to
- * an in-memory Ledger + a temp-path NotifyStore — so a real
- * `POST /api/auth/delete-user` exercises the actual cascade.
+ * an in-memory Ledger — so a real `POST /api/auth/delete-user` exercises the
+ * actual cascade.
  */
-async function buildFixture(
-  getNotifyStore?: (notifyPath: string) => { delete(owner: string): Promise<boolean> },
-  runtime?: AccountDeletionRuntime,
-) {
+async function buildFixture(runtime?: AccountDeletionRuntime) {
   const dir = mkdtempSync(join(tmpdir(), "account-delete-test-"));
   const authDbPath = join(dir, "auth.db");
-  const notifyPath = join(dir, "notify.json");
 
   const { db: ledgerDb, ledger, advance } = makeLedgerHarness();
   const purgeResults: OwnerPurgeResult[] = [];
-  const notifyStore = new NotifyStore({ key: NOTIFY_KEY, storePath: notifyPath });
 
   const db = new Database(authDbPath);
   const hooks = createAccountDeletionHooks({
@@ -138,9 +131,6 @@ async function buildFixture(
       purgeResults.push(result);
       return result;
     },
-    getNotifyStore: getNotifyStore
-      ? () => getNotifyStore(notifyPath)
-      : () => notifyStore,
   });
 
   const config = {
@@ -186,8 +176,6 @@ async function buildFixture(
     ledger,
     ledgerDb,
     purgeResults,
-    notifyPath,
-    notifyStore,
     advance,
   };
 }
@@ -270,7 +258,7 @@ const LEDGER_TRIGGERS = [
 ];
 
 describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
-  test("happy path: user/sessions/apikey/notify/ledger purged for the owner, bystander untouched, triggers restored", async () => {
+  test("happy path: user/sessions/apikey/ledger purged for the owner, bystander untouched, triggers restored", async () => {
     const f = await buildFixture();
 
     const victim = await signUp(f.app, f.db, "victim@example.com");
@@ -290,16 +278,6 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
       bystander.cookie,
     );
     assert.equal(keyBystander.status, 200, JSON.stringify(keyBystander.data));
-
-    const seed = new NotifyStore({ key: NOTIFY_KEY, storePath: f.notifyPath });
-    await seed.set(victim.userId, {
-      topic: "topic-victim",
-      accessToken: "token-victim",
-    });
-    await seed.set(bystander.userId, {
-      topic: "topic-bystander",
-      accessToken: "token-bystander",
-    });
 
     const seeded = seedOwnerTasks(f.ledger, f.advance, victim.userId);
     f.advance(1_000);
@@ -349,14 +327,6 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
       1,
     );
 
-    // Notify credentials: victim's gone, bystander's intact (fresh read).
-    const fresh = new NotifyStore({
-      key: NOTIFY_KEY,
-      storePath: f.notifyPath,
-    });
-    assert.equal(await fresh.get(victim.userId), undefined);
-    assert.equal((await fresh.get(bystander.userId))?.topic, "topic-bystander");
-
     // Ledger rows: victim fully purged (task + step + chain), bystander kept.
     assert.equal(
       countRows(f.ledgerDb, "ledger_task", "owner", victim.userId),
@@ -404,82 +374,22 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
     );
   });
 
-  test("deletion and notify routes share one store snapshot; deleting one owner cannot resurrect it", async () => {
-    const f = await buildFixture();
-    const victim = await signUp(f.app, f.db, "notify-shared-victim@example.com");
-    const bystander = await signUp(f.app, f.db, "notify-shared-bystander@example.com");
-    const owners: Record<string, string> = {
-      "victim-key": victim.userId,
-      "bystander-key": bystander.userId,
-    };
-    const notifyApp = new Hono();
-    notifyApp.route(
-      "/api/notify",
-      createNotifyRoutes({
-        store: f.notifyStore,
-        verifyKey: async (c) => {
-          const token = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-          const owner = token ? owners[token] : undefined;
-          return owner
-            ? { ok: true as const, owner }
-            : { ok: false as const, reason: "bad_key" as const };
-        },
-      }),
-    );
-
-    const victimProvision = await notifyApp.request("/api/notify/provision", {
-      method: "POST",
-      headers: { authorization: "Bearer victim-key" },
-    });
-    assert.equal(victimProvision.status, 200);
-    const bystanderProvision = await notifyApp.request("/api/notify/provision", {
-      method: "POST",
-      headers: { authorization: "Bearer bystander-key" },
-    });
-    assert.equal(bystanderProvision.status, 200);
-    const { topic, accessToken } = (await bystanderProvision.json()) as {
-      topic: string;
-      accessToken: string;
-    };
-    const bystanderCredentials = { topic, accessToken };
-
-    const deleted = await post(
-      f.app,
-      "/api/auth/delete-user",
-      { password: PASSWORD },
-      victim.cookie,
-    );
-    assert.equal(deleted.status, 200, JSON.stringify(deleted.data));
-    const afterDelete = new NotifyStore({
-      key: NOTIFY_KEY,
-      storePath: f.notifyPath,
-    });
-    assert.equal(await afterDelete.get(victim.userId), undefined);
-    assert.deepEqual(await afterDelete.get(bystander.userId), bystanderCredentials);
-
-    const rotated = await notifyApp.request("/api/notify/rotate", {
-      method: "POST",
-      headers: { authorization: "Bearer bystander-key" },
-    });
-    assert.equal(rotated.status, 200);
-
-    const fresh = new NotifyStore({ key: NOTIFY_KEY, storePath: f.notifyPath });
-    assert.equal(await fresh.get(victim.userId), undefined);
-    const rotatedBystander = await fresh.get(bystander.userId);
-    assert.equal(rotatedBystander?.topic, bystanderCredentials.topic);
-    assert.equal(typeof rotatedBystander?.accessToken, "string");
-  });
-
   test("RAM cleanup runs in order, purges only the deleted owner, and leaves its tombstone", async (t) => {
     const sessionStore = createSessionStore();
     const toolCache = createToolResultCache();
     const pins = new CredentialPinStore();
+    const sseHub = createSseHub();
     t.after(() => {
       sessionStore.dispose();
       toolCache.dispose();
+      sseHub.dispose();
     });
     const order: string[] = [];
     const runtime: AccountDeletionRuntime = {
+      closeOwner: (owner) => {
+        order.push(`close:${owner}`);
+        sseHub.closeOwner(owner);
+      },
       abortOwner: (owner) => order.push(`abort:${owner}`),
       deleteSessionsForOwner: (owner) => {
         order.push(`sessions:${owner}`);
@@ -494,15 +404,7 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
         return pins.releaseOwner(owner);
       },
     };
-    const f = await buildFixture((notifyPath) => {
-      const store = new NotifyStore({ key: NOTIFY_KEY, storePath: notifyPath });
-      return {
-        delete: async (owner: string) => {
-          order.push(`notify:${owner}`);
-          return store.delete(owner);
-        },
-      };
-    }, runtime);
+    const f = await buildFixture(runtime);
 
     const victim = await signUp(f.app, f.db, "ram-victim@example.com");
     const bystander = await signUp(f.app, f.db, "ram-bystander@example.com");
@@ -525,6 +427,9 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
     toolCache.set(bystanderKey, "bystander-result");
     pins.pin(victim.userId, "plugin", { apiKey: "victim" });
     pins.pin(bystander.userId, "plugin", { apiKey: "bystander" });
+    // One open notification stream each; deletion must close the victim's only.
+    sseHub.open(victim.userId);
+    sseHub.open(bystander.userId);
 
     const deleted = await post(
       f.app,
@@ -534,12 +439,14 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
     );
     assert.equal(deleted.status, 200, JSON.stringify(deleted.data));
     assert.deepEqual(order, [
+      `close:${victim.userId}`,
       `abort:${victim.userId}`,
       `sessions:${victim.userId}`,
       `cache:${victim.userId}`,
       `pins:${victim.userId}`,
-      `notify:${victim.userId}`,
     ]);
+    assert.equal(sseHub.connectionCount(victim.userId), 0);
+    assert.equal(sseHub.connectionCount(bystander.userId), 1);
     assert.equal(isDeleting(victim.userId), true);
     assert.equal(isDeleting(bystander.userId), false);
     assert.equal(sessionStore.count(victim.userId), 0);
@@ -559,7 +466,7 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
         return 0;
       },
     };
-    const f = await buildFixture(undefined, runtime);
+    const f = await buildFixture(runtime);
     const user = await signUp(f.app, f.db, "ram-failure@example.com");
     await post(f.app, "/api/auth/api-key/create", {}, user.cookie);
 
@@ -622,48 +529,6 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
     assert.equal(retry.status, 200, JSON.stringify(retry.data));
     assert.equal(countRows(f.db, "user", "id", user.userId), 0);
     assert.equal(isDeleting(user.userId), true);
-  });
-
-  test("notify cleanup failure leaves the user intact and a retry succeeds", async () => {
-    let notifyDeleteAttempts = 0;
-    const f = await buildFixture((notifyPath) => {
-      const store = new NotifyStore({ key: NOTIFY_KEY, storePath: notifyPath });
-      return {
-        delete: async (owner: string) => {
-          notifyDeleteAttempts += 1;
-          if (notifyDeleteAttempts === 1) throw new Error("notify store unavailable");
-          return store.delete(owner);
-        },
-      };
-    });
-    const user = await signUp(f.app, f.db, "notify-failure@example.com");
-    const seed = new NotifyStore({ key: NOTIFY_KEY, storePath: f.notifyPath });
-    await seed.set(user.userId, { topic: "topic-retry", accessToken: "token-retry" });
-
-    const first = await post(
-      f.app,
-      "/api/auth/delete-user",
-      { password: PASSWORD },
-      user.cookie,
-    );
-    assert.ok(first.status >= 400 && first.status < 600, JSON.stringify(first.data));
-    assert.equal(countRows(f.db, "user", "id", user.userId), 1);
-    assert.equal(isDeleting(user.userId), false, "a failed cleanup clears the tombstone for retry");
-
-    const retry = await post(
-      f.app,
-      "/api/auth/delete-user",
-      { password: PASSWORD },
-      user.cookie,
-    );
-    assert.equal(retry.status, 200, JSON.stringify(retry.data));
-    assert.equal(countRows(f.db, "user", "id", user.userId), 0);
-    assert.equal(isDeleting(user.userId), true, "successful deletion keeps the tombstone");
-    assert.equal(notifyDeleteAttempts, 2);
-    assert.equal(
-      await new NotifyStore({ key: NOTIFY_KEY, storePath: f.notifyPath }).get(user.userId),
-      undefined,
-    );
   });
 
   test("no session -> 401 UNAUTHORIZED; hooks never run, account intact", async () => {
@@ -738,8 +603,6 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
     const f = await buildFixture();
     const user = await signUp(f.app, f.db, "stale@example.com");
     await post(f.app, "/api/auth/api-key/create", {}, user.cookie);
-    const seed = new NotifyStore({ key: NOTIFY_KEY, storePath: f.notifyPath });
-    await seed.set(user.userId, { topic: "topic-stale", accessToken: "t" });
 
     // Age the session past better-auth's default freshAge (1 day) without
     // touching expiresAt — the session is valid but no longer "fresh".
@@ -754,11 +617,6 @@ describe("M12: account deletion cascade (POST /api/auth/delete-user)", () => {
     assert.deepEqual(f.purgeResults, [], "beforeDelete must not run");
     assert.equal(countRows(f.db, "user", "id", user.userId), 1);
     assert.equal(countRows(f.db, "apikey", "referenceId", user.userId), 1);
-    const fresh = new NotifyStore({
-      key: NOTIFY_KEY,
-      storePath: f.notifyPath,
-    });
-    assert.equal((await fresh.get(user.userId))?.topic, "topic-stale");
   });
 });
 

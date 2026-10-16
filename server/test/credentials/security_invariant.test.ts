@@ -83,6 +83,7 @@ function openRouterBuiltin(): ModelPluginDefinition {
       supportsStreaming: true,
       visionCapable: true,
       parameters: {},
+      mode: "chat",
     },
     baseUrls: [{ id: "openrouter-api", url: "https://openrouter.ai" }],
     credentials: { apiKey: { label: "OpenRouter API key", required: true } },
@@ -206,7 +207,9 @@ const verifyKey: VerifyApiKeyFn = async () => ({ ok: true, owner: "test-user" })
 function makeApp(registry: PluginRegistry, store: PluginStore): Hono {
   const catalogs = poisonedCatalogs();
   const app = new Hono();
-  app.route("/v1", createPluginRoutes({ registry, store, verifyKey }));
+  // Detail is superuser-gated; both the canary token and the plain test key are
+  // configured so the leak checks exercise the real detail payload.
+  app.route("/v1", createPluginRoutes({ registry, store, verifyKey, superuserKeys: [SENTINEL, "test-key"] }));
   app.route("/v1", createModelsRoutes({ registry, verifyKey }));
   app.route("/v1", createAgentsRoutes({ registry, catalogs, verifyKey }));
   app.route("/v1", createSkillsRoutes({ catalogs, verifyKey }));

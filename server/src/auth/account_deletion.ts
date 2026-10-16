@@ -7,9 +7,8 @@ import { AsyncMutex } from "../jobs/mutex.ts";
  * SINGLE-REPLICA assumption requires **exactly one gateway replica; no
  * overlapping rolling deployments**. A second process can miss a tombstone or
  * owner barrier and admit work that raced deletion; there is no in-process
- * replica-count guard, so ops must enforce the Deployment and rollout. Lock
- * order is owner barrier -> NotifyStore mutex; code must never acquire an owner
- * barrier while holding the store mutex. Multi-replica deletion coordination is
+ * replica-count guard, so ops must enforce the Deployment and rollout.
+ * Multi-replica deletion coordination is
  * a separate distributed-coordination project.
  */
 const deletingOwners = new Set<string>();

@@ -98,6 +98,12 @@ export const API_KEY_PLUGIN_OPTIONS = {
 export type DeletionHookUser = { id: string };
 
 export type AccountDeletionRuntime = {
+  /**
+   * Close every open notification stream for the owner. Run FIRST, before the
+   * abort/purge steps, so a late job completion cannot notify a deleted
+   * account (DEFENSIVE_PATTERNS §4: close registries before killing children).
+   */
+  closeOwner?: (owner: string) => unknown | Promise<unknown>;
   abortOwner?: (owner: string) => unknown | Promise<unknown>;
   deleteSessionsForOwner?: (owner: string) => unknown | Promise<unknown>;
   invalidateForUser?: (owner: string) => unknown | Promise<unknown>;
@@ -105,20 +111,11 @@ export type AccountDeletionRuntime = {
 };
 
 let accountDeletionRuntime: AccountDeletionRuntime | undefined;
-let accountDeletionNotifyStore:
-  | { delete(owner: string): Promise<boolean> }
-  | undefined;
 
 export function configureAccountDeletionRuntime(
   runtime: AccountDeletionRuntime | undefined,
 ): void {
   accountDeletionRuntime = runtime;
-}
-
-export function configureAccountDeletionNotifyStore(
-  store: { delete(owner: string): Promise<boolean> } | undefined,
-): void {
-  accountDeletionNotifyStore = store;
 }
 
 export type AccountDeletionDeps = {
@@ -130,13 +127,6 @@ export type AccountDeletionDeps = {
    * the rows in one transaction. Omitted when the caller has no ledger.
    */
   purgeLedgerOwner?: (owner: string) => unknown | Promise<unknown>;
-  /**
-   * Resolves the notify credential store used for `NotifyStore.delete(owner)`.
-   * Omitted when the caller has no notify store.
-   */
-  getNotifyStore?: () =>
-    | { delete(owner: string): Promise<boolean> }
-    | undefined;
   getRuntime?: () => AccountDeletionRuntime | undefined;
 };
 
@@ -148,9 +138,9 @@ export type AccountDeletionHooks = {
 /**
  * Cascade cleanup for better-auth's built-in, session-guarded
  * `POST /api/auth/delete-user`. The built-in delete removes the `user`
- * and `session` rows but MISSES apikey rows, the encrypted notify blob and
- * ledger tasks — these hooks sweep them, each strictly self-scoped to
- * `user.id` (never another owner's rows).
+ * and `session` rows but MISSES apikey rows and ledger tasks — these hooks
+ * sweep them, each strictly self-scoped to `user.id` (never another owner's
+ * rows).
  *
  * All cleanup runs in `beforeDelete`, while the user row still exists. A
  * failure aborts the delete and leaves the account retryable; every purge is
@@ -165,6 +155,7 @@ export function createAccountDeletionHooks(
       try {
         await withOwnerBarrier(user.id, async () => {
           const runtime = deps.getRuntime?.() ?? {};
+          await runtime.closeOwner?.(user.id);
           await runtime.abortOwner?.(user.id);
           await runtime.deleteSessionsForOwner?.(user.id);
           await runtime.invalidateForUser?.(user.id);
@@ -173,8 +164,6 @@ export function createAccountDeletionHooks(
             .prepare("DELETE FROM apikey WHERE referenceId = ?")
             .run(user.id);
           if (deps.purgeLedgerOwner) await deps.purgeLedgerOwner(user.id);
-          const store = deps.getNotifyStore?.();
-          if (store) await store.delete(user.id);
         });
       } catch (error) {
         clearDeleting(user.id);
@@ -260,7 +249,6 @@ export const auth = betterAuth({
           const { ledger } = await import("../ledger/routes.ts");
           return ledger.purgeOwnerData(owner);
         },
-        getNotifyStore: () => accountDeletionNotifyStore,
       }),
     },
   },

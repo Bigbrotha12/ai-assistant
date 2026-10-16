@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { redactForOutbound } from "../security/redact.ts";
 import { BudgetExhaustedError } from "../managers/budget.ts";
 import { ContextBudgetError } from "../managers/context.ts";
+import type { SentinelCategory, SentinelSeverity } from "../sentinel/types.ts";
 
 function exhaustionCode(error: unknown): string | undefined {
   return error instanceof BudgetExhaustedError || error instanceof ContextBudgetError
@@ -61,7 +62,29 @@ export type ToOpenAiSseOptions = {
   created?: number;
   /** Completion id (`chatcmpl-…`) echoed on the first chunk. Defaults to a random one. */
   id?: string;
+  /**
+   * Input-derived L1 Sentinel advisory (§3.5). When present it is emitted as
+   * the stream's FIRST frame; when absent the stream is byte-identical to a
+   * clean turn.
+   */
+  sentinelAdvisory?: SentinelAdvisory;
+  /**
+   * Async semantic enrichment (§3.5). Resolves to the semantic frame to emit
+   * before the finish chunk/`[DONE]`, or `null` when the stage is
+   * disabled/unavailable/dropped. The adapter awaits it ONLY at the terminal
+   * event, bounded by {@link ToOpenAiSseOptions.sentinelSemanticTimeoutMs}, so
+   * a stuck semantic queue can never withhold `[DONE]`.
+   */
+  sentinelSemantic?: Promise<SentinelSemanticEnrichment | null>;
+  /**
+   * Upper bound (ms) the adapter will wait for `sentinelSemantic` before
+   * terminating without enrichment. Mirrors `SENTINEL_SEMANTIC_TIMEOUT_MS`.
+   */
+  sentinelSemanticTimeoutMs?: number;
 };
+
+/** Default terminal wait for the semantic frame; mirrors SENTINEL_SEMANTIC_TIMEOUT_MS. */
+export const DEFAULT_SENTINEL_SEMANTIC_TIMEOUT_MS = 2_000;
 
 const DEFAULT_MODEL = "langchain-agent";
 const ERROR_TYPE_MODEL = "model_error";
@@ -137,6 +160,85 @@ export function errorFrame(message: string, type: string, code?: string): string
   const error: Record<string, string> = { message, type };
   if (code !== undefined) error.code = code;
   return frame({ error });
+}
+
+/** One finding as it appears on a §3.5 sentinel frame. */
+export type SentinelFindingWire = {
+  ruleId: string;
+  category: SentinelCategory;
+  severity: SentinelSeverity;
+  source: "l1" | "semantic";
+  confidence?: number;
+};
+
+/**
+ * Input-derived L1 Sentinel advisory (§3.5). A standalone, non-OpenAI frame
+ * emitted as the stream's FIRST frame when the turn's input text produced at
+ * least one L1 finding. It carries no `choices` and no `error`, and does NOT
+ * claim the chat chunk envelope (§2): the first `chat.completion.chunk` frame
+ * still carries id/object/created/model.
+ *
+ * The P3 fields `advisory`/`categories`/`severity`/`matchedRules` remain on
+ * both sentinel frames for backward compatibility; the P5 fields `phase`,
+ * `source`, `findings`, and `action` are additive so an older client ignores
+ * them and keeps the conservative L1 advisory.
+ */
+export type SentinelAdvisory = {
+  categories: readonly SentinelCategory[];
+  severity: SentinelSeverity;
+  matchedRules: readonly string[];
+  findings: readonly SentinelFindingWire[];
+  action: { cannedResponseId: string | null };
+};
+
+/**
+ * The async semantic enrichment frame (§3.5). Emitted once, after the L1
+ * provisional frame (if any) and before the finish chunk/`[DONE]`.
+ * `advisory:false` is the explicit clear: the semantic stage was available and
+ * clean, so any provisional L1 advisory no longer stands.
+ */
+export type SentinelSemanticEnrichment = {
+  advisory: boolean;
+  semanticAvailable: true;
+  findings: readonly SentinelFindingWire[];
+  categories: readonly SentinelCategory[];
+  severity: SentinelSeverity | null;
+  matchedRules: readonly string[];
+  action: { cannedResponseId: string | null };
+};
+
+/** The §3.5 L1 advisory frame. Present only on finding turns. */
+export function sentinelAdvisoryFrame(advisory: SentinelAdvisory): string {
+  return frame({
+    sentinel: {
+      advisory: true,
+      phase: "l1",
+      source: "l1",
+      categories: advisory.categories,
+      severity: advisory.severity,
+      matchedRules: advisory.matchedRules,
+      findings: advisory.findings,
+      action: advisory.action,
+    },
+  });
+}
+
+/** The §3.5 semantic enrichment frame. Emitted once, before the terminal pair. */
+export function sentinelSemanticFrame(enrichment: SentinelSemanticEnrichment): string {
+  return frame({
+    sentinel: {
+      advisory: enrichment.advisory,
+      phase: "semantic",
+      final: true,
+      source: "semantic",
+      semanticAvailable: enrichment.semanticAvailable,
+      categories: enrichment.categories,
+      severity: enrichment.severity,
+      matchedRules: enrichment.matchedRules,
+      findings: enrichment.findings,
+      action: enrichment.action,
+    },
+  });
 }
 
 /**
@@ -278,6 +380,39 @@ export async function* toOpenAiSse(
   // the loop even if the iterator dies mid-flight.
   let lastError: unknown = undefined;
 
+  // §3.5: an input-derived L1 advisory leads the stream on finding turns. It is
+  // emitted without calling `takeEnvelope()`, so it does not consume the chat
+  // chunk envelope (§2) — the first completion chunk still carries it.
+  if (opts.sentinelAdvisory !== undefined) {
+    yield sentinelAdvisoryFrame(opts.sentinelAdvisory);
+  }
+
+  // §3.5 semantic enrichment: awaited ONLY at the terminal event, bounded so a
+  // stuck semantic queue cannot stall `[DONE]`. A rejection is treated as
+  // unavailable (no frame). Resolved at most once.
+  const semanticTimeoutMs =
+    opts.sentinelSemanticTimeoutMs ?? DEFAULT_SENTINEL_SEMANTIC_TIMEOUT_MS;
+  let semanticSettled = false;
+  const resolveSemanticEnrichment = async (): Promise<string | null> => {
+    const pending = opts.sentinelSemantic;
+    if (pending === undefined || semanticSettled) return null;
+    semanticSettled = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const resolved = await Promise.race([
+        pending,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), semanticTimeoutMs);
+        }),
+      ]);
+      return resolved === null ? null : sentinelSemanticFrame(resolved);
+    } catch {
+      return null;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
   try {
     for await (const event of events) {
       if (rootRunId === null && event.event === "on_chain_start") {
@@ -369,11 +504,14 @@ export async function* toOpenAiSse(
       case "on_chain_end": {
         if (event.run_id !== rootRunId) break;
         // Root run terminates: decide the finish reason once, then emit the
-        // finish chunk (§3.3) immediately before the single `[DONE]` (§6).
+        // semantic enrichment frame (if any) ahead of the finish chunk (§3.3)
+        // and the single `[DONE]` (§6).
         const decision = finishReasonFromOutput(
           lastAssistantMessage(event.data.output),
         );
         if (finishReason === null) finishReason = decision;
+        const semanticFrame = await resolveSemanticEnrichment();
+        if (semanticFrame !== null) yield semanticFrame;
         if (finishReason === null) {
           yield DONE_FRAME;
         } else {
@@ -413,8 +551,10 @@ export async function* toOpenAiSse(
   // terminator, so guarantee it: emit a `stop` finish chunk (which, per L8,
   // carries the envelope when nothing else has been emitted) and then `[DONE]`.
   // Only degenerate streams reach this — a real graph run always delivers root
-  // termination.
+  // termination. The semantic enrichment frame still precedes the terminal pair.
   if (!terminated) {
+    const semanticFrame = await resolveSemanticEnrichment();
+    if (semanticFrame !== null) yield semanticFrame;
     yield finishFrame("stop", takeEnvelope());
     yield DONE_FRAME;
   }

@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -5,13 +7,13 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ai_assistant/features/notifications/data/notif_client.dart';
 
-/// Captures every actual request (path/headers) and returns a scripted
-/// response body.
-class _CaptureAdapter implements HttpClientAdapter {
-  _CaptureAdapter(this.body);
+/// Scripts one response per call and records every request.
+class _ScriptedAdapter implements HttpClientAdapter {
+  _ScriptedAdapter(this.respond);
 
-  final ResponseBody body;
+  final ResponseBody Function(RequestOptions options, int call) respond;
   final List<RequestOptions> requests = [];
+  int _calls = 0;
 
   @override
   Future<ResponseBody> fetch(
@@ -19,95 +21,212 @@ class _CaptureAdapter implements HttpClientAdapter {
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    final call = _calls++;
     requests.add(options);
-    return body;
+    return respond(options, call);
   }
 
   @override
   void close({bool force = false}) {}
 }
 
+Uint8List _bytes(String text) => Uint8List.fromList(utf8.encode(text));
+
+Future<void> _pump() => Future<void>.delayed(Duration.zero);
+
+Future<void> _waitFor(bool Function() condition, {String? reason}) async {
+  for (var i = 0; i < 500; i++) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+  }
+  fail(reason ?? 'condition not met');
+}
+
+GatewaySseNotifClient _client(
+  Dio dio, {
+  required Future<String?> Function() resolveApiKey,
+}) => GatewaySseNotifClient(
+  dio: dio,
+  backendOrigin: 'https://gw.example',
+  resolveApiKey: resolveApiKey,
+  initialRetryDelay: const Duration(milliseconds: 5),
+  maxRetryDelay: const Duration(milliseconds: 10),
+);
+
 void main() {
-  group('parseNtfyEvent', () {
-    test('parses a message event', () {
-      const line =
-          '{"id":"abc","event":"message","topic":"mytopic","message":"Hello","title":"Hi","click":"https://example.com"}';
-      final message = parseNtfyEvent(line);
+  group('parseNotifData', () {
+    test('parses title and body', () {
+      final message = parseNotifData('{"title":"Job t1","body":"done"}');
       expect(message, isNotNull);
-      expect(message!.topic, 'mytopic');
-      expect(message.title, 'Hi');
-      expect(message.body, 'Hello');
-      expect(message.link, 'https://example.com');
+      expect(message!.title, 'Job t1');
+      expect(message.body, 'done');
     });
 
-    test('returns null for control events', () {
-      expect(parseNtfyEvent('{"id":"x","event":"open","topic":"mytopic"}'),
-          isNull);
-      expect(
-          parseNtfyEvent('{"id":"x","event":"keepalive","topic":"mytopic"}'),
-          isNull);
-    });
-
-    test('returns null for malformed or empty lines', () {
-      expect(parseNtfyEvent(''), isNull);
-      expect(parseNtfyEvent('not json'), isNull);
-      expect(parseNtfyEvent('{'), isNull);
-    });
-
-    test('returns null when message and title are both empty', () {
-      expect(
-          parseNtfyEvent(
-              '{"id":"x","event":"message","topic":"t","message":"","title":""}'),
-          isNull);
-    });
-
-    test('topic defaults to empty string', () {
-      final message = parseNtfyEvent(
-          '{"id":"x","event":"message","message":"Hi","title":"T"}');
-      expect(message, isNotNull);
-      expect(message!.topic, '');
+    test('returns null for malformed, non-object, or missing fields', () {
+      expect(parseNotifData(''), isNull);
+      expect(parseNotifData('not json'), isNull);
+      expect(parseNotifData('{'), isNull);
+      expect(parseNotifData('[1,2]'), isNull);
+      expect(parseNotifData('{"title":"Job t1"}'), isNull);
+      expect(parseNotifData('{"title":"","body":""}'), isNull);
     });
   });
 
-  group('NtfyNotifClient', () {
-    const base = 'https://ntfy.example';
-
-    ResponseBody streamBody() => ResponseBody.fromString(
-          '{"id":"a","event":"message","topic":"alerts","message":"Hi","title":"T"}\n',
-          200,
-        );
-
-    test('subscribe sends Bearer token when accessToken is set', () async {
-      final adapter = _CaptureAdapter(streamBody());
-      final dio = Dio()..httpClientAdapter = adapter;
-      addTearDown(dio.close);
-      final client = NtfyNotifClient(
-        baseUrl: base,
-        dio: dio,
-        accessToken: 'test-token',
-      );
-      addTearDown(client.dispose);
-
-      await client.subscribe('alerts');
-
-      final req = adapter.requests.single;
-      expect(req.uri.path, '/alerts/json');
-      expect(req.headers['Authorization'], 'Bearer test-token');
+  group('SseNotifParser', () {
+    test('emits one message per data frame terminated by a blank line', () {
+      final parser = SseNotifParser();
+      expect(parser.addLine('data: {"title":"Job a","body":"1"}'), isNull);
+      final message = parser.addLine('');
+      expect(message, isNotNull);
+      expect(message!.title, 'Job a');
     });
 
-    test('subscribe sends no Authorization header without accessToken',
-        () async {
-      final adapter = _CaptureAdapter(streamBody());
+    test('ignores heartbeat comments', () {
+      final parser = SseNotifParser();
+      expect(parser.addLine(': keepalive'), isNull);
+      expect(parser.addLine(''), isNull);
+    });
+
+    test('ignores non-data fields', () {
+      final parser = SseNotifParser();
+      expect(parser.addLine('event: message'), isNull);
+      expect(parser.addLine('data: {"title":"Job a","body":"1"}'), isNull);
+      final message = parser.addLine('');
+      expect(message!.title, 'Job a');
+    });
+  });
+
+  group('GatewaySseNotifClient', () {
+    test('opens the owner-wide endpoint with bearer auth', () async {
+      final controller = StreamController<Uint8List>();
+      addTearDown(() async {
+        if (!controller.isClosed) await controller.close();
+      });
+      final adapter = _ScriptedAdapter(
+        (_, _) => ResponseBody(controller.stream, 200),
+      );
       final dio = Dio()..httpClientAdapter = adapter;
       addTearDown(dio.close);
-      final client = NtfyNotifClient(baseUrl: base, dio: dio);
+      final client = _client(dio, resolveApiKey: () async => 'key-1');
       addTearDown(client.dispose);
 
-      await client.subscribe('alerts');
+      await _waitFor(() => adapter.requests.isNotEmpty);
+      final request = adapter.requests.single;
+      expect(request.uri.toString(), 'https://gw.example/v1/notify/events');
+      expect(request.headers['Authorization'], 'Bearer key-1');
+      expect(request.headers['Accept'], 'text/event-stream');
+      expect(request.responseType, ResponseType.stream);
+    });
 
-      final req = adapter.requests.single;
-      expect(req.uri.path, '/alerts/json');
-      expect(req.headers.containsKey('Authorization'), isFalse);
+    test('emits parsed frames and ignores heartbeats', () async {
+      final controller = StreamController<Uint8List>();
+      addTearDown(() async {
+        if (!controller.isClosed) await controller.close();
+      });
+      final adapter = _ScriptedAdapter(
+        (_, _) => ResponseBody(controller.stream, 200),
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = _client(dio, resolveApiKey: () async => 'key-1');
+      addTearDown(client.dispose);
+      final received = <NotifMessage>[];
+      final sub = client.messages.listen(received.add);
+      addTearDown(sub.cancel);
+
+      await _waitFor(() => adapter.requests.isNotEmpty);
+      controller.add(_bytes('data: {"title":"Job t1","body":"one"}\n\n'));
+      controller.add(_bytes(': keepalive\n\n'));
+      controller.add(_bytes('data: {"title":"Job t2","body":"two"}\n\n'));
+      await _waitFor(() => received.length == 2);
+
+      expect(received.map((m) => m.title).toList(), ['Job t1', 'Job t2']);
+      expect(received.map((m) => m.body).toList(), ['one', 'two']);
+    });
+
+    test('re-resolves credentials fresh and retries after a 401', () async {
+      final controller = StreamController<Uint8List>();
+      addTearDown(() async {
+        if (!controller.isClosed) await controller.close();
+      });
+      final keys = ['stale', 'fresh'];
+      var resolved = 0;
+      final adapter = _ScriptedAdapter((_, call) {
+        if (call == 0) return ResponseBody.fromString('', 401);
+        return ResponseBody(controller.stream, 200);
+      });
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = _client(
+        dio,
+        resolveApiKey: () async =>
+            keys[resolved < keys.length ? resolved++ : keys.length - 1],
+      );
+      addTearDown(client.dispose);
+      final sub = client.messages.listen((_) {});
+      addTearDown(sub.cancel);
+
+      await _waitFor(() => adapter.requests.length >= 2);
+      expect(adapter.requests[0].headers['Authorization'], 'Bearer stale');
+      expect(adapter.requests[1].headers['Authorization'], 'Bearer fresh');
+    });
+
+    test('recovers from a network error by reconnecting', () async {
+      final controller = StreamController<Uint8List>();
+      addTearDown(() async {
+        if (!controller.isClosed) await controller.close();
+      });
+      final adapter = _ScriptedAdapter((options, call) {
+        if (call == 0) {
+          throw DioException(
+            requestOptions: options,
+            type: DioExceptionType.connectionError,
+          );
+        }
+        return ResponseBody(controller.stream, 200);
+      });
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = _client(dio, resolveApiKey: () async => 'key-1');
+      addTearDown(client.dispose);
+      final sub = client.messages.listen((_) {});
+      addTearDown(sub.cancel);
+
+      await _waitFor(() => adapter.requests.length >= 2);
+      expect(adapter.requests.length, greaterThanOrEqualTo(2));
+      expect(adapter.requests[1].headers['Authorization'], 'Bearer key-1');
+    });
+
+    test('dispose cancels the request, stops reconnecting, closes the '
+        'stream', () async {
+      final controller = StreamController<Uint8List>();
+      addTearDown(() async {
+        if (!controller.isClosed) await controller.close();
+      });
+      final adapter = _ScriptedAdapter(
+        (_, _) => ResponseBody(controller.stream, 200),
+      );
+      final dio = Dio()..httpClientAdapter = adapter;
+      addTearDown(dio.close);
+      final client = _client(dio, resolveApiKey: () async => 'key-1');
+      var done = false;
+      final sub = client.messages.listen((_) {}, onDone: () => done = true);
+
+      await _waitFor(() => adapter.requests.isNotEmpty);
+      final before = adapter.requests.length;
+
+      await client.dispose();
+      await _pump();
+
+      expect(adapter.requests.first.cancelToken?.isCancelled, isTrue);
+      expect(controller.hasListener, isFalse);
+      expect(done, isTrue);
+      expect(
+        adapter.requests.length,
+        before,
+        reason: 'dispose must prevent reconnection',
+      );
+      await sub.cancel();
     });
   });
 }

@@ -20,6 +20,7 @@ import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
 import 'package:ai_assistant/features/memory/data/memory_model.dart';
 import 'package:ai_assistant/features/memory/data/memory_store.dart';
+import 'package:ai_assistant/features/notifications/data/notif_provider.dart';
 import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
 import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
 import 'package:ai_assistant/features/plugins/data/managed_conversation_repository.dart';
@@ -429,6 +430,7 @@ void main() {
           pluginCredentialsStoreProvider.overrideWithValue(plugins),
           managedConversationRepositoryProvider.overrideWithValue(repo),
           managedChatPollerFactoryProvider.overrideWithValue(pollerFactory),
+          notifClientProvider.overrideWithValue(FakeNotifClient()),
           settingsStoreProvider.overrideWithValue(
             FakeSettingsStore(
               stored: const BackendSettings(host: 'example.com'),

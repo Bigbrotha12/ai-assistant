@@ -8,9 +8,9 @@ import {
   policyForMode,
 } from "../../src/sentinel/policy.ts";
 import type {
-  L1Finding,
   SentinelCategory,
   SentinelDirection,
+  SentinelFinding,
   SentinelSeverity,
 } from "../../src/sentinel/types.ts";
 
@@ -28,8 +28,8 @@ const categories: SentinelCategory[] = [
 ];
 const severities: SentinelSeverity[] = ["low", "medium", "high"];
 
-function finding(category: SentinelCategory, severity: SentinelSeverity = "high"): L1Finding {
-  return { ruleId: `test.${category}.${severity}`, category, severity };
+function finding(category: SentinelCategory, severity: SentinelSeverity = "high"): SentinelFinding {
+  return { ruleId: `test.${category}.${severity}`, category, severity, source: "l1" };
 }
 
 describe("Sentinel L3 policy", () => {
@@ -75,8 +75,8 @@ describe("Sentinel L3 policy", () => {
   test("aggregates severity, categories, and rule ids deterministically", () => {
     const decision = decideSentinel(
       [
-        { ruleId: "z.rule", category: "jailbreak_attempt", severity: "high" },
-        { ruleId: "a.rule", category: "illegal", severity: "medium" },
+        { ruleId: "z.rule", category: "jailbreak_attempt", severity: "high", source: "l1" },
+        { ruleId: "a.rule", category: "illegal", severity: "medium", source: "l1" },
       ],
       { direction: "speak_pass" },
     );

@@ -36,6 +36,7 @@ function openRouterBuiltin(): ModelPluginDefinition {
       supportsStreaming: true,
       visionCapable: true,
       parameters: {},
+      mode: "chat",
     },
     baseUrls: [{ id: "openrouter-api", url: "https://openrouter.ai" }],
     credentials: { apiKey: { label: "OpenRouter API key", required: true } },

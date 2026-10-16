@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart' show Dio;
 import 'package:flutter/widgets.dart' show WidgetsBinding;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -10,9 +12,11 @@ import '../../auth/data/auth_credentials_store.dart';
 import '../../chat/data/chat_client.dart';
 import '../../chat/data/context_trimmer.dart';
 import '../../chat/data/message_model.dart';
+import '../../chat/data/sse.dart';
 import '../../chat/ui/chat_lifecycle_observer.dart';
 import '../../chat/ui/chat_providers.dart' show contextTrimmerProvider;
-import '../../sentinel/sentinel.dart';
+import '../../notifications/data/notif_client.dart';
+import '../../notifications/data/notif_provider.dart';
 import 'langchain_client.dart';
 import 'ledger_client.dart';
 import 'managed_conversation_repository.dart';
@@ -62,6 +66,12 @@ final managedChatAdapterProvider = Provider<ManagedChatAdapter>((ref) {
   final authStore = ref.watch(authCredentialsStoreProvider);
   final pluginStore = ref.watch(pluginCredentialsStoreProvider);
   final registry = ref.watch(pluginRegistryClientProvider);
+  // The account-scoped owner-wide notification stream. A matching
+  // `Job <taskId>` push accelerates the adapter's own background watch for that
+  // task so the reply is fetched without waiting for the next poll tick. The
+  // stream's transport is owned (and disposed) by [notifClientProvider]; the
+  // adapter only holds the subscription and cancels it on dispose.
+  final notifications = ref.watch(notifClientProvider).messages;
   // NOTE: the model list is intentionally NOT cached across resolutions (M1
   // perf finding): resolveManagedSelection re-fetches it per dispatch/poll so
   // the gateway's catalog is always fresh — a stale cache would keep resolving
@@ -85,6 +95,7 @@ final managedChatAdapterProvider = Provider<ManagedChatAdapter>((ref) {
       loadAgents: ({required gatewayKey, cancelToken}) =>
           registry.listAgents(gatewayKey: gatewayKey, cancelToken: cancelToken),
     ),
+    notifications: notifications,
   );
   ref.onDispose(adapter.dispose);
   return adapter;
@@ -144,6 +155,7 @@ class ManagedChatAdapter {
     bool ownsPoller = false,
     ManagedChatPollerFactory? pollerFactory,
     Future<void> Function(Object error)? onAccountDeleted,
+    Stream<NotifMessage>? notifications,
   }) => ManagedChatAdapter._(
     scope,
     client,
@@ -154,6 +166,7 @@ class ManagedChatAdapter {
     ownsPoller,
     pollerFactory,
     onAccountDeleted,
+    notifications,
   );
 
   ManagedChatAdapter._(
@@ -166,7 +179,13 @@ class ManagedChatAdapter {
     this._ownsPoller,
     this._pollerFactory,
     this._onAccountDeleted,
-  );
+    Stream<NotifMessage>? notifications,
+  ) {
+    final stream = notifications;
+    if (stream != null) {
+      _notifSubscription = stream.listen(_onJobNotification);
+    }
+  }
 
   final AuthAccountScope scope;
 
@@ -179,7 +198,26 @@ class ManagedChatAdapter {
   LedgerPoller? _poller;
   bool _ownsPoller;
   Dio? _ownedDio;
+  StreamSubscription<NotifMessage>? _notifSubscription;
   bool _disposed = false;
+
+  /// Accelerates this adapter's background watch for a matching job-completion
+  /// push. Only `Job <taskId>` titles are honoured (the server's hook shape);
+  /// any other event, or one whose task no active watch expects, is ignored.
+  /// [LedgerPoller.accelerate] itself matches only the watch expecting that task
+  /// id (or one that already observed it), so unrelated watches are untouched.
+  /// The backoff poll remains the fallback when no push arrives.
+  void _onJobNotification(NotifMessage message) {
+    final match = RegExp(r'^Job\s+([^\s]+)').firstMatch(message.title.trim());
+    final taskId = match?.group(1);
+    if (taskId == null) return;
+    try {
+      poller.accelerate(taskId);
+    } on PluginClientException {
+      // The adapter was disposed between the event and this callback: the
+      // backoff poll (or nothing, on teardown) reconciles the job.
+    }
+  }
 
   Future<void> _notifyAccountDeleted(Object error) async {
     final callback = _onAccountDeleted;
@@ -351,7 +389,7 @@ class ManagedChatAdapter {
     required String userText,
     String? sessionId,
     void Function(String delta)? onContent,
-    void Function(SentinelAdvisory advisory)? onAdvisory,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async {
     final service = await buildService();
     return service.sendTurn(
@@ -360,7 +398,7 @@ class ManagedChatAdapter {
       userText: userText,
       sessionId: sessionId,
       onContent: onContent,
-      onAdvisory: onAdvisory,
+      onSentinelAdvisory: onSentinelAdvisory,
     );
   }
 
@@ -464,6 +502,8 @@ class ManagedChatAdapter {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _notifSubscription?.cancel();
+    _notifSubscription = null;
     try {
       final poller = _poller;
       if (poller != null && _ownsPoller) {

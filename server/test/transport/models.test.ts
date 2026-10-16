@@ -37,6 +37,7 @@ function openRouterPlugin(): ModelPluginDefinition {
       supportsStreaming: true,
       visionCapable: true,
       parameters: {},
+      mode: "chat",
     },
     baseUrls: [{ id: "openrouter-api", url: "https://openrouter.ai/api/v1" }],
     credentials: { apiKey: { label: "OpenRouter API key", required: true } },
@@ -58,6 +59,7 @@ function secondaryModelPlugin(): ModelPluginDefinition {
       supportsStreaming: true,
       visionCapable: false,
       parameters: { temperature: 0.2 },
+      mode: "chat",
     },
   };
 }

@@ -332,12 +332,6 @@ describe("Fix 3: parseTrustedHostEntries / PLUGINS_TRUSTED_HOSTS entry validatio
         e.message.includes("invalid MCP_TRUSTED_HOSTS entry 'http://bad.example'"),
     );
     assert.throws(
-      () => parseTrustedHostEntries(["http://bad.example"], "NOTIFY_TRUSTED_HOSTS"),
-      (e: unknown) =>
-        e instanceof SsrfValidationError &&
-        e.message.includes("invalid NOTIFY_TRUSTED_HOSTS entry"),
-    );
-    assert.throws(
       () => parseTrustedHostEntries(["http://bad.example"]),
       (e: unknown) =>
         e instanceof SsrfValidationError &&

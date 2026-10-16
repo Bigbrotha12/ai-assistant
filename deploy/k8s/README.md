@@ -9,8 +9,9 @@ Deployment; it does not define the complete Deployment.
 The gateway Deployment must explicitly pin `spec.replicas: 1`. The supported
 contract is **exactly one gateway replica; no overlapping rolling deployments**.
 Do not allow an old and new gateway pod to run at the same time: deletion
-tombstones, RAM-only sessions and middleware state, runner registries, and the
-file-backed notify/ledger stores are process-local or single-writer state.
+tombstones, RAM-only sessions and middleware state, runner registries, the
+in-memory SSE notify registry, and the file-backed ledger store are
+process-local or single-writer state.
 
 This is a deliberate deployment choice, not a temporary gap. Multi-replica
 account-deletion coordination would be a separate distributed-coordination

@@ -152,14 +152,11 @@ String _sha256Hex(List<int> input) {
   return hash.map((value) => value.toRadixString(16).padLeft(8, '0')).join();
 }
 
-String _dartLiteral(String value) {
-  return jsonEncode(value).replaceAll(r'$', r'\$');
-}
-
 void main() {
   final script = File(Platform.script.toFilePath());
-  // `tool/` sits under the Flutter package root; the server and the shared
-  // golden fixtures live two levels up at the repository root.
+  // `tool/` sits under the Flutter package root; the server, which owns the
+  // canonical rule source and the generated TS bundle, lives two levels up at
+  // the repository root.
   final packageRoot = script.parent.parent;
   final repoRoot = packageRoot.parent.parent;
   final sourceFile = File('${repoRoot.path}/server/src/sentinel/rules.v1.json');
@@ -177,18 +174,6 @@ void main() {
     'export const SENTINEL_RULE_SET_SOURCE_SHA256 = '
     '${jsonEncode(hash)};\n'
     'export const SENTINEL_RULE_SET_SOURCE_JSON = $jsonLiteral;\n',
-  );
-  final dartFile = File(
-    '${packageRoot.path}/lib/features/sentinel/data/rules.generated.dart',
-  );
-  dartFile.writeAsStringSync(
-    "import 'dart:convert';\n\n"
-    "import '../types.dart';\n\n"
-    'const generatedSentinelRuleSetVersion = ${jsonEncode(version)};\n'
-    'const generatedSentinelRuleSetSourceSha256 = ${jsonEncode(hash)};\n'
-    'const generatedSentinelRuleSetSourceJson = ${_dartLiteral(source)};\n\n'
-    'SentinelRuleSet get generatedSentinelRuleSet =>\n'
-    '    SentinelRuleSet.fromJson(jsonDecode(generatedSentinelRuleSetSourceJson));\n',
   );
   stdout.writeln('generated $hash ($version)');
 }

@@ -53,21 +53,29 @@ class LangChainClient {
     void Function()? onReceived,
     void Function(String text)? onContent,
     void Function(ToolCallDelta delta)? onToolCallDelta,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) async => (await _turn(
     request,
     cancelToken: cancelToken,
     onReceived: onReceived,
     onContent: onContent,
     onToolCallDelta: onToolCallDelta,
+    onSentinelAdvisory: onSentinelAdvisory,
   )).result!;
 
   Future<ManagedTurnResult> managedTurn(
     LangChainRequest request, {
     CancelToken? cancelToken,
     void Function(String text)? onContent,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) {
     if (!request.managed) throw const PluginClientException('invalid_request');
-    return _turn(request, cancelToken: cancelToken, onContent: onContent);
+    return _turn(
+      request,
+      cancelToken: cancelToken,
+      onContent: onContent,
+      onSentinelAdvisory: onSentinelAdvisory,
+    );
   }
 
   /// Submits a background job (plan §5 async submission). The gateway admits
@@ -128,6 +136,7 @@ class LangChainClient {
     void Function()? onReceived,
     void Function(String text)? onContent,
     void Function(ToolCallDelta delta)? onToolCallDelta,
+    void Function(SentinelAdvisoryEvent advisory)? onSentinelAdvisory,
   }) => _http.run(cancelToken, (token) async {
     final response = await _http.send(
       path: '/chat/completions',
@@ -189,6 +198,8 @@ class LangChainClient {
           tool.name ??= delta.name;
           tool.arguments.write(delta.argsFragment);
           onToolCallDelta?.call(delta);
+        case SseEventType.sentinel:
+          onSentinelAdvisory?.call(event.sentinel!);
         case SseEventType.error:
           throw PluginClientException(safePluginErrorCode(event.error));
         case SseEventType.done:

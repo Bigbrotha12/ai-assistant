@@ -697,12 +697,23 @@ class LedgerPollResult {
 }
 
 class LedgerPollHandle {
-  LedgerPollHandle._(this._poller, this.lookup, this._onUpdate)
-    : _deadline = _poller.scheduler.elapsed + _poller.maxElapsed;
+  LedgerPollHandle._(
+    this._poller,
+    this.lookup,
+    this._onUpdate,
+    this.expectedTaskId,
+  ) : _deadline = _poller.scheduler.elapsed + _poller.maxElapsed;
 
   final LedgerPoller _poller;
   final LedgerLookup lookup;
   final void Function(LedgerTask)? _onUpdate;
+
+  /// The task this watch is expected to observe, when known up front. A
+  /// task-id lookup derives it from [lookup]; a message-id lookup takes it
+  /// from the optional `watch` argument. It lets
+  /// [LedgerPoller.accelerate] match a watch before the first poll has echoed
+  /// the task's id.
+  final String? expectedTaskId;
   final Duration _deadline;
   final _completion = Completer<LedgerPollResult>();
   LedgerCancel? _timer;
@@ -723,6 +734,13 @@ class LedgerPollHandle {
       identical(_poller._handles[lookup], this) &&
       (_completionGeneration == null || _completionGeneration == _generation);
 
+  /// Whether this watch is for [taskId]: either it was told that id up front
+  /// ([expectedTaskId]) or it has already observed a task carrying it. An
+  /// unrelated task never matches, so [LedgerPoller.accelerate] leaves other
+  /// watches alone.
+  bool _matchesTask(String taskId) =>
+      expectedTaskId == taskId || _task?.id == taskId;
+
   void cancel() => _poller._cancel(this);
 
   void _suspend() {
@@ -737,6 +755,11 @@ class LedgerPollHandle {
 
   void _finish(LedgerPollEnd end) {
     _suspend();
+    // A finished watch is no longer current, so evict it before settling:
+    // otherwise the terminal entry would stay in the poller's account-lifetime
+    // map, retaining this handle, its observed task (including step results),
+    // and its completed future indefinitely.
+    _poller._evict(this);
     if (!_completion.isCompleted) {
       _completionGeneration = _generation;
       _completion.complete(
@@ -766,6 +789,23 @@ class LedgerPollHandle {
       _timer = null;
       if (_valid(generation)) unawaited(_poll(generation));
     });
+  }
+
+  /// Requests an immediate poll without disturbing work already in flight.
+  ///
+  /// A request already awaiting the network owns the next schedule ([_poll]
+  /// re-arms with fresh backoff when it settles), so accelerating while the
+  /// in-flight token is set is a no-op rather than a second concurrent request.
+  /// Otherwise the pending backoff timer is cancelled and replaced by a
+  /// zero-delay poll; [_arm] still enforces the fixed deadline and attempt cap.
+  /// A suspended, completed, replaced, or disposed handle matches none of
+  /// these and is left untouched.
+  void _accelerate() {
+    if (!isCurrent || _completion.isCompleted || _token != null) return;
+    _timer?.call();
+    _timer = null;
+    _notBefore = _poller.scheduler.elapsed;
+    _arm();
   }
 
   bool _valid(int generation) =>
@@ -884,18 +924,37 @@ class LedgerPoller {
   LedgerPollHandle watch(
     LedgerLookup lookup, {
     void Function(LedgerTask)? onUpdate,
+    String? expectedTaskId,
   }) {
     if (_disposed) throw const PluginClientException('cancelled');
     try {
       _publicId(lookup.value);
+      if (expectedTaskId != null) _publicId(expectedTaskId);
     } on PluginProtocolException {
       throw const PluginClientException('invalid_request');
     }
     invalidateKey(lookup);
-    final handle = LedgerPollHandle._(this, lookup, onUpdate);
+    final handle = LedgerPollHandle._(
+      this,
+      lookup,
+      onUpdate,
+      expectedTaskId ?? (lookup.isMessageId ? null : lookup.value),
+    );
     _handles[lookup] = handle;
     handle._arm();
     return handle;
+  }
+
+  /// Immediately re-arms every active watch for [taskId], bypassing its
+  /// backoff delay. A watch matches by its expected task id or a task id it
+  /// has already observed, so watches for other tasks are never accelerated.
+  /// A watch with a request already in flight, or one that is suspended,
+  /// completed, replaced, or disposed, is left untouched.
+  void accelerate(String taskId) {
+    if (_disposed) return;
+    for (final handle in _handles.values.toList()) {
+      if (handle._matchesTask(taskId)) handle._accelerate();
+    }
   }
 
   void setForeground(bool foreground) {
@@ -922,10 +981,18 @@ class LedgerPoller {
   }
 
   void _cancel(LedgerPollHandle handle) {
+    _evict(handle);
+    handle._finish(LedgerPollEnd.cancelled);
+  }
+
+  /// Drops [handle] from the active set only when it is still the registered
+  /// watch for its lookup. The identity guard keeps a superseded handle's late
+  /// completion or cancellation from evicting a newer watch for the same
+  /// lookup.
+  void _evict(LedgerPollHandle handle) {
     if (identical(_handles[handle.lookup], handle)) {
       _handles.remove(handle.lookup);
     }
-    handle._finish(LedgerPollEnd.cancelled);
   }
 
   void dispose() {

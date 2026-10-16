@@ -10,6 +10,8 @@ import 'package:ai_assistant/features/chat/data/database.dart';
 import 'package:ai_assistant/features/chat/data/database_providers.dart';
 import 'package:ai_assistant/features/chat/data/context_trimmer.dart';
 import 'package:ai_assistant/features/chat/data/message_model.dart';
+import 'package:ai_assistant/features/notifications/data/notif_client.dart';
+import 'package:ai_assistant/features/notifications/data/notif_provider.dart';
 import 'package:ai_assistant/features/plugins/data/langchain_request.dart';
 import 'package:ai_assistant/features/plugins/data/ledger_client.dart';
 import 'package:ai_assistant/features/plugins/data/managed_chat_providers.dart';
@@ -172,12 +174,15 @@ void main() {
   late Future<ManagedTurnResult> Function(LangChainRequest) respondWith;
   late List<_PollerHarness> pollers;
   late ManagedChatPollerFactory pollerFactory;
+  late FakeNotifClient notif;
   late FutureOr<ResponseBody> Function(_PollerHarness, RequestOptions)
       ledgerResponder;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     addTearDown(() async => db.close());
+    notif = FakeNotifClient();
+    addTearDown(notif.dispose);
     pluginStore = PluginCredentialsStore(storage: InMemorySecureStorage());
     registry = _FakeRegistryClient();
     respondWith = (request) async => ManagedTurnResult(
@@ -228,6 +233,7 @@ void main() {
         pluginCredentialsStoreProvider.overrideWithValue(pluginStore),
         pluginRegistryClientProvider.overrideWithValue(registry),
         managedChatPollerFactoryProvider.overrideWithValue(pollerFactory),
+        notifClientProvider.overrideWithValue(notif),
         databaseProvider.overrideWithValue(db),
         managedLangChainClientProvider.overrideWithValue(client),
       ],
@@ -679,5 +685,86 @@ void main() {
     );
     expect(stored!.messages.last.content, 'partial ');
     sent.ignore();
+  });
+
+  test(
+    'a matching Job notification accelerates only the watch expecting that task',
+    () async {
+      ledgerResponder = (harness, request) {
+        final id = Uri.decodeComponent(request.uri.pathSegments.last);
+        return _ledgerResponse(harness.scope, id, status: 'running');
+      };
+      await seedReadyConfig();
+      final adapter = container.read(managedChatAdapterProvider);
+      final poller = adapter.poller;
+      final harness = pollers.single;
+      final task1 = poller.watch(const LedgerLookup.byTaskId('task-1'));
+      final task2 = poller.watch(const LedgerLookup.byTaskId('task-2'));
+      poller.setForeground(true);
+      await harness.clock.advance(Duration.zero);
+
+      int requestsFor(String taskId) => harness.adapter.requests
+          .where((r) => r.uri.path == '/ledger/tasks/$taskId')
+          .length;
+      expect(requestsFor('task-1'), 1);
+      expect(requestsFor('task-2'), 1);
+
+      notif.add(
+        const NotifMessage(title: 'Job task-1', body: '{"status":"running"}'),
+      );
+      await _flushLedger();
+      await harness.clock.advance(Duration.zero);
+
+      expect(
+        requestsFor('task-1'),
+        2,
+        reason: 'the push accelerates its expected watch without waiting for '
+            'the backoff tick',
+      );
+      expect(
+        requestsFor('task-2'),
+        1,
+        reason: 'a watch expecting a different task is never accelerated',
+      );
+      expect(task1.isCurrent, isTrue);
+      expect(task2.isCurrent, isTrue);
+    },
+  );
+
+  test('a malformed or non-job notification is ignored', () async {
+    ledgerResponder = (harness, request) {
+      final id = Uri.decodeComponent(request.uri.pathSegments.last);
+      return _ledgerResponse(harness.scope, id, status: 'running');
+    };
+    await seedReadyConfig();
+    final adapter = container.read(managedChatAdapterProvider);
+    final poller = adapter.poller;
+    final harness = pollers.single;
+    poller.watch(const LedgerLookup.byTaskId('task-1'));
+    poller.setForeground(true);
+    await harness.clock.advance(Duration.zero);
+    expect(harness.adapter.requests, hasLength(1));
+
+    notif.add(const NotifMessage(title: 'Job', body: 'task-1'));
+    notif.add(const NotifMessage(title: 'Build finished', body: 'Job task-1'));
+    notif.add(const NotifMessage(title: '   ', body: 'Job task-1'));
+    await _flushLedger();
+    await harness.clock.advance(Duration.zero);
+
+    expect(
+      harness.adapter.requests,
+      hasLength(1),
+      reason: 'no Job <taskId> title parsed, so nothing was accelerated',
+    );
+  });
+
+  test('disposing the adapter cancels the notification subscription', () async {
+    final adapter = container.read(managedChatAdapterProvider);
+    expect(notif.hasListener, isTrue);
+
+    adapter.dispose();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(notif.hasListener, isFalse);
   });
 }

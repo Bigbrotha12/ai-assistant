@@ -90,17 +90,15 @@ the ledger needs migrating.
 | `LEDGER_LEASE_EXPIRY_MS` | no | `60000` | Worker lease expiry. |
 | `LEDGER_RETENTION_MS` | no | `86400000` | Retention period for terminal ledger tasks and their steps/chain. |
 | `LEDGER_SWEEP_INTERVAL_MS` | no | `3600000` | Interval between ledger retention sweeps. |
-| `NOTIFY_STORE_KEY` | prod | *(dev default, warned)* | AES-256-GCM key for the notify store (ntfy topic and access token at rest); required when `NODE_ENV=production`. |
 | `SMTP_HOST` | no | `""` | SMTP relay host; empty disables sending and logs the link in development. |
 | `SMTP_PORT` | no | `587` | SMTP relay port. |
 | `SMTP_USER` | no | `""` | SMTP relay username. |
 | `SMTP_PASS` | no | `""` | SMTP relay password. |
 | `SMTP_FROM` | no | `""` | From address for password-reset and email-verification mail. |
-| `NOTIFY_BASE_URL` | no | `""` | ntfy base URL; empty disables push delivery while provisioning endpoints remain available. |
 | `PLUGINS_STORE_PATH` | no | `./data/plugins.json` | JSON file persisting admin-installed tool-plugin manifests. |
 | `PLUGINS_TRUSTED_HOSTS` | no | `""` | Comma-separated hostnames/IPs that bypass SSRF private-range rejection for plugin base URLs; scheme enforcement is not bypassed. |
+| `SUPERUSER_API_KEY` | no | `""` | Comma-separated ops-secret list gating the plugin superuser surface (full-detail `GET /v1/plugins/:id`, `POST /v1/plugins/reload`, `POST /v1/plugins/:id/install\|uninstall`). Empty **disables** the gate (gated routes answer `403 forbidden`). Present as a single `Authorization: Bearer <secret>`; requests act as the synthetic owner `admin`. This is **not** a better-auth key — no user row, and it is not revoked by account deletion. List the old and new values together to rotate without downtime; every entry is compared in constant time. |
 | `MCP_TRUSTED_HOSTS` | no | `""` | Comma-separated admin-vouched MCP hostnames/IPs; internal MCP services may use HTTP in production. |
-| `NOTIFY_TRUSTED_HOSTS` | no | `""` | Comma-separated admin-vouched ntfy push hosts. A private/reserved-address ntfy, or a plain-`http:` ntfy in production, **must** be listed here or SSRF validation refuses the push and notifications are silently dropped. Listing a host with an `http:` `NOTIFY_BASE_URL` lets the notify bearer token travel in cleartext — prefer `https:`. |
 | `DEFAULT_MODEL_PROVIDER_BASE_URL` | no | `https://openrouter.ai/api/v1` | Provider-agnostic base URL for the built-in model plugin. |
 | `DEFAULT_MODEL_PROVIDER_MODEL` | no | `openrouter/auto` | Default model name for the built-in model plugin. |
 | `LOG_LEVEL` | no | `info` | Console log level: `error`, `warn`, `info`, or `debug`. |
@@ -110,10 +108,12 @@ the ledger needs migrating.
 > as **exactly one gateway replica; no overlapping rolling deployments**.
 > Process-local deletion tombstones/owner barriers, RAM-only managed sessions
 > and per-process tool-cache, budget, and rate-limit state, runner registries,
-> and the file-backed notify/ledger stores assume one writer. A second or
+> the in-memory SSE notify registry, and the file-backed ledger store assume one
+> writer. A second or
 > overlapping replica can miss a tombstone, admit work that raced deletion, lose
 > session coordination, or
-> overwrite a stale notify snapshot. This is a deliberate operational boundary,
+> route a job completion to the wrong replica's notify streams. This is a
+> deliberate operational boundary,
 > not a temporary gap; multi-replica deletion coordination would be a separate
 > distributed-coordination project. There is no in-process replica-count
 > detection: an environment flag cannot assert the real replica count, so ops
@@ -134,7 +134,7 @@ Auth (better-auth standard endpoint + shape, all under the gateway base URL):
 | `POST /api/auth/sign-out`                 | session         | Revokes current session.                       |
 | `GET  /api/auth/get-session`              | session         | Current session (`Authorization: Bearer <token>` or session cookie). |
 | `POST /api/auth/send-verification-email`  | none + rate     | Resend the verification mail; custom ≥60s per-address limiter fronts it. |
-| `POST /api/auth/delete-user`              | session         | Account deletion (M12); password-confirmed body; cascades apiKeys + notify + ledger rows. |
+| `POST /api/auth/delete-user`              | session         | Account deletion (M12); password-confirmed body; cascades apiKeys + ledger rows and closes the owner's SSE streams. |
 | `GET  /verify-email?token=…`              | none            | Hono HTML page that runs better-auth's `GET /api/auth/verify-email` wire route (1h signed JWT; never echoed into the DOM). |
 
 > **Note:** better-auth 1.7's own `/api/auth/ok` returns `{"ok":true}`. This gateway
@@ -314,6 +314,32 @@ introduces a plugin system foundation under `server/src/plugins/`:
 - `index.ts` — composition root wiring env + bundled builtins +
   `availableToolManifests` (both owned by the build artifact).
 
+### HTTP surface and authorization
+
+The plugin routes are mounted under `/v1` behind two gates. Every other `/v1/*`
+route (chat, models, agents, skills, MCPs, sessions, `auth/check`) stays
+owner-gated and is unaffected by `SUPERUSER_API_KEY`.
+
+| Endpoint                          | Gate                | Purpose                                                        |
+| --------------------------------- | ------------------- | -------------------------------------------------------------- |
+| `GET  /v1/plugins`                | owner API key       | Redacted catalog list (`PluginSummary[]`); any valid better-auth gateway key. |
+| `GET  /v1/plugins/:id`            | superuser           | Full plugin definition incl. baseUrl `url` values and a model's `inference.endpoint` (reveals admin-trusted internal hosts). |
+| `POST /v1/plugins/reload`         | superuser           | Hot-reload the registry from the store file.                   |
+| `POST /v1/plugins/:id/install`    | superuser           | Install an admin-curated manifest.                             |
+| `POST /v1/plugins/:id/uninstall`  | superuser           | Uninstall a manifest (builtins refuse with `403 builtin_plugin`). |
+
+The ordinary catalog list (`GET /v1/plugins`) remains **owner-gated**: it uses
+a normal better-auth owner gateway key, the same as the rest of the inference
+surface. Only the full-detail `GET /v1/plugins/:id` and the three management
+POSTs are **superuser-gated**: they accept a single
+`Authorization: Bearer <secret>` header whose token must equal one of the
+comma-separated `SUPERUSER_API_KEY` entries, compared in constant time with
+every entry checked (so an old and a new secret can coexist while rotating). A
+superuser request acts as the synthetic owner `admin`. When `SUPERUSER_API_KEY`
+is empty the superuser gate is disabled and those routes answer `403
+forbidden`; the secret is not a better-auth key, so it is rejected on the
+owner-gated list just as an owner key is rejected on the superuser routes.
+
 ## Managed conversations (`/v1/sessions`, stateless gateway)
 
 Conversations run through the stateless-gateway path (plan `docs/archive/stateless-gateway-plan.md`). The client owns the conversation history and sends it on
@@ -352,28 +378,27 @@ The legacy checkpoint surface (`/v1/threads`, `compileGraphWithCheckpointer`,
 `checkpointThreadId`) was removed with the sync-path cutover; the
 client no longer routes through `thread_id`.
 
-## Notify store
+## Notifications (`/v1/notify/events`)
 
-The ntfy topic and access token are encrypted at rest by `NotifyStore` in
-`./data/notify.json` (or the configured store path) and are provisioned through
-`/api/notify`. `NOTIFY_STORE_KEY` supplies the encryption key; `NOTIFY_BASE_URL`
-is the optional ntfy base URL, with an empty value disabling push delivery. If
-`NOTIFY_BASE_URL` targets a private/reserved address, or uses plain `http:` in
-production, its host **must** be added to `NOTIFY_TRUSTED_HOSTS` — otherwise
-SSRF validation refuses every push and notifications are silently dropped (the
-gateway logs a boot warning; delivery is best-effort by design). Listing such a
-host with an `http:` base URL sends the bearer token in cleartext.
-The file is atomically replaced with `0600` permissions, and the store keeps a
-cached in-process snapshot behind a mutation mutex.
+Background-job completion notifications fan out over an owner-scoped SSE stream.
+`GET /v1/notify/events` (mounted at the exclusive `/v1/notify`, owner-gated like
+the other `/v1` routes) holds one long-lived `text/event-stream` per connected
+client. When a job finishes, the runner broadcasts through the in-memory hub
+(`src/notify/sse_hub.ts`) to **every** open stream for that owner — the event is
+a single `data:` frame `{"title":"Job <taskId>","body":<summary>}` with no
+per-topic field, and `:` comment lines are keep-alives. Delivery is best-effort:
+a write to a dead stream is dropped, and a completion for an owner with no open
+streams is a no-op that never fails the job. Account deletion closes the owner's
+streams first, and shutdown disposes the hub before draining (`src/index.ts`).
 
-**Single-replica contract.** The notify file, cached snapshot, and mutex require
-**exactly one gateway replica; no overlapping rolling deployments**. A second
-or overlapping process can write a stale snapshot over a newer credential set
-because the file-level coordination is process-local. This is a deliberate
-deployment choice, not a temporary gap; multi-replica deletion coordination
-would be a separate distributed-coordination project. An environment flag cannot
-assert the real replica count, so ops must enforce this in the k3s Deployment
-and rollout strategy.
+**Single-replica contract.** The SSE registry is process-local and holds each
+stream in the replica's memory, so it requires **exactly one gateway replica; no
+overlapping rolling deployments**. Under that contract a completion always
+reaches the stream that requested it; a second or overlapping replica would not
+see another replica's streams, so a job completing on replica A could miss a
+client streamed to replica B. This is a deliberate deployment choice, not a
+temporary gap. An environment flag cannot assert the real replica count, so ops
+must enforce it in the k3s Deployment and rollout strategy.
 
 ## Production notes
 
@@ -382,10 +407,12 @@ and rollout strategy.
   **exactly one gateway replica; no overlapping rolling deployments**. This
   covers process-local deletion tombstones/owner barriers,
   RAM-only managed sessions and per-process tool-cache, budget, and rate-limit
-  state, runner pin/controller registries, and the file-backed notify/ledger
-  stores. A second or overlapping process can miss a tombstone, admit work that
+  state, runner pin/controller registries, the in-memory SSE notify registry,
+  and the file-backed ledger
+  store. A second or overlapping process can miss a tombstone, admit work that
   raced deletion, lose session
-  coordination, or overwrite a stale notify snapshot. There is no in-process
+  coordination, or route a job completion to the wrong replica's notify streams.
+  There is no in-process
   way to detect the real replica count: an environment flag cannot assert it, so
   ops must enforce `spec.replicas: 1` and a non-overlapping rollout. Multi-replica
   deletion coordination would be a separate distributed-coordination project.

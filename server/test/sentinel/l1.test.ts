@@ -89,6 +89,7 @@ describe("Sentinel L1 rules", () => {
         ruleId: "test.context",
         category: "jailbreak_attempt",
         severity: "high",
+        source: "l1",
       },
     ]);
     assert.deepEqual(

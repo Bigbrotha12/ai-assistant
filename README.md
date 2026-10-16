@@ -22,7 +22,8 @@ sends it with each turn.
   SpielIndexer, calendar) and model plugins with user-owned provider keys.
 - **LangChain agent graph** — server-side orchestration with tool execution,
   budget, and idempotency; the gateway is stateless.
-- **Push notifications** — ntfy-based provisioning for async job status.
+- **Job notifications** — an owner-scoped SSE stream delivers async job
+  completions to the signed-in account; no separate push channel.
 
 ## Architecture
 
@@ -35,7 +36,7 @@ sends it with each turn.
 │  │ Voice (STT + TTS)  │  │        │  · Tool execution + budget          │
 │  │ Plugin credentials  │  │  ◀─────│  · Request-scoped execution        │
 │  │ Local SQLite +      │  │  SSE   │  · Task ledger + idempotency       │
-│  │ secure storage      │  │        │  · ntfy notification hook          │
+│  │ secure storage      │  │        │  · in-memory SSE notify hub        │
 │  └────────────────────┘  │        └─────────┬──────────────────────┬─────┘
 │                          │                   │                      │
 └──────────────────────────┘        ┌──────────▼────┐    ┌───────────▼──────┐
@@ -66,7 +67,7 @@ clients/mobile/      Flutter client
       |              staged inference adapters, managed conversation service
       vision/        image understanding client + VRAM gate
       memory/        drift-backed AI memory (search/compact)
-      notifications/ ntfy push client
+      notifications/ owner-scoped SSE notification client
       onboarding/    setup screen (host, auth, models)
       settings/      settings screen + preference stores
   test/              Flutter unit tests (700+)
@@ -77,7 +78,7 @@ server/              Node.js gateway (Hono + better-auth)
     plugins/         plugin types, registry, store, SSRF validation
     transport/       LangChain agent graph, OpenAI-compatible /v1/chat/completions
     sessions/        ephemeral, owner-scoped conversation mirror
-    notify/          encrypted ntfy notification provisioning + push hook
+    notify/          in-memory, owner-scoped SSE notification hub + hook
     ledger/          task ledger with idempotency and lease management
   test/              server unit tests (567+, node:test)
 test/fixtures/       shared test fixtures (used by both server and client)
@@ -138,11 +139,12 @@ cd clients/mobile && flutter test # client unit tests (700+)
 - **No upstream secrets stored on the server.** User-owned provider API keys
   flow per-request in the request body over HTTPS and are never persisted.
   The client stores them in the OS secure storage.
-- **Encrypted ntfy tokens.** Notification credentials are AES-256-GCM
-  encrypted at rest, keyed by `NOTIFY_STORE_KEY`, and never logged.
-- **SSRF-hardened outbound calls.** Plugin endpoints — and ntfy push delivery —
-  are validated against an admin-curated allowlist; DNS-rebinding pinning
-  prevents host-name reuse attacks; redirects are not followed.
+- **Owner-scoped notifications.** Job-completion events fan out over the
+  already-authenticated owner's SSE stream — there is no separate push channel
+  and no per-device notification credential to provision or store.
+- **SSRF-hardened outbound calls.** Plugin endpoints are validated against an
+  admin-curated allowlist; DNS-rebinding pinning prevents host-name reuse
+  attacks; redirects are not followed.
 - **Budget and rate limiting.** Per-user budget gates prevent runaway spending;
   per-owner rate limiters prevent abuse of the inference endpoint.
 - Full details are in the (local-only) planning docs under `docs/`; the

@@ -5,18 +5,8 @@ import { parseTrustedHostEntries } from "../plugins/ssrf.ts";
 config({ quiet: true });
 
 /**
- * Development-only encryption key for the notify store (ntfy credentials at
- * rest). Encrypted records must survive gateway restarts in dev too, so this
- * default is a STABLE literal — never randomly re-derived, or a fresh key per
- * boot would make previously-written stores unreadable. It is deliberately a
- * loud dev-only value; production is fail-fast instead (see the superRefine
- * below).
- */
-const NOTIFY_STORE_DEV_DEFAULT_KEY = "dev-only-checkpoint-encryption-key-not-for-production";
-
-/**
  * Shared parser for the comma-separated trusted-host allowlists
- * (`PLUGINS_`/`MCP_`/`NOTIFY_TRUSTED_HOSTS`): split on commas, trim, drop
+ * (`PLUGINS_TRUSTED_HOSTS`/`MCP_TRUSTED_HOSTS`): split on commas, trim, drop
  * empties. Entry-SHAPE validation is deferred to the fail-fast pass below so
  * the error can name the specific env var (see `parseTrustedHostEntries`).
  */
@@ -28,6 +18,22 @@ const trustedHostsList = z
       .split(",")
       .map((host) => host.trim())
       .filter((host) => host.length > 0),
+  );
+
+/**
+ * Shared parser for comma-separated secret lists (`SUPERUSER_API_KEY`): split
+ * on commas, trim, drop empties, so a secret can be rotated by listing the old
+ * and new values together. Entries are opaque secrets rather than host
+ * patterns, so there is no shape-validation pass like `trustedHostsList` has.
+ */
+const secretList = z
+  .string()
+  .default("")
+  .transform((value) =>
+    value
+      .split(",")
+      .map((secret) => secret.trim())
+      .filter((secret) => secret.length > 0),
   );
 
 export const envSchema = z.object({
@@ -91,6 +97,28 @@ export const envSchema = z.object({
   SENTINEL_MAX_BODY_BYTES: z.coerce.number().int().positive().max(2_147_483_647).default(65_536),
   SENTINEL_RATE_LIMIT: z.coerce.number().int().positive().default(60),
   SENTINEL_RATE_BURST: z.coerce.number().int().positive().default(20),
+  // Internal semantic (decision-model) path (Kev-4B). `SENTINEL_SEMANTIC_ENABLED`
+  // is a strict "true"/"false" string enum, NOT `z.coerce.boolean()`: the latter
+  // maps every non-empty string (including "false") to true, so an operator
+  // writing "false" would silently enable a feature that calls a private model.
+  SENTINEL_SEMANTIC_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  // Model plugin id backed by the internal decision server. Must resolve to a
+  // `mode: "decisions"` plugin; the URL comes from that plugin's definition.
+  SENTINEL_SEMANTIC_PLUGIN_ID: z.string().trim().min(1).default("kev-4b"),
+  // Minimum confidence at which a semantic question is acted on (0..1).
+  SENTINEL_SEMANTIC_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
+  // Per-question timeout for the semantic decision model call (ms).
+  SENTINEL_SEMANTIC_TIMEOUT_MS: z.coerce.number().int().positive().max(2_147_483_647).default(2_000),
+  // Whether a semantic question is phrased context-aware (does the text itself
+  // express/request it) rather than merely topical. Parsed with the same strict
+  // string-enum transform as ENABLED (never `z.coerce.boolean`).
+  SENTINEL_SEMANTIC_CONTEXT_AWARE: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   LEDGER_DB_PATH: z.string().default("./data/ledger.db"),
   LEDGER_STUCK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   LEDGER_LEASE_EXPIRY_MS: z.coerce.number().int().positive().default(60_000),
@@ -98,33 +126,6 @@ export const envSchema = z.object({
   // periodic sweep purges it, and how often that sweep runs.
   LEDGER_RETENTION_MS: z.coerce.number().int().positive().default(86_400_000),
   LEDGER_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
-  // Encryption key for the notify store (`notify/store.ts` — ntfy topic +
-  // access token at rest, AES-256-GCM via sha256(key)). Required in
-  // production (fail-fast below); development falls back to a stable DEV-ONLY
-  // default and warns loudly. The transform guarantees a non-undefined value
-  // by export.
-  NOTIFY_STORE_KEY: z
-    .string()
-    .optional()
-    .superRefine((value, ctx) => {
-      if (process.env.NODE_ENV === "production" && !value) {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "NOTIFY_STORE_KEY is required when NODE_ENV=production; " +
-            "the notify store is encrypted at rest and refuses a plaintext default",
-        });
-      }
-    })
-    .transform((value) => {
-      if (value) return value;
-      console.warn(
-        "Gateway: NOTIFY_STORE_KEY is unset; using a DEVELOPMENT-ONLY default " +
-          "key for the notify store. Set NOTIFY_STORE_KEY to a real secret " +
-          "(e.g. `openssl rand -hex 32`) before production.",
-      );
-      return NOTIFY_STORE_DEV_DEFAULT_KEY;
-    }),
   // SMTP settings for the password-reset and email-verification emails
   // (better-auth `sendResetPassword` / `sendVerificationEmail`). Empty
   // SMTP_HOST (the default) disables sending and logs the link instead — a
@@ -134,29 +135,17 @@ export const envSchema = z.object({
   SMTP_USER: z.string().default(""),
   SMTP_PASS: z.string().default(""),
   SMTP_FROM: z.string().default(""),
-  // ntfy push-notification server base URL (e.g. `https://ntfy.example.com`).
-  // Empty (the default) = push notifications disabled; the /api/notify
-  // provisioning endpoints remain available regardless.
-  NOTIFY_BASE_URL: z
-    .string()
-    .default("")
-    .superRefine((value, ctx) => {
-      if (value === "") return;
-      try {
-        const url = new URL(value);
-        if (url.protocol !== "http:" && url.protocol !== "https:") {
-          throw new Error(`unsupported protocol '${url.protocol}'`);
-        }
-      } catch {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "NOTIFY_BASE_URL must be an absolute http(s) URL or empty to disable notifications",
-        });
-      }
-    }),
   PLUGINS_STORE_PATH: z.string().default("./data/plugins.json"),
   PLUGINS_TRUSTED_HOSTS: trustedHostsList,
+  // Process-wide ops secrets for the superuser surface (`requireSuperuser`):
+  // POST /v1/plugins/reload, POST /v1/plugins/:id/install|uninstall, and the
+  // full-detail GET /v1/plugins/:id. Comma-separated so a secret can be rotated
+  // without downtime. This is NOT a better-auth API key and corresponds to no
+  // user row: it names the synthetic owner "admin" and is deliberately NOT
+  // revoked by account deletion. Empty (the default) leaves the superuser gate
+  // DISABLED — gated endpoints answer 403. No default is ever generated,
+  // logged, or echoed.
+  SUPERUSER_API_KEY: secretList,
   // Admin-vouched MCP server hosts (hostnames/IPs/wildcards, comma-separated).
   // Two privileges over the default SSRF posture, scoped to the MCP path ONLY:
   //  1. Range checks are bypassed (like PLUGINS_TRUSTED_HOSTS) so in-cluster
@@ -168,18 +157,6 @@ export const envSchema = z.object({
   //     other SSRF defenses (DNS-rebinding pinning, redirect refusal) still
   //     apply to MCP calls.
   MCP_TRUSTED_HOSTS: trustedHostsList,
-  // Admin-vouched ntfy push hosts (hostnames/IPs/wildcards, comma-separated).
-  // Two privileges over the default SSRF posture, scoped to the notify push
-  // path ONLY:
-  //  1. Range checks are bypassed (like PLUGINS_TRUSTED_HOSTS) so a self-hosted
-  //     ntfy on loopback or an RFC1918 address delivers without
-  //     DISALLOWED_HOST/DNS_REBINDING.
-  //  2. Unlike plugins — which stay https-only in production — a notify host on
-  //     this list MAY use http: in production, because a homelab ntfy is often a
-  //     plain http service. Scheme enforcement for everything else (plugins, LLM
-  //     endpoints, MCP) is untouched, and all other SSRF defenses (DNS-rebinding
-  //     pinning, redirect refusal) still apply to notify calls.
-  NOTIFY_TRUSTED_HOSTS: trustedHostsList,
   // Default model plugin provider override — provider-agnostic. The builtin
   // model plugin's endpoint + default model come from these (OpenRouter
   // defaults), so a self-hosted operator can point at any OpenAI-compatible
@@ -211,12 +188,11 @@ export const env = parsed.data;
 // malformed entry (a scheme, port, path, whitespace, bare `*` or mid-string
 // wildcard) silently never matches and would leave an admin thinking an
 // internal host is allowed when it is not. Fail fast at load, naming the
-// specific knob. Order is PLUGINS → MCP → NOTIFY, before the ledger threshold
-// check below.
+// specific knob. Order is PLUGINS → MCP, before the ledger threshold check
+// below.
 const trustedHostsEnvs: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["PLUGINS_TRUSTED_HOSTS", env.PLUGINS_TRUSTED_HOSTS],
   ["MCP_TRUSTED_HOSTS", env.MCP_TRUSTED_HOSTS],
-  ["NOTIFY_TRUSTED_HOSTS", env.NOTIFY_TRUSTED_HOSTS],
 ];
 for (const [envVarName, entries] of trustedHostsEnvs) {
   try {

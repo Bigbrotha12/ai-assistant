@@ -119,6 +119,7 @@ void main() {
           onReceived,
           onContent,
           onToolCallDelta,
+          onSentinelAdvisory,
         }) {
           return resolvedChat.sendTurn(
             conversationId,
@@ -130,6 +131,7 @@ void main() {
             onReceived: onReceived,
             onContent: onContent,
             onToolCallDelta: onToolCallDelta,
+            onSentinelAdvisory: onSentinelAdvisory,
           );
         }),
         chatStoreProvider.overrideWithValue(store ?? FakeChatStore()),
@@ -762,6 +764,7 @@ void main() {
           onReceived,
           onContent,
           onToolCallDelta,
+          onSentinelAdvisory,
         }) {
           return client.sendTurn(
             conversationId,
@@ -773,6 +776,7 @@ void main() {
             onReceived: onReceived,
             onContent: onContent,
             onToolCallDelta: onToolCallDelta,
+            onSentinelAdvisory: onSentinelAdvisory,
           );
         }),
         filesStoreProvider.overrideWithValue(FakeFileStore()),

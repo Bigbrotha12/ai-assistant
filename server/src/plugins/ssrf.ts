@@ -750,9 +750,10 @@ export function parseTrustedHostEntries(
 /**
  * The SSRF trust options for an egress path where the private-range bypass
  * (`trustedHosts`) and the production `http:` carve-out (`httpAllowedHosts`) are
- * the SAME admin-vouched list and MUST always move together. Used by the ntfy
- * notify hook: an admin-listed private homelab ntfy is also the plain-`http:`
- * carve-out, so passing one without the other silently drops notifications.
+ * the SAME admin-vouched list and MUST always move together. Used by the MCP
+ * egress paths: an admin-listed private in-cluster MCP server is also the
+ * plain-`http:` carve-out, so passing one without the other silently drops MCP
+ * calls.
  *
  * `agents/mcp.ts` and `catalog/mcp.ts` pair their lists through this helper
  * and feed the result to `EgressClient.resolvePins` instead of inlining the

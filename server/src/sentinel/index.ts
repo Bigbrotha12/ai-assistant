@@ -46,6 +46,8 @@ export {
 export type {
   SentinelShadowInput,
   SentinelShadowMetadata,
+  SentinelShadowMetadataV1,
+  SentinelShadowMetadataV2,
   SentinelShadowQueueStats,
   SentinelShadowReport,
   SentinelShadowReporterOptions,
@@ -62,6 +64,29 @@ export type {
   SentinelReportQuery,
   SentinelReportSummary,
 } from "./reports.ts";
+export {
+  SENTINEL_SEMANTIC_CACHE_MAX_ENTRIES,
+  SENTINEL_SEMANTIC_DESCRIPTIONS,
+  SENTINEL_SEMANTIC_MODEL_ID,
+  SENTINEL_SEMANTIC_SEVERITY,
+  SentinelSemanticCache,
+  buildSemanticQuestions,
+  evaluateSemanticAnswers,
+  evaluateSentinelSemantic,
+  semanticCacheKey,
+  semanticInstruction,
+  semanticModelVersion,
+  semanticRuleId,
+  sentinelFindingsForDecision,
+} from "./semantic.ts";
+export type {
+  SemanticAvailable,
+  SemanticCacheKeyInput,
+  SemanticEvaluateOptions,
+  SemanticEvaluation,
+  SemanticUnavailable,
+  SemanticUnavailableReason,
+} from "./semantic.ts";
 export * from "./eval.ts";
 export {
   SENTINEL_RULE_SET_SOURCE_JSON,

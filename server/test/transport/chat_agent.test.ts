@@ -42,6 +42,7 @@ function fakeModelPlugin(): ModelPluginDefinition {
       supportsStreaming: true,
       visionCapable: true,
       parameters: {},
+      mode: "chat",
     },
     baseUrls: [{ id: "openrouter-api", url: "https://openrouter.ai/api/v1" }],
     credentials: { apiKey: { label: "OpenRouter API key", required: true } },
