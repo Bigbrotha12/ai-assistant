@@ -3,9 +3,9 @@ import type { Database as DatabaseType } from "better-sqlite3";
 /**
  * Ledger migration v9 — the goal-loop tables (Phase 2.1, plan §Storage).
  *
- * This module owns the goal-domain DDL; `ledger.ts` wires `migrateGoals` into
+ * This module owns the goal-domain DDL; `ledger/index.ts` wires `migrateGoals` into
  * its `LEDGER_MIGRATIONS` list so there is exactly ONE `PRAGMA user_version`
- * owner per database. Do NOT import from `../ledger.ts` here (import cycle).
+ * owner per database. Do NOT import from `../ledger/index.ts` here (import cycle).
  *
  * `goal_mutation` / `goal_refusal` stay empty until Phase 6, but are real,
  * checkable tables (Phase 2.5 inserts rows directly to test `effectState`).
@@ -17,37 +17,37 @@ import type { Database as DatabaseType } from "better-sqlite3";
 /**
  * Append-only trigger DDL (goal messages and refusals are write-once).
  * Exported because THREE sites create them: `migrateGoals` below, the
- * account-purge recreate in `ledger.ts`, and the compaction recreate in
+ * account-purge recreate in `ledger/index.ts`, and the compaction recreate in
  * `goals/ledger.ts` — one definition, so a later drop/recreate can never
  * drift from the migration.
  */
 export const GOAL_MESSAGE_UPDATE_TRIGGER_SQL = `
-  CREATE TRIGGER goal_message_append_only_update
+  CREATE TRIGGER IF NOT EXISTS goal_message_append_only_update
   BEFORE UPDATE ON goal_message
   BEGIN SELECT RAISE(ABORT, 'goal_message is append-only'); END;
 `;
 
 export const GOAL_MESSAGE_DELETE_TRIGGER_SQL = `
-  CREATE TRIGGER goal_message_append_only_delete
+  CREATE TRIGGER IF NOT EXISTS goal_message_append_only_delete
   BEFORE DELETE ON goal_message
   BEGIN SELECT RAISE(ABORT, 'goal_message is append-only'); END;
 `;
 
 export const GOAL_REFUSAL_UPDATE_TRIGGER_SQL = `
-  CREATE TRIGGER goal_refusal_append_only_update
+  CREATE TRIGGER IF NOT EXISTS goal_refusal_append_only_update
   BEFORE UPDATE ON goal_refusal
   BEGIN SELECT RAISE(ABORT, 'goal_refusal is append-only'); END;
 `;
 
 export const GOAL_REFUSAL_DELETE_TRIGGER_SQL = `
-  CREATE TRIGGER goal_refusal_append_only_delete
+  CREATE TRIGGER IF NOT EXISTS goal_refusal_append_only_delete
   BEFORE DELETE ON goal_refusal
   BEGIN SELECT RAISE(ABORT, 'goal_refusal is append-only'); END;
 `;
 
 export function migrateGoals(db: DatabaseType): void {
   db.exec(`
-    CREATE TABLE goal (
+    CREATE TABLE IF NOT EXISTS goal (
       id               TEXT PRIMARY KEY,
       owner            TEXT NOT NULL,
       instruction      TEXT NOT NULL,
@@ -74,7 +74,7 @@ export function migrateGoals(db: DatabaseType): void {
       UNIQUE (owner, idempotency_key)
     );
 
-    CREATE TABLE goal_step (
+    CREATE TABLE IF NOT EXISTS goal_step (
       id               TEXT PRIMARY KEY,
       goal_id          TEXT NOT NULL REFERENCES goal(id),
       seq              INTEGER NOT NULL,
@@ -88,7 +88,7 @@ export function migrateGoals(db: DatabaseType): void {
       UNIQUE (goal_id, seq)
     );
 
-    CREATE TABLE goal_message (
+    CREATE TABLE IF NOT EXISTS goal_message (
       id              TEXT PRIMARY KEY,
       goal_id         TEXT NOT NULL REFERENCES goal(id),
       seq             INTEGER NOT NULL,
@@ -100,7 +100,7 @@ export function migrateGoals(db: DatabaseType): void {
       UNIQUE (goal_id, seq)
     );
 
-    CREATE TABLE goal_mutation (
+    CREATE TABLE IF NOT EXISTS goal_mutation (
       id         TEXT PRIMARY KEY,
       goal_id    TEXT NOT NULL REFERENCES goal(id),
       plugin_id  TEXT NOT NULL,
@@ -114,7 +114,7 @@ export function migrateGoals(db: DatabaseType): void {
       UNIQUE (goal_id, plugin_id, tool, args_hash)
     );
 
-    CREATE TABLE goal_refusal (
+    CREATE TABLE IF NOT EXISTS goal_refusal (
       id           TEXT PRIMARY KEY,
       goal_id      TEXT NOT NULL REFERENCES goal(id),
       step_seq     INTEGER NOT NULL,

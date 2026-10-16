@@ -875,8 +875,8 @@ Submit-time errors only: `400 invalid_request`, `400 invalid_credentials`,
 
 ### `GET /v1/goals?status=&limit=&offset=`
 
-`status` is a validated enum. `limit` and `offset` follow `ledger.routes.ts:479-506`;
-pagination uses the `nextOffset` convention without a total (`ledger.ts:915-938`).
+`status` is a validated enum. `limit` and `offset` follow `ledger/routes.ts:479-506`;
+pagination uses the `nextOffset` convention without a total (`ledger/index.ts:915-938`).
 Each list item carries the same goal fields the detail exposes, including
 `modelPluginId` (the goal's pinned model plugin, `null` when none was pinned).
 

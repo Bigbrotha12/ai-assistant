@@ -34,7 +34,7 @@ import type { ToolInterceptor } from "../pipeline.ts";
  * about . This interceptor deliberately does not register the hook
  * itself; the deferred is channel-owned (`ToolCallScope.rawSettled`).
  *
- * `middleware/budget.ts` is intentionally NOT modified: the only change is this
+ * `managers/budget.ts` is intentionally NOT modified: the only change is this
  * caller, which now threads the effective `call.timeoutMs` and the
  * channel's raw-settlement promise.
  */

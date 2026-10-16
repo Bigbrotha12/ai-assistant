@@ -19,7 +19,7 @@
  *
  * EVICTION:
  *   - idle TTL (default 24 h), swept by an unref'd periodic timer (mirrors
- *     `src/middleware/cache.ts`; injectable `now`/timers for tests);
+ *     `src/managers/cache.ts`; injectable `now`/timers for tests);
  *   - per-owner active-session cap (default 32), evicts that owner's LRU;
  *   - global cap (default 1000) with OWNER-AWARE LRU: evict the requesting
  *     owner's own least-recently-used sessions first, only touching other

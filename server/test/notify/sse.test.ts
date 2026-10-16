@@ -140,6 +140,27 @@ describe("sse notification hook", () => {
       { owner: "owner-a", event: { title: "Job t-1", body: "summary" } },
     ]);
   });
+
+  test("notifyGoalStopped titles 'paused' as 'Goal needs you' and everything else as 'Goal failed'", () => {
+    const events: Array<{ owner: string; event: { title: string; body: string } }> = [];
+    const hook = createSseNotificationHook({
+      broadcast: (owner, event) => events.push({ owner, event }),
+    });
+
+    hook.notifyGoalStopped!("owner-a", "g-1", "paused", "needs input");
+    hook.notifyGoalStopped!("owner-a", "g-1", "failed", "step exploded");
+
+    assert.deepEqual(events, [
+      {
+        owner: "owner-a",
+        event: { title: "Goal needs you", body: "Goal g-1 paused (needs input)" },
+      },
+      {
+        owner: "owner-a",
+        event: { title: "Goal failed", body: "Goal g-1 failed (step exploded)" },
+      },
+    ]);
+  });
 });
 
 describe("sse notify routes", () => {

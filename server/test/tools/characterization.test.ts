@@ -80,7 +80,7 @@ import {
  *     with the pin updated alongside.
  *   - The four channels are: `sync-stateless`, `sync-managed` (both in
  *     transport/chat.ts), `job` (jobs/runner.ts `bindJobTools`), and `warmup`
- *     (middleware/warmup.ts). Per the plan §10, the channels deliberately
+ *     (managers/warmup.ts). Per the plan §10, the channels deliberately
  *     diverge; this file records the divergences.
  */
 

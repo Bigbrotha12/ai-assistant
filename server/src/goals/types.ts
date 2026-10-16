@@ -1,6 +1,6 @@
 /**
  * Goal-domain unions and row shapes. Mirrors the v9 DDL in `goals/migrate.ts`
- * one-to-one; the union convention follows `ledger.ts` / `sentinel/types.ts`
+ * one-to-one; the union convention follows `ledger/index.ts` / `sentinel/types.ts`
  * (`X_STATUSES as const` array + derived `XStatus` type).
  */
 

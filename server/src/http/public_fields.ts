@@ -3,14 +3,13 @@ import type { Context } from "hono";
 /**
  * Shared validation for user-supplied public request fields (N3 DRY).
  *
- * Both the ledger route surface (`ledger.routes.ts`) and the goal route
+ * Both the ledger route surface (`ledger/routes.ts`) and the goal route
  * surface (`goals/routes.ts`) validate public text/JSON fields identically:
  * non-empty, control-character-free, byte-bounded strings, plus the
  * "is a plain JSON object" predicate their bodies need. Keeping one copy here
  * means a bound or predicate change cannot drift between the two surfaces.
  *
- * The behavior is deliberately bit-identical to the two former local copies:
- * trimming decides emptiness but the FULL (untrimmed) value is byte-counted,
+ * Trimming decides emptiness but the FULL (untrimmed) value is byte-counted,
  * and `identifier` additionally rejects the `.`/`..` path sentinels.
  */
 

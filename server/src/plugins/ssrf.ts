@@ -40,7 +40,7 @@ export type Mode = "production" | "development" | "test";
 
 /**
  * The process mode, captured once at module load. A missing or unrecognized
- * NODE_ENV falls back to "development" to match `env.ts`. Production
+ * NODE_ENV falls back to "development" to match `config/env.ts`. Production
  * deployments MUST set NODE_ENV=production; only then is `http:` refused.
  * Prefer passing an explicit `mode` option to the validation functions so
  * tests can control it.

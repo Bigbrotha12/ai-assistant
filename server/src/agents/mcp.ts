@@ -1897,7 +1897,7 @@ export async function defaultSseClientFactory(
  * (sorted JSON `[key, value]` pairs → versioned SHA-256), the same derivation
  * used for pin and credential-store identities. Absent headers fingerprint as
  * the empty set, so unkeyed servers dedupe too. NUL-joins like `internalKey` in
- * `middleware/cache.ts` (URLs cannot contain `\u0000`).
+ * `managers/cache.ts` (URLs cannot contain `\u0000`).
  */
 export function mcpToolListCacheKey(
   server: Pick<McpServerConfig, "url" | "headers" | "headerRefs">,

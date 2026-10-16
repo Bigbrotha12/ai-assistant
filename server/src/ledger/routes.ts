@@ -6,6 +6,12 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { getOrCreateTask } from "../credentials/idempotency.ts";
 import { env } from "../config/env.ts";
+import {
+  exceedsByteLimit,
+  isJsonObject,
+  publicFieldError,
+  publicTextError,
+} from "../http/public_fields.ts";
 import { accountDeletedResponse, requireApiKey, requireOwner } from "../auth/request_auth.ts";
 import type { OwnerVariables, VerifyApiKeyFn } from "../auth/request_auth.ts";
 import { AccountDeletedError, isDeleting } from "../auth/account_deletion.ts";
@@ -234,42 +240,6 @@ export function createLedgerRoutes(
   });
 
   return routes;
-}
-
-const PUBLIC_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-
-type PublicFieldError = "invalid_request" | "request_too_large";
-
-function exceedsByteLimit(value: string, maxBytes: number): boolean {
-  return Buffer.byteLength(value, "utf8") > maxBytes;
-}
-
-function publicTextError(
-  value: unknown,
-  maxBytes: number,
-  identifier: boolean,
-): PublicFieldError | null {
-  if (
-    typeof value !== "string" ||
-    value.trim() === "" ||
-    PUBLIC_CONTROL_CHARACTERS.test(value)
-  ) {
-    return "invalid_request";
-  }
-  if (identifier && (value === "." || value === "..")) {
-    return "invalid_request";
-  }
-  return exceedsByteLimit(value, maxBytes) ? "request_too_large" : null;
-}
-
-function publicFieldError(c: Context, error: PublicFieldError): Response {
-  return error === "request_too_large"
-    ? c.json({ error }, 413)
-    : c.json({ error }, 400);
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function publicTaskPage(

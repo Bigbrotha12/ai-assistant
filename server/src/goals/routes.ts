@@ -728,7 +728,7 @@ export function createGoalRoutes(opts: GoalRoutesOptions): Hono {
 
 /**
  * `GET /v1/goals` paging query (`WIRE_SPEC §12`: "follow
- * `ledger.routes.ts:479-506`"), reusing the ledger list's caps so a goal list
+ * `ledger/routes.ts:479-506`"), reusing the ledger list's caps so a goal list
  * cannot be used to read more per page than a task list can.
  */
 function goalPageQuery(c: Context): { limit: number; offset: number } | null {

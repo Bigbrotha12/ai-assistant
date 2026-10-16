@@ -279,7 +279,7 @@ describe("Fix 3: parseTrustedHostEntries / PLUGINS_TRUSTED_HOSTS entry validatio
     // Retargeted from the deleted `parseTrustedHosts`
     // (`parseTrustedHostEntries(raw.split(","))`): this covers the
     // trimming, empty-dropping and ordering behaviour on the already-split
-    // list env.ts passes. It no longer exercises the comma-split itself; that
+    // list config/env.ts passes. It no longer exercises the comma-split itself; that
     // path is covered by `test/env_override.test.ts`.
     assert.deepEqual(
       parseTrustedHostEntries([" vn.example ", "", " vikunja.local ", "*.internal", "  "]),

@@ -307,7 +307,7 @@ describe("cache interceptor", () => {
     // The cache stores `boundToolResult(dispatch.content)` at the DEFAULT cap,
     // not `call.maxResultChars`. With maxResultChars > DEFAULT an unbounded body
     // result exceeds the cache's own `maxValueChars` and `set` silently drops it
-    // (middleware/cache.ts), so without this bound NOTHING is cached. The stored
+    // (managers/cache.ts), so without this bound NOTHING is cached. The stored
     // value must also be redacted.
     const cache = makeCache(t);
     const pipeline = createToolPipeline({

@@ -7,7 +7,7 @@ import 'plugin_dto.dart';
 import 'plugin_http.dart';
 
 /// Terminal statuses a background submission can echo (matches the server's
-/// `TERMINAL_TASK_STATUSES` in `server/src/ledger.ts`). `awaiting_review` IS
+/// `TERMINAL_TASK_STATUSES` in `server/src/ledger/index.ts`). `awaiting_review` IS
 /// terminal on the job wire — a re-submitted job in review cannot accept the
 /// submission — but NOT terminal for client reconciliation
 /// ([LedgerTaskStatus.isTerminal] excludes it so a review task keeps its

@@ -34,7 +34,7 @@ class PluginClientException implements Exception {
 //   are never exposed over HTTP (`server/src/ledger/routes.ts`), so this never
 //   reaches the client as a wire `error` envelope; the ledger client only
 //   cancels and reads.
-// - `not_configured` — `server/src/notify/routes.ts`; `notif_client.dart`
+// - `not_configured` — `server/src/notify/sse_routes.ts`; `notif_client.dart`
 //   reaches it through its own `Dio`, never through [PluginHttp].
 //
 // FORWARD-REGISTERED EXCEPTION (goal surface, Phase 3.6). The four codes at the

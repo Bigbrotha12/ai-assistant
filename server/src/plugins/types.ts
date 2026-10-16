@@ -264,7 +264,7 @@ export class PluginSchemaError extends Error {
 
 /**
  * Parse a persisted plugin store and fail fast when the on-disk schema version
- * no longer matches this build. Mirrors `env.ts`'s load-time fail-fast
+ * no longer matches this build. Mirrors `config/env.ts`'s load-time fail-fast
  * philosophy, but throws so the caller (the store) can route the error.
  */
 export type PluginStoreMigration = {

@@ -30,7 +30,7 @@ import { ToolResourceError } from "../tools/bounds.ts";
  *
  * Handler/model timeouts and MCP wrapper errors are intentionally NOT retried:
  *   - the `execution` interceptor's bound (`invokeBoundedToolHandler`,
- *     `tool_bounds.ts`) wraps OUTSIDE the body. On a timeout it aborts the
+ *     `tools/bounds.ts`) wraps OUTSIDE the body. On a timeout it aborts the
  *     composed signal with a `tool_timeout` reason and rejects the dispatch with
  *     its OWN `ToolResourceError`; the BODY never sees that object — it sees an
  *     aborted signal / `AbortError`, which the predicate deliberately rejects
