@@ -187,6 +187,23 @@ export function createAccountDeletionHooks(
   };
 }
 
+/**
+ * Reset-time credential revocation.
+ *
+ * `revokeSessionsOnPasswordReset` makes better-auth delete the user's session
+ * rows after the password hash changes. The API-key plugin owns a separate
+ * `apikey` table, which better-auth does not touch, so the hook deletes those
+ * rows explicitly. Both effects are scoped to the reset user.
+ */
+export function createPasswordResetHooks(db: DatabaseType) {
+  return {
+    revokeSessionsOnPasswordReset: true,
+    onPasswordReset: async ({ user }: { user: { id: string } }) => {
+      db.prepare("DELETE FROM apikey WHERE referenceId = ?").run(user.id);
+    },
+  };
+}
+
 export const auth = betterAuth({
   appName: "AI Assistant",
   secret: env.BETTER_AUTH_SECRET,
@@ -203,6 +220,7 @@ export const auth = betterAuth({
     // reads both from `emailAndPassword`, not from `emailVerification`.)
     autoSignIn: false,
     requireEmailVerification: true,
+    ...createPasswordResetHooks(authDb),
     // Route the email to our own reset page (`GET /reset-password?token=…`,
     // served by the Hono app) instead of better-auth's `/api/auth` callback
     // redirect — the app has no deep-link handling, so the emailed link must
